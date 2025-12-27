@@ -1,0 +1,29 @@
+[tool.poetry]
+name = "scholar"
+version = "0.1.0"
+description = "A tool for structured literature searches across bibliographic databases"
+authors = ["Daniel Bosk <dbosk@kth.se>"]
+readme = "README.md"
+license = "MIT"
+packages = [{include = "scholar", from = "src"}]
+
+[tool.poetry.dependencies]
+python = "^3.10"
+requests = "^2.31"
+
+[tool.poetry.group.dev.dependencies]
+pytest = "^8.0"
+pytest-cov = "^4.1"
+black = "^24.0"
+mypy = "^1.8"
+
+[build-system]
+requires = ["poetry-core"]
+build-backend = "poetry.core.masonry.api"
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+python_files = ["test_*.py"]
+
+[tool.black]
+line-length = 88

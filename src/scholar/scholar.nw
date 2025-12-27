@@ -1,0 +1,369 @@
+\input{preamble.tex}
+
+\begin{document}
+\maketitle
+\tableofcontents
+
+\chapter{Introduction}
+
+Systematic literature reviews and structured searches are essential for
+rigorous academic research.
+However, searching across multiple databases---such as Web of Science,
+IEEE~Xplore, Semantic~Scholar, and OpenAlex---is tedious and error-prone.
+Each database has its own query syntax, interface, and export format.
+Reproducing a search requires careful documentation of queries, filters, and
+timestamps.
+
+This program, \emph{Scholar}, provides a unified interface for structured
+searches across multiple bibliographic databases.
+It produces reproducible reports documenting the search process: the queries
+used, filters applied, timestamps, and resulting papers.
+This supports the transparency required for systematic reviews while reducing
+manual effort.
+
+\section{Overall design}
+
+The system consists of several components:
+\begin{description}
+\item[Search providers] Adapters for different bibliographic databases
+  (Semantic~Scholar, OpenAlex, IEEE~Xplore, Web of Science, DBLP, etc.).
+\item[Query abstraction] A common query format that translates to
+  provider-specific syntax.
+\item[Results management] Data structures for papers, with deduplication across
+  sources.
+\item[Report generation] Tools to export structured, reproducible search
+  documentation.
+\end{description}
+
+\section{Module structure}
+
+We organize the code as a Python package.
+The main module provides the public API:
+
+<<[[scholar.py]]>>=
+"""
+Scholar: A tool for structured literature searches.
+
+Provides a unified interface for searching bibliographic databases
+and generating reproducible search reports.
+"""
+
+<<imports>>
+<<constants>>
+<<classes>>
+<<functions>>
+@
+
+The package initialization exports the public interface:
+
+<<[[__init__.py]]>>=
+"""
+Scholar package for structured literature searches.
+"""
+
+from .scholar import Search, SearchResult, Paper
+from .scholar import search
+
+__all__ = [
+    "Search",
+    "SearchResult",
+    "Paper",
+    "search",
+]
+@
+
+
+\chapter{Data model}
+
+Before implementing search functionality, we establish the data structures that
+represent papers and search results.
+Getting these abstractions right is crucial: they determine how papers from
+different sources are unified and how results can be exported.
+
+\section{Representing papers}
+
+A paper has bibliographic metadata that we need for deduplication and export.
+Different databases return varying amounts of detail, so we design for the
+common core while allowing optional fields:
+
+<<classes>>=
+@dataclass
+class Paper:
+    """Represents a paper from a bibliographic database."""
+
+    title: str
+    authors: list[str]
+    year: int | None = None
+    doi: str | None = None
+    abstract: str | None = None
+    venue: str | None = None
+    url: str | None = None
+    source: str | None = None
+
+    <<paper methods>>
+@
+
+We use a dataclass for simplicity.
+The [[source]] field tracks which database returned this paper, useful for
+provenance in reports.
+
+\subsection{Paper identity and deduplication}
+
+When merging results from multiple databases, we need to identify duplicate
+papers.
+The DOI is the most reliable identifier when available:
+
+<<paper methods>>=
+def __eq__(self, other: object) -> bool:
+    """Check equality based on DOI if available, else title."""
+    if not isinstance(other, Paper):
+        return NotImplemented
+    if self.doi and other.doi:
+        return self.doi.lower() == other.doi.lower()
+    return self.title.lower() == other.title.lower()
+
+def __hash__(self) -> int:
+    """Hash based on DOI if available, else title."""
+    if self.doi:
+        return hash(self.doi.lower())
+    return hash(self.title.lower())
+@
+
+This allows us to use papers in sets for automatic deduplication.
+
+
+\section{Search results}
+
+A search result bundles papers with metadata about the search itself, supporting
+reproducibility:
+
+<<classes>>=
+@dataclass
+class SearchResult:
+    """Represents the result of a search query."""
+
+    query: str
+    provider: str
+    timestamp: str
+    papers: list[Paper]
+    filters: dict | None = None
+
+    <<search result methods>>
+@
+
+The [[filters]] dictionary captures any provider-specific constraints (date
+ranges, document types, etc.) that were applied.
+
+\subsection{Combining results}
+
+We can merge results from multiple searches, deduplicating papers:
+
+<<search result methods>>=
+def merge(self, other: "SearchResult") -> "SearchResult":
+    """Merge two search results, deduplicating papers."""
+    seen = set(self.papers)
+    merged_papers = list(self.papers)
+    for paper in other.papers:
+        if paper not in seen:
+            merged_papers.append(paper)
+            seen.add(paper)
+
+    return SearchResult(
+        query=f"{self.query} | {other.query}",
+        provider=f"{self.provider}, {other.provider}",
+        timestamp=self.timestamp,
+        papers=merged_papers,
+        filters=None,
+    )
+@
+
+
+\section{Search abstraction}
+
+The [[Search]] class provides the main interface for conducting searches:
+
+<<classes>>=
+class Search:
+    """Manages a structured search across bibliographic databases."""
+
+    def __init__(self, query: str):
+        """Initialize a search with the given query."""
+        self.query = query
+        self.results: list[SearchResult] = []
+
+    <<search methods>>
+@
+
+
+\chapter{Search functionality}
+
+With the data model in place, we implement the search functionality.
+For now, we provide a simple interface; provider implementations will be added
+as the project develops.
+
+\section{Simple search function}
+
+A convenience function for quick searches:
+
+<<functions>>=
+def search(query: str) -> SearchResult:
+    """
+    Perform a simple search and return results.
+
+    This is a convenience function for quick searches.
+    For more control, use the Search class directly.
+    """
+    s = Search(query)
+    s.execute()
+    return s.results[0] if s.results else SearchResult(
+        query=query,
+        provider="none",
+        timestamp=datetime.now().isoformat(),
+        papers=[],
+    )
+@
+
+\section{Executing searches}
+
+The [[Search]] class orchestrates queries across providers:
+
+<<search methods>>=
+def execute(self, providers: list[str] | None = None) -> list[SearchResult]:
+    """
+    Execute the search across specified providers.
+
+    Args:
+        providers: List of provider names to search. If None, uses all
+            available providers.
+
+    Returns:
+        List of SearchResult objects, one per provider.
+    """
+    timestamp = datetime.now().isoformat()
+
+    # For now, return empty result as placeholder
+    # Provider implementations will be added in future chapters
+    result = SearchResult(
+        query=self.query,
+        provider="placeholder",
+        timestamp=timestamp,
+        papers=[],
+    )
+    self.results.append(result)
+    return self.results
+@
+
+
+\chapter{Dependencies}
+
+We collect the imports used throughout the module:
+
+<<imports>>=
+from dataclasses import dataclass
+from datetime import datetime
+@
+
+<<constants>>=
+VERSION = "0.1.0"
+@
+
+
+\chapter{Testing}
+\label{ch:testing}
+
+We verify the implementation with tests distributed throughout, but collected
+here for pytest.
+
+<<test [[scholar.py]]>>=
+"""Tests for the scholar module."""
+import pytest
+from scholar import Paper, SearchResult, Search, search
+@
+
+\section{Testing paper equality}
+
+Papers should be equal if they have the same DOI:
+
+<<test [[scholar.py]]>>=
+class TestPaper:
+    """Tests for the Paper class."""
+
+    def test_equality_by_doi(self):
+        """Papers with same DOI are equal."""
+        p1 = Paper(title="Paper One", authors=["A"], doi="10.1234/test")
+        p2 = Paper(title="Paper 1", authors=["B"], doi="10.1234/test")
+        assert p1 == p2
+
+    def test_equality_by_title(self):
+        """Papers without DOI are equal by title."""
+        p1 = Paper(title="Test Paper", authors=["A"])
+        p2 = Paper(title="test paper", authors=["B"])
+        assert p1 == p2
+
+    def test_inequality(self):
+        """Different papers are not equal."""
+        p1 = Paper(title="Paper A", authors=["A"])
+        p2 = Paper(title="Paper B", authors=["B"])
+        assert p1 != p2
+
+    def test_hash_consistency(self):
+        """Equal papers have the same hash."""
+        p1 = Paper(title="Test", authors=["A"], doi="10.1234/test")
+        p2 = Paper(title="Different", authors=["B"], doi="10.1234/test")
+        assert hash(p1) == hash(p2)
+@
+
+\section{Testing search results}
+
+The merge operation should deduplicate papers:
+
+<<test [[scholar.py]]>>=
+class TestSearchResult:
+    """Tests for the SearchResult class."""
+
+    def test_merge_deduplicates(self):
+        """Merging results deduplicates papers."""
+        p1 = Paper(title="Paper A", authors=["A"])
+        p2 = Paper(title="Paper B", authors=["B"])
+        p3 = Paper(title="Paper A", authors=["A"])  # Duplicate of p1
+
+        r1 = SearchResult(
+            query="test",
+            provider="p1",
+            timestamp="2024-01-01",
+            papers=[p1, p2],
+        )
+        r2 = SearchResult(
+            query="test",
+            provider="p2",
+            timestamp="2024-01-01",
+            papers=[p2, p3],
+        )
+
+        merged = r1.merge(r2)
+        assert len(merged.papers) == 2
+@
+
+\section{Testing the search interface}
+
+The search function should return a valid result:
+
+<<test [[scholar.py]]>>=
+class TestSearch:
+    """Tests for the Search class and search function."""
+
+    def test_search_returns_result(self):
+        """search() returns a SearchResult."""
+        result = search("test query")
+        assert isinstance(result, SearchResult)
+        assert result.query == "test query"
+
+    def test_search_class_execute(self):
+        """Search.execute() returns results."""
+        s = Search("test")
+        results = s.execute()
+        assert len(results) > 0
+@
+
+
+\end{document}
