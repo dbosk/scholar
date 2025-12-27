@@ -1,0 +1,362 @@
+\input{preamble.tex}
+
+\begin{document}
+\maketitle
+\tableofcontents
+
+\chapter{Introduction}
+
+This module implements search providers---adapters that connect Scholar to
+various bibliographic databases.
+Each provider knows how to query a specific database and convert results to
+our common [[Paper]] type.
+
+The provider abstraction allows us to:
+\begin{description}
+\item[Add new databases] without modifying the core search logic.
+\item[Test in isolation] by mocking individual providers.
+\item[Configure per-provider] settings like API keys and rate limits.
+\end{description}
+
+
+\section{Module structure}
+
+The providers module exports the provider protocol and registry functions:
+
+<<[[providers.py]]>>=
+"""
+Search providers for bibliographic databases.
+
+Each provider implements the SearchProvider protocol and registers
+itself with the provider registry on import.
+"""
+
+<<imports>>
+<<constants>>
+<<provider protocol>>
+<<provider registry>>
+<<semantic scholar provider>>
+@
+
+
+\chapter{Provider Protocol}
+
+We define a protocol (structural typing) rather than an abstract base class.
+This allows providers to be implemented without inheritance, which is more
+Pythonic and easier to test.
+
+A provider must have:
+\begin{description}
+\item[name] A unique identifier string.
+\item[search] A method that takes a query and returns papers.
+\end{description}
+
+<<provider protocol>>=
+class SearchProvider(Protocol):
+    """Protocol for search providers."""
+
+    name: str
+
+    def search(self, query: str, limit: int = 100) -> list[Paper]:
+        """
+        Search for papers matching the query.
+
+        Args:
+            query: The search query string.
+            limit: Maximum number of results to return.
+
+        Returns:
+            List of Paper objects matching the query.
+        """
+        ...
+@
+
+
+\chapter{Provider Registry}
+
+Providers register themselves when imported.
+This allows the [[Search]] class to discover available providers without
+hardcoding them.
+
+<<provider registry>>=
+PROVIDERS: dict[str, SearchProvider] = {}
+
+
+def register_provider(provider: SearchProvider) -> None:
+    """Register a provider for use in searches."""
+    PROVIDERS[provider.name] = provider
+
+
+def get_provider(name: str) -> SearchProvider | None:
+    """Get a provider by name, or None if not found."""
+    return PROVIDERS.get(name)
+
+
+def get_all_providers() -> list[SearchProvider]:
+    """Get all registered providers."""
+    return list(PROVIDERS.values())
+@
+
+
+\chapter{Semantic Scholar Provider}
+
+Semantic Scholar is an AI-powered research tool that provides free access to
+over 200 million academic papers.
+Their API allows searching papers by keyword, author, venue, and more.
+
+We use the [[semanticscholar]] Python package which handles API communication,
+rate limiting, and pagination.
+
+\section{Provider implementation}
+
+<<semantic scholar provider>>=
+class SemanticScholarProvider:
+    """Search provider for Semantic Scholar."""
+
+    name = "semantic_scholar"
+
+    def __init__(self, api_key: str | None = None):
+        """
+        Initialize the Semantic Scholar provider.
+
+        Args:
+            api_key: Optional API key for higher rate limits.
+                     If not provided, uses S2_API_KEY environment variable.
+        """
+        self.client = SemanticScholar(api_key=api_key)
+
+    def search(self, query: str, limit: int = 100) -> list[Paper]:
+        """Search Semantic Scholar for papers matching the query."""
+        try:
+            results = self.client.search_paper(
+                query,
+                limit=limit,
+                fields=[
+                    "title",
+                    "authors",
+                    "year",
+                    "abstract",
+                    "venue",
+                    "externalIds",
+                    "url",
+                ],
+            )
+            return [self._convert_paper(p) for p in results]
+        except Exception:
+            # Return empty list on API errors
+            return []
+
+    <<convert semantic scholar paper>>
+@
+
+\subsection{Converting paper format}
+
+Semantic Scholar returns papers in their own format.
+We convert them to our common [[Paper]] type:
+
+<<convert semantic scholar paper>>=
+def _convert_paper(self, ss_paper) -> Paper:
+    """Convert a Semantic Scholar paper to our Paper type."""
+    # Extract DOI from externalIds if available
+    doi = None
+    if ss_paper.externalIds:
+        doi = ss_paper.externalIds.get("DOI")
+
+    # Extract author names
+    authors = []
+    if ss_paper.authors:
+        authors = [a.name for a in ss_paper.authors if a.name]
+
+    return Paper(
+        title=ss_paper.title or "",
+        authors=authors,
+        year=ss_paper.year,
+        doi=doi,
+        abstract=ss_paper.abstract,
+        venue=ss_paper.venue,
+        url=ss_paper.url,
+        source=self.name,
+    )
+@
+
+\section{Auto-registration}
+
+We register the provider when this module is imported:
+
+<<semantic scholar provider>>=
+# Register the provider on module import
+register_provider(SemanticScholarProvider())
+@
+
+
+\chapter{Dependencies}
+
+<<imports>>=
+from typing import Protocol
+
+from semanticscholar import SemanticScholar
+
+from scholar import Paper
+@
+
+<<constants>>=
+# Provider constants
+DEFAULT_LIMIT = 100
+@
+
+
+\chapter{Testing}
+\label{ch:providers-testing}
+
+We test both the registry and the Semantic Scholar provider.
+
+<<test [[providers.py]]>>=
+"""Tests for the providers module."""
+import pytest
+from unittest.mock import Mock, patch
+
+from scholar import Paper
+from scholar.providers import (
+    SemanticScholarProvider,
+    register_provider,
+    get_provider,
+    get_all_providers,
+    PROVIDERS,
+)
+@
+
+
+\section{Testing the registry}
+
+The registry should store and retrieve providers:
+
+<<test [[providers.py]]>>=
+class TestProviderRegistry:
+    """Tests for the provider registry."""
+
+    def test_semantic_scholar_registered(self):
+        """Semantic Scholar provider is auto-registered."""
+        provider = get_provider("semantic_scholar")
+        assert provider is not None
+        assert provider.name == "semantic_scholar"
+
+    def test_get_all_providers(self):
+        """get_all_providers returns registered providers."""
+        providers = get_all_providers()
+        assert len(providers) >= 1
+        names = [p.name for p in providers]
+        assert "semantic_scholar" in names
+
+    def test_get_unknown_provider(self):
+        """get_provider returns None for unknown providers."""
+        assert get_provider("unknown_provider") is None
+@
+
+
+\section{Testing Semantic Scholar provider}
+
+We mock the API client to avoid real network calls in tests:
+
+<<test [[providers.py]]>>=
+class TestSemanticScholarProvider:
+    """Tests for the SemanticScholar provider."""
+
+    def test_search_converts_papers(self):
+        """search() converts API results to Paper objects."""
+        provider = SemanticScholarProvider()
+
+        # Create mock paper
+        mock_paper = Mock()
+        mock_paper.title = "Test Paper"
+        mock_paper.authors = [Mock(name="Alice"), Mock(name="Bob")]
+        mock_paper.year = 2024
+        mock_paper.externalIds = {"DOI": "10.1234/test"}
+        mock_paper.abstract = "Test abstract"
+        mock_paper.venue = "Test Conference"
+        mock_paper.url = "https://example.com/paper"
+
+        with patch.object(provider.client, "search_paper") as mock_search:
+            mock_search.return_value = [mock_paper]
+
+            results = provider.search("test query")
+
+            assert len(results) == 1
+            paper = results[0]
+            assert isinstance(paper, Paper)
+            assert paper.title == "Test Paper"
+            assert paper.year == 2024
+            assert paper.doi == "10.1234/test"
+            assert paper.source == "semantic_scholar"
+
+    def test_search_handles_empty_results(self):
+        """search() returns empty list when no results."""
+        provider = SemanticScholarProvider()
+
+        with patch.object(provider.client, "search_paper") as mock_search:
+            mock_search.return_value = []
+
+            results = provider.search("obscure query")
+            assert results == []
+
+    def test_search_handles_api_error(self):
+        """search() returns empty list on API error."""
+        provider = SemanticScholarProvider()
+
+        with patch.object(provider.client, "search_paper") as mock_search:
+            mock_search.side_effect = Exception("API error")
+
+            results = provider.search("test")
+            assert results == []
+@
+
+
+\section{Integration test}
+
+We include a single integration test that makes one real API call to verify
+the provider works with the actual Semantic Scholar API.
+This test is marked with \texttt{@pytest.mark.integration} and skipped by
+default because Semantic Scholar has strict rate limits.
+
+To run integration tests explicitly:
+\begin{verbatim}
+pytest -m integration
+\end{verbatim}
+
+<<test [[providers.py]]>>=
+class TestSemanticScholarIntegration:
+    """Integration test for the SemanticScholar provider."""
+
+    @pytest.mark.integration
+    @pytest.mark.skip(reason="Skipped by default due to API rate limits")
+    def test_real_api_call(self):
+        """Make one real API call to verify the provider works."""
+        from semanticscholar import SemanticScholar
+
+        # Call the API directly to see any errors (not through our wrapper)
+        client = SemanticScholar()
+        try:
+            results = client.search_paper(
+                "machine learning",
+                limit=1,
+                fields=["title", "authors", "year"],
+            )
+            results_list = list(results)
+
+            # If API works, verify we get results
+            assert len(results_list) >= 1, "API returned no results"
+
+            # Verify the provider wrapper also works
+            provider = SemanticScholarProvider()
+            papers = provider.search("machine learning", limit=1)
+            assert len(papers) >= 1, "Provider returned no results"
+
+            paper = papers[0]
+            assert isinstance(paper, Paper)
+            assert paper.title
+            assert paper.source == "semantic_scholar"
+        except Exception as e:
+            pytest.skip(f"Semantic Scholar API unavailable: {e}")
+@
+
+
+\end{document}

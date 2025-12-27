@@ -1,4 +1,5 @@
 DOC+=		scholar.pdf
+DOC+=		providers.pdf
 DOC+=		cli.pdf
 
 .PHONY: all clean distclean
@@ -17,6 +18,12 @@ cli.pdf: preamble.tex
 cli.tex: ../src/scholar/cli.nw
 	noweave ${NOWEAVEFLAGS.tex} $< > $@
 
+providers.pdf: providers.tex
+providers.pdf: preamble.tex
+
+providers.tex: ../src/scholar/providers.nw
+	noweave ${NOWEAVEFLAGS.tex} $< > $@
+
 NOWEAVEFLAGS.tex?= -x -n -delay -t2
 
 INCLUDE_MAKEFILES=../makefiles
@@ -24,6 +31,6 @@ include ${INCLUDE_MAKEFILES}/tex.mk
 
 clean:
 	latexmk -C ${DOC}
-	${RM} scholar.tex cli.tex
+	${RM} scholar.tex providers.tex cli.tex
 
 distclean:

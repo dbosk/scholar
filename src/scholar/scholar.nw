@@ -225,7 +225,8 @@ def search(query: str) -> SearchResult:
 
 \section{Executing searches}
 
-The [[Search]] class orchestrates queries across providers:
+The [[Search]] class orchestrates queries across providers.
+We import the provider registry lazily to avoid circular imports:
 
 <<search methods>>=
 def execute(self, providers: list[str] | None = None) -> list[SearchResult]:
@@ -239,17 +240,31 @@ def execute(self, providers: list[str] | None = None) -> list[SearchResult]:
     Returns:
         List of SearchResult objects, one per provider.
     """
+    from scholar.providers import get_provider, get_all_providers
+
     timestamp = datetime.now().isoformat()
 
-    # For now, return empty result as placeholder
-    # Provider implementations will be added in future chapters
-    result = SearchResult(
-        query=self.query,
-        provider="placeholder",
-        timestamp=timestamp,
-        papers=[],
-    )
-    self.results.append(result)
+    # Determine which providers to use
+    if providers is None:
+        provider_list = get_all_providers()
+    else:
+        provider_list = [
+            get_provider(name)
+            for name in providers
+            if get_provider(name) is not None
+        ]
+
+    # Query each provider
+    for provider in provider_list:
+        papers = provider.search(self.query)
+        result = SearchResult(
+            query=self.query,
+            provider=provider.name,
+            timestamp=timestamp,
+            papers=papers,
+        )
+        self.results.append(result)
+
     return self.results
 @
 
@@ -277,6 +292,8 @@ here for pytest.
 <<test [[scholar.py]]>>=
 """Tests for the scholar module."""
 import pytest
+from unittest.mock import Mock
+
 from scholar import Paper, SearchResult, Search, search
 @
 
@@ -352,14 +369,30 @@ The search function should return a valid result:
 class TestSearch:
     """Tests for the Search class and search function."""
 
-    def test_search_returns_result(self):
+    def test_search_returns_result(self, monkeypatch):
         """search() returns a SearchResult."""
+        from scholar import providers
+
+        mock_provider = Mock()
+        mock_provider.name = "mock"
+        mock_provider.search.return_value = [
+            Paper(title="Test", authors=["Author"])
+        ]
+        monkeypatch.setattr(providers, "PROVIDERS", {"mock": mock_provider})
+
         result = search("test query")
         assert isinstance(result, SearchResult)
         assert result.query == "test query"
 
-    def test_search_class_execute(self):
+    def test_search_class_execute(self, monkeypatch):
         """Search.execute() returns results."""
+        from scholar import providers
+
+        mock_provider = Mock()
+        mock_provider.name = "mock"
+        mock_provider.search.return_value = []
+        monkeypatch.setattr(providers, "PROVIDERS", {"mock": mock_provider})
+
         s = Search("test")
         results = s.execute()
         assert len(results) > 0

@@ -377,6 +377,7 @@ We verify the CLI functionality with tests.
 <<test [[cli.py]]>>=
 """Tests for the CLI module."""
 import pytest
+from unittest.mock import Mock
 from typer.testing import CliRunner
 
 from scholar.cli import app, TableFormatter, JSONFormatter, BibTeXFormatter
@@ -414,8 +415,16 @@ class TestCLI:
         assert result.exit_code == 0
         assert "Search bibliographic databases" in result.stdout
 
-    def test_search_runs(self):
+    def test_search_runs(self, monkeypatch):
         """Search command executes without error."""
+        # Mock the provider to avoid real API calls
+        from scholar import providers
+
+        mock_provider = Mock()
+        mock_provider.name = "mock"
+        mock_provider.search.return_value = []
+        monkeypatch.setattr(providers, "PROVIDERS", {"mock": mock_provider})
+
         result = runner.invoke(app, ["search", "test query"])
         assert result.exit_code == 0
 @
