@@ -10,6 +10,11 @@ packages = [{include = "scholar", from = "src"}]
 [tool.poetry.dependencies]
 python = "^3.10"
 requests = "^2.31"
+typer = "^0.21"
+rich = "^13.0"
+
+[tool.poetry.scripts]
+scholar = "scholar.cli:main"
 
 [tool.poetry.group.dev.dependencies]
 pytest = "^8.0"

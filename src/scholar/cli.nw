@@ -1,0 +1,478 @@
+\input{preamble.tex}
+
+\begin{document}
+\maketitle
+\tableofcontents
+
+\chapter{Introduction}
+
+This document describes the command-line interface for Scholar.
+While the core library (\texttt{scholar.py}) provides the data model and search
+functionality, users need a convenient way to invoke searches from the terminal.
+
+The CLI serves several purposes:
+\begin{description}
+\item[Direct invocation] Users can run searches without writing Python code.
+\item[Scripting] The CLI supports output formats suitable for shell pipelines.
+\item[Extensibility] The subcommand structure allows adding new functionality
+  (like snowball searching) without modifying the core interface.
+\end{description}
+
+
+\section{Design decisions}
+
+We use Typer for the CLI framework because it provides:
+\begin{itemize}
+\item Automatic help generation from type annotations
+\item Subcommand support for modular organization
+\item Integration with Rich for formatted output
+\end{itemize}
+
+The CLI is organized as subcommands to prepare for future extensions.
+Currently, we have the [[search]] command; later we will add [[snowball]] and
+[[tuxedo]] as git submodules that register their own commands.
+
+
+\section{Module structure}
+
+The CLI module provides the main entry point:
+
+<<[[cli.py]]>>=
+"""
+Scholar command-line interface.
+
+Provides commands for structured literature searches
+across bibliographic databases.
+"""
+
+<<cli imports>>
+<<constants>>
+<<output formatters>>
+<<typer application>>
+<<search command>>
+<<submodule registration>>
+<<main entry point>>
+@
+
+We also provide a [[__main__.py]] module so users can run Scholar with
+[[python -m scholar]]:
+
+<<[[__main__.py]]>>=
+"""Allow running Scholar as a module: python -m scholar"""
+from scholar.cli import main
+
+if __name__ == "__main__":
+    main()
+@
+
+
+\chapter{The Typer Application}
+
+We create a Typer application that serves as the root for all subcommands.
+The [[no_args_is_help=True]] setting ensures users see help when they run
+[[scholar]] without arguments.
+
+To ensure proper subcommand behavior (where users must type [[scholar search]]
+rather than just [[scholar]]), we add a callback to the main app.
+Without this callback, Typer treats a single command as the default and
+absorbs its arguments into the main app.
+
+<<typer application>>=
+app = typer.Typer(
+    name="scholar",
+    help="Structured literature search tool for systematic reviews.",
+    no_args_is_help=True,
+)
+
+
+@app.callback()
+def callback() -> None:
+    """
+    Scholar: A tool for structured literature searches.
+
+    Use 'scholar search' to query bibliographic databases.
+    """
+    pass
+@
+
+
+\chapter{The Search Command}
+
+The primary command is [[search]], which queries bibliographic databases and
+displays results.
+We use Typer's [[Annotated]] syntax for clean argument definitions.
+
+<<search command>>=
+@app.command()
+def search(
+    query: Annotated[str, typer.Argument(help="Search query string")],
+    <<search command options>>
+) -> None:
+    """
+    Search bibliographic databases with structured queries.
+
+    Examples:
+        scholar search "machine learning privacy"
+        scholar search "federated learning" -p semantic_scholar -f json
+    """
+    <<execute search and display results>>
+@
+
+\section{Command options}
+
+The search command accepts options for controlling which providers to query
+and how to format output:
+
+<<search command options>>=
+provider: Annotated[
+    Optional[list[str]],
+    typer.Option(
+        "--provider", "-p",
+        help="Search provider(s) to use. Can be specified multiple times.",
+    ),
+] = None,
+output_format: Annotated[
+    str,
+    typer.Option(
+        "--format", "-f",
+        help="Output format: table, json, or bibtex.",
+    ),
+] = "table"
+@
+
+\section{Executing the search}
+
+We import the [[Search]] class from the core module and execute the query.
+The results are then passed to the appropriate formatter:
+
+<<execute search and display results>>=
+from scholar import Search
+
+s = Search(query)
+results = s.execute(providers=provider)
+display_results(results, output_format)
+@
+
+
+\chapter{Output Formatting}
+
+Different use cases require different output formats:
+\begin{description}
+\item[table] Human-readable Rich tables for interactive use.
+\item[json] Machine-readable format for scripting and pipelines.
+\item[bibtex] Citation format for integration with \LaTeX{} documents.
+\end{description}
+
+We implement a formatter for each and dispatch based on the user's choice.
+
+\section{The display function}
+
+This function selects the appropriate formatter and invokes it:
+
+<<output formatters>>=
+<<formatter classes>>
+
+FORMATTERS: dict[str, type] = {
+    "table": TableFormatter,
+    "json": JSONFormatter,
+    "bibtex": BibTeXFormatter,
+}
+
+
+def display_results(results: list, output_format: str = "table") -> None:
+    """
+    Display search results in the specified format.
+
+    Args:
+        results: List of SearchResult objects to display.
+        output_format: One of 'table', 'json', or 'bibtex'.
+    """
+    formatter_class = FORMATTERS.get(output_format, TableFormatter)
+    formatter = formatter_class()
+    formatter.format(results)
+@
+
+
+\section{Table formatter}
+
+The table formatter uses Rich to create visually appealing output.
+We show the query and provider as context, then list papers with key metadata:
+
+<<formatter classes>>=
+class TableFormatter:
+    """Display results as Rich tables."""
+
+    def __init__(self) -> None:
+        self.console = Console()
+
+    def format(self, results: list) -> None:
+        """Display results in formatted tables."""
+        for result in results:
+            table = Table(
+                title=f"Results for: {result.query}",
+                caption=f"Provider: {result.provider} | {result.timestamp}",
+            )
+
+            table.add_column("Title", style="cyan", no_wrap=False)
+            table.add_column("Authors", style="green")
+            table.add_column("Year", justify="right")
+            table.add_column("DOI", style="dim")
+
+            for paper in result.papers:
+                authors = ", ".join(paper.authors[:3])
+                if len(paper.authors) > 3:
+                    authors += "..."
+                table.add_row(
+                    paper.title,
+                    authors,
+                    str(paper.year) if paper.year else "",
+                    paper.doi or "",
+                )
+
+            self.console.print(table)
+
+            if not result.papers:
+                self.console.print("[dim]No results found.[/dim]")
+@
+
+
+\section{JSON formatter}
+
+For scripting, we provide JSON output that includes all paper metadata:
+
+<<formatter classes>>=
+class JSONFormatter:
+    """Output results as JSON for scripting."""
+
+    def format(self, results: list) -> None:
+        """Output results as JSON."""
+        output = []
+        for result in results:
+            output.append({
+                "query": result.query,
+                "provider": result.provider,
+                "timestamp": result.timestamp,
+                "papers": [
+                    {
+                        "title": p.title,
+                        "authors": p.authors,
+                        "year": p.year,
+                        "doi": p.doi,
+                        "abstract": p.abstract,
+                        "venue": p.venue,
+                        "url": p.url,
+                    }
+                    for p in result.papers
+                ],
+            })
+        print(json.dumps(output, indent=2))
+@
+
+
+\section{BibTeX formatter}
+
+For \LaTeX{} users, we generate BibTeX entries that can be added to a
+[[.bib]] file:
+
+<<formatter classes>>=
+class BibTeXFormatter:
+    """Output results as BibTeX entries."""
+
+    def format(self, results: list) -> None:
+        """Output results as BibTeX."""
+        for result in results:
+            for paper in result.papers:
+                self._format_paper(paper)
+
+    def _format_paper(self, paper) -> None:
+        """Format a single paper as BibTeX."""
+        first_author = (
+            paper.authors[0].split()[-1] if paper.authors else "unknown"
+        )
+        year = paper.year or "nd"
+        key = f"{first_author.lower()}{year}"
+
+        print(f"@article{{{key},")
+        print(f"  title = {{{paper.title}}},")
+        print(f"  author = {{{' and '.join(paper.authors)}}},")
+        if paper.year:
+            print(f"  year = {{{paper.year}}},")
+        if paper.doi:
+            print(f"  doi = {{{paper.doi}}},")
+        if paper.venue:
+            print(f"  journal = {{{paper.venue}}},")
+        print("}")
+        print()
+@
+
+
+\chapter{Submodule Registration}
+
+To support future extensions like snowball and tuxedo, we provide a mechanism
+for submodules to register their commands with the main application.
+
+Each submodule should provide a [[register_commands(app)]] function that adds
+its commands to the Typer app.
+We attempt to import each known submodule and call this function if it exists:
+
+<<submodule registration>>=
+SUBMODULES = ["snowball", "tuxedo"]
+
+
+def register_submodules() -> None:
+    """
+    Dynamically register subcommand modules if available.
+
+    This allows snowball and tuxedo to be added as git submodules
+    without modifying this file. Each submodule should provide a
+    `register_commands(app)` function.
+    """
+    for name in SUBMODULES:
+        try:
+            module = __import__(f"scholar.{name}", fromlist=["register_commands"])
+            if hasattr(module, "register_commands"):
+                module.register_commands(app)
+        except ImportError:
+            pass  # Submodule not installed
+@
+
+
+\chapter{Entry Point}
+
+The main entry point registers any available submodules and then runs the
+Typer application:
+
+<<main entry point>>=
+def main() -> None:
+    """Main entry point for the Scholar CLI."""
+    register_submodules()
+    app()
+@
+
+
+\chapter{Dependencies}
+
+We collect the imports used throughout the module:
+
+<<cli imports>>=
+from typing import Optional
+from typing_extensions import Annotated
+import json
+
+import typer
+from rich.console import Console
+from rich.table import Table
+@
+
+<<constants>>=
+# CLI constants (reserved for future use)
+@
+
+
+\chapter{Testing}
+\label{ch:cli-testing}
+
+We verify the CLI functionality with tests.
+
+<<test [[cli.py]]>>=
+"""Tests for the CLI module."""
+import pytest
+from typer.testing import CliRunner
+
+from scholar.cli import app, TableFormatter, JSONFormatter, BibTeXFormatter
+from scholar import SearchResult, Paper
+@
+
+\section{Testing the CLI application}
+
+We use Typer's [[CliRunner]] to test the CLI without actually invoking
+a subprocess:
+
+<<test [[cli.py]]>>=
+runner = CliRunner()
+
+
+class TestCLI:
+    """Tests for the CLI application."""
+
+    def test_help_displayed(self):
+        """Running without args shows help with 'search' command listed."""
+        result = runner.invoke(app, [])
+        # Exit code 2 is expected (no command given), but help should show
+        assert "search" in result.stdout
+        assert "Commands" in result.stdout
+
+    def test_explicit_help(self):
+        """Running with --help shows help with exit code 0."""
+        result = runner.invoke(app, ["--help"])
+        assert result.exit_code == 0
+        assert "search" in result.stdout
+
+    def test_search_command_exists(self):
+        """The search command is registered."""
+        result = runner.invoke(app, ["search", "--help"])
+        assert result.exit_code == 0
+        assert "Search bibliographic databases" in result.stdout
+
+    def test_search_runs(self):
+        """Search command executes without error."""
+        result = runner.invoke(app, ["search", "test query"])
+        assert result.exit_code == 0
+@
+
+\section{Testing formatters}
+
+We test each formatter with sample data:
+
+<<test [[cli.py]]>>=
+class TestFormatters:
+    """Tests for output formatters."""
+
+    @pytest.fixture
+    def sample_results(self):
+        """Create sample search results for testing."""
+        papers = [
+            Paper(
+                title="Test Paper",
+                authors=["Alice", "Bob"],
+                year=2024,
+                doi="10.1234/test",
+            ),
+        ]
+        return [
+            SearchResult(
+                query="test",
+                provider="test_provider",
+                timestamp="2024-01-01T00:00:00",
+                papers=papers,
+            )
+        ]
+
+    def test_table_formatter(self, sample_results, capsys):
+        """TableFormatter produces output."""
+        formatter = TableFormatter()
+        formatter.format(sample_results)
+        captured = capsys.readouterr()
+        assert "Test Paper" in captured.out
+
+    def test_json_formatter(self, sample_results, capsys):
+        """JSONFormatter produces valid JSON."""
+        formatter = JSONFormatter()
+        formatter.format(sample_results)
+        captured = capsys.readouterr()
+        import json
+        data = json.loads(captured.out)
+        assert data[0]["query"] == "test"
+        assert data[0]["papers"][0]["title"] == "Test Paper"
+
+    def test_bibtex_formatter(self, sample_results, capsys):
+        """BibTeXFormatter produces BibTeX entries."""
+        formatter = BibTeXFormatter()
+        formatter.format(sample_results)
+        captured = capsys.readouterr()
+        assert "@article{" in captured.out
+        assert "title = {Test Paper}" in captured.out
+@
+
+
+\end{document}

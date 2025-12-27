@@ -4,6 +4,7 @@ src/**/*.py
 src/**/*.tex
 tests/*.py
 doc/scholar.tex
+doc/cli.tex
 doc/*.pdf
 doc/ltxobj/
 
