@@ -35,6 +35,7 @@ and generating reports from review sessions.
 """Interactive TUI for reviewing academic papers."""
 <<tui imports>>
 <<tui data structures>>
+<<tui pdf cache>>
 <<tui paper list widget>>
 <<tui abstract screen>>
 <<tui discard modal>>
@@ -51,12 +52,20 @@ We need data structures to track the review state of each paper. The
 pending review, along with the motivation for discards.
 
 <<tui imports>>=
+from dataclasses import dataclass
 from dataclasses import dataclass, field
 from datetime import datetime
 from enum import Enum
 from pathlib import Path
 from typing import Callable
+import hashlib
+import os
+import subprocess
 import sys
+import tempfile
+
+import platformdirs
+import requests
 
 from textual.app import App, ComposeResult
 from textual.binding import Binding
@@ -148,6 +157,68 @@ class ReviewSession:
             self.decisions.sort(key=lambda d: d.provider.lower(), reverse=reverse)
 @
 
+\chapter{PDF Caching}
+
+When a paper has no abstract, we can download and open the PDF instead. PDFs are
+cached locally to avoid redundant downloads. The cache uses the same directory
+structure as the search cache.
+
+<<tui pdf cache>>=
+def get_pdf_cache_dir() -> Path:
+    """Get the PDF cache directory, creating it if needed."""
+    cache_dir = Path(user_cache_dir("scholar")) / "pdfs"
+    cache_dir.mkdir(parents=True, exist_ok=True)
+    return cache_dir
+
+
+def get_cached_pdf_path(url: str) -> Path:
+    """Get the cache path for a PDF URL."""
+    url_hash = hashlib.sha256(url.encode()).hexdigest()[:16]
+    return get_pdf_cache_dir() / f"{url_hash}.pdf"
+
+
+def download_pdf(url: str) -> Path | None:
+    """
+    Download a PDF to the cache if not already cached.
+    
+    Returns the path to the cached PDF, or None if download fails.
+    """
+    cache_path = get_cached_pdf_path(url)
+    
+    if cache_path.exists():
+        return cache_path
+    
+    try:
+        response = requests.get(url, timeout=30, stream=True)
+        response.raise_for_status()
+        
+        with open(cache_path, "wb") as f:
+            for chunk in response.iter_content(chunk_size=8192):
+                f.write(chunk)
+        
+        return cache_path
+    except Exception:
+        return None
+
+
+def open_pdf(path: Path) -> bool:
+    """
+    Open a PDF with the system default viewer.
+    
+    Returns True if successful, False otherwise.
+    """
+    try:
+        if sys.platform == "darwin":
+            subprocess.run(["open", str(path)], check=True)
+        elif sys.platform == "win32":
+            os.startfile(str(path))  # type: ignore
+        else:
+            subprocess.run(["xdg-open", str(path)], check=True)
+        return True
+    except Exception:
+        return False
+@
+
 \chapter{Paper List Widget}
 
 The main interface displays papers in a navigable list. Each paper shows its 
@@ -203,11 +274,13 @@ class AbstractScreen(Screen[None]):
         Binding("q", "dismiss_screen", "Back"),
         Binding("k", "keep", "Keep"),
         Binding("d", "discard", "Discard"),
+        Binding("p", "open_pdf", "Open PDF"),
     ]
     
     def __init__(self, decision: ReviewDecision) -> None:
         super().__init__()
         self.decision = decision
+        self.pdf_status: str = ""
     
     def compose(self) -> ComposeResult:
         paper = self.decision.paper
@@ -227,10 +300,42 @@ class AbstractScreen(Screen[None]):
                 yield Static(f"[bold]DOI:[/bold] {paper.doi}")
             if paper.url:
                 yield Static(f"[bold]URL:[/bold] {paper.url}")
+            if paper.pdf_url:
+                yield Static(f"[bold]PDF:[/bold] {paper.pdf_url}")
             
             yield Static("")
             yield Static("[bold]Abstract:[/bold]")
-            yield Static(paper.abstract or "[dim]No abstract available[/dim]")
+            if paper.abstract:
+                yield Static(paper.abstract)
+            else:
+                if paper.pdf_url:
+                    yield Static("[dim]No abstract available. Press [bold yellow]p[/bold yellow] to open PDF.[/dim]")
+                else:
+                    yield Static("[dim]No abstract available and no PDF link found.[/dim]")
+            
+            yield Static("", id="pdf-status")
+        yield Footer()
+    
+    def action_open_pdf(self) -> None:
+        """Download and open the PDF."""
+        paper = self.decision.paper
+        status_widget = self.query_one("#pdf-status", Static)
+        
+        if not paper.pdf_url:
+            status_widget.update("[red]No PDF URL available[/red]")
+            return
+        
+        status_widget.update("[yellow]Downloading PDF...[/yellow]")
+        self.refresh()
+        
+        pdf_path = download_pdf(paper.pdf_url)
+        if pdf_path:
+            if open_pdf(pdf_path):
+                status_widget.update(f"[green]PDF opened: {pdf_path}[/green]")
+            else:
+                status_widget.update(f"[red]Failed to open PDF viewer[/red]")
+        else:
+            status_widget.update("[red]Failed to download PDF[/red]")
         yield Footer()
     
     async def action_dismiss_screen(self) -> None:
@@ -318,16 +423,41 @@ class SortModal(ModalScreen[tuple[str, bool] | None]):
         Binding("p", "sort_provider", "Provider", priority=True),
     ]
     
+    DEFAULT_CSS = """
+    SortModal {
+        align: center middle;
+    }
+    #sort-dialog {
+        width: 50;
+        height: auto;
+        border: thick $primary;
+        background: $surface;
+        padding: 1 2;
+    }
+    #sort-title {
+        text-align: center;
+        width: 100%;
+        margin-bottom: 1;
+    }
+    .sort-option {
+        margin: 0 1;
+    }
+    .key {
+        color: $warning;
+        text-style: bold;
+    }
+    """
+    
     def compose(self) -> ComposeResult:
         with Container(id="sort-dialog"):
             yield Static("[bold]Sort Papers[/bold]", id="sort-title")
             yield Static("")
-            yield Static("[t] Title (A-Z)   [T] Title (Z-A)")
-            yield Static("[y] Year (oldest) [Y] Year (newest)")
-            yield Static("[a] Author (A-Z)  [A] Author (Z-A)")
-            yield Static("[p] Provider")
+            yield Static("[bold yellow]t[/] Title (A→Z)    [bold yellow]T[/] Title (Z→A)")
+            yield Static("[bold yellow]y[/] Year (oldest)  [bold yellow]Y[/] Year (newest)")
+            yield Static("[bold yellow]a[/] Author (A→Z)   [bold yellow]A[/] Author (Z→A)")
+            yield Static("[bold yellow]p[/] Provider")
             yield Static("")
-            yield Static("[dim]Press Escape to cancel[/dim]")
+            yield Static("[dim]Press [bold]Escape[/bold] to cancel[/dim]")
     
     def action_cancel(self) -> None:
         self.dismiss(None)

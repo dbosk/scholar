@@ -98,6 +98,7 @@ class Paper:
     abstract: str | None = None
     venue: str | None = None
     url: str | None = None
+    pdf_url: str | None = None
     source: str | None = None
 
     <<paper methods>>

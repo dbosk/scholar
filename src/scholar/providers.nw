@@ -286,6 +286,14 @@ def _convert_work(self, work: dict) -> Paper:
         if source:
             venue = source.get("display_name")
 
+    # Extract PDF URL from open_access or primary_location
+    pdf_url = None
+    open_access = work.get("open_access", {})
+    if open_access:
+        pdf_url = open_access.get("oa_url")
+    if not pdf_url and primary_location:
+        pdf_url = primary_location.get("pdf_url")
+
     return Paper(
         title=work.get("title", ""),
         authors=authors,
@@ -294,6 +302,7 @@ def _convert_work(self, work: dict) -> Paper:
         abstract=work.get("abstract"),
         venue=venue,
         url=work.get("id"),
+        pdf_url=pdf_url,
         source=self.name,
     )
 @
