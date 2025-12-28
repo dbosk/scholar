@@ -2,6 +2,7 @@ TESTS+=		test_scholar.py
 TESTS+=		test_providers.py
 TESTS+=		test_cache.py
 TESTS+=		test_cli.py
+TESTS+=		test_tui.py
 
 .PHONY: all clean distclean test
 
@@ -18,6 +19,9 @@ test_cache.py: ../src/scholar/cache.nw
 
 test_cli.py: ../src/scholar/cli.nw
 	notangle -R"test [[cli.py]]" $< | cpif $@
+
+test_tui.py: ../src/scholar/tui.nw
+	notangle -R"test [[tui.py]]" $< | cpif $@
 
 test: all
 	uv run pytest -v

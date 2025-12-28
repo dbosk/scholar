@@ -3,6 +3,7 @@ MODULES+=	scholar.py
 MODULES+=	providers.py
 MODULES+=	cache.py
 MODULES+=	cli.py
+MODULES+=	tui.py
 MODULES+=	__main__.py
 
 .PHONY: all clean distclean
@@ -22,6 +23,9 @@ cache.py: cache.nw
 	${NOTANGLE.py}
 
 cli.py: cli.nw
+	${NOTANGLE.py}
+
+tui.py: tui.nw
 	${NOTANGLE.py}
 
 __main__.py: cli.nw
