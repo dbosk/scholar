@@ -76,7 +76,7 @@ from textual.widgets import (
     ListItem, ListView, Static, TextArea,
 )
 from textual.message import Message
-from textual.worker import work
+from textual import work
 from rich.text import Text
 
 from scholar.scholar import Paper, SearchResult
