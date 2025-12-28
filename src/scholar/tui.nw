@@ -297,7 +297,7 @@ class AbstractScreen(Screen[None]):
     BINDINGS = [
         Binding("escape", "dismiss_screen", "Back"),
         Binding("q", "dismiss_screen", "Back"),
-        Binding("k", "keep", "Keep"),
+        Binding("K", "keep", "Keep"),
         Binding("d", "discard", "Discard"),
         Binding("p", "open_pdf", "Open PDF"),
     ]
@@ -629,10 +629,10 @@ class PaperReviewApp(App):
         for i, decision in enumerate(self.session.decisions):
             list_view.append(PaperListItem(decision, i))
         
-        # Restore selection and focus
+        # Restore selection and focus after UI updates complete
         if self.session.decisions:
             list_view.index = min(self.current_index, len(self.session.decisions) - 1)
-        list_view.focus()
+        self.call_later(list_view.focus)
     
     def _update_status(self) -> None:
         """Update the status bar with current counts."""
