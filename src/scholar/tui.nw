@@ -302,9 +302,10 @@ class AbstractScreen(Screen[None]):
         Binding("p", "open_pdf", "Open PDF"),
     ]
     
-    def __init__(self, decision: ReviewDecision) -> None:
+    def __init__(self, decision: ReviewDecision, previous_motivations: list[str]) -> None:
         super().__init__()
         self.decision = decision
+        self.previous_motivations = previous_motivations
         self.pdf_status: str = ""
     
     def compose(self) -> ComposeResult:
@@ -383,7 +384,7 @@ class AbstractScreen(Screen[None]):
             if result:
                 self.dismiss(None)
         
-        self.app.push_screen(DiscardModal(self.decision), handle_discard)
+        self.app.push_screen(DiscardModal(self.decision, self.previous_motivations), handle_discard)
 @
 
 \chapter{Discard Modal}
@@ -400,9 +401,10 @@ class DiscardModal(ModalScreen[bool]):
         Binding("escape", "cancel", "Cancel"),
     ]
     
-    def __init__(self, decision: ReviewDecision) -> None:
+    def __init__(self, decision: ReviewDecision, previous_motivations: list[str]) -> None:
         super().__init__()
         self.decision = decision
+        self.previous_motivations = previous_motivations
     
     def compose(self) -> ComposeResult:
         with Container(id="discard-dialog"):
@@ -410,25 +412,45 @@ class DiscardModal(ModalScreen[bool]):
                 f"[bold]Discard:[/bold] {self.decision.paper.title[:50]}...",
                 id="discard-title"
             )
-            yield Static("Why are you discarding this paper?")
-            yield TextArea(id="motivation-input")
-            with Horizontal(id="discard-buttons"):
-                yield Button("Discard", variant="error", id="confirm-discard")
-                yield Button("Cancel", variant="default", id="cancel-discard")
+            if self.previous_motivations:
+                yield Static("\n[bold]Previous reasons (click or type number):[/bold]")
+                for i, motivation in enumerate(self.previous_motivations[-5:], 1):
+                    short = motivation[:60] + "..." if len(motivation) > 60 else motivation
+                    yield Button(f"{i}. {short}", id=f"prev-{i-1}", variant="default")
+                yield Static("\n[bold]Or enter a new reason:[/bold]")
+            else:
+                yield Static("Why are you discarding this paper?")
+            yield Input(placeholder="Type reason and press Enter", id="motivation-input")
     
     def on_button_pressed(self, event: Button.Pressed) -> None:
-        if event.button.id == "confirm-discard":
-            motivation_input = self.query_one("#motivation-input", TextArea)
-            motivation = motivation_input.text.strip()
-            if motivation:
+        if event.button.id and event.button.id.startswith("prev-"):
+            idx = int(event.button.id.split("-")[1])
+            motivations = self.previous_motivations[-5:]
+            if idx < len(motivations):
                 self.decision.status = DecisionStatus.DISCARDED
-                self.decision.motivation = motivation
+                self.decision.motivation = motivations[idx]
                 self.dismiss(True)
-            else:
-                # Flash the input to indicate required field
-                motivation_input.styles.background = "darkred"
-        elif event.button.id == "cancel-discard":
-            self.dismiss(False)
+    
+    def on_input_submitted(self, event: Input.Submitted) -> None:
+        """Handle Enter key in input field."""
+        motivation = event.value.strip()
+        # Check if it's a number selecting a previous motivation
+        if motivation.isdigit():
+            idx = int(motivation) - 1
+            motivations = self.previous_motivations[-5:]
+            if 0 <= idx < len(motivations):
+                self.decision.status = DecisionStatus.DISCARDED
+                self.decision.motivation = motivations[idx]
+                self.dismiss(True)
+                return
+        
+        if motivation:
+            self.decision.status = DecisionStatus.DISCARDED
+            self.decision.motivation = motivation
+            self.dismiss(True)
+        else:
+            # Flash the input to indicate required field
+            self.query_one("#motivation-input", Input).styles.background = "darkred"
     
     def action_cancel(self) -> None:
         self.dismiss(False)
@@ -607,9 +629,10 @@ class PaperReviewApp(App):
         for i, decision in enumerate(self.session.decisions):
             list_view.append(PaperListItem(decision, i))
         
-        # Restore selection
+        # Restore selection and focus
         if self.session.decisions:
             list_view.index = min(self.current_index, len(self.session.decisions) - 1)
+        list_view.focus()
     
     def _update_status(self) -> None:
         """Update the status bar with current counts."""
@@ -651,7 +674,9 @@ class PaperReviewApp(App):
         """Show the abstract screen for current paper."""
         decision = self._get_current_decision()
         if decision:
-            self.push_screen(AbstractScreen(decision), self._on_abstract_closed)
+            previous = [d.motivation for d in self.session.decisions 
+                       if d.status == DecisionStatus.DISCARDED and d.motivation]
+            self.push_screen(AbstractScreen(decision, previous), self._on_abstract_closed)
     
     def _on_abstract_closed(self, result: None) -> None:
         """Called when abstract screen is closed."""
@@ -672,7 +697,10 @@ class PaperReviewApp(App):
         """Open discard modal for current paper."""
         decision = self._get_current_decision()
         if decision:
-            self.push_screen(DiscardModal(decision), self._on_discard_closed)
+            # Collect previous motivations from discarded papers
+            previous = [d.motivation for d in self.session.decisions 
+                       if d.status == DecisionStatus.DISCARDED and d.motivation]
+            self.push_screen(DiscardModal(decision, previous), self._on_discard_closed)
     
     def _on_discard_closed(self, result: bool | None) -> None:
         """Called when discard modal is closed."""
