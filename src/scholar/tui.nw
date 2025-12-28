@@ -657,6 +657,7 @@ class PaperReviewApp(App):
         """Called when abstract screen is closed."""
         self._refresh_list()
         self._update_status()
+        self.query_one("#paper-list", ListView).focus()
     
     def action_keep(self) -> None:
         """Mark current paper as kept."""
@@ -677,6 +678,7 @@ class PaperReviewApp(App):
         """Called when discard modal is closed."""
         self._refresh_list()
         self._update_status()
+        self.query_one("#paper-list", ListView).focus()
     
     def action_sort(self) -> None:
         """Open sort modal."""
@@ -688,6 +690,7 @@ class PaperReviewApp(App):
             key, reverse = result
             self.session.sort_by(key, reverse)
             self._refresh_list()
+        self.query_one("#paper-list", ListView).focus()
 @
 
 \chapter{Report Generation}
