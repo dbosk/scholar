@@ -384,9 +384,7 @@ class AbstractScreen(Screen[None]):
             if result:
                 self.dismiss(None)
         
-        # Get unique previous motivations
-        unique_motivations = list(dict.fromkeys(self.previous_motivations))
-        self.app.push_screen(DiscardModal(self.decision, unique_motivations), handle_discard)
+        self.app.push_screen(DiscardModal(self.decision, self.previous_motivations), handle_discard)
 @
 
 \chapter{Discard Modal}
@@ -408,27 +406,24 @@ class DiscardModal(ModalScreen[bool]):
         align: center middle;
     }
     #discard-dialog {
-        width: 80;
+        width: 60;
         height: auto;
-        max-height: 80%;
+        padding: 1 2;
         border: thick $primary;
         background: $surface;
-        padding: 1 2;
     }
     #reason-list {
         height: auto;
-        max-height: 15;
-        margin: 1 0;
-    }
-    #motivation-input {
-        margin: 1 0;
+        max-height: 10;
+        margin-bottom: 1;
     }
     """
     
     def __init__(self, decision: ReviewDecision, previous_motivations: list[str]) -> None:
         super().__init__()
         self.decision = decision
-        self.previous_motivations = previous_motivations
+        # Deduplicate motivations here so callers don't need to
+        self.previous_motivations = list(dict.fromkeys(previous_motivations))
     
     def compose(self) -> ComposeResult:
         from textual.widgets import OptionList
@@ -720,11 +715,11 @@ class PaperReviewApp(App):
         """Open discard modal for current paper."""
         decision = self._get_current_decision()
         if decision:
-            # Collect unique previous motivations from discarded papers
-            previous = list(dict.fromkeys(
+            # Collect previous motivations from discarded papers
+            previous = [
                 d.motivation for d in self.session.decisions 
                 if d.status == DecisionStatus.DISCARDED and d.motivation
-            ))
+            ]
             self.push_screen(DiscardModal(decision, previous), self._on_discard_closed)
     
     def _on_discard_closed(self, result: bool | None) -> None:
