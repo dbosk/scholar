@@ -113,6 +113,8 @@ def search(
     """
     Search bibliographic databases with structured queries.
 
+    Queries all available providers by default. Use -p to select specific ones.
+
     Examples:
         scholar search "machine learning privacy"
         scholar search "federated learning" -p semantic_scholar -f json
@@ -130,16 +132,24 @@ provider: Annotated[
     Optional[list[str]],
     typer.Option(
         "--provider", "-p",
-        help="Search provider(s) to use. Can be specified multiple times.",
+        help="Provider to query. Repeatable. Default: all providers.",
     ),
 ] = None,
 output_format: Annotated[
     str,
     typer.Option(
         "--format", "-f",
-        help="Output format: table, json, or bibtex.",
+        help="Output format: auto, table, csv, json, or bibtex. "
+             "Auto selects table for TTY, csv otherwise.",
     ),
-] = "table"
+] = "auto",
+review: Annotated[
+    bool,
+    typer.Option(
+        "--review", "-r",
+        help="Launch interactive TUI to review and filter results.",
+    ),
+] = False
 @
 
 \section{Executing the search}
@@ -149,10 +159,23 @@ The results are then passed to the appropriate formatter:
 
 <<execute search and display results>>=
 from scholar import Search
+import sys
 
 s = Search(query)
 results = s.execute(providers=provider)
-display_results(results, output_format)
+
+# If review mode, launch TUI instead of displaying results
+if review:
+    from scholar.tui import run_review
+    run_review(results, query)
+    return
+
+# Auto-detect format based on TTY
+actual_format = output_format
+if output_format == "auto":
+    actual_format = "table" if sys.stdout.isatty() else "csv"
+
+display_results(results, actual_format)
 @
 
 
@@ -328,6 +351,7 @@ This function selects the appropriate formatter and invokes it:
 
 FORMATTERS: dict[str, type] = {
     "table": TableFormatter,
+    "csv": CSVFormatter,
     "json": JSONFormatter,
     "bibtex": BibTeXFormatter,
 }
@@ -339,7 +363,7 @@ def display_results(results: list, output_format: str = "table") -> None:
 
     Args:
         results: List of SearchResult objects to display.
-        output_format: One of 'table', 'json', or 'bibtex'.
+        output_format: One of 'table', 'csv', 'json', or 'bibtex'.
     """
     formatter_class = FORMATTERS.get(output_format, TableFormatter)
     formatter = formatter_class()
@@ -387,6 +411,40 @@ class TableFormatter:
 
             if not result.papers:
                 self.console.print("[dim]No results found.[/dim]")
+@
+
+
+\section{CSV formatter}
+
+For scripting and shell pipelines, we provide a tab-separated CSV format.
+This is especially useful when output is piped to other commands.
+We include metadata as a comment header so consumers know the search context:
+
+<<formatter classes>>=
+class CSVFormatter:
+    """Output results as tab-separated values for scripting."""
+
+    def format(self, results: list) -> None:
+        """Output results as CSV with metadata header."""
+        for result in results:
+            # Metadata header as comments
+            print(f"# Query: {result.query}")
+            print(f"# Provider: {result.provider}")
+            print(f"# Timestamp: {result.timestamp}")
+            print(f"# Results: {len(result.papers)}")
+            print()
+
+            # Header row
+            print("title\tauthors\tyear\tdoi\tvenue\turl")
+
+            # Data rows
+            for paper in result.papers:
+                authors = "; ".join(paper.authors)
+                year = str(paper.year) if paper.year else ""
+                print(f"{paper.title}\t{authors}\t{year}\t"
+                      f"{paper.doi or ''}\t{paper.venue or ''}\t"
+                      f"{paper.url or ''}")
+            print()
 @
 
 
