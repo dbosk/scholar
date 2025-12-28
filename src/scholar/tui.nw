@@ -184,7 +184,7 @@ class PaperListItem(ListItem):
         
         yield Static(
             f"{status_indicator} {paper.title[:60]}{'...' if len(paper.title) > 60 else ''}\n"
-            f"   [dim]{authors} ({year})[/dim] {provider}\n"
+            f"   [dim]{authors} ({year})[/dim] {provider}"
         )
 @
 
