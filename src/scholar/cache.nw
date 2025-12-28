@@ -82,6 +82,31 @@ def get_cache_dir() -> Path:
     return path
 @
 
+\section{Testing cache directory}
+
+The cache directory should be created if it doesn't exist, and should respect
+the environment variable override.
+
+<<test cache directory>>=
+class TestGetCacheDir:
+    """Tests for get_cache_dir function."""
+
+    def test_creates_directory(self, tmp_path, monkeypatch):
+        """Cache directory is created if it doesn't exist."""
+        cache_dir = tmp_path / "scholar_cache"
+        monkeypatch.setenv("SCHOLAR_CACHE_DIR", str(cache_dir))
+        result = get_cache_dir()
+        assert result == cache_dir
+        assert cache_dir.exists()
+
+    def test_respects_environment_variable(self, tmp_path, monkeypatch):
+        """SCHOLAR_CACHE_DIR overrides default location."""
+        custom_dir = tmp_path / "custom"
+        monkeypatch.setenv("SCHOLAR_CACHE_DIR", str(custom_dir))
+        result = get_cache_dir()
+        assert result == custom_dir
+@
+
 
 \chapter{Loading and saving caches}
 
@@ -129,6 +154,40 @@ def save_cache(provider_name: str, cache: dict[Any, Any]) -> None:
             pickle.dump(cache, f)
     except OSError:
         pass  # Silently fail if we can't write
+@
+
+\section{Testing load and save}
+
+Caches should round-trip through save and load correctly.
+
+<<test load save>>=
+class TestLoadSaveCache:
+    """Tests for load_cache and save_cache functions."""
+
+    def test_load_nonexistent_returns_empty(self, tmp_path, monkeypatch):
+        """Loading a nonexistent cache returns empty dict."""
+        monkeypatch.setenv("SCHOLAR_CACHE_DIR", str(tmp_path))
+        result = load_cache("nonexistent")
+        assert result == {}
+
+    def test_save_and_load_roundtrip(self, tmp_path, monkeypatch):
+        """Saved cache can be loaded back."""
+        monkeypatch.setenv("SCHOLAR_CACHE_DIR", str(tmp_path))
+        cache = {
+            ("query1", 100): [Paper(title="Test", authors=["A"])],
+            ("query2", 50): [],
+        }
+        save_cache("test_provider", cache)
+        loaded = load_cache("test_provider")
+        assert loaded == cache
+
+    def test_load_corrupted_returns_empty(self, tmp_path, monkeypatch):
+        """Loading a corrupted cache file returns empty dict."""
+        monkeypatch.setenv("SCHOLAR_CACHE_DIR", str(tmp_path))
+        cache_file = tmp_path / "corrupted.pkl"
+        cache_file.write_bytes(b"not valid pickle data")
+        result = load_cache("corrupted")
+        assert result == {}
 @
 
 
@@ -187,6 +246,37 @@ def get_cache_stats() -> dict[str, Any]:
     }
 @
 
+\section{Testing cache management}
+
+<<test cache management>>=
+class TestCacheManagement:
+    """Tests for cache management functions."""
+
+    def test_clear_cache(self, tmp_path, monkeypatch):
+        """clear_cache removes all cache files."""
+        monkeypatch.setenv("SCHOLAR_CACHE_DIR", str(tmp_path))
+        # Create some cache files
+        save_cache("provider1", {"key": "value"})
+        save_cache("provider2", {"key": "value"})
+        assert len(list(tmp_path.glob("*.pkl"))) == 2
+        # Clear them
+        count = clear_cache()
+        assert count == 2
+        assert len(list(tmp_path.glob("*.pkl"))) == 0
+
+    def test_get_cache_stats(self, tmp_path, monkeypatch):
+        """get_cache_stats returns accurate information."""
+        monkeypatch.setenv("SCHOLAR_CACHE_DIR", str(tmp_path))
+        save_cache("provider1", {("q1", 100): [], ("q2", 50): []})
+        save_cache("provider2", {("q3", 100): []})
+        stats = get_cache_stats()
+        assert stats["cache_dir"] == str(tmp_path)
+        assert stats["providers"]["provider1"] == 2
+        assert stats["providers"]["provider2"] == 1
+        assert stats["total_entries"] == 3
+        assert stats["total_size_bytes"] > 0
+@
+
 
 \chapter{Automatic cache persistence}
 
@@ -224,11 +314,36 @@ def _save_all_caches() -> None:
 atexit.register(_save_all_caches)
 @
 
+\section{Testing automatic persistence}
 
-\chapter{Testing}
+<<test auto persistence>>=
+class TestAutoPersistence:
+    """Tests for automatic cache persistence."""
+
+    def test_register_and_save_all(self, tmp_path, monkeypatch):
+        """Registered caches are saved on _save_all_caches."""
+        monkeypatch.setenv("SCHOLAR_CACHE_DIR", str(tmp_path))
+        # Clear any existing registrations
+        _CACHE_REGISTRY.clear()
+        # Register a cache
+        cache = {("query", 100): [Paper(title="Test", authors=["A"])]}
+        register_cache("test_provider", cache)
+        # Save all caches
+        _save_all_caches()
+        # Verify it was saved
+        loaded = load_cache("test_provider")
+        assert loaded == cache
+        # Clean up
+        _CACHE_REGISTRY.clear()
+@
+
+
+\chapter{Tests}
 \label{ch:testing}
 
-We verify the cache functionality with tests.
+Tests are distributed throughout this document, appearing after each
+implementation section they verify.
+The test file collects all distributed test chunks:
 
 <<test [[cache.py]]>>=
 """Tests for the cache module."""
@@ -248,119 +363,36 @@ from scholar.cache import (
     _CACHE_REGISTRY,
 )
 from scholar import Paper
+
+
+<<test cache directory>>
+<<test load save>>
+<<test cache management>>
+<<test auto persistence>>
 @
 
-\section{Testing cache directory}
 
-The cache directory should be created if it doesn't exist, and should respect
-the environment variable override.
+\chapter{Test Configuration}
 
-<<test [[cache.py]]>>=
-class TestGetCacheDir:
-    """Tests for get_cache_dir function."""
+The provider tests use caching, which can cause test pollution---cached results
+from one test may be returned in another test, causing mock assertions to fail.
+We provide a pytest fixture that isolates each test with its own cache directory.
 
-    def test_creates_directory(self, tmp_path, monkeypatch):
-        """Cache directory is created if it doesn't exist."""
-        cache_dir = tmp_path / "scholar_cache"
-        monkeypatch.setenv("SCHOLAR_CACHE_DIR", str(cache_dir))
-        result = get_cache_dir()
-        assert result == cache_dir
-        assert cache_dir.exists()
+<<[[conftest.py]]>>=
+"""Pytest configuration and fixtures for Scholar tests."""
+import pytest
 
-    def test_respects_environment_variable(self, tmp_path, monkeypatch):
-        """SCHOLAR_CACHE_DIR overrides default location."""
-        custom_dir = tmp_path / "custom"
-        monkeypatch.setenv("SCHOLAR_CACHE_DIR", str(custom_dir))
-        result = get_cache_dir()
-        assert result == custom_dir
-@
 
-\section{Testing load and save}
+@pytest.fixture(autouse=True)
+def isolate_cache(tmp_path, monkeypatch):
+    """Use a temporary cache directory to prevent cache pollution between tests.
 
-Caches should round-trip through save and load correctly.
-
-<<test [[cache.py]]>>=
-class TestLoadSaveCache:
-    """Tests for load_cache and save_cache functions."""
-
-    def test_load_nonexistent_returns_empty(self, tmp_path, monkeypatch):
-        """Loading a nonexistent cache returns empty dict."""
-        monkeypatch.setenv("SCHOLAR_CACHE_DIR", str(tmp_path))
-        result = load_cache("nonexistent")
-        assert result == {}
-
-    def test_save_and_load_roundtrip(self, tmp_path, monkeypatch):
-        """Saved cache can be loaded back."""
-        monkeypatch.setenv("SCHOLAR_CACHE_DIR", str(tmp_path))
-        cache = {
-            ("query1", 100): [Paper(title="Test", authors=["A"])],
-            ("query2", 50): [],
-        }
-        save_cache("test_provider", cache)
-        loaded = load_cache("test_provider")
-        assert loaded == cache
-
-    def test_load_corrupted_returns_empty(self, tmp_path, monkeypatch):
-        """Loading a corrupted cache file returns empty dict."""
-        monkeypatch.setenv("SCHOLAR_CACHE_DIR", str(tmp_path))
-        cache_file = tmp_path / "corrupted.pkl"
-        cache_file.write_bytes(b"not valid pickle data")
-        result = load_cache("corrupted")
-        assert result == {}
-@
-
-\section{Testing cache management}
-
-<<test [[cache.py]]>>=
-class TestCacheManagement:
-    """Tests for cache management functions."""
-
-    def test_clear_cache(self, tmp_path, monkeypatch):
-        """clear_cache removes all cache files."""
-        monkeypatch.setenv("SCHOLAR_CACHE_DIR", str(tmp_path))
-        # Create some cache files
-        save_cache("provider1", {"key": "value"})
-        save_cache("provider2", {"key": "value"})
-        assert len(list(tmp_path.glob("*.pkl"))) == 2
-        # Clear them
-        count = clear_cache()
-        assert count == 2
-        assert len(list(tmp_path.glob("*.pkl"))) == 0
-
-    def test_get_cache_stats(self, tmp_path, monkeypatch):
-        """get_cache_stats returns accurate information."""
-        monkeypatch.setenv("SCHOLAR_CACHE_DIR", str(tmp_path))
-        save_cache("provider1", {("q1", 100): [], ("q2", 50): []})
-        save_cache("provider2", {("q3", 100): []})
-        stats = get_cache_stats()
-        assert stats["cache_dir"] == str(tmp_path)
-        assert stats["providers"]["provider1"] == 2
-        assert stats["providers"]["provider2"] == 1
-        assert stats["total_entries"] == 3
-        assert stats["total_size_bytes"] > 0
-@
-
-\section{Testing automatic persistence}
-
-<<test [[cache.py]]>>=
-class TestAutoPersistence:
-    """Tests for automatic cache persistence."""
-
-    def test_register_and_save_all(self, tmp_path, monkeypatch):
-        """Registered caches are saved on _save_all_caches."""
-        monkeypatch.setenv("SCHOLAR_CACHE_DIR", str(tmp_path))
-        # Clear any existing registrations
-        _CACHE_REGISTRY.clear()
-        # Register a cache
-        cache = {("query", 100): [Paper(title="Test", authors=["A"])]}
-        register_cache("test_provider", cache)
-        # Save all caches
-        _save_all_caches()
-        # Verify it was saved
-        loaded = load_cache("test_provider")
-        assert loaded == cache
-        # Clean up
-        _CACHE_REGISTRY.clear()
+    This fixture is applied automatically to all tests to ensure each test run
+    starts with an empty cache and doesn't interfere with other tests.
+    """
+    cache_dir = tmp_path / "scholar_cache"
+    cache_dir.mkdir()
+    monkeypatch.setenv("SCHOLAR_CACHE_DIR", str(cache_dir))
 @
 
 

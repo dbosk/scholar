@@ -211,6 +211,97 @@ register_provider(SemanticScholarProvider())
 from semanticscholar import SemanticScholar
 @
 
+\section{Testing Semantic Scholar provider}
+
+We mock the API client to avoid real network calls in tests:
+
+<<test semantic scholar>>=
+class TestSemanticScholarProvider:
+    """Tests for the SemanticScholar provider."""
+
+    def test_search_converts_papers(self):
+        """search() converts API results to Paper objects."""
+        provider = SemanticScholarProvider()
+
+        # Create mock paper
+        mock_paper = Mock()
+        mock_paper.title = "Test Paper"
+        mock_paper.authors = [Mock(name="Alice"), Mock(name="Bob")]
+        mock_paper.year = 2024
+        mock_paper.externalIds = {"DOI": "10.1234/test"}
+        mock_paper.abstract = "Test abstract"
+        mock_paper.venue = "Test Conference"
+        mock_paper.url = "https://example.com/paper"
+
+        with patch.object(provider.client, "search_paper") as mock_search:
+            mock_search.return_value = [mock_paper]
+
+            results = provider.search("test query")
+
+            assert len(results) == 1
+            paper = results[0]
+            assert isinstance(paper, Paper)
+            assert paper.title == "Test Paper"
+            assert paper.year == 2024
+            assert paper.doi == "10.1234/test"
+            assert paper.source == "semantic_scholar"
+
+    def test_search_handles_empty_results(self):
+        """search() returns empty list when no results."""
+        provider = SemanticScholarProvider()
+
+        with patch.object(provider.client, "search_paper") as mock_search:
+            mock_search.return_value = []
+
+            results = provider.search("obscure query")
+            assert results == []
+
+    def test_search_handles_api_error(self):
+        """search() returns empty list on API error."""
+        provider = SemanticScholarProvider()
+
+        with patch.object(provider.client, "search_paper") as mock_search:
+            mock_search.side_effect = Exception("API error")
+
+            results = provider.search("test")
+            assert results == []
+
+
+class TestSemanticScholarIntegration:
+    """Integration test for the SemanticScholar provider."""
+
+    @pytest.mark.integration
+    @pytest.mark.skip(reason="Skipped by default due to API rate limits")
+    def test_real_api_call(self):
+        """Make one real API call to verify the provider works."""
+        from semanticscholar import SemanticScholar
+
+        # Call the API directly to see any errors (not through our wrapper)
+        client = SemanticScholar()
+        try:
+            results = client.search_paper(
+                "machine learning",
+                limit=1,
+                fields=["title", "authors", "year"],
+            )
+            results_list = list(results)
+
+            # If API works, verify we get results
+            assert len(results_list) >= 1, "API returned no results"
+
+            # Verify the provider wrapper also works
+            provider = SemanticScholarProvider()
+            papers = provider.search("machine learning", limit=1)
+            assert len(papers) >= 1, "Provider returned no results"
+
+            paper = papers[0]
+            assert isinstance(paper, Paper)
+            assert paper.title
+            assert paper.source == "semantic_scholar"
+        except Exception as e:
+            pytest.skip(f"Semantic Scholar API unavailable: {e}")
+@
+
 
 \chapter{OpenAlex Provider}
 
@@ -318,6 +409,118 @@ register_provider(OpenAlexProvider())
 
 <<openalex imports>>=
 import pyalex
+@
+
+\section{Testing OpenAlex provider}
+
+We test the OpenAlex provider with mocked API responses:
+
+<<test openalex>>=
+class TestOpenAlexProvider:
+    """Tests for the OpenAlex provider."""
+
+    def test_search_converts_works(self):
+        """search() converts API results to Paper objects."""
+        provider = OpenAlexProvider()
+
+        # Create mock work (OpenAlex returns dicts)
+        mock_work = {
+            "title": "Test Paper",
+            "authorships": [
+                {"author": {"display_name": "Alice"}},
+                {"author": {"display_name": "Bob"}},
+            ],
+            "publication_year": 2024,
+            "doi": "https://doi.org/10.1234/test",
+            "abstract": "Test abstract",
+            "primary_location": {
+                "source": {"display_name": "Test Journal"}
+            },
+            "id": "https://openalex.org/W123456",
+        }
+
+        with patch("pyalex.Works") as mock_works:
+            mock_works.return_value.search.return_value.get.return_value = [
+                mock_work
+            ]
+
+            results = provider.search("test query")
+
+            assert len(results) == 1
+            paper = results[0]
+            assert isinstance(paper, Paper)
+            assert paper.title == "Test Paper"
+            assert paper.authors == ["Alice", "Bob"]
+            assert paper.year == 2024
+            assert paper.doi == "10.1234/test"
+            assert paper.venue == "Test Journal"
+            assert paper.source == "openalex"
+
+    def test_search_handles_empty_results(self):
+        """search() returns empty list when no results."""
+        provider = OpenAlexProvider()
+
+        with patch("pyalex.Works") as mock_works:
+            mock_works.return_value.search.return_value.get.return_value = []
+
+            results = provider.search("obscure query")
+            assert results == []
+
+    def test_search_handles_api_error(self):
+        """search() returns empty list on API error."""
+        provider = OpenAlexProvider()
+
+        with patch("pyalex.Works") as mock_works:
+            mock_works.return_value.search.side_effect = Exception("API error")
+
+            results = provider.search("test")
+            assert results == []
+
+    def test_handles_missing_fields(self):
+        """search() handles works with missing optional fields."""
+        provider = OpenAlexProvider()
+
+        # Minimal work with only required fields
+        mock_work = {
+            "title": "Minimal Paper",
+            "authorships": [],
+        }
+
+        with patch("pyalex.Works") as mock_works:
+            mock_works.return_value.search.return_value.get.return_value = [
+                mock_work
+            ]
+
+            results = provider.search("test")
+
+            assert len(results) == 1
+            paper = results[0]
+            assert paper.title == "Minimal Paper"
+            assert paper.authors == []
+            assert paper.year is None
+            assert paper.doi is None
+
+
+class TestOpenAlexIntegration:
+    """Integration test for the OpenAlex provider."""
+
+    @pytest.mark.integration
+    @pytest.mark.skip(reason="Skipped by default to avoid API calls")
+    def test_real_api_call(self):
+        """Make one real API call to verify the provider works."""
+        provider = OpenAlexProvider()
+
+        try:
+            papers = provider.search("machine learning", limit=1)
+
+            assert len(papers) >= 1, "Provider returned no results"
+
+            paper = papers[0]
+            assert isinstance(paper, Paper)
+            assert paper.title
+            assert paper.source == "openalex"
+        except Exception as e:
+            pytest.skip(f"OpenAlex API unavailable: {e}")
 @
 
 
@@ -453,625 +656,11 @@ import requests
 DBLP_API_URL = "https://dblp.org/search/publ/api"
 @
 
-
-\chapter{Web of Science Provider}
-
-Web of Science (WoS) is a comprehensive citation index covering scholarly
-literature across sciences, social sciences, arts, and humanities.
-It is maintained by Clarivate and requires institutional access or an API key.
-
-\section{API options}
-
-Clarivate provides several API options:
-
-\begin{description}
-\item[Web of Science API Expanded] Full access with advanced features.
-  Requires institutional subscription.
-\item[Web of Science Starter API] Basic search with bibliographic metadata.
-  Has a free tier (50 requests/day) and institutional tiers (5,000--20,000
-  requests/day).
-\end{description}
-
-The official Python client ([[wosstarter_python_client]]) is only available
-from GitHub, not PyPI.
-For consistency with our DBLP implementation, we use the Starter API's REST
-endpoint directly via [[requests]].
-
-\section{Provider implementation}
-
-<<wos provider>>=
-class WebOfScienceProvider:
-    """Search provider for Web of Science."""
-
-    name = "wos"
-
-    def __init__(self, api_key: str | None = None):
-        """
-        Initialize the Web of Science provider.
-
-        Args:
-            api_key: API key for WoS Starter API.
-                     If not provided, uses WOS_API_KEY environment variable.
-        """
-        self.api_key = api_key or os.environ.get("WOS_API_KEY")
-        self._cache: dict = load_cache(self.name)
-        register_cache(self.name, self._cache)
-
-    @cachedmethod(lambda self: self._cache)
-    def search(self, query: str, limit: int = 100) -> list[Paper]:
-        """Search Web of Science for papers matching the query."""
-        if not self.api_key:
-            return []  # No API key configured
-
-        try:
-            # WoS Starter API has max 50 results per page
-            effective_limit = min(limit, 50)
-            response = requests.get(
-                WOS_API_URL,
-                params={
-                    "q": query,
-                    "db": "WOS",
-                    "limit": effective_limit,
-                    "page": 1,
-                },
-                headers={"X-ApiKey": self.api_key},
-                timeout=30,
-            )
-            response.raise_for_status()
-            data = response.json()
-
-            hits = data.get("hits", [])
-            return [self._convert_hit(hit) for hit in hits]
-        except Exception:
-            return []
-
-    <<convert wos hit>>
-@
-
-\subsection{Converting document format}
-
-The WoS Starter API returns documents with fields including:
-\begin{description}
-\item[uid] Unique WoS identifier.
-\item[title] The document title.
-\item[names] Object with [[authors]] array containing author names.
-\item[source] Source publication information including [[sourceTitle]].
-\item[links] Object with [[record]] URL to WoS page.
-\item[identifiers] Object with DOI and other identifiers.
-\item[keywords] Object with [[authorKeywords]] array.
-\end{description}
-
-We convert each hit to our common [[Paper]] type:
-
-<<convert wos hit>>=
-def _convert_hit(self, hit: dict) -> Paper:
-    """Convert a WoS API hit to our Paper type."""
-    # Extract publication year from source
-    source = hit.get("source", {})
-    year = None
-    pub_year = source.get("publishYear")
-    if pub_year:
-        try:
-            year = int(pub_year)
-        except (ValueError, TypeError):
-            pass
-
-    # Extract author names
-    authors = []
-    names = hit.get("names", {})
-    for author in names.get("authors", []):
-        name = author.get("displayName")
-        if name:
-            authors.append(name)
-
-    # Extract DOI from identifiers
-    doi = None
-    identifiers = hit.get("identifiers", {})
-    doi = identifiers.get("doi")
-
-    # Extract URL from links
-    url = None
-    links = hit.get("links", {})
-    url = links.get("record")
-
-    return Paper(
-        title=hit.get("title", "") or "",
-        authors=authors,
-        year=year,
-        doi=doi,
-        abstract=None,  # Not available in Starter API
-        venue=source.get("sourceTitle"),
-        url=url,
-        source=self.name,
-    )
-@
-
-\section{Auto-registration}
-
-<<wos provider>>=
-# Register the provider on module import
-register_provider(WebOfScienceProvider())
-@
-
-\section{Dependencies}
-
-Since the provider uses the same [[requests]] library as DBLP, we only need
-to define the API URL constant:
-
-<<wos constants>>=
-WOS_API_URL = "https://api.clarivate.com/apis/wos-starter/v1/documents"
-@
-
-
-\chapter{IEEE Xplore Provider}
-
-IEEE Xplore is a research database providing access to scientific and technical
-content published by IEEE (Institute of Electrical and Electronics Engineers)
-and its publishing partners.
-It contains over 6 million documents including journals, conference proceedings,
-technical standards, and books.
-
-\section{API access}
-
-IEEE provides a Metadata API for searching and retrieving bibliographic data.
-The API requires registration and an API key, which can be obtained from the
-IEEE Developer Portal.
-
-The official Python SDK ([[xploreapi]]) is provided by IEEE but is not available
-on PyPI---it must be downloaded from the Developer Portal.
-For consistency with our other providers, we use the REST API directly via
-[[requests]].
-
-\section{Provider implementation}
-
-<<ieee provider>>=
-class IEEEXploreProvider:
-    """Search provider for IEEE Xplore."""
-
-    name = "ieee"
-
-    def __init__(self, api_key: str | None = None):
-        """
-        Initialize the IEEE Xplore provider.
-
-        Args:
-            api_key: API key for IEEE Xplore API.
-                     If not provided, uses IEEE_API_KEY environment variable.
-        """
-        self.api_key = api_key or os.environ.get("IEEE_API_KEY")
-        self._cache: dict = load_cache(self.name)
-        register_cache(self.name, self._cache)
-
-    @cachedmethod(lambda self: self._cache)
-    def search(self, query: str, limit: int = 100) -> list[Paper]:
-        """Search IEEE Xplore for papers matching the query."""
-        if not self.api_key:
-            return []  # No API key configured
-
-        try:
-            # IEEE API returns max 200 results per request
-            effective_limit = min(limit, 200)
-            response = requests.get(
-                IEEE_API_URL,
-                params={
-                    "querytext": query,
-                    "max_records": effective_limit,
-                    "apikey": self.api_key,
-                },
-                timeout=30,
-            )
-            response.raise_for_status()
-            data = response.json()
-
-            articles = data.get("articles", [])
-            return [self._convert_article(article) for article in articles]
-        except Exception:
-            return []
-
-    <<convert ieee article>>
-@
-
-\subsection{Converting article format}
-
-The IEEE Xplore API returns articles with fields including:
-\begin{description}
-\item[title] The document title.
-\item[authors] Object with [[authors]] array containing author details.
-\item[abstract] Brief summary of the document.
-\item[publication\_title] Journal or conference name.
-\item[publication\_year] Year of publication.
-\item[doi] Digital Object Identifier.
-\item[html\_url] URL to the article page.
-\end{description}
-
-We convert each article to our common [[Paper]] type:
-
-<<convert ieee article>>=
-def _convert_article(self, article: dict) -> Paper:
-    """Convert an IEEE Xplore article to our Paper type."""
-    # Extract publication year
-    year = None
-    pub_year = article.get("publication_year")
-    if pub_year:
-        try:
-            year = int(pub_year)
-        except (ValueError, TypeError):
-            pass
-
-    # Extract author names from authors object
-    authors = []
-    authors_data = article.get("authors", {}).get("authors", [])
-    for author in authors_data:
-        name = author.get("full_name")
-        if name:
-            authors.append(name)
-
-    # Prefer html_url, fall back to abstract_url
-    url = article.get("html_url") or article.get("abstract_url")
-
-    return Paper(
-        title=article.get("title", "") or "",
-        authors=authors,
-        year=year,
-        doi=article.get("doi"),
-        abstract=article.get("abstract"),
-        venue=article.get("publication_title"),
-        url=url,
-        source=self.name,
-    )
-@
-
-\section{Auto-registration}
-
-<<ieee provider>>=
-# Register the provider on module import
-register_provider(IEEEXploreProvider())
-@
-
-\section{Dependencies}
-
-Since the provider uses the same [[requests]] library as DBLP and WoS, we only
-need to define the API URL constant:
-
-<<ieee constants>>=
-IEEE_API_URL = "https://ieeexploreapi.ieee.org/api/v1/search/articles"
-@
-
-
-\chapter{Dependencies}
-
-We organize imports so each provider's dependencies are co-located with
-its implementation.
-If a provider is removed, its dependencies go with it.
-
-<<imports>>=
-import os
-from typing import Protocol
-
-from cachetools import cachedmethod
-
-from scholar import Paper
-from scholar.cache import load_cache, register_cache
-<<semantic scholar imports>>
-<<openalex imports>>
-<<dblp imports>>
-@
-
-<<constants>>=
-# Provider constants
-DEFAULT_LIMIT = 100
-<<dblp constants>>
-<<wos constants>>
-<<ieee constants>>
-@
-
-
-\chapter{Testing}
-\label{ch:providers-testing}
-
-We test both the registry and the Semantic Scholar provider.
-
-<<test [[providers.py]]>>=
-"""Tests for the providers module."""
-import pytest
-from unittest.mock import Mock, patch
-
-from scholar import Paper
-from scholar.providers import (
-    SemanticScholarProvider,
-    OpenAlexProvider,
-    DBLPProvider,
-    WebOfScienceProvider,
-    IEEEXploreProvider,
-    register_provider,
-    get_provider,
-    get_all_providers,
-    PROVIDERS,
-)
-@
-
-
-\section{Testing the registry}
-
-The registry should store and retrieve providers:
-
-<<test [[providers.py]]>>=
-class TestProviderRegistry:
-    """Tests for the provider registry."""
-
-    def test_semantic_scholar_registered(self):
-        """Semantic Scholar provider is auto-registered."""
-        provider = get_provider("semantic_scholar")
-        assert provider is not None
-        assert provider.name == "semantic_scholar"
-
-    def test_openalex_registered(self):
-        """OpenAlex provider is auto-registered."""
-        provider = get_provider("openalex")
-        assert provider is not None
-        assert provider.name == "openalex"
-
-    def test_dblp_registered(self):
-        """DBLP provider is auto-registered."""
-        provider = get_provider("dblp")
-        assert provider is not None
-        assert provider.name == "dblp"
-
-    def test_wos_registered(self):
-        """Web of Science provider is auto-registered."""
-        provider = get_provider("wos")
-        assert provider is not None
-        assert provider.name == "wos"
-
-    def test_ieee_registered(self):
-        """IEEE Xplore provider is auto-registered."""
-        provider = get_provider("ieee")
-        assert provider is not None
-        assert provider.name == "ieee"
-
-    def test_get_all_providers(self):
-        """get_all_providers returns registered providers."""
-        providers = get_all_providers()
-        assert len(providers) >= 5
-        names = [p.name for p in providers]
-        assert "semantic_scholar" in names
-        assert "openalex" in names
-        assert "dblp" in names
-        assert "wos" in names
-        assert "ieee" in names
-
-    def test_get_unknown_provider(self):
-        """get_provider returns None for unknown providers."""
-        assert get_provider("unknown_provider") is None
-@
-
-
-\section{Testing Semantic Scholar provider}
-
-We mock the API client to avoid real network calls in tests:
-
-<<test [[providers.py]]>>=
-class TestSemanticScholarProvider:
-    """Tests for the SemanticScholar provider."""
-
-    def test_search_converts_papers(self):
-        """search() converts API results to Paper objects."""
-        provider = SemanticScholarProvider()
-
-        # Create mock paper
-        mock_paper = Mock()
-        mock_paper.title = "Test Paper"
-        mock_paper.authors = [Mock(name="Alice"), Mock(name="Bob")]
-        mock_paper.year = 2024
-        mock_paper.externalIds = {"DOI": "10.1234/test"}
-        mock_paper.abstract = "Test abstract"
-        mock_paper.venue = "Test Conference"
-        mock_paper.url = "https://example.com/paper"
-
-        with patch.object(provider.client, "search_paper") as mock_search:
-            mock_search.return_value = [mock_paper]
-
-            results = provider.search("test query")
-
-            assert len(results) == 1
-            paper = results[0]
-            assert isinstance(paper, Paper)
-            assert paper.title == "Test Paper"
-            assert paper.year == 2024
-            assert paper.doi == "10.1234/test"
-            assert paper.source == "semantic_scholar"
-
-    def test_search_handles_empty_results(self):
-        """search() returns empty list when no results."""
-        provider = SemanticScholarProvider()
-
-        with patch.object(provider.client, "search_paper") as mock_search:
-            mock_search.return_value = []
-
-            results = provider.search("obscure query")
-            assert results == []
-
-    def test_search_handles_api_error(self):
-        """search() returns empty list on API error."""
-        provider = SemanticScholarProvider()
-
-        with patch.object(provider.client, "search_paper") as mock_search:
-            mock_search.side_effect = Exception("API error")
-
-            results = provider.search("test")
-            assert results == []
-@
-
-
-\section{Integration test}
-
-We include a single integration test that makes one real API call to verify
-the provider works with the actual Semantic Scholar API.
-This test is marked with \texttt{@pytest.mark.integration} and skipped by
-default because Semantic Scholar has strict rate limits.
-
-To run integration tests explicitly:
-\begin{verbatim}
-pytest -m integration
-\end{verbatim}
-
-<<test [[providers.py]]>>=
-class TestSemanticScholarIntegration:
-    """Integration test for the SemanticScholar provider."""
-
-    @pytest.mark.integration
-    @pytest.mark.skip(reason="Skipped by default due to API rate limits")
-    def test_real_api_call(self):
-        """Make one real API call to verify the provider works."""
-        from semanticscholar import SemanticScholar
-
-        # Call the API directly to see any errors (not through our wrapper)
-        client = SemanticScholar()
-        try:
-            results = client.search_paper(
-                "machine learning",
-                limit=1,
-                fields=["title", "authors", "year"],
-            )
-            results_list = list(results)
-
-            # If API works, verify we get results
-            assert len(results_list) >= 1, "API returned no results"
-
-            # Verify the provider wrapper also works
-            provider = SemanticScholarProvider()
-            papers = provider.search("machine learning", limit=1)
-            assert len(papers) >= 1, "Provider returned no results"
-
-            paper = papers[0]
-            assert isinstance(paper, Paper)
-            assert paper.title
-            assert paper.source == "semantic_scholar"
-        except Exception as e:
-            pytest.skip(f"Semantic Scholar API unavailable: {e}")
-@
-
-
-\section{Testing OpenAlex provider}
-
-We test the OpenAlex provider with mocked API responses:
-
-<<test [[providers.py]]>>=
-class TestOpenAlexProvider:
-    """Tests for the OpenAlex provider."""
-
-    def test_search_converts_works(self):
-        """search() converts API results to Paper objects."""
-        provider = OpenAlexProvider()
-
-        # Create mock work (OpenAlex returns dicts)
-        mock_work = {
-            "title": "Test Paper",
-            "authorships": [
-                {"author": {"display_name": "Alice"}},
-                {"author": {"display_name": "Bob"}},
-            ],
-            "publication_year": 2024,
-            "doi": "https://doi.org/10.1234/test",
-            "abstract": "Test abstract",
-            "primary_location": {
-                "source": {"display_name": "Test Journal"}
-            },
-            "id": "https://openalex.org/W123456",
-        }
-
-        with patch("pyalex.Works") as mock_works:
-            mock_works.return_value.search.return_value.get.return_value = [
-                mock_work
-            ]
-
-            results = provider.search("test query")
-
-            assert len(results) == 1
-            paper = results[0]
-            assert isinstance(paper, Paper)
-            assert paper.title == "Test Paper"
-            assert paper.authors == ["Alice", "Bob"]
-            assert paper.year == 2024
-            assert paper.doi == "10.1234/test"
-            assert paper.venue == "Test Journal"
-            assert paper.source == "openalex"
-
-    def test_search_handles_empty_results(self):
-        """search() returns empty list when no results."""
-        provider = OpenAlexProvider()
-
-        with patch("pyalex.Works") as mock_works:
-            mock_works.return_value.search.return_value.get.return_value = []
-
-            results = provider.search("obscure query")
-            assert results == []
-
-    def test_search_handles_api_error(self):
-        """search() returns empty list on API error."""
-        provider = OpenAlexProvider()
-
-        with patch("pyalex.Works") as mock_works:
-            mock_works.return_value.search.side_effect = Exception("API error")
-
-            results = provider.search("test")
-            assert results == []
-
-    def test_handles_missing_fields(self):
-        """search() handles works with missing optional fields."""
-        provider = OpenAlexProvider()
-
-        # Minimal work with only required fields
-        mock_work = {
-            "title": "Minimal Paper",
-            "authorships": [],
-        }
-
-        with patch("pyalex.Works") as mock_works:
-            mock_works.return_value.search.return_value.get.return_value = [
-                mock_work
-            ]
-
-            results = provider.search("test")
-
-            assert len(results) == 1
-            paper = results[0]
-            assert paper.title == "Minimal Paper"
-            assert paper.authors == []
-            assert paper.year is None
-            assert paper.doi is None
-@
-
-
-<<test [[providers.py]]>>=
-class TestOpenAlexIntegration:
-    """Integration test for the OpenAlex provider."""
-
-    @pytest.mark.integration
-    @pytest.mark.skip(reason="Skipped by default to avoid API calls")
-    def test_real_api_call(self):
-        """Make one real API call to verify the provider works."""
-        provider = OpenAlexProvider()
-
-        try:
-            papers = provider.search("machine learning", limit=1)
-
-            assert len(papers) >= 1, "Provider returned no results"
-
-            paper = papers[0]
-            assert isinstance(paper, Paper)
-            assert paper.title
-            assert paper.source == "openalex"
-        except Exception as e:
-            pytest.skip(f"OpenAlex API unavailable: {e}")
-@
-
-
 \section{Testing DBLP provider}
 
 We test the DBLP provider with mocked API responses:
 
-<<test [[providers.py]]>>=
+<<test dblp>>=
 class TestDBLPProvider:
     """Tests for the DBLP provider."""
 
@@ -1079,7 +668,6 @@ class TestDBLPProvider:
         """search() converts API results to Paper objects."""
         provider = DBLPProvider()
 
-        # Create mock API response (DBLP returns JSON)
         mock_response = Mock()
         mock_response.json.return_value = {
             "result": {
@@ -1234,10 +822,8 @@ class TestDBLPProvider:
 
             call_args = mock_get.call_args
             assert call_args[1]["params"]["h"] == 1000
-@
 
 
-<<test [[providers.py]]>>=
 class TestDBLPIntegration:
     """Integration test for the DBLP provider."""
 
@@ -1261,12 +847,160 @@ class TestDBLPIntegration:
 @
 
 
+\chapter{Web of Science Provider}
+
+Web of Science (WoS) is a comprehensive citation index covering scholarly
+literature across sciences, social sciences, arts, and humanities.
+It is maintained by Clarivate and requires institutional access or an API key.
+
+\section{API options}
+
+Clarivate provides several API options:
+
+\begin{description}
+\item[Web of Science API Expanded] Full access with advanced features.
+  Requires institutional subscription.
+\item[Web of Science Starter API] Basic search with bibliographic metadata.
+  Has a free tier (50 requests/day) and institutional tiers (5,000--20,000
+  requests/day).
+\end{description}
+
+The official Python client ([[wosstarter_python_client]]) is only available
+from GitHub, not PyPI.
+For consistency with our DBLP implementation, we use the Starter API's REST
+endpoint directly via [[requests]].
+
+\section{Provider implementation}
+
+<<wos provider>>=
+class WebOfScienceProvider:
+    """Search provider for Web of Science."""
+
+    name = "wos"
+
+    def __init__(self, api_key: str | None = None):
+        """
+        Initialize the Web of Science provider.
+
+        Args:
+            api_key: API key for WoS Starter API.
+                     If not provided, uses WOS_API_KEY environment variable.
+        """
+        self.api_key = api_key or os.environ.get("WOS_API_KEY")
+        self._cache: dict = load_cache(self.name)
+        register_cache(self.name, self._cache)
+
+    @cachedmethod(lambda self: self._cache)
+    def search(self, query: str, limit: int = 100) -> list[Paper]:
+        """Search Web of Science for papers matching the query."""
+        if not self.api_key:
+            return []  # No API key configured
+
+        try:
+            # WoS Starter API has max 50 results per page
+            effective_limit = min(limit, 50)
+            response = requests.get(
+                WOS_API_URL,
+                params={
+                    "q": query,
+                    "db": "WOS",
+                    "limit": effective_limit,
+                    "page": 1,
+                },
+                headers={"X-ApiKey": self.api_key},
+                timeout=30,
+            )
+            response.raise_for_status()
+            data = response.json()
+
+            hits = data.get("hits", [])
+            return [self._convert_hit(hit) for hit in hits]
+        except Exception:
+            return []
+
+    <<convert wos hit>>
+@
+
+\subsection{Converting document format}
+
+The WoS Starter API returns documents with fields including:
+\begin{description}
+\item[uid] Unique WoS identifier.
+\item[title] The document title.
+\item[names] Object with [[authors]] array containing author names.
+\item[source] Source publication information including [[sourceTitle]].
+\item[links] Object with [[record]] URL to WoS page.
+\item[identifiers] Object with DOI and other identifiers.
+\item[keywords] Object with [[authorKeywords]] array.
+\end{description}
+
+We convert each hit to our common [[Paper]] type:
+
+<<convert wos hit>>=
+def _convert_hit(self, hit: dict) -> Paper:
+    """Convert a WoS API hit to our Paper type."""
+    # Extract publication year from source
+    source = hit.get("source", {})
+    year = None
+    pub_year = source.get("publishYear")
+    if pub_year:
+        try:
+            year = int(pub_year)
+        except (ValueError, TypeError):
+            pass
+
+    # Extract author names
+    authors = []
+    names = hit.get("names", {})
+    for author in names.get("authors", []):
+        name = author.get("displayName")
+        if name:
+            authors.append(name)
+
+    # Extract DOI from identifiers
+    doi = None
+    identifiers = hit.get("identifiers", {})
+    doi = identifiers.get("doi")
+
+    # Extract URL from links
+    url = None
+    links = hit.get("links", {})
+    url = links.get("record")
+
+    return Paper(
+        title=hit.get("title", "") or "",
+        authors=authors,
+        year=year,
+        doi=doi,
+        abstract=None,  # Not available in Starter API
+        venue=source.get("sourceTitle"),
+        url=url,
+        source=self.name,
+    )
+@
+
+\section{Auto-registration}
+
+<<wos provider>>=
+# Register the provider on module import
+register_provider(WebOfScienceProvider())
+@
+
+\section{Dependencies}
+
+Since the provider uses the same [[requests]] library as DBLP, we only need
+to define the API URL constant:
+
+<<wos constants>>=
+WOS_API_URL = "https://api.clarivate.com/apis/wos-starter/v1/documents"
+@
+
 \section{Testing Web of Science provider}
 
 We test the WoS provider with mocked API responses.
 Note that without an API key, the provider returns empty results:
 
-<<test [[providers.py]]>>=
+<<test wos>>=
 class TestWebOfScienceProvider:
     """Tests for the Web of Science provider."""
 
@@ -1280,7 +1014,6 @@ class TestWebOfScienceProvider:
         """search() converts API results to Paper objects."""
         provider = WebOfScienceProvider(api_key="test_key")
 
-        # Create mock API response
         mock_response = Mock()
         mock_response.json.return_value = {
             "hits": [{
@@ -1394,10 +1127,8 @@ class TestWebOfScienceProvider:
 
             call_args = mock_get.call_args
             assert call_args[1]["headers"]["X-ApiKey"] == "my_secret_key"
-@
 
 
-<<test [[providers.py]]>>=
 class TestWebOfScienceIntegration:
     """Integration test for the Web of Science provider."""
 
@@ -1427,12 +1158,146 @@ class TestWebOfScienceIntegration:
 @
 
 
+\chapter{IEEE Xplore Provider}
+
+IEEE Xplore is a research database providing access to scientific and technical
+content published by IEEE (Institute of Electrical and Electronics Engineers)
+and its publishing partners.
+It contains over 6 million documents including journals, conference proceedings,
+technical standards, and books.
+
+\section{API access}
+
+IEEE provides a Metadata API for searching and retrieving bibliographic data.
+The API requires registration and an API key, which can be obtained from the
+IEEE Developer Portal.
+
+The official Python SDK ([[xploreapi]]) is provided by IEEE but is not available
+on PyPI---it must be downloaded from the Developer Portal.
+For consistency with our other providers, we use the REST API directly via
+[[requests]].
+
+\section{Provider implementation}
+
+<<ieee provider>>=
+class IEEEXploreProvider:
+    """Search provider for IEEE Xplore."""
+
+    name = "ieee"
+
+    def __init__(self, api_key: str | None = None):
+        """
+        Initialize the IEEE Xplore provider.
+
+        Args:
+            api_key: API key for IEEE Xplore API.
+                     If not provided, uses IEEE_API_KEY environment variable.
+        """
+        self.api_key = api_key or os.environ.get("IEEE_API_KEY")
+        self._cache: dict = load_cache(self.name)
+        register_cache(self.name, self._cache)
+
+    @cachedmethod(lambda self: self._cache)
+    def search(self, query: str, limit: int = 100) -> list[Paper]:
+        """Search IEEE Xplore for papers matching the query."""
+        if not self.api_key:
+            return []  # No API key configured
+
+        try:
+            # IEEE API returns max 200 results per request
+            effective_limit = min(limit, 200)
+            response = requests.get(
+                IEEE_API_URL,
+                params={
+                    "querytext": query,
+                    "max_records": effective_limit,
+                    "apikey": self.api_key,
+                },
+                timeout=30,
+            )
+            response.raise_for_status()
+            data = response.json()
+
+            articles = data.get("articles", [])
+            return [self._convert_article(article) for article in articles]
+        except Exception:
+            return []
+
+    <<convert ieee article>>
+@
+
+\subsection{Converting article format}
+
+The IEEE Xplore API returns articles with fields including:
+\begin{description}
+\item[title] The document title.
+\item[authors] Object with [[authors]] array containing author details.
+\item[abstract] Brief summary of the document.
+\item[publication\_title] Journal or conference name.
+\item[publication\_year] Year of publication.
+\item[doi] Digital Object Identifier.
+\item[html\_url] URL to the article page.
+\end{description}
+
+We convert each article to our common [[Paper]] type:
+
+<<convert ieee article>>=
+def _convert_article(self, article: dict) -> Paper:
+    """Convert an IEEE Xplore article to our Paper type."""
+    # Extract publication year
+    year = None
+    pub_year = article.get("publication_year")
+    if pub_year:
+        try:
+            year = int(pub_year)
+        except (ValueError, TypeError):
+            pass
+
+    # Extract author names from authors object
+    authors = []
+    authors_data = article.get("authors", {}).get("authors", [])
+    for author in authors_data:
+        name = author.get("full_name")
+        if name:
+            authors.append(name)
+
+    # Prefer html_url, fall back to abstract_url
+    url = article.get("html_url") or article.get("abstract_url")
+
+    return Paper(
+        title=article.get("title", "") or "",
+        authors=authors,
+        year=year,
+        doi=article.get("doi"),
+        abstract=article.get("abstract"),
+        venue=article.get("publication_title"),
+        url=url,
+        source=self.name,
+    )
+@
+
+\section{Auto-registration}
+
+<<ieee provider>>=
+# Register the provider on module import
+register_provider(IEEEXploreProvider())
+@
+
+\section{Dependencies}
+
+Since the provider uses the same [[requests]] library as DBLP and WoS, we only
+need to define the API URL constant:
+
+<<ieee constants>>=
+IEEE_API_URL = "https://ieeexploreapi.ieee.org/api/v1/search/articles"
+@
+
 \section{Testing IEEE Xplore provider}
 
 We test the IEEE Xplore provider with mocked API responses.
 Like WoS, without an API key the provider returns empty results:
 
-<<test [[providers.py]]>>=
+<<test ieee>>=
 class TestIEEEXploreProvider:
     """Tests for the IEEE Xplore provider."""
 
@@ -1446,7 +1311,6 @@ class TestIEEEXploreProvider:
         """search() converts API results to Paper objects."""
         provider = IEEEXploreProvider(api_key="test_key")
 
-        # Create mock API response
         mock_response = Mock()
         mock_response.json.return_value = {
             "articles": [{
@@ -1580,10 +1444,8 @@ class TestIEEEXploreProvider:
             results = provider.search("test")
 
             assert results[0].url == "https://ieeexplore.ieee.org/abstract/1234"
-@
 
 
-<<test [[providers.py]]>>=
 class TestIEEEXploreIntegration:
     """Integration test for the IEEE Xplore provider."""
 
@@ -1610,6 +1472,132 @@ class TestIEEEXploreIntegration:
             assert paper.source == "ieee"
         except Exception as e:
             pytest.skip(f"IEEE Xplore API unavailable: {e}")
+@
+
+
+\chapter{Dependencies}
+
+We organize imports so each provider's dependencies are co-located with
+its implementation.
+If a provider is removed, its dependencies go with it.
+
+<<imports>>=
+import os
+from typing import Protocol
+
+from cachetools import cachedmethod
+
+from scholar import Paper
+from scholar.cache import load_cache, register_cache
+<<semantic scholar imports>>
+<<openalex imports>>
+<<dblp imports>>
+@
+
+<<constants>>=
+# Provider constants
+DEFAULT_LIMIT = 100
+<<dblp constants>>
+<<wos constants>>
+<<ieee constants>>
+@
+
+
+\chapter{Testing}
+\label{ch:providers-testing}
+
+Tests are distributed throughout this document, appearing immediately after
+each provider's implementation.
+This chapter assembles all test chunks into the test file and includes the
+registry tests.
+
+<<test [[providers.py]]>>=
+"""Tests for the providers module."""
+import pytest
+from unittest.mock import Mock, patch
+
+from scholar import Paper
+from scholar.providers import (
+    SemanticScholarProvider,
+    OpenAlexProvider,
+    DBLPProvider,
+    WebOfScienceProvider,
+    IEEEXploreProvider,
+    register_provider,
+    get_provider,
+    get_all_providers,
+    PROVIDERS,
+)
+@
+
+
+\section{Testing the registry}
+
+The registry should store and retrieve providers:
+
+<<test [[providers.py]]>>=
+class TestProviderRegistry:
+    """Tests for the provider registry."""
+
+    def test_semantic_scholar_registered(self):
+        """Semantic Scholar provider is auto-registered."""
+        provider = get_provider("semantic_scholar")
+        assert provider is not None
+        assert provider.name == "semantic_scholar"
+
+    def test_openalex_registered(self):
+        """OpenAlex provider is auto-registered."""
+        provider = get_provider("openalex")
+        assert provider is not None
+        assert provider.name == "openalex"
+
+    def test_dblp_registered(self):
+        """DBLP provider is auto-registered."""
+        provider = get_provider("dblp")
+        assert provider is not None
+        assert provider.name == "dblp"
+
+    def test_wos_registered(self):
+        """Web of Science provider is auto-registered."""
+        provider = get_provider("wos")
+        assert provider is not None
+        assert provider.name == "wos"
+
+    def test_ieee_registered(self):
+        """IEEE Xplore provider is auto-registered."""
+        provider = get_provider("ieee")
+        assert provider is not None
+        assert provider.name == "ieee"
+
+    def test_get_all_providers(self):
+        """get_all_providers returns registered providers."""
+        providers = get_all_providers()
+        assert len(providers) >= 5
+        names = [p.name for p in providers]
+        assert "semantic_scholar" in names
+        assert "openalex" in names
+        assert "dblp" in names
+        assert "wos" in names
+        assert "ieee" in names
+
+    def test_get_unknown_provider(self):
+        """get_provider returns None for unknown providers."""
+        assert get_provider("unknown_provider") is None
+@
+
+
+\section{Provider tests}
+
+Tests for each provider are distributed throughout this document, appearing
+immediately after each provider's implementation.
+We reference them here to assemble the complete test file:
+
+<<test [[providers.py]]>>=
+<<test semantic scholar>>
+<<test openalex>>
+<<test dblp>>
+<<test wos>>
+<<test ieee>>
 @
 
 

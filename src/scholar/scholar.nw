@@ -132,6 +132,39 @@ def __hash__(self) -> int:
 
 This allows us to use papers in sets for automatic deduplication.
 
+\subsection{Testing paper equality}
+
+Let's verify that paper equality and hashing work correctly for deduplication:
+
+<<test paper>>=
+class TestPaper:
+    """Tests for the Paper class."""
+
+    def test_equality_by_doi(self):
+        """Papers with same DOI are equal."""
+        p1 = Paper(title="Paper One", authors=["A"], doi="10.1234/test")
+        p2 = Paper(title="Paper 1", authors=["B"], doi="10.1234/test")
+        assert p1 == p2
+
+    def test_equality_by_title(self):
+        """Papers without DOI are equal by title."""
+        p1 = Paper(title="Test Paper", authors=["A"])
+        p2 = Paper(title="test paper", authors=["B"])
+        assert p1 == p2
+
+    def test_inequality(self):
+        """Different papers are not equal."""
+        p1 = Paper(title="Paper A", authors=["A"])
+        p2 = Paper(title="Paper B", authors=["B"])
+        assert p1 != p2
+
+    def test_hash_consistency(self):
+        """Equal papers have the same hash."""
+        p1 = Paper(title="Test", authors=["A"], doi="10.1234/test")
+        p2 = Paper(title="Different", authors=["B"], doi="10.1234/test")
+        assert hash(p1) == hash(p2)
+@
+
 
 \section{Search results}
 
@@ -176,6 +209,37 @@ def merge(self, other: "SearchResult") -> "SearchResult":
         papers=merged_papers,
         filters=None,
     )
+@
+
+\subsection{Testing search results}
+
+The merge operation should deduplicate papers:
+
+<<test search result>>=
+class TestSearchResult:
+    """Tests for the SearchResult class."""
+
+    def test_merge_deduplicates(self):
+        """Merging results deduplicates papers."""
+        p1 = Paper(title="Paper A", authors=["A"])
+        p2 = Paper(title="Paper B", authors=["B"])
+        p3 = Paper(title="Paper A", authors=["A"])  # Duplicate of p1
+
+        r1 = SearchResult(
+            query="test",
+            provider="p1",
+            timestamp="2024-01-01",
+            papers=[p1, p2],
+        )
+        r2 = SearchResult(
+            query="test",
+            provider="p2",
+            timestamp="2024-01-01",
+            papers=[p2, p3],
+        )
+
+        merged = r1.merge(r2)
+        assert len(merged.papers) == 2
 @
 
 
@@ -269,104 +333,11 @@ def execute(self, providers: list[str] | None = None) -> list[SearchResult]:
     return self.results
 @
 
-
-\chapter{Dependencies}
-
-We collect the imports used throughout the module:
-
-<<imports>>=
-from dataclasses import dataclass
-from datetime import datetime
-@
-
-<<constants>>=
-VERSION = "0.1.0"
-@
-
-
-\chapter{Testing}
-\label{ch:testing}
-
-We verify the implementation with tests distributed throughout, but collected
-here for pytest.
-
-<<test [[scholar.py]]>>=
-"""Tests for the scholar module."""
-import pytest
-from unittest.mock import Mock
-
-from scholar import Paper, SearchResult, Search, search
-@
-
-\section{Testing paper equality}
-
-Papers should be equal if they have the same DOI:
-
-<<test [[scholar.py]]>>=
-class TestPaper:
-    """Tests for the Paper class."""
-
-    def test_equality_by_doi(self):
-        """Papers with same DOI are equal."""
-        p1 = Paper(title="Paper One", authors=["A"], doi="10.1234/test")
-        p2 = Paper(title="Paper 1", authors=["B"], doi="10.1234/test")
-        assert p1 == p2
-
-    def test_equality_by_title(self):
-        """Papers without DOI are equal by title."""
-        p1 = Paper(title="Test Paper", authors=["A"])
-        p2 = Paper(title="test paper", authors=["B"])
-        assert p1 == p2
-
-    def test_inequality(self):
-        """Different papers are not equal."""
-        p1 = Paper(title="Paper A", authors=["A"])
-        p2 = Paper(title="Paper B", authors=["B"])
-        assert p1 != p2
-
-    def test_hash_consistency(self):
-        """Equal papers have the same hash."""
-        p1 = Paper(title="Test", authors=["A"], doi="10.1234/test")
-        p2 = Paper(title="Different", authors=["B"], doi="10.1234/test")
-        assert hash(p1) == hash(p2)
-@
-
-\section{Testing search results}
-
-The merge operation should deduplicate papers:
-
-<<test [[scholar.py]]>>=
-class TestSearchResult:
-    """Tests for the SearchResult class."""
-
-    def test_merge_deduplicates(self):
-        """Merging results deduplicates papers."""
-        p1 = Paper(title="Paper A", authors=["A"])
-        p2 = Paper(title="Paper B", authors=["B"])
-        p3 = Paper(title="Paper A", authors=["A"])  # Duplicate of p1
-
-        r1 = SearchResult(
-            query="test",
-            provider="p1",
-            timestamp="2024-01-01",
-            papers=[p1, p2],
-        )
-        r2 = SearchResult(
-            query="test",
-            provider="p2",
-            timestamp="2024-01-01",
-            papers=[p2, p3],
-        )
-
-        merged = r1.merge(r2)
-        assert len(merged.papers) == 2
-@
-
-\section{Testing the search interface}
+\subsection{Testing the search interface}
 
 The search function should return a valid result:
 
-<<test [[scholar.py]]>>=
+<<test search>>=
 class TestSearch:
     """Tests for the Search class and search function."""
 
@@ -397,6 +368,41 @@ class TestSearch:
         s = Search("test")
         results = s.execute()
         assert len(results) > 0
+@
+
+
+\chapter{Dependencies}
+
+We collect the imports used throughout the module:
+
+<<imports>>=
+from dataclasses import dataclass
+from datetime import datetime
+@
+
+<<constants>>=
+VERSION = "0.1.0"
+@
+
+
+\chapter{Tests}
+\label{ch:testing}
+
+Tests are distributed throughout this document, appearing after each
+implementation section they verify.
+The test file collects all distributed test chunks:
+
+<<test [[scholar.py]]>>=
+"""Tests for the scholar module."""
+import pytest
+from unittest.mock import Mock
+
+from scholar import Paper, SearchResult, Search, search
+
+
+<<test paper>>
+<<test search result>>
+<<test search>>
 @
 
 

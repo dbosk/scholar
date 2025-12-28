@@ -52,7 +52,6 @@ We need data structures to track the review state of each paper. The
 pending review, along with the motivation for discards.
 
 <<tui imports>>=
-from dataclasses import dataclass
 from dataclasses import dataclass, field
 from datetime import datetime
 from enum import Enum
@@ -157,6 +156,106 @@ class ReviewSession:
         elif key == "provider":
             self.decisions.sort(key=lambda d: d.provider.lower(), reverse=reverse)
 @
+
+\section{Testing the data structures}
+
+Let's verify that our review data structures work correctly.
+
+<<test data structures>>=
+class TestReviewDecision:
+    """Tests for ReviewDecision dataclass."""
+
+    def test_default_status_is_pending(self):
+        """New decisions should be pending."""
+        paper = Paper(title="Test", authors=["Author"], year=2024)
+        decision = ReviewDecision(paper=paper, provider="test")
+        assert decision.status == DecisionStatus.PENDING
+        assert not decision.is_decided
+
+    def test_kept_is_decided(self):
+        """Kept papers are decided."""
+        paper = Paper(title="Test", authors=["Author"], year=2024)
+        decision = ReviewDecision(
+            paper=paper,
+            provider="test",
+            status=DecisionStatus.KEPT
+        )
+        assert decision.is_decided
+
+    def test_discarded_requires_motivation(self):
+        """Discarded papers should have motivation."""
+        paper = Paper(title="Test", authors=["Author"], year=2024)
+        decision = ReviewDecision(
+            paper=paper,
+            provider="test",
+            status=DecisionStatus.DISCARDED,
+            motivation="Not relevant"
+        )
+        assert decision.is_decided
+        assert decision.motivation == "Not relevant"
+
+
+class TestReviewSession:
+    """Tests for ReviewSession dataclass."""
+
+    @pytest.fixture
+    def sample_session(self):
+        """Create a sample session with mixed decisions."""
+        papers = [
+            Paper(title="Paper A", authors=["Author A"], year=2020),
+            Paper(title="Paper B", authors=["Author B"], year=2022),
+            Paper(title="Paper C", authors=["Author C"], year=2021),
+        ]
+        session = ReviewSession(
+            query="test query",
+            providers=["provider1"],
+            timestamp=datetime.now(),
+        )
+        session.decisions = [
+            ReviewDecision(paper=papers[0], provider="p1", status=DecisionStatus.KEPT),
+            ReviewDecision(paper=papers[1], provider="p1", status=DecisionStatus.DISCARDED, motivation="Off topic"),
+            ReviewDecision(paper=papers[2], provider="p1", status=DecisionStatus.PENDING),
+        ]
+        return session
+
+    def test_kept_papers(self, sample_session):
+        """Test filtering kept papers."""
+        kept = sample_session.kept_papers
+        assert len(kept) == 1
+        assert kept[0].paper.title == "Paper A"
+
+    def test_discarded_papers(self, sample_session):
+        """Test filtering discarded papers."""
+        discarded = sample_session.discarded_papers
+        assert len(discarded) == 1
+        assert discarded[0].paper.title == "Paper B"
+        assert discarded[0].motivation == "Off topic"
+
+    def test_pending_papers(self, sample_session):
+        """Test filtering pending papers."""
+        pending = sample_session.pending_papers
+        assert len(pending) == 1
+        assert pending[0].paper.title == "Paper C"
+
+    def test_sort_by_year(self, sample_session):
+        """Test sorting by year."""
+        sample_session.sort_by("year")
+        years = [d.paper.year for d in sample_session.decisions]
+        assert years == [2020, 2021, 2022]
+
+    def test_sort_by_year_reverse(self, sample_session):
+        """Test sorting by year descending."""
+        sample_session.sort_by("year", reverse=True)
+        years = [d.paper.year for d in sample_session.decisions]
+        assert years == [2022, 2021, 2020]
+
+    def test_sort_by_title(self, sample_session):
+        """Test sorting by title."""
+        sample_session.sort_by("title")
+        titles = [d.paper.title for d in sample_session.decisions]
+        assert titles == ["Paper A", "Paper B", "Paper C"]
+@
+
 
 \chapter{PDF Caching}
 
@@ -757,7 +856,19 @@ def generate_latex_report(session: ReviewSession, output_path: Path) -> None:
     - Summary statistics
     - List of kept papers with citations
     - List of discarded papers with motivations
+    
+    Also generates a .bib file with the same base name.
     """
+    def escape_bibtex(text: str) -> str:
+        """Escape special BibTeX characters."""
+        # BibTeX needs braces around special chars
+        text = text.replace('&', r'\&')
+        text = text.replace('%', r'\%')
+        text = text.replace('$', r'\$')
+        text = text.replace('#', r'\#')
+        text = text.replace('_', r'\_')
+        return text
+    
     def escape_latex(text: str) -> str:
         """Escape special LaTeX characters.
         
@@ -782,30 +893,60 @@ def generate_latex_report(session: ReviewSession, output_path: Path) -> None:
             text = text.replace(char, replacement)
         return text
     
-    def format_paper(decision: ReviewDecision) -> str:
-        """Format a paper entry for LaTeX."""
-        paper = decision.paper
-        authors = ", ".join(paper.authors[:3]) if paper.authors else "Unknown"
-        if len(paper.authors) > 3:
-            authors += " et al."
-        year = paper.year or "n.d."
-        title = escape_latex(paper.title)
-        authors = escape_latex(authors)
-        venue = escape_latex(paper.venue or "")
-        
-        entry = f"\\item {authors} ({year}). \\emph{{{title}}}."
-        if venue:
-            entry += f" {venue}."
-        if paper.doi:
-            entry += f" DOI: \\url{{{paper.doi}}}"
-        return entry
+    def make_cite_key(paper: Paper, index: int) -> str:
+        """Generate a unique citation key for a paper."""
+        # Use first author's last name + year + index for uniqueness
+        if paper.authors:
+            first_author = paper.authors[0].split()[-1].lower()
+            # Remove non-alphanumeric characters
+            first_author = ''.join(c for c in first_author if c.isalnum())
+        else:
+            first_author = "unknown"
+        year = paper.year or "nd"
+        return f"{first_author}{year}_{index}"
     
+    def format_bibtex_entry(paper: Paper, cite_key: str) -> str:
+        """Format a paper as a BibTeX entry."""
+        lines = [f"@article{{{cite_key},"]
+        lines.append(f"  title = {{{escape_bibtex(paper.title)}}},")
+        if paper.authors:
+            authors = " and ".join(paper.authors)
+            lines.append(f"  author = {{{escape_bibtex(authors)}}},")
+        if paper.year:
+            lines.append(f"  year = {{{paper.year}}},")
+        if paper.venue:
+            lines.append(f"  journal = {{{escape_bibtex(paper.venue)}}},")
+        if paper.doi:
+            lines.append(f"  doi = {{{paper.doi}}},")
+        if paper.url:
+            lines.append(f"  url = {{{paper.url}}},")
+        lines.append("}")
+        return "\n".join(lines)
+    
+    # Generate citation keys for all papers
+    all_decisions = session.kept_papers + session.discarded_papers
+    cite_keys: dict[int, str] = {}
+    for i, decision in enumerate(all_decisions):
+        cite_keys[id(decision)] = make_cite_key(decision.paper, i)
+    
+    # Generate .bib file
+    bib_entries = []
+    for decision in all_decisions:
+        cite_key = cite_keys[id(decision)]
+        bib_entries.append(format_bibtex_entry(decision.paper, cite_key))
+    
+    bib_path = output_path.with_suffix('.bib')
+    bib_path.write_text("\n\n".join(bib_entries))
+    
+    # Generate .tex file with biblatex
     lines = [
         r"\documentclass{article}",
         r"\usepackage[utf8]{inputenc}",
         r"\usepackage{hyperref}",
         r"\usepackage{enumitem}",
         r"\usepackage{geometry}",
+        r"\usepackage[backend=biber,style=authoryear]{biblatex}",
+        f"\\addbibresource{{{bib_path.name}}}",
         r"\geometry{margin=1in}",
         r"",
         r"\title{Literature Review Report}",
@@ -838,7 +979,8 @@ def generate_latex_report(session: ReviewSession, output_path: Path) -> None:
             r"\begin{enumerate}",
         ])
         for decision in session.kept_papers:
-            lines.append(format_paper(decision))
+            cite_key = cite_keys[id(decision)]
+            lines.append(f"\\item \\fullcite{{{cite_key}}}")
         lines.append(r"\end{enumerate}")
         lines.append("")
     
@@ -849,8 +991,9 @@ def generate_latex_report(session: ReviewSession, output_path: Path) -> None:
             r"\begin{enumerate}",
         ])
         for decision in session.discarded_papers:
-            lines.append(format_paper(decision))
+            cite_key = cite_keys[id(decision)]
             motivation = escape_latex(decision.motivation)
+            lines.append(f"\\item \\fullcite{{{cite_key}}}")
             lines.append(f"  \\\\\\textbf{{Motivation:}} {motivation}")
         lines.append(r"\end{enumerate}")
         lines.append("")
@@ -892,6 +1035,81 @@ def prompt_for_report(session: ReviewSession) -> None:
         console.print(f"[green]Report saved to {output_path}[/green]")
 @
 
+\section{Testing report generation}
+
+Let's verify that the LaTeX report generation works correctly and properly
+escapes special characters.
+
+<<test report generation>>=
+class TestLatexReport:
+    """Tests for LaTeX report generation."""
+
+    def test_generate_report(self, tmp_path):
+        """Test basic report generation.
+
+        The generator creates both a .tex file (with fullcite references)
+        and a .bib file (with paper details). We check both files.
+        """
+        paper = Paper(
+            title="Test Paper",
+            authors=["John Doe", "Jane Smith"],
+            year=2024,
+            doi="10.1234/test",
+            venue="Test Conference",
+        )
+        session = ReviewSession(
+            query="machine learning",
+            providers=["semantic_scholar"],
+            timestamp=datetime(2024, 1, 15, 10, 30),
+        )
+        session.decisions = [
+            ReviewDecision(paper=paper, provider="semantic_scholar", status=DecisionStatus.KEPT),
+        ]
+
+        output_path = tmp_path / "report.tex"
+        generate_latex_report(session, output_path)
+
+        # Check .tex file for report structure
+        tex_content = output_path.read_text()
+        assert r"\title{Literature Review Report}" in tex_content
+        assert "machine learning" in tex_content
+        assert r"\fullcite{" in tex_content
+
+        # Check .bib file for paper details
+        bib_path = output_path.with_suffix(".bib")
+        bib_content = bib_path.read_text()
+        assert "Test Paper" in bib_content
+        assert "John Doe" in bib_content
+        assert "2024" in bib_content
+
+    def test_escapes_special_characters(self, tmp_path):
+        """Test that special BibTeX characters are escaped in .bib file."""
+        paper = Paper(
+            title="Test & Paper with 100% special_chars",
+            authors=["O'Brien"],
+            year=2024,
+        )
+        session = ReviewSession(
+            query="test",
+            providers=["test"],
+            timestamp=datetime.now(),
+        )
+        session.decisions = [
+            ReviewDecision(paper=paper, provider="test", status=DecisionStatus.KEPT),
+        ]
+
+        output_path = tmp_path / "report.tex"
+        generate_latex_report(session, output_path)
+
+        # Special characters should be escaped in the .bib file
+        bib_path = output_path.with_suffix(".bib")
+        bib_content = bib_path.read_text()
+        assert r"\&" in bib_content
+        assert r"\%" in bib_content
+        assert r"\_" in bib_content
+@
+
+
 \chapter{Entry Point}
 
 The main entry point creates a review session from search results and launches 
@@ -932,8 +1150,9 @@ def run_review(results: list[SearchResult], query: str) -> ReviewSession:
 
 \chapter{Tests}
 
-We test the TUI components using Textual's testing framework, which allows
-simulating user interactions without actually displaying the interface.
+Tests are distributed throughout this document, appearing after each
+implementation section they verify.
+The test file collects all distributed test chunks:
 
 <<test [[tui.py]]>>=
 """Tests for the TUI module."""
@@ -949,154 +1168,8 @@ from scholar.tui import (
 )
 
 
-class TestReviewDecision:
-    """Tests for ReviewDecision dataclass."""
-    
-    def test_default_status_is_pending(self):
-        """New decisions should be pending."""
-        paper = Paper(title="Test", authors=["Author"], year=2024)
-        decision = ReviewDecision(paper=paper, provider="test")
-        assert decision.status == DecisionStatus.PENDING
-        assert not decision.is_decided
-    
-    def test_kept_is_decided(self):
-        """Kept papers are decided."""
-        paper = Paper(title="Test", authors=["Author"], year=2024)
-        decision = ReviewDecision(
-            paper=paper, 
-            provider="test", 
-            status=DecisionStatus.KEPT
-        )
-        assert decision.is_decided
-    
-    def test_discarded_requires_motivation(self):
-        """Discarded papers should have motivation."""
-        paper = Paper(title="Test", authors=["Author"], year=2024)
-        decision = ReviewDecision(
-            paper=paper,
-            provider="test",
-            status=DecisionStatus.DISCARDED,
-            motivation="Not relevant"
-        )
-        assert decision.is_decided
-        assert decision.motivation == "Not relevant"
-
-
-class TestReviewSession:
-    """Tests for ReviewSession dataclass."""
-    
-    @pytest.fixture
-    def sample_session(self):
-        """Create a sample session with mixed decisions."""
-        papers = [
-            Paper(title="Paper A", authors=["Author A"], year=2020),
-            Paper(title="Paper B", authors=["Author B"], year=2022),
-            Paper(title="Paper C", authors=["Author C"], year=2021),
-        ]
-        session = ReviewSession(
-            query="test query",
-            providers=["provider1"],
-            timestamp=datetime.now(),
-        )
-        session.decisions = [
-            ReviewDecision(paper=papers[0], provider="p1", status=DecisionStatus.KEPT),
-            ReviewDecision(paper=papers[1], provider="p1", status=DecisionStatus.DISCARDED, motivation="Off topic"),
-            ReviewDecision(paper=papers[2], provider="p1", status=DecisionStatus.PENDING),
-        ]
-        return session
-    
-    def test_kept_papers(self, sample_session):
-        """Test filtering kept papers."""
-        kept = sample_session.kept_papers
-        assert len(kept) == 1
-        assert kept[0].paper.title == "Paper A"
-    
-    def test_discarded_papers(self, sample_session):
-        """Test filtering discarded papers."""
-        discarded = sample_session.discarded_papers
-        assert len(discarded) == 1
-        assert discarded[0].paper.title == "Paper B"
-        assert discarded[0].motivation == "Off topic"
-    
-    def test_pending_papers(self, sample_session):
-        """Test filtering pending papers."""
-        pending = sample_session.pending_papers
-        assert len(pending) == 1
-        assert pending[0].paper.title == "Paper C"
-    
-    def test_sort_by_year(self, sample_session):
-        """Test sorting by year."""
-        sample_session.sort_by("year")
-        years = [d.paper.year for d in sample_session.decisions]
-        assert years == [2020, 2021, 2022]
-    
-    def test_sort_by_year_reverse(self, sample_session):
-        """Test sorting by year descending."""
-        sample_session.sort_by("year", reverse=True)
-        years = [d.paper.year for d in sample_session.decisions]
-        assert years == [2022, 2021, 2020]
-    
-    def test_sort_by_title(self, sample_session):
-        """Test sorting by title."""
-        sample_session.sort_by("title")
-        titles = [d.paper.title for d in sample_session.decisions]
-        assert titles == ["Paper A", "Paper B", "Paper C"]
-
-
-class TestLatexReport:
-    """Tests for LaTeX report generation."""
-    
-    def test_generate_report(self, tmp_path):
-        """Test basic report generation."""
-        paper = Paper(
-            title="Test Paper",
-            authors=["John Doe", "Jane Smith"],
-            year=2024,
-            doi="10.1234/test",
-            venue="Test Conference",
-        )
-        session = ReviewSession(
-            query="machine learning",
-            providers=["semantic_scholar"],
-            timestamp=datetime(2024, 1, 15, 10, 30),
-        )
-        session.decisions = [
-            ReviewDecision(paper=paper, provider="semantic_scholar", status=DecisionStatus.KEPT),
-        ]
-        
-        output_path = tmp_path / "report.tex"
-        generate_latex_report(session, output_path)
-        
-        content = output_path.read_text()
-        assert r"\title{Literature Review Report}" in content
-        assert "machine learning" in content
-        assert "Test Paper" in content
-        assert "John Doe" in content
-        assert "2024" in content
-    
-    def test_escapes_special_characters(self, tmp_path):
-        """Test that special LaTeX characters are escaped."""
-        paper = Paper(
-            title="Test & Paper with 100% special_chars",
-            authors=["O'Brien"],
-            year=2024,
-        )
-        session = ReviewSession(
-            query="test",
-            providers=["test"],
-            timestamp=datetime.now(),
-        )
-        session.decisions = [
-            ReviewDecision(paper=paper, provider="test", status=DecisionStatus.KEPT),
-        ]
-        
-        output_path = tmp_path / "report.tex"
-        generate_latex_report(session, output_path)
-        
-        content = output_path.read_text()
-        assert r"\&" in content
-        assert r"\%" in content
-        assert r"\_" in content
+<<test data structures>>
+<<test report generation>>
 @
 
 \end{document}

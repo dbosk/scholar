@@ -405,6 +405,7 @@ class TableFormatter:
                     authors,
                     str(paper.year) if paper.year else "",
                     paper.doi or "",
+                    end_section=True,
                 )
 
             self.console.print(table)
@@ -517,6 +518,60 @@ class BibTeXFormatter:
         print()
 @
 
+\section{Testing formatters}
+
+We test each formatter with sample data:
+
+<<test formatters>>=
+class TestFormatters:
+    """Tests for output formatters."""
+
+    @pytest.fixture
+    def sample_results(self):
+        """Create sample search results for testing."""
+        papers = [
+            Paper(
+                title="Test Paper",
+                authors=["Alice", "Bob"],
+                year=2024,
+                doi="10.1234/test",
+            ),
+        ]
+        return [
+            SearchResult(
+                query="test",
+                provider="test_provider",
+                timestamp="2024-01-01T00:00:00",
+                papers=papers,
+            )
+        ]
+
+    def test_table_formatter(self, sample_results, capsys):
+        """TableFormatter produces output."""
+        formatter = TableFormatter()
+        formatter.format(sample_results)
+        captured = capsys.readouterr()
+        assert "Test Paper" in captured.out
+
+    def test_json_formatter(self, sample_results, capsys):
+        """JSONFormatter produces valid JSON."""
+        formatter = JSONFormatter()
+        formatter.format(sample_results)
+        captured = capsys.readouterr()
+        import json
+        data = json.loads(captured.out)
+        assert data[0]["query"] == "test"
+        assert data[0]["papers"][0]["title"] == "Test Paper"
+
+    def test_bibtex_formatter(self, sample_results, capsys):
+        """BibTeXFormatter produces BibTeX entries."""
+        formatter = BibTeXFormatter()
+        formatter.format(sample_results)
+        captured = capsys.readouterr()
+        assert "@article{" in captured.out
+        assert "title = {Test Paper}" in captured.out
+@
+
 
 \chapter{Submodule Registration}
 
@@ -561,47 +616,12 @@ def main() -> None:
     app()
 @
 
-
-\chapter{Dependencies}
-
-We collect the imports used throughout the module:
-
-<<cli imports>>=
-from typing import Optional
-from typing_extensions import Annotated
-import json
-
-import typer
-from rich.console import Console
-from rich.table import Table
-@
-
-<<constants>>=
-# CLI constants (reserved for future use)
-@
-
-
-\chapter{Testing}
-\label{ch:cli-testing}
-
-We verify the CLI functionality with tests.
-
-<<test [[cli.py]]>>=
-"""Tests for the CLI module."""
-import pytest
-from unittest.mock import Mock
-from typer.testing import CliRunner
-
-from scholar.cli import app, TableFormatter, JSONFormatter, BibTeXFormatter
-from scholar import SearchResult, Paper
-@
-
 \section{Testing the CLI application}
 
 We use Typer's [[CliRunner]] to test the CLI without actually invoking
 a subprocess:
 
-<<test [[cli.py]]>>=
+<<test cli>>=
 runner = CliRunner()
 
 
@@ -701,58 +721,45 @@ class TestCLI:
         assert "Unknown action" in result.stdout
 @
 
-\section{Testing formatters}
 
-We test each formatter with sample data:
+\chapter{Dependencies}
+
+We collect the imports used throughout the module:
+
+<<cli imports>>=
+from typing import Optional
+from typing_extensions import Annotated
+import json
+
+import typer
+from rich.console import Console
+from rich.table import Table
+@
+
+<<constants>>=
+# CLI constants (reserved for future use)
+@
+
+
+\chapter{Tests}
+\label{ch:cli-testing}
+
+Tests are distributed throughout this document, appearing after each
+implementation section they verify.
+The test file collects all distributed test chunks:
 
 <<test [[cli.py]]>>=
-class TestFormatters:
-    """Tests for output formatters."""
+"""Tests for the CLI module."""
+import pytest
+from unittest.mock import Mock
+from typer.testing import CliRunner
 
-    @pytest.fixture
-    def sample_results(self):
-        """Create sample search results for testing."""
-        papers = [
-            Paper(
-                title="Test Paper",
-                authors=["Alice", "Bob"],
-                year=2024,
-                doi="10.1234/test",
-            ),
-        ]
-        return [
-            SearchResult(
-                query="test",
-                provider="test_provider",
-                timestamp="2024-01-01T00:00:00",
-                papers=papers,
-            )
-        ]
+from scholar.cli import app, TableFormatter, JSONFormatter, BibTeXFormatter
+from scholar import SearchResult, Paper
 
-    def test_table_formatter(self, sample_results, capsys):
-        """TableFormatter produces output."""
-        formatter = TableFormatter()
-        formatter.format(sample_results)
-        captured = capsys.readouterr()
-        assert "Test Paper" in captured.out
 
-    def test_json_formatter(self, sample_results, capsys):
-        """JSONFormatter produces valid JSON."""
-        formatter = JSONFormatter()
-        formatter.format(sample_results)
-        captured = capsys.readouterr()
-        import json
-        data = json.loads(captured.out)
-        assert data[0]["query"] == "test"
-        assert data[0]["papers"][0]["title"] == "Test Paper"
-
-    def test_bibtex_formatter(self, sample_results, capsys):
-        """BibTeXFormatter produces BibTeX entries."""
-        formatter = BibTeXFormatter()
-        formatter.format(sample_results)
-        captured = capsys.readouterr()
-        assert "@article{" in captured.out
-        assert "title = {Test Paper}" in captured.out
+<<test cli>>
+<<test formatters>>
 @
 
 
