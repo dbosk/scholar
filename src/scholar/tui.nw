@@ -1,0 +1,880 @@
+\documentclass[a4paper,oneside]{memoir}
+\usepackage{noweb}
+\usepackage[hyphens]{url}
+\usepackage{hyperref}
+
+\begin{document}
+
+\title{Scholar TUI: Interactive Paper Review Interface}
+\author{Scholar Project}
+\maketitle
+
+\tableofcontents
+
+\chapter{Introduction}
+
+This module provides an interactive terminal user interface (TUI) for reviewing 
+academic papers returned from search results. The TUI allows researchers to:
+\begin{itemize}
+\item Browse papers with vim-style navigation
+\item View paper abstracts
+\item Keep or discard papers with mandatory motivations for discards
+\item Sort papers by various criteria
+\item Generate LaTeX reports of the review session
+\end{itemize}
+
+The interface is built using Textual, a modern Python TUI framework that 
+provides rich terminal interfaces with mouse support and responsive layouts.
+
+\chapter{Module Structure}
+
+The TUI module exports functions for launching the interactive review interface 
+and generating reports from review sessions.
+
+<<[[tui.py]]>>=
+"""Interactive TUI for reviewing academic papers."""
+<<tui imports>>
+<<tui data structures>>
+<<tui paper list widget>>
+<<tui abstract screen>>
+<<tui discard modal>>
+<<tui sort modal>>
+<<tui main app>>
+<<tui report generation>>
+<<tui entry point>>
+@
+
+\chapter{Data Structures}
+
+We need data structures to track the review state of each paper. The 
+[[ReviewDecision]] captures whether a paper is kept, discarded, or still 
+pending review, along with the motivation for discards.
+
+<<tui imports>>=
+from dataclasses import dataclass, field
+from datetime import datetime
+from enum import Enum
+from pathlib import Path
+from typing import Callable
+import sys
+
+from textual.app import App, ComposeResult
+from textual.binding import Binding
+from textual.containers import Container, Horizontal, Vertical, VerticalScroll
+from textual.screen import Screen, ModalScreen
+from textual.widgets import (
+    Button, DataTable, Footer, Header, Input, Label,
+    ListItem, ListView, Static, TextArea,
+)
+from textual.message import Message
+from rich.text import Text
+
+from scholar.scholar import Paper, SearchResult
+@
+
+The decision status uses an enum to ensure type safety and clear semantics.
+
+<<tui data structures>>=
+class DecisionStatus(Enum):
+    """Status of a paper review decision."""
+    PENDING = "pending"
+    KEPT = "kept"
+    DISCARDED = "discarded"
+
+
+@dataclass
+class ReviewDecision:
+    """
+    A review decision for a single paper.
+    
+    Tracks whether the paper was kept or discarded during review,
+    along with the source provider and motivation for discards.
+    """
+    paper: Paper
+    provider: str
+    status: DecisionStatus = DecisionStatus.PENDING
+    motivation: str = ""
+    
+    @property
+    def is_decided(self) -> bool:
+        """Check if a decision has been made."""
+        return self.status != DecisionStatus.PENDING
+
+
+@dataclass 
+class ReviewSession:
+    """
+    A complete review session with all papers and decisions.
+    
+    Maintains the search parameters and all review decisions,
+    supporting sorting and filtering operations.
+    """
+    query: str
+    providers: list[str]
+    timestamp: datetime
+    decisions: list[ReviewDecision] = field(default_factory=list)
+    
+    @property
+    def kept_papers(self) -> list[ReviewDecision]:
+        """Get all papers marked as kept."""
+        return [d for d in self.decisions if d.status == DecisionStatus.KEPT]
+    
+    @property
+    def discarded_papers(self) -> list[ReviewDecision]:
+        """Get all papers marked as discarded."""
+        return [d for d in self.decisions if d.status == DecisionStatus.DISCARDED]
+    
+    @property
+    def pending_papers(self) -> list[ReviewDecision]:
+        """Get all papers still pending review."""
+        return [d for d in self.decisions if d.status == DecisionStatus.PENDING]
+    
+    def sort_by(self, key: str, reverse: bool = False) -> None:
+        """
+        Sort decisions by a paper attribute.
+        
+        Supported keys: title, year, author, provider
+        """
+        if key == "title":
+            self.decisions.sort(key=lambda d: d.paper.title.lower(), reverse=reverse)
+        elif key == "year":
+            self.decisions.sort(key=lambda d: d.paper.year or 0, reverse=reverse)
+        elif key == "author":
+            self.decisions.sort(
+                key=lambda d: d.paper.authors[0].lower() if d.paper.authors else "",
+                reverse=reverse
+            )
+        elif key == "provider":
+            self.decisions.sort(key=lambda d: d.provider.lower(), reverse=reverse)
+@
+
+\chapter{Paper List Widget}
+
+The main interface displays papers in a navigable list. Each paper shows its 
+title, authors, year, and current review status using color coding.
+
+<<tui paper list widget>>=
+class PaperListItem(ListItem):
+    """A list item displaying a paper with its review status."""
+    
+    def __init__(self, decision: ReviewDecision, index: int) -> None:
+        super().__init__()
+        self.decision = decision
+        self.index = index
+    
+    def compose(self) -> ComposeResult:
+        paper = self.decision.paper
+        status = self.decision.status
+        
+        # Color code by status
+        if status == DecisionStatus.KEPT:
+            status_indicator = "[green]✓[/green]"
+        elif status == DecisionStatus.DISCARDED:
+            status_indicator = "[red]✗[/red]"
+        else:
+            status_indicator = "[dim]○[/dim]"
+        
+        # Format authors (truncate if too many)
+        authors = ", ".join(paper.authors[:3])
+        if len(paper.authors) > 3:
+            authors += " et al."
+        
+        year = paper.year or "n/a"
+        provider = f"[dim]{self.decision.provider}[/dim]"
+        
+        yield Static(
+            f"{status_indicator} {paper.title[:60]}{'...' if len(paper.title) > 60 else ''}\n"
+            f"   [dim]{authors} ({year})[/dim] {provider}"
+        )
+@
+
+\chapter{Abstract Viewing Screen}
+
+When the user presses Enter on a paper, we show a full-screen view of the 
+abstract along with all paper metadata. This screen allows the user to read 
+the full abstract and make a decision about the paper.
+
+<<tui abstract screen>>=
+class AbstractScreen(Screen[None]):
+    """Full-screen view of a paper's abstract and details."""
+    
+    BINDINGS = [
+        Binding("escape", "dismiss_screen", "Back"),
+        Binding("q", "dismiss_screen", "Back"),
+        Binding("k", "keep", "Keep"),
+        Binding("d", "discard", "Discard"),
+    ]
+    
+    def __init__(self, decision: ReviewDecision) -> None:
+        super().__init__()
+        self.decision = decision
+    
+    def compose(self) -> ComposeResult:
+        paper = self.decision.paper
+        
+        yield Header()
+        with VerticalScroll():
+            yield Static(f"[bold]{paper.title}[/bold]", classes="title")
+            yield Static(f"[dim]Provider: {self.decision.provider}[/dim]")
+            yield Static("")
+            
+            authors = ", ".join(paper.authors) if paper.authors else "Unknown"
+            yield Static(f"[bold]Authors:[/bold] {authors}")
+            yield Static(f"[bold]Year:[/bold] {paper.year or 'Unknown'}")
+            yield Static(f"[bold]Venue:[/bold] {paper.venue or 'Unknown'}")
+            
+            if paper.doi:
+                yield Static(f"[bold]DOI:[/bold] {paper.doi}")
+            if paper.url:
+                yield Static(f"[bold]URL:[/bold] {paper.url}")
+            
+            yield Static("")
+            yield Static("[bold]Abstract:[/bold]")
+            yield Static(paper.abstract or "[dim]No abstract available[/dim]")
+        yield Footer()
+    
+    async def action_dismiss_screen(self) -> None:
+        """Return to the paper list."""
+        self.dismiss(None)
+    
+    def action_keep(self) -> None:
+        """Mark paper as kept and return."""
+        self.decision.status = DecisionStatus.KEPT
+        self.decision.motivation = ""
+        self.dismiss(None)
+    
+    async def action_discard(self) -> None:
+        """Open discard modal to get motivation."""
+        result = await self.app.push_screen_wait(DiscardModal(self.decision))
+        if result:
+            self.dismiss(None)
+@
+
+\chapter{Discard Modal}
+
+When discarding a paper, the user must provide a motivation. This modal 
+captures that motivation before marking the paper as discarded. This 
+requirement ensures reviewers document their decision-making process.
+
+<<tui discard modal>>=
+class DiscardModal(ModalScreen[bool]):
+    """Modal dialog to capture discard motivation."""
+    
+    BINDINGS = [
+        Binding("escape", "cancel", "Cancel"),
+    ]
+    
+    def __init__(self, decision: ReviewDecision) -> None:
+        super().__init__()
+        self.decision = decision
+    
+    def compose(self) -> ComposeResult:
+        with Container(id="discard-dialog"):
+            yield Static(
+                f"[bold]Discard:[/bold] {self.decision.paper.title[:50]}...",
+                id="discard-title"
+            )
+            yield Static("Why are you discarding this paper?")
+            yield TextArea(id="motivation-input")
+            with Horizontal(id="discard-buttons"):
+                yield Button("Discard", variant="error", id="confirm-discard")
+                yield Button("Cancel", variant="default", id="cancel-discard")
+    
+    def on_button_pressed(self, event: Button.Pressed) -> None:
+        if event.button.id == "confirm-discard":
+            motivation_input = self.query_one("#motivation-input", TextArea)
+            motivation = motivation_input.text.strip()
+            if motivation:
+                self.decision.status = DecisionStatus.DISCARDED
+                self.decision.motivation = motivation
+                self.dismiss(True)
+            else:
+                # Flash the input to indicate required field
+                motivation_input.styles.background = "darkred"
+        elif event.button.id == "cancel-discard":
+            self.dismiss(False)
+    
+    def action_cancel(self) -> None:
+        self.dismiss(False)
+@
+
+\chapter{Sort Modal}
+
+The sort modal allows users to change the sort order of papers. Sorting helps 
+users organize papers by relevance criteria like year or author.
+
+<<tui sort modal>>=
+class SortModal(ModalScreen[tuple[str, bool] | None]):
+    """Modal dialog to select sort criteria."""
+    
+    BINDINGS = [
+        Binding("escape", "cancel", "Cancel"),
+        Binding("t", "sort_title", "By Title"),
+        Binding("y", "sort_year", "By Year"),
+        Binding("a", "sort_author", "By Author"),
+        Binding("p", "sort_provider", "By Provider"),
+    ]
+    
+    def compose(self) -> ComposeResult:
+        with Container(id="sort-dialog"):
+            yield Static("[bold]Sort Papers[/bold]", id="sort-title")
+            yield Static("")
+            yield Static("[t] Title (A-Z)")
+            yield Static("[T] Title (Z-A)")
+            yield Static("[y] Year (oldest first)")
+            yield Static("[Y] Year (newest first)")
+            yield Static("[a] Author (A-Z)")
+            yield Static("[A] Author (Z-A)")
+            yield Static("[p] Provider (A-Z)")
+            yield Static("")
+            yield Static("[dim]Press Escape to cancel[/dim]")
+    
+    def action_cancel(self) -> None:
+        self.dismiss(None)
+    
+    def action_sort_title(self) -> None:
+        self.dismiss(("title", False))
+    
+    def action_sort_year(self) -> None:
+        self.dismiss(("year", False))
+    
+    def action_sort_author(self) -> None:
+        self.dismiss(("author", False))
+    
+    def action_sort_provider(self) -> None:
+        self.dismiss(("provider", False))
+    
+    def on_key(self, event) -> None:
+        """Handle uppercase keys for reverse sort."""
+        if event.key == "T":
+            self.dismiss(("title", True))
+        elif event.key == "Y":
+            self.dismiss(("year", True))
+        elif event.key == "A":
+            self.dismiss(("author", True))
+        elif event.key == "P":
+            self.dismiss(("provider", True))
+@
+
+\chapter{Main Application}
+
+The main TUI application coordinates all the screens and manages the review 
+session state. It provides vim-style keybindings for efficient navigation.
+
+<<tui main app>>=
+class PaperReviewApp(App):
+    """Interactive paper review application."""
+    
+    CSS = """
+    #paper-list {
+        height: 1fr;
+    }
+    
+    #status-bar {
+        dock: bottom;
+        height: 1;
+        background: $primary;
+        color: $text;
+        padding: 0 1;
+    }
+    
+    #discard-dialog {
+        width: 60;
+        height: auto;
+        padding: 1 2;
+        background: $surface;
+        border: solid $primary;
+    }
+    
+    #discard-buttons {
+        margin-top: 1;
+        height: auto;
+    }
+    
+    #discard-buttons Button {
+        margin-right: 1;
+    }
+    
+    #motivation-input {
+        height: 5;
+        margin: 1 0;
+    }
+    
+    #sort-dialog {
+        width: 40;
+        height: auto;
+        padding: 1 2;
+        background: $surface;
+        border: solid $primary;
+    }
+    
+    .title {
+        margin-bottom: 1;
+    }
+    """
+    
+    BINDINGS = [
+        Binding("q", "quit", "Quit"),
+        Binding("j", "cursor_down", "Down", show=False),
+        Binding("k", "cursor_up", "Up", show=False),
+        Binding("down", "cursor_down", "Down", show=False),
+        Binding("up", "cursor_up", "Up", show=False),
+        Binding("enter", "view_abstract", "View"),
+        Binding("K", "keep", "Keep"),
+        Binding("d", "discard", "Discard"),
+        Binding("s", "sort", "Sort"),
+    ]
+    
+    def __init__(self, session: ReviewSession) -> None:
+        super().__init__()
+        self.session = session
+        self.current_index = 0
+    
+    def compose(self) -> ComposeResult:
+        yield Header()
+        yield ListView(id="paper-list")
+        yield Static(id="status-bar")
+        yield Footer()
+    
+    def on_mount(self) -> None:
+        """Initialize the paper list after mounting."""
+        self._refresh_list()
+        self._update_status()
+    
+    def _refresh_list(self) -> None:
+        """Refresh the paper list display."""
+        list_view = self.query_one("#paper-list", ListView)
+        list_view.clear()
+        
+        for i, decision in enumerate(self.session.decisions):
+            list_view.append(PaperListItem(decision, i))
+        
+        # Restore selection
+        if self.session.decisions:
+            list_view.index = min(self.current_index, len(self.session.decisions) - 1)
+    
+    def _update_status(self) -> None:
+        """Update the status bar with current counts."""
+        kept = len(self.session.kept_papers)
+        discarded = len(self.session.discarded_papers)
+        pending = len(self.session.pending_papers)
+        total = len(self.session.decisions)
+        
+        status = self.query_one("#status-bar", Static)
+        status.update(
+            f"Query: {self.session.query} | "
+            f"[green]Kept: {kept}[/green] | "
+            f"[red]Discarded: {discarded}[/red] | "
+            f"Pending: {pending} | "
+            f"Total: {total}"
+        )
+    
+    def _get_current_decision(self) -> ReviewDecision | None:
+        """Get the currently selected decision."""
+        list_view = self.query_one("#paper-list", ListView)
+        if list_view.index is not None and list_view.index < len(self.session.decisions):
+            self.current_index = list_view.index
+            return self.session.decisions[list_view.index]
+        return None
+    
+    def action_cursor_down(self) -> None:
+        list_view = self.query_one("#paper-list", ListView)
+        list_view.action_cursor_down()
+    
+    def action_cursor_up(self) -> None:
+        list_view = self.query_one("#paper-list", ListView)
+        list_view.action_cursor_up()
+    
+    async def action_view_abstract(self) -> None:
+        """Show the abstract screen for current paper."""
+        decision = self._get_current_decision()
+        if decision:
+            await self.push_screen_wait(AbstractScreen(decision))
+            self._refresh_list()
+            self._update_status()
+    
+    def action_keep(self) -> None:
+        """Mark current paper as kept."""
+        decision = self._get_current_decision()
+        if decision:
+            decision.status = DecisionStatus.KEPT
+            decision.motivation = ""
+            self._refresh_list()
+            self._update_status()
+    
+    async def action_discard(self) -> None:
+        """Open discard modal for current paper."""
+        decision = self._get_current_decision()
+        if decision:
+            await self.push_screen_wait(DiscardModal(decision))
+            self._refresh_list()
+            self._update_status()
+    
+    async def action_sort(self) -> None:
+        """Open sort modal."""
+        result = await self.push_screen_wait(SortModal())
+        if result:
+            key, reverse = result
+            self.session.sort_by(key, reverse)
+            self._refresh_list()
+@
+
+\chapter{Report Generation}
+
+After the review session, we generate a LaTeX report documenting the search 
+parameters, review decisions, and motivations. This provides an audit trail 
+for systematic literature reviews.
+
+<<tui report generation>>=
+def generate_latex_report(session: ReviewSession, output_path: Path) -> None:
+    """
+    Generate a LaTeX report of the review session.
+    
+    The report includes:
+    - Search parameters (query, providers, date)
+    - Summary statistics
+    - List of kept papers with citations
+    - List of discarded papers with motivations
+    """
+    def escape_latex(text: str) -> str:
+        """Escape special LaTeX characters.
+        
+        Order matters: backslash must be escaped first to avoid double-escaping
+        the backslashes introduced by other replacements.
+        """
+        # First escape backslashes
+        text = text.replace('\\', r'\textbackslash{}')
+        # Then escape other special characters
+        replacements = {
+            '&': r'\&',
+            '%': r'\%',
+            '$': r'\$',
+            '#': r'\#',
+            '_': r'\_',
+            '{': r'\{',
+            '}': r'\}',
+            '~': r'\textasciitilde{}',
+            '^': r'\textasciicircum{}',
+        }
+        for char, replacement in replacements.items():
+            text = text.replace(char, replacement)
+        return text
+    
+    def format_paper(decision: ReviewDecision) -> str:
+        """Format a paper entry for LaTeX."""
+        paper = decision.paper
+        authors = ", ".join(paper.authors[:3]) if paper.authors else "Unknown"
+        if len(paper.authors) > 3:
+            authors += " et al."
+        year = paper.year or "n.d."
+        title = escape_latex(paper.title)
+        authors = escape_latex(authors)
+        venue = escape_latex(paper.venue or "")
+        
+        entry = f"\\item {authors} ({year}). \\emph{{{title}}}."
+        if venue:
+            entry += f" {venue}."
+        if paper.doi:
+            entry += f" DOI: \\url{{{paper.doi}}}"
+        return entry
+    
+    lines = [
+        r"\documentclass{article}",
+        r"\usepackage[utf8]{inputenc}",
+        r"\usepackage{hyperref}",
+        r"\usepackage{enumitem}",
+        r"\usepackage{geometry}",
+        r"\geometry{margin=1in}",
+        r"",
+        r"\title{Literature Review Report}",
+        f"\\date{{{session.timestamp.strftime('%Y-%m-%d')}}}",
+        r"",
+        r"\begin{document}",
+        r"\maketitle",
+        r"",
+        r"\section{Search Parameters}",
+        r"\begin{description}",
+        f"\\item[Query] {escape_latex(session.query)}",
+        f"\\item[Providers] {', '.join(session.providers)}",
+        f"\\item[Date] {session.timestamp.strftime('%Y-%m-%d %H:%M')}",
+        f"\\item[Total Papers] {len(session.decisions)}",
+        r"\end{description}",
+        r"",
+        r"\section{Summary}",
+        r"\begin{description}",
+        f"\\item[Kept] {len(session.kept_papers)}",
+        f"\\item[Discarded] {len(session.discarded_papers)}",
+        f"\\item[Pending] {len(session.pending_papers)}",
+        r"\end{description}",
+        r"",
+    ]
+    
+    # Kept papers section
+    if session.kept_papers:
+        lines.extend([
+            r"\section{Kept Papers}",
+            r"\begin{enumerate}",
+        ])
+        for decision in session.kept_papers:
+            lines.append(format_paper(decision))
+        lines.append(r"\end{enumerate}")
+        lines.append("")
+    
+    # Discarded papers section
+    if session.discarded_papers:
+        lines.extend([
+            r"\section{Discarded Papers}",
+            r"\begin{enumerate}",
+        ])
+        for decision in session.discarded_papers:
+            lines.append(format_paper(decision))
+            motivation = escape_latex(decision.motivation)
+            lines.append(f"  \\\\\\textbf{{Motivation:}} {motivation}")
+        lines.append(r"\end{enumerate}")
+        lines.append("")
+    
+    lines.extend([
+        r"\end{document}",
+    ])
+    
+    output_path.write_text("\n".join(lines))
+
+
+def prompt_for_report(session: ReviewSession) -> None:
+    """
+    Prompt the user to save a LaTeX report after the review session.
+    
+    Called after the TUI exits if any decisions were made.
+    """
+    from rich.prompt import Prompt, Confirm
+    from rich.console import Console
+    
+    console = Console()
+    
+    kept = len(session.kept_papers)
+    discarded = len(session.discarded_papers)
+    
+    if kept == 0 and discarded == 0:
+        return
+    
+    console.print(f"\n[bold]Review session complete![/bold]")
+    console.print(f"  [green]Kept:[/green] {kept}")
+    console.print(f"  [red]Discarded:[/red] {discarded}")
+    console.print(f"  Pending: {len(session.pending_papers)}")
+    
+    if Confirm.ask("\nWould you like to save a LaTeX report?", default=True):
+        default_name = f"review_{session.timestamp.strftime('%Y%m%d_%H%M%S')}.tex"
+        filename = Prompt.ask("Filename", default=default_name)
+        output_path = Path(filename)
+        generate_latex_report(session, output_path)
+        console.print(f"[green]Report saved to {output_path}[/green]")
+@
+
+\chapter{Entry Point}
+
+The main entry point creates a review session from search results and launches 
+the TUI application.
+
+<<tui entry point>>=
+def run_review(results: list[SearchResult], query: str) -> ReviewSession:
+    """
+    Run the interactive review TUI for search results.
+    
+    Converts SearchResult objects into a ReviewSession, launches the TUI,
+    and returns the session with all decisions after the user exits.
+    """
+    # Create review session
+    providers = list(set(r.provider for r in results))
+    session = ReviewSession(
+        query=query,
+        providers=providers,
+        timestamp=datetime.now(),
+    )
+    
+    # Convert search results to review decisions
+    for result in results:
+        for paper in result.papers:
+            session.decisions.append(
+                ReviewDecision(paper=paper, provider=result.provider)
+            )
+    
+    # Run the TUI
+    app = PaperReviewApp(session)
+    app.run()
+    
+    # Prompt for report
+    prompt_for_report(session)
+    
+    return session
+@
+
+\chapter{Tests}
+
+We test the TUI components using Textual's testing framework, which allows
+simulating user interactions without actually displaying the interface.
+
+<<test [[tui.py]]>>=
+"""Tests for the TUI module."""
+import pytest
+from datetime import datetime
+
+from scholar.scholar import Paper
+from scholar.tui import (
+    DecisionStatus,
+    ReviewDecision,
+    ReviewSession,
+    generate_latex_report,
+)
+
+
+class TestReviewDecision:
+    """Tests for ReviewDecision dataclass."""
+    
+    def test_default_status_is_pending(self):
+        """New decisions should be pending."""
+        paper = Paper(title="Test", authors=["Author"], year=2024)
+        decision = ReviewDecision(paper=paper, provider="test")
+        assert decision.status == DecisionStatus.PENDING
+        assert not decision.is_decided
+    
+    def test_kept_is_decided(self):
+        """Kept papers are decided."""
+        paper = Paper(title="Test", authors=["Author"], year=2024)
+        decision = ReviewDecision(
+            paper=paper, 
+            provider="test", 
+            status=DecisionStatus.KEPT
+        )
+        assert decision.is_decided
+    
+    def test_discarded_requires_motivation(self):
+        """Discarded papers should have motivation."""
+        paper = Paper(title="Test", authors=["Author"], year=2024)
+        decision = ReviewDecision(
+            paper=paper,
+            provider="test",
+            status=DecisionStatus.DISCARDED,
+            motivation="Not relevant"
+        )
+        assert decision.is_decided
+        assert decision.motivation == "Not relevant"
+
+
+class TestReviewSession:
+    """Tests for ReviewSession dataclass."""
+    
+    @pytest.fixture
+    def sample_session(self):
+        """Create a sample session with mixed decisions."""
+        papers = [
+            Paper(title="Paper A", authors=["Author A"], year=2020),
+            Paper(title="Paper B", authors=["Author B"], year=2022),
+            Paper(title="Paper C", authors=["Author C"], year=2021),
+        ]
+        session = ReviewSession(
+            query="test query",
+            providers=["provider1"],
+            timestamp=datetime.now(),
+        )
+        session.decisions = [
+            ReviewDecision(paper=papers[0], provider="p1", status=DecisionStatus.KEPT),
+            ReviewDecision(paper=papers[1], provider="p1", status=DecisionStatus.DISCARDED, motivation="Off topic"),
+            ReviewDecision(paper=papers[2], provider="p1", status=DecisionStatus.PENDING),
+        ]
+        return session
+    
+    def test_kept_papers(self, sample_session):
+        """Test filtering kept papers."""
+        kept = sample_session.kept_papers
+        assert len(kept) == 1
+        assert kept[0].paper.title == "Paper A"
+    
+    def test_discarded_papers(self, sample_session):
+        """Test filtering discarded papers."""
+        discarded = sample_session.discarded_papers
+        assert len(discarded) == 1
+        assert discarded[0].paper.title == "Paper B"
+        assert discarded[0].motivation == "Off topic"
+    
+    def test_pending_papers(self, sample_session):
+        """Test filtering pending papers."""
+        pending = sample_session.pending_papers
+        assert len(pending) == 1
+        assert pending[0].paper.title == "Paper C"
+    
+    def test_sort_by_year(self, sample_session):
+        """Test sorting by year."""
+        sample_session.sort_by("year")
+        years = [d.paper.year for d in sample_session.decisions]
+        assert years == [2020, 2021, 2022]
+    
+    def test_sort_by_year_reverse(self, sample_session):
+        """Test sorting by year descending."""
+        sample_session.sort_by("year", reverse=True)
+        years = [d.paper.year for d in sample_session.decisions]
+        assert years == [2022, 2021, 2020]
+    
+    def test_sort_by_title(self, sample_session):
+        """Test sorting by title."""
+        sample_session.sort_by("title")
+        titles = [d.paper.title for d in sample_session.decisions]
+        assert titles == ["Paper A", "Paper B", "Paper C"]
+
+
+class TestLatexReport:
+    """Tests for LaTeX report generation."""
+    
+    def test_generate_report(self, tmp_path):
+        """Test basic report generation."""
+        paper = Paper(
+            title="Test Paper",
+            authors=["John Doe", "Jane Smith"],
+            year=2024,
+            doi="10.1234/test",
+            venue="Test Conference",
+        )
+        session = ReviewSession(
+            query="machine learning",
+            providers=["semantic_scholar"],
+            timestamp=datetime(2024, 1, 15, 10, 30),
+        )
+        session.decisions = [
+            ReviewDecision(paper=paper, provider="semantic_scholar", status=DecisionStatus.KEPT),
+        ]
+        
+        output_path = tmp_path / "report.tex"
+        generate_latex_report(session, output_path)
+        
+        content = output_path.read_text()
+        assert r"\title{Literature Review Report}" in content
+        assert "machine learning" in content
+        assert "Test Paper" in content
+        assert "John Doe" in content
+        assert "2024" in content
+    
+    def test_escapes_special_characters(self, tmp_path):
+        """Test that special LaTeX characters are escaped."""
+        paper = Paper(
+            title="Test & Paper with 100% special_chars",
+            authors=["O'Brien"],
+            year=2024,
+        )
+        session = ReviewSession(
+            query="test",
+            providers=["test"],
+            timestamp=datetime.now(),
+        )
+        session.decisions = [
+            ReviewDecision(paper=paper, provider="test", status=DecisionStatus.KEPT),
+        ]
+        
+        output_path = tmp_path / "report.tex"
+        generate_latex_report(session, output_path)
+        
+        content = output_path.read_text()
+        assert r"\&" in content
+        assert r"\%" in content
+        assert r"\_" in content
+@
+
+\end{document}
