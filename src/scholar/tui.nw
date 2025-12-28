@@ -182,17 +182,23 @@ class PDFDownloadError(Exception):
     pass
 
 
-def download_pdf(url: str) -> Path:
+def download_pdf(url: str, console_print: Callable[[str], None] | None = None) -> Path:
     """
     Download a PDF to the cache if not already cached.
     
     Returns the path to the cached PDF.
     Raises PDFDownloadError with details if download fails.
+    console_print is an optional callback to print status messages.
     """
     cache_path = get_cached_pdf_path(url)
     
     if cache_path.exists():
+        if console_print:
+            console_print(f"Using cached PDF: {cache_path}")
         return cache_path
+    
+    if console_print:
+        console_print(f"Downloading PDF from {url}...")
     
     try:
         response = requests.get(url, timeout=30, stream=True)
@@ -343,11 +349,14 @@ class AbstractScreen(Screen[None]):
             status_widget.update("[red]No PDF URL available[/red]")
             return
         
-        status_widget.update("[yellow]Downloading PDF...[/yellow]")
-        self.refresh()
+        def update_status(msg: str) -> None:
+            status_widget.update(f"[yellow]{msg}[/yellow]")
+            self.refresh()
         
         try:
-            pdf_path = download_pdf(paper.pdf_url)
+            pdf_path = download_pdf(paper.pdf_url, console_print=update_status)
+            status_widget.update(f"[green]Opening PDF: {pdf_path}[/green]")
+            self.refresh()
             if open_pdf(pdf_path):
                 status_widget.update(f"[green]PDF opened: {pdf_path}[/green]")
             else:
