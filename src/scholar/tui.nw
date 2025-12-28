@@ -166,7 +166,7 @@ structure as the search cache.
 <<tui pdf cache>>=
 def get_pdf_cache_dir() -> Path:
     """Get the PDF cache directory, creating it if needed."""
-    cache_dir = Path(user_cache_dir("scholar")) / "pdfs"
+    cache_dir = Path(platformdirs.user_cache_dir("scholar")) / "pdfs"
     cache_dir.mkdir(parents=True, exist_ok=True)
     return cache_dir
 
