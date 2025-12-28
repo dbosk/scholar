@@ -1,5 +1,6 @@
 TESTS+=		test_scholar.py
 TESTS+=		test_providers.py
+TESTS+=		test_cache.py
 TESTS+=		test_cli.py
 
 .PHONY: all clean distclean test
@@ -12,11 +13,14 @@ test_scholar.py: ../src/scholar/scholar.nw
 test_providers.py: ../src/scholar/providers.nw
 	notangle -R"test [[providers.py]]" $< | cpif $@
 
+test_cache.py: ../src/scholar/cache.nw
+	notangle -R"test [[cache.py]]" $< | cpif $@
+
 test_cli.py: ../src/scholar/cli.nw
 	notangle -R"test [[cli.py]]" $< | cpif $@
 
 test: all
-	poetry run pytest -v
+	uv run pytest -v
 
 INCLUDE_MAKEFILES=../makefiles
 include ${INCLUDE_MAKEFILES}/noweb.mk

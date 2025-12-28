@@ -51,6 +51,7 @@ across bibliographic databases.
 <<typer application>>
 <<search command>>
 <<providers command>>
+<<cache command>>
 <<submodule registration>>
 <<main entry point>>
 @
@@ -240,6 +241,70 @@ for provider in get_all_providers():
         info.get("env_var", "-"),
         info.get("how_to_get", ""),
     )
+@
+
+
+\chapter{Cache Management}
+
+Search results are cached to avoid redundant API calls.
+Users can inspect and manage the cache using the [[cache]] command.
+
+<<cache command>>=
+@app.command()
+def cache(
+    action: Annotated[
+        str,
+        typer.Argument(help="Action: clear, info, or path"),
+    ],
+) -> None:
+    """
+    Manage the search result cache.
+
+    Actions:
+        clear  - Delete all cached search results
+        info   - Show cache statistics (entries, size, location)
+        path   - Print the cache directory path
+    """
+    from scholar.cache import clear_cache, get_cache_stats
+
+    console = Console()
+
+    if action == "clear":
+        count = clear_cache()
+        console.print(f"Cleared {count} cached provider(s).")
+
+    elif action == "info":
+        stats = get_cache_stats()
+        table = Table(title="Cache Statistics")
+        table.add_column("Metric", style="cyan")
+        table.add_column("Value", style="green")
+
+        table.add_row("Location", stats["cache_dir"])
+        table.add_row("Total entries", str(stats["total_entries"]))
+        size_kb = stats["total_size_bytes"] / 1024
+        table.add_row("Total size", f"{size_kb:.1f} KB")
+
+        console.print(table)
+
+        if stats["providers"]:
+            console.print()
+            provider_table = Table(title="Entries per Provider")
+            provider_table.add_column("Provider", style="cyan")
+            provider_table.add_column("Cached queries", justify="right")
+
+            for provider_name, count in sorted(stats["providers"].items()):
+                provider_table.add_row(provider_name, str(count))
+
+            console.print(provider_table)
+
+    elif action == "path":
+        stats = get_cache_stats()
+        print(stats["cache_dir"])
+
+    else:
+        console.print(f"[red]Unknown action: {action}[/red]")
+        console.print("Valid actions: clear, info, path")
+        raise typer.Exit(1)
 @
 
 
@@ -540,6 +605,42 @@ class TestCLI:
         assert "S2_API_KEY" in result.stdout
         assert "WOS_API_KEY" in result.stdout
         assert "IEEE_API_KEY" in result.stdout
+
+    def test_cache_command_exists(self):
+        """The cache command is registered."""
+        result = runner.invoke(app, ["cache", "--help"])
+        assert result.exit_code == 0
+        assert "Manage the search result cache" in result.stdout
+
+    def test_cache_info(self, tmp_path, monkeypatch):
+        """Cache info shows statistics."""
+        monkeypatch.setenv("SCHOLAR_CACHE_DIR", str(tmp_path))
+        result = runner.invoke(app, ["cache", "info"])
+        assert result.exit_code == 0
+        assert "Location" in result.stdout
+        assert "Total entries" in result.stdout
+
+    def test_cache_clear(self, tmp_path, monkeypatch):
+        """Cache clear removes cache files."""
+        monkeypatch.setenv("SCHOLAR_CACHE_DIR", str(tmp_path))
+        # Create a dummy cache file
+        (tmp_path / "test.pkl").touch()
+        result = runner.invoke(app, ["cache", "clear"])
+        assert result.exit_code == 0
+        assert "Cleared" in result.stdout
+
+    def test_cache_path(self, tmp_path, monkeypatch):
+        """Cache path prints directory."""
+        monkeypatch.setenv("SCHOLAR_CACHE_DIR", str(tmp_path))
+        result = runner.invoke(app, ["cache", "path"])
+        assert result.exit_code == 0
+        assert str(tmp_path) in result.stdout
+
+    def test_cache_invalid_action(self):
+        """Cache with invalid action shows error."""
+        result = runner.invoke(app, ["cache", "invalid"])
+        assert result.exit_code == 1
+        assert "Unknown action" in result.stdout
 @
 
 \section{Testing formatters}

@@ -16,7 +16,17 @@ The provider abstraction allows us to:
 \item[Add new databases] without modifying the core search logic.
 \item[Test in isolation] by mocking individual providers.
 \item[Configure per-provider] settings like API keys and rate limits.
+\item[Cache results] to avoid redundant API calls and respect rate limits.
 \end{description}
+
+\section{Caching}
+
+Each provider caches search results using [[cachetools]].
+The cache is a plain dictionary keyed by the query and limit parameters.
+Caches are persisted to disk using pickle, so results survive across program
+runs.
+This is particularly useful for systematic reviews where the same search may
+be run multiple times.
 
 
 \section{Module structure}
@@ -128,7 +138,10 @@ class SemanticScholarProvider:
                      If not provided, uses S2_API_KEY environment variable.
         """
         self.client = SemanticScholar(api_key=api_key)
+        self._cache: dict = load_cache(self.name)
+        register_cache(self.name, self._cache)
 
+    @cachedmethod(lambda self: self._cache)
     def search(self, query: str, limit: int = 100) -> list[Paper]:
         """Search Semantic Scholar for papers matching the query."""
         try:
@@ -229,7 +242,10 @@ class OpenAlexProvider:
         configured_email = email or os.environ.get("OPENALEX_EMAIL")
         if configured_email:
             pyalex.config.email = configured_email
+        self._cache: dict = load_cache(self.name)
+        register_cache(self.name, self._cache)
 
+    @cachedmethod(lambda self: self._cache)
     def search(self, query: str, limit: int = 100) -> list[Paper]:
         """Search OpenAlex for papers matching the query."""
         try:
@@ -331,6 +347,12 @@ class DBLPProvider:
 
     name = "dblp"
 
+    def __init__(self):
+        """Initialize the DBLP provider."""
+        self._cache: dict = load_cache(self.name)
+        register_cache(self.name, self._cache)
+
+    @cachedmethod(lambda self: self._cache)
     def search(self, query: str, limit: int = 100) -> list[Paper]:
         """Search DBLP for papers matching the query."""
         try:
@@ -463,7 +485,10 @@ class WebOfScienceProvider:
                      If not provided, uses WOS_API_KEY environment variable.
         """
         self.api_key = api_key or os.environ.get("WOS_API_KEY")
+        self._cache: dict = load_cache(self.name)
+        register_cache(self.name, self._cache)
 
+    @cachedmethod(lambda self: self._cache)
     def search(self, query: str, limit: int = 100) -> list[Paper]:
         """Search Web of Science for papers matching the query."""
         if not self.api_key:
@@ -605,7 +630,10 @@ class IEEEXploreProvider:
                      If not provided, uses IEEE_API_KEY environment variable.
         """
         self.api_key = api_key or os.environ.get("IEEE_API_KEY")
+        self._cache: dict = load_cache(self.name)
+        register_cache(self.name, self._cache)
 
+    @cachedmethod(lambda self: self._cache)
     def search(self, query: str, limit: int = 100) -> list[Paper]:
         """Search IEEE Xplore for papers matching the query."""
         if not self.api_key:
@@ -711,7 +739,10 @@ If a provider is removed, its dependencies go with it.
 import os
 from typing import Protocol
 
+from cachetools import cachedmethod
+
 from scholar import Paper
+from scholar.cache import load_cache, register_cache
 <<semantic scholar imports>>
 <<openalex imports>>
 <<dblp imports>>

@@ -1,0 +1,367 @@
+\input{preamble.tex}
+
+\begin{document}
+\maketitle
+\tableofcontents
+
+\chapter{Introduction}
+
+When conducting systematic literature reviews, researchers often run the same
+search multiple times---refining queries, re-running reports, or continuing
+work across sessions.
+Each search hits external APIs that impose rate limits and add latency.
+Caching search results provides two key benefits:
+\begin{description}
+\item[API rate limit management] Many academic databases impose strict rate
+  limits. Caching avoids redundant requests when refining searches or
+  re-running reports.
+\item[Reproducibility] Cached results ensure that re-running a search produces
+  identical results, supporting systematic review methodology.
+\end{description}
+
+\section{Design overview}
+
+We implement caching using the [[cachetools]] library with the [[@cached]]
+decorator.
+Each provider maintains its own cache dictionary, which we persist to disk
+using [[pickle]].
+The cache never expires automatically---users clear it manually when they want
+fresh results.
+
+The cache files are stored in a platform-appropriate location:
+\begin{itemize}
+\item Linux: [[~/.cache/scholar/]]
+\item macOS: [[~/Library/Caches/scholar/]]
+\item Windows: [[C:\Users\<user>\AppData\Local\scholar\Cache\]]
+\end{itemize}
+
+<<[[cache.py]]>>=
+"""
+Cache management for Scholar search providers.
+
+Provides persistent caching of search results to avoid redundant API calls.
+Cache is stored as pickled dictionaries, one per provider.
+"""
+
+<<imports>>
+<<constants>>
+<<cache directory functions>>
+<<cache load and save functions>>
+<<cache management functions>>
+<<atexit registration>>
+@
+
+
+\chapter{Cache directory management}
+
+We use [[platformdirs]] to determine the appropriate cache directory for each
+operating system.
+This follows platform conventions and allows users to find and manage the cache
+easily.
+
+<<imports>>=
+import os
+from pathlib import Path
+import platformdirs
+@
+
+<<cache directory functions>>=
+def get_cache_dir() -> Path:
+    """
+    Return the platform-appropriate cache directory for Scholar.
+
+    The directory is created if it doesn't exist.
+    Can be overridden with SCHOLAR_CACHE_DIR environment variable.
+    """
+    cache_dir = os.environ.get("SCHOLAR_CACHE_DIR")
+    if cache_dir:
+        path = Path(cache_dir)
+    else:
+        path = Path(platformdirs.user_cache_dir("scholar"))
+    path.mkdir(parents=True, exist_ok=True)
+    return path
+@
+
+
+\chapter{Loading and saving caches}
+
+Each provider has its own cache file, named after the provider.
+We use [[pickle]] for serialization because it handles the [[Paper]] dataclass
+objects without any additional configuration.
+
+<<imports>>=
+import pickle
+from typing import Any
+@
+
+When loading a cache, we return an empty dictionary if the file doesn't exist
+or is corrupted.
+This ensures the application continues working even if cache files are damaged.
+
+<<cache load and save functions>>=
+def load_cache(provider_name: str) -> dict[Any, Any]:
+    """
+    Load the cache for a provider from disk.
+
+    Returns an empty dictionary if no cache exists or if loading fails.
+    """
+    cache_file = get_cache_dir() / f"{provider_name}.pkl"
+    if not cache_file.exists():
+        return {}
+    try:
+        with open(cache_file, "rb") as f:
+            return pickle.load(f)
+    except (pickle.PickleError, EOFError, OSError):
+        return {}
+@
+
+Saving is straightforward---we write the dictionary to a pickle file.
+We use atomic writes would be safer, but for simplicity we write directly.
+
+<<cache load and save functions>>=
+def save_cache(provider_name: str, cache: dict[Any, Any]) -> None:
+    """
+    Save the cache for a provider to disk.
+    """
+    cache_file = get_cache_dir() / f"{provider_name}.pkl"
+    try:
+        with open(cache_file, "wb") as f:
+            pickle.dump(cache, f)
+    except OSError:
+        pass  # Silently fail if we can't write
+@
+
+
+\chapter{Cache management}
+
+Users need ways to inspect and clear the cache.
+We provide functions to get statistics and clear all cached data.
+
+<<cache management functions>>=
+def clear_cache() -> int:
+    """
+    Clear all cached search results.
+
+    Returns the number of cache files deleted.
+    """
+    cache_dir = get_cache_dir()
+    count = 0
+    for cache_file in cache_dir.glob("*.pkl"):
+        try:
+            cache_file.unlink()
+            count += 1
+        except OSError:
+            pass
+    return count
+@
+
+<<cache management functions>>=
+def get_cache_stats() -> dict[str, Any]:
+    """
+    Return statistics about the cache.
+
+    Returns a dictionary with:
+    - cache_dir: Path to the cache directory
+    - providers: Dict mapping provider names to entry counts
+    - total_entries: Total number of cached queries
+    - total_size_bytes: Total size of cache files
+    """
+    cache_dir = get_cache_dir()
+    providers: dict[str, int] = {}
+    total_size = 0
+
+    for cache_file in cache_dir.glob("*.pkl"):
+        provider_name = cache_file.stem
+        total_size += cache_file.stat().st_size
+        try:
+            cache = load_cache(provider_name)
+            providers[provider_name] = len(cache)
+        except Exception:
+            providers[provider_name] = 0
+
+    return {
+        "cache_dir": str(cache_dir),
+        "providers": providers,
+        "total_entries": sum(providers.values()),
+        "total_size_bytes": total_size,
+    }
+@
+
+
+\chapter{Automatic cache persistence}
+
+We want caches to be saved automatically when the program exits.
+We maintain a registry of active caches and use [[atexit]] to save them.
+
+<<imports>>=
+import atexit
+@
+
+<<constants>>=
+# Registry of caches to save on exit: provider_name -> cache dict
+_CACHE_REGISTRY: dict[str, dict[Any, Any]] = {}
+@
+
+<<cache management functions>>=
+def register_cache(provider_name: str, cache: dict[Any, Any]) -> None:
+    """
+    Register a cache for automatic persistence on exit.
+    """
+    _CACHE_REGISTRY[provider_name] = cache
+
+
+def _save_all_caches() -> None:
+    """
+    Save all registered caches to disk.
+
+    Called automatically on program exit.
+    """
+    for provider_name, cache in _CACHE_REGISTRY.items():
+        save_cache(provider_name, cache)
+@
+
+<<atexit registration>>=
+atexit.register(_save_all_caches)
+@
+
+
+\chapter{Testing}
+\label{ch:testing}
+
+We verify the cache functionality with tests.
+
+<<test [[cache.py]]>>=
+"""Tests for the cache module."""
+import os
+import pytest
+from pathlib import Path
+from unittest.mock import patch
+
+from scholar.cache import (
+    get_cache_dir,
+    load_cache,
+    save_cache,
+    clear_cache,
+    get_cache_stats,
+    register_cache,
+    _save_all_caches,
+    _CACHE_REGISTRY,
+)
+from scholar import Paper
+@
+
+\section{Testing cache directory}
+
+The cache directory should be created if it doesn't exist, and should respect
+the environment variable override.
+
+<<test [[cache.py]]>>=
+class TestGetCacheDir:
+    """Tests for get_cache_dir function."""
+
+    def test_creates_directory(self, tmp_path, monkeypatch):
+        """Cache directory is created if it doesn't exist."""
+        cache_dir = tmp_path / "scholar_cache"
+        monkeypatch.setenv("SCHOLAR_CACHE_DIR", str(cache_dir))
+        result = get_cache_dir()
+        assert result == cache_dir
+        assert cache_dir.exists()
+
+    def test_respects_environment_variable(self, tmp_path, monkeypatch):
+        """SCHOLAR_CACHE_DIR overrides default location."""
+        custom_dir = tmp_path / "custom"
+        monkeypatch.setenv("SCHOLAR_CACHE_DIR", str(custom_dir))
+        result = get_cache_dir()
+        assert result == custom_dir
+@
+
+\section{Testing load and save}
+
+Caches should round-trip through save and load correctly.
+
+<<test [[cache.py]]>>=
+class TestLoadSaveCache:
+    """Tests for load_cache and save_cache functions."""
+
+    def test_load_nonexistent_returns_empty(self, tmp_path, monkeypatch):
+        """Loading a nonexistent cache returns empty dict."""
+        monkeypatch.setenv("SCHOLAR_CACHE_DIR", str(tmp_path))
+        result = load_cache("nonexistent")
+        assert result == {}
+
+    def test_save_and_load_roundtrip(self, tmp_path, monkeypatch):
+        """Saved cache can be loaded back."""
+        monkeypatch.setenv("SCHOLAR_CACHE_DIR", str(tmp_path))
+        cache = {
+            ("query1", 100): [Paper(title="Test", authors=["A"])],
+            ("query2", 50): [],
+        }
+        save_cache("test_provider", cache)
+        loaded = load_cache("test_provider")
+        assert loaded == cache
+
+    def test_load_corrupted_returns_empty(self, tmp_path, monkeypatch):
+        """Loading a corrupted cache file returns empty dict."""
+        monkeypatch.setenv("SCHOLAR_CACHE_DIR", str(tmp_path))
+        cache_file = tmp_path / "corrupted.pkl"
+        cache_file.write_bytes(b"not valid pickle data")
+        result = load_cache("corrupted")
+        assert result == {}
+@
+
+\section{Testing cache management}
+
+<<test [[cache.py]]>>=
+class TestCacheManagement:
+    """Tests for cache management functions."""
+
+    def test_clear_cache(self, tmp_path, monkeypatch):
+        """clear_cache removes all cache files."""
+        monkeypatch.setenv("SCHOLAR_CACHE_DIR", str(tmp_path))
+        # Create some cache files
+        save_cache("provider1", {"key": "value"})
+        save_cache("provider2", {"key": "value"})
+        assert len(list(tmp_path.glob("*.pkl"))) == 2
+        # Clear them
+        count = clear_cache()
+        assert count == 2
+        assert len(list(tmp_path.glob("*.pkl"))) == 0
+
+    def test_get_cache_stats(self, tmp_path, monkeypatch):
+        """get_cache_stats returns accurate information."""
+        monkeypatch.setenv("SCHOLAR_CACHE_DIR", str(tmp_path))
+        save_cache("provider1", {("q1", 100): [], ("q2", 50): []})
+        save_cache("provider2", {("q3", 100): []})
+        stats = get_cache_stats()
+        assert stats["cache_dir"] == str(tmp_path)
+        assert stats["providers"]["provider1"] == 2
+        assert stats["providers"]["provider2"] == 1
+        assert stats["total_entries"] == 3
+        assert stats["total_size_bytes"] > 0
+@
+
+\section{Testing automatic persistence}
+
+<<test [[cache.py]]>>=
+class TestAutoPersistence:
+    """Tests for automatic cache persistence."""
+
+    def test_register_and_save_all(self, tmp_path, monkeypatch):
+        """Registered caches are saved on _save_all_caches."""
+        monkeypatch.setenv("SCHOLAR_CACHE_DIR", str(tmp_path))
+        # Clear any existing registrations
+        _CACHE_REGISTRY.clear()
+        # Register a cache
+        cache = {("query", 100): [Paper(title="Test", authors=["A"])]}
+        register_cache("test_provider", cache)
+        # Save all caches
+        _save_all_caches()
+        # Verify it was saved
+        loaded = load_cache("test_provider")
+        assert loaded == cache
+        # Clean up
+        _CACHE_REGISTRY.clear()
+@
+
+
+\end{document}

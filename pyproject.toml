@@ -5,15 +5,26 @@ description = "A tool for structured literature searches across bibliographic da
 authors = [{ name = "Daniel Bosk", email = "dbosk@kth.se" }]
 readme = "README.md"
 license = "MIT"
-packages = [{include = "scholar", from = "src"}]
 requires-python = ">= 3.12"
+dependencies = [
+    "requests>=2.32.5",
+    "typer>=0.21.0",
+    "rich>=14.2.0",
+    "semanticscholar>=0.11.0",
+    "pyalex>=0.19",
+    "cachetools>=6.2.4",
+    "platformdirs>=4.5.1",
+]
 
 [project.scripts]
 scholar = "scholar.cli:main"
 
 [build-system]
-requires = ["poetry-core"]
-build-backend = "poetry.core.masonry.api"
+requires = ["setuptools>=61.0"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools.packages.find]
+where = ["src"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
@@ -24,13 +35,6 @@ markers = [
 
 [tool.black]
 line-length = 78
-
-[tool.poetry.dependencies]
-requests = "^2.32.5"
-typer = "^0.21.0"
-rich = "^14.2.0"
-semanticscholar = "^0.11.0"
-pyalex = "^0.19"
 
 [dependency-groups]
 dev = [

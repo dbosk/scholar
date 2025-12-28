@@ -1,6 +1,7 @@
 MODULES+=	__init__.py
 MODULES+=	scholar.py
 MODULES+=	providers.py
+MODULES+=	cache.py
 MODULES+=	cli.py
 MODULES+=	__main__.py
 
@@ -15,6 +16,9 @@ scholar.py: scholar.nw
 	${NOTANGLE.py}
 
 providers.py: providers.nw
+	${NOTANGLE.py}
+
+cache.py: cache.nw
 	${NOTANGLE.py}
 
 cli.py: cli.nw
