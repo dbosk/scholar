@@ -341,39 +341,31 @@ class AbstractScreen(Screen[None]):
             yield Static("", id="pdf-status")
         yield Footer()
     
-    @work(exclusive=True, thread=True)
     def action_open_pdf(self) -> None:
-        """Download and open the PDF in a background worker thread."""
+        """Download and open the PDF."""
         paper = self.decision.paper
         
-        def update_status(msg: str) -> None:
-            """Update status widget from worker thread."""
-            self.app.call_from_thread(
-                self.query_one("#pdf-status", Static).update, msg
-            )
-        
         if not paper.pdf_url:
-            update_status("[red]No PDF URL available[/red]")
+            self.notify("No PDF URL available", severity="error")
             return
         
         cache_path = get_cached_pdf_path(paper.pdf_url)
         
         if cache_path.exists():
-            update_status(f"[green]Using cached PDF: {cache_path}[/green]")
+            self.notify(f"Using cached PDF", severity="information")
         else:
-            update_status(f"[yellow]Downloading PDF from {paper.pdf_url}...[/yellow]")
+            self.notify(f"Downloading PDF...", severity="information")
             try:
-                pdf_path = download_pdf(paper.pdf_url)
-                update_status(f"[green]Downloaded to: {pdf_path}[/green]")
+                download_pdf(paper.pdf_url)
+                self.notify("Download complete", severity="information")
             except PDFDownloadError as e:
-                update_status(f"[red]Download failed:\n{e}[/red]")
+                self.notify(f"Download failed: {e}", severity="error")
                 return
         
-        update_status(f"[green]Opening PDF...[/green]")
         if open_pdf(cache_path):
-            update_status(f"[green]PDF opened: {cache_path}[/green]")
+            self.notify("PDF opened", severity="information")
         else:
-            update_status("[red]Failed to open PDF viewer[/red]")
+            self.notify("Failed to open PDF viewer", severity="error")
     
     async def action_dismiss_screen(self) -> None:
         """Return to the paper list."""
