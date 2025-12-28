@@ -377,11 +377,13 @@ class AbstractScreen(Screen[None]):
         self.decision.motivation = ""
         self.dismiss(None)
     
-    async def action_discard(self) -> None:
+    def action_discard(self) -> None:
         """Open discard modal to get motivation."""
-        result = await self.app.push_screen_wait(DiscardModal(self.decision))
-        if result:
-            self.dismiss(None)
+        def handle_discard(result: bool | None) -> None:
+            if result:
+                self.dismiss(None)
+        
+        self.app.push_screen(DiscardModal(self.decision), handle_discard)
 @
 
 \chapter{Discard Modal}
