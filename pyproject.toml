@@ -1,28 +1,15 @@
-[tool.poetry]
+[project]
 name = "scholar"
 version = "0.1.0"
 description = "A tool for structured literature searches across bibliographic databases"
-authors = ["Daniel Bosk <dbosk@kth.se>"]
+authors = [{ name = "Daniel Bosk", email = "dbosk@kth.se" }]
 readme = "README.md"
 license = "MIT"
 packages = [{include = "scholar", from = "src"}]
+requires-python = ">= 3.12"
 
-[tool.poetry.dependencies]
-python = "^3.10"
-requests = "^2.31"
-typer = "^0.21"
-rich = "^13.0"
-semanticscholar = "^0.11"
-pyalex = "^0.14"
-
-[tool.poetry.scripts]
+[project.scripts]
 scholar = "scholar.cli:main"
-
-[tool.poetry.group.dev.dependencies]
-pytest = "^8.0"
-pytest-cov = "^4.1"
-black = "^24.0"
-mypy = "^1.8"
 
 [build-system]
 requires = ["poetry-core"]
@@ -36,4 +23,19 @@ markers = [
 ]
 
 [tool.black]
-line-length = 88
+line-length = 78
+
+[tool.poetry.dependencies]
+requests = "^2.32.5"
+typer = "^0.21.0"
+rich = "^14.2.0"
+semanticscholar = "^0.11.0"
+pyalex = "^0.19"
+
+[dependency-groups]
+dev = [
+    "pytest (>=9.0.2,<10.0.0)",
+    "pytest-cov (>=7.0.0,<8.0.0)",
+    "black (>=25.12.0,<26.0.0)",
+    "mypy (>=1.19.1,<2.0.0)"
+]
