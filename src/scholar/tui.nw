@@ -419,7 +419,7 @@ class PaperReviewApp(App):
         Binding("k", "cursor_up", "Up", show=False),
         Binding("down", "cursor_down", "Down", show=False),
         Binding("up", "cursor_up", "Up", show=False),
-        Binding("enter", "view_abstract", "View"),
+        Binding("enter", "view_abstract", "Abstract"),
         Binding("K", "keep", "Keep"),
         Binding("d", "discard", "Discard"),
         Binding("s", "sort", "Sort"),
