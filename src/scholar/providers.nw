@@ -1,10 +1,7 @@
-\input{preamble.tex}
+\chapter{Search Providers}
+\label{providers-module}
 
-\begin{document}
-\maketitle
-\tableofcontents
-
-\chapter{Introduction}
+\section{Introduction}
 
 This module implements search providers---adapters that connect Scholar to
 various bibliographic databases.
@@ -1599,6 +1596,3 @@ We reference them here to assemble the complete test file:
 <<test wos>>
 <<test ieee>>
 @
-
-
-\end{document}

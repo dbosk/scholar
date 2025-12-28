@@ -1,17 +1,7 @@
-\documentclass[a4paper,oneside]{memoir}
-\usepackage{noweb}
-\usepackage[hyphens]{url}
-\usepackage{hyperref}
+\chapter{Interactive Review Interface}
+\label{tui-module}
 
-\begin{document}
-
-\title{Scholar TUI: Interactive Paper Review Interface}
-\author{Scholar Project}
-\maketitle
-
-\tableofcontents
-
-\chapter{Introduction}
+\section{Introduction}
 
 This module provides an interactive terminal user interface (TUI) for reviewing 
 academic papers returned from search results. The TUI allows researchers to:
@@ -1171,5 +1161,3 @@ from scholar.tui import (
 <<test data structures>>
 <<test report generation>>
 @
-
-\end{document}

@@ -1,10 +1,7 @@
-\input{preamble.tex}
+\chapter{Command-Line Interface}
+\label{cli-module}
 
-\begin{document}
-\maketitle
-\tableofcontents
-
-\chapter{Introduction}
+\section{Introduction}
 
 This document describes the command-line interface for Scholar.
 While the core library (\texttt{scholar.py}) provides the data model and search
@@ -761,6 +758,3 @@ from scholar import SearchResult, Paper
 <<test cli>>
 <<test formatters>>
 @
-
-
-\end{document}

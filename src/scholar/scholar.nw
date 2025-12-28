@@ -1,10 +1,7 @@
-\input{preamble.tex}
+\chapter{The Core Module}
+\label{scholar-module}
 
-\begin{document}
-\maketitle
-\tableofcontents
-
-\chapter{Introduction}
+\section{Introduction}
 
 Systematic literature reviews and structured searches are essential for
 rigorous academic research.
@@ -404,6 +401,3 @@ from scholar import Paper, SearchResult, Search, search
 <<test search result>>
 <<test search>>
 @
-
-
-\end{document}

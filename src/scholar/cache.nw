@@ -1,10 +1,7 @@
-\input{preamble.tex}
+\chapter{Caching}
+\label{cache-module}
 
-\begin{document}
-\maketitle
-\tableofcontents
-
-\chapter{Introduction}
+\section{Introduction}
 
 When conducting systematic literature reviews, researchers often run the same
 search multiple times---refining queries, re-running reports, or continuing
@@ -394,6 +391,3 @@ def isolate_cache(tmp_path, monkeypatch):
     cache_dir.mkdir()
     monkeypatch.setenv("SCHOLAR_CACHE_DIR", str(cache_dir))
 @
-
-
-\end{document}

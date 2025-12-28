@@ -1,36 +1,26 @@
 DOC+=		scholar.pdf
-DOC+=		providers.pdf
-DOC+=		cli.pdf
+
+SRC_TEX+=	../src/scholar/scholar.tex
+SRC_TEX+=	../src/scholar/cache.tex
+SRC_TEX+=	../src/scholar/providers.tex
+SRC_TEX+=	../src/scholar/cli.tex
+SRC_TEX+=	../src/scholar/tui.tex
 
 .PHONY: all clean distclean
 
 all: ${DOC}
 
 scholar.pdf: scholar.tex
-scholar.pdf: preamble.tex
+scholar.pdf: ${SRC_TEX}
 
-scholar.tex: ../src/scholar/scholar.nw
-	noweave ${NOWEAVEFLAGS.tex} $< > $@
-
-cli.pdf: cli.tex
-cli.pdf: preamble.tex
-
-cli.tex: ../src/scholar/cli.nw
-	noweave ${NOWEAVEFLAGS.tex} $< > $@
-
-providers.pdf: providers.tex
-providers.pdf: preamble.tex
-
-providers.tex: ../src/scholar/providers.nw
-	noweave ${NOWEAVEFLAGS.tex} $< > $@
-
-NOWEAVEFLAGS.tex?= -x -n -delay -t2
+# Build .tex files in src/scholar if they don't exist or are outdated
+../src/scholar/%.tex::
+	${MAKE} -C ../src/scholar $(notdir $@)
 
 INCLUDE_MAKEFILES=../makefiles
 include ${INCLUDE_MAKEFILES}/tex.mk
 
 clean:
 	latexmk -C ${DOC}
-	${RM} scholar.tex providers.tex cli.tex
 
 distclean:
