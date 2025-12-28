@@ -50,6 +50,7 @@ across bibliographic databases.
 <<output formatters>>
 <<typer application>>
 <<search command>>
+<<providers command>>
 <<submodule registration>>
 <<main entry point>>
 @
@@ -151,6 +152,94 @@ from scholar import Search
 s = Search(query)
 results = s.execute(providers=provider)
 display_results(results, output_format)
+@
+
+
+\chapter{Listing Available Providers}
+
+Users need to know which search providers are available and how to configure
+them.
+Rather than requiring users to read the literate documentation, we provide a
+[[providers]] command that displays this information directly.
+
+<<providers command>>=
+@app.command()
+def providers() -> None:
+    """
+    List available search providers and their configuration.
+
+    Shows which providers require API keys and how to obtain them.
+    """
+    <<display provider information>>
+@
+
+We organize provider information in a table showing the provider name,
+whether an API key is required, and the environment variable to set:
+
+<<display provider information>>=
+from scholar.providers import get_all_providers
+
+console = Console()
+
+table = Table(title="Available Search Providers")
+table.add_column("Provider", style="cyan")
+table.add_column("API Key", style="yellow")
+table.add_column("Environment Variable", style="green")
+table.add_column("How to Get Key", style="dim")
+
+<<add provider rows to table>>
+
+console.print(table)
+console.print()
+console.print("[dim]Providers without API keys work immediately.[/dim]")
+console.print(
+    "[dim]Set environment variables to enable key-required providers.[/dim]"
+)
+@
+
+We define the configuration details for each provider.
+This information is kept here rather than in the provider classes because
+it is user-facing documentation, not implementation details:
+
+<<add provider rows to table>>=
+provider_info = {
+    "semantic_scholar": {
+        "required": False,
+        "env_var": "S2_API_KEY",
+        "how_to_get": "api.semanticscholar.org (optional, higher rate limits)",
+    },
+    "openalex": {
+        "required": False,
+        "env_var": "OPENALEX_EMAIL",
+        "how_to_get": "Any email (optional, faster responses)",
+    },
+    "dblp": {
+        "required": False,
+        "env_var": "-",
+        "how_to_get": "No key needed",
+    },
+    "wos": {
+        "required": True,
+        "env_var": "WOS_API_KEY",
+        "how_to_get": "developer.clarivate.com",
+    },
+    "ieee": {
+        "required": True,
+        "env_var": "IEEE_API_KEY",
+        "how_to_get": "developer.ieee.org",
+    },
+}
+
+for provider in get_all_providers():
+    info = provider_info.get(provider.name, {})
+    required = info.get("required", False)
+    key_status = "[red]Required[/red]" if required else "[green]Optional[/green]"
+    table.add_row(
+        provider.name,
+        key_status,
+        info.get("env_var", "-"),
+        info.get("how_to_get", ""),
+    )
 @
 
 
@@ -427,6 +516,30 @@ class TestCLI:
 
         result = runner.invoke(app, ["search", "test query"])
         assert result.exit_code == 0
+
+    def test_providers_command_exists(self):
+        """The providers command is registered."""
+        result = runner.invoke(app, ["providers", "--help"])
+        assert result.exit_code == 0
+        assert "List available search providers" in result.stdout
+
+    def test_providers_lists_providers(self):
+        """The providers command lists available providers."""
+        result = runner.invoke(app, ["providers"])
+        assert result.exit_code == 0
+        # Should show at least these providers
+        assert "semantic_scholar" in result.stdout
+        assert "openalex" in result.stdout
+        assert "dblp" in result.stdout
+
+    def test_providers_shows_api_info(self):
+        """The providers command shows API key information."""
+        result = runner.invoke(app, ["providers"])
+        assert result.exit_code == 0
+        # Should show environment variable names
+        assert "S2_API_KEY" in result.stdout
+        assert "WOS_API_KEY" in result.stdout
+        assert "IEEE_API_KEY" in result.stdout
 @
 
 \section{Testing formatters}
