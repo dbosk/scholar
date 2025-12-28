@@ -336,7 +336,6 @@ class AbstractScreen(Screen[None]):
                 status_widget.update(f"[red]Failed to open PDF viewer[/red]")
         else:
             status_widget.update("[red]Failed to download PDF[/red]")
-        yield Footer()
     
     async def action_dismiss_screen(self) -> None:
         """Return to the paper list."""
