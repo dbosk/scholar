@@ -76,6 +76,7 @@ from textual.widgets import (
     ListItem, ListView, Static, TextArea,
 )
 from textual.message import Message
+from textual.worker import work
 from rich.text import Text
 
 from scholar.scholar import Paper, SearchResult
@@ -340,8 +341,9 @@ class AbstractScreen(Screen[None]):
             yield Static("", id="pdf-status")
         yield Footer()
     
-    def action_open_pdf(self) -> None:
-        """Download and open the PDF."""
+    @work(exclusive=True)
+    async def action_open_pdf(self) -> None:
+        """Download and open the PDF in a background worker."""
         paper = self.decision.paper
         status_widget = self.query_one("#pdf-status", Static)
         
@@ -349,20 +351,24 @@ class AbstractScreen(Screen[None]):
             status_widget.update("[red]No PDF URL available[/red]")
             return
         
-        def update_status(msg: str) -> None:
-            status_widget.update(f"[yellow]{msg}[/yellow]")
-            self.refresh()
+        cache_path = get_cached_pdf_path(paper.pdf_url)
         
-        try:
-            pdf_path = download_pdf(paper.pdf_url, console_print=update_status)
-            status_widget.update(f"[green]Opening PDF: {pdf_path}[/green]")
-            self.refresh()
-            if open_pdf(pdf_path):
-                status_widget.update(f"[green]PDF opened: {pdf_path}[/green]")
-            else:
-                status_widget.update("[red]Failed to open PDF viewer[/red]")
-        except PDFDownloadError as e:
-            status_widget.update(f"[red]Download failed:\n{e}[/red]")
+        if cache_path.exists():
+            status_widget.update(f"[green]Using cached PDF: {cache_path}[/green]")
+        else:
+            status_widget.update(f"[yellow]Downloading PDF from {paper.pdf_url}...[/yellow]")
+            try:
+                pdf_path = download_pdf(paper.pdf_url)
+                status_widget.update(f"[green]Downloaded to: {pdf_path}[/green]")
+            except PDFDownloadError as e:
+                status_widget.update(f"[red]Download failed:\n{e}[/red]")
+                return
+        
+        status_widget.update(f"[green]Opening PDF...[/green]")
+        if open_pdf(cache_path):
+            status_widget.update(f"[green]PDF opened: {cache_path}[/green]")
+        else:
+            status_widget.update("[red]Failed to open PDF viewer[/red]")
     
     async def action_dismiss_screen(self) -> None:
         """Return to the paper list."""
