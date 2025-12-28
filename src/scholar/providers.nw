@@ -37,6 +37,7 @@ itself with the provider registry on import.
 <<provider registry>>
 <<semantic scholar provider>>
 <<openalex provider>>
+<<dblp provider>>
 @
 
 
@@ -293,6 +294,133 @@ import pyalex
 @
 
 
+\chapter{DBLP Provider}
+
+DBLP is a computer science bibliography database hosted at the University of
+Trier and Schloss Dagstuhl.
+It provides comprehensive coverage of major computer science journals and
+conference proceedings.
+
+\section{Package evaluation}
+
+We evaluated several Python packages for DBLP access:
+
+\begin{description}
+\item[dblpy-lib (0.1.3)] Appeared well-maintained with a clean API
+  ([[get_publications(q, max_results)]]).
+  However, it requires [[requests>=2.27.1,<2.28.0]], which conflicts with our
+  [[requests^2.31]] dependency.
+\item[dblp (0.1.0)] Returns pandas DataFrames, which seemed convenient.
+  However, it fails to install due to a bug in its setup script---it passes a
+  list where a string is expected ([[TypeError: expected string or bytes-like
+  object, got 'list']]).
+\end{description}
+
+Given these issues, we use the DBLP public API directly via [[requests]], which
+we already depend on.
+No API key is required.
+The API returns JSON with publication data that we parse directly.
+
+\section{Provider implementation}
+
+<<dblp provider>>=
+class DBLPProvider:
+    """Search provider for DBLP."""
+
+    name = "dblp"
+
+    def search(self, query: str, limit: int = 100) -> list[Paper]:
+        """Search DBLP for papers matching the query."""
+        try:
+            # DBLP API caps at 1000 results per request
+            effective_limit = min(limit, 1000)
+            response = requests.get(
+                DBLP_API_URL,
+                params={"q": query, "format": "json", "h": effective_limit},
+                timeout=30,
+            )
+            response.raise_for_status()
+            data = response.json()
+
+            hits = data.get("result", {}).get("hits", {}).get("hit", [])
+            return [self._convert_hit(hit) for hit in hits]
+        except Exception:
+            return []
+
+    <<convert dblp hit>>
+@
+
+\subsection{Converting publication format}
+
+The DBLP API returns each publication as a JSON object with an [[info]] field
+containing:
+\begin{description}
+\item[authors] Object with [[author]] array, each having a [[text]] field.
+\item[title] The publication title.
+\item[venue] The venue (conference or journal).
+\item[year] Publication year as string.
+\item[doi] The DOI (if available).
+\item[ee] Electronic edition URL.
+\item[url] URL to the DBLP record.
+\end{description}
+
+We convert each hit to our common [[Paper]] type:
+
+<<convert dblp hit>>=
+def _convert_hit(self, hit: dict) -> Paper:
+    """Convert a DBLP API hit to our Paper type."""
+    info = hit.get("info", {})
+
+    # Extract year as integer if available
+    year = None
+    year_str = info.get("year")
+    if year_str:
+        try:
+            year = int(year_str)
+        except (ValueError, TypeError):
+            pass
+
+    # Extract author names from nested structure
+    authors = []
+    authors_data = info.get("authors", {}).get("author", [])
+    # Handle single author (dict) vs multiple authors (list)
+    if isinstance(authors_data, dict):
+        authors_data = [authors_data]
+    for author in authors_data:
+        name = author.get("text") if isinstance(author, dict) else author
+        if name:
+            authors.append(name)
+
+    return Paper(
+        title=info.get("title", "") or "",
+        authors=authors,
+        year=year,
+        doi=info.get("doi"),
+        abstract=None,  # DBLP doesn't provide abstracts
+        venue=info.get("venue"),
+        url=info.get("url") or info.get("ee"),
+        source=self.name,
+    )
+@
+
+\section{Auto-registration}
+
+<<dblp provider>>=
+# Register the provider on module import
+register_provider(DBLPProvider())
+@
+
+\section{Dependencies}
+
+<<dblp imports>>=
+import requests
+@
+
+<<dblp constants>>=
+DBLP_API_URL = "https://dblp.org/search/publ/api"
+@
+
+
 \chapter{Dependencies}
 
 We organize imports so each provider's dependencies are co-located with
@@ -306,11 +434,13 @@ from typing import Protocol
 from scholar import Paper
 <<semantic scholar imports>>
 <<openalex imports>>
+<<dblp imports>>
 @
 
 <<constants>>=
 # Provider constants
 DEFAULT_LIMIT = 100
+<<dblp constants>>
 @
 
 
@@ -328,6 +458,7 @@ from scholar import Paper
 from scholar.providers import (
     SemanticScholarProvider,
     OpenAlexProvider,
+    DBLPProvider,
     register_provider,
     get_provider,
     get_all_providers,
@@ -356,13 +487,20 @@ class TestProviderRegistry:
         assert provider is not None
         assert provider.name == "openalex"
 
+    def test_dblp_registered(self):
+        """DBLP provider is auto-registered."""
+        provider = get_provider("dblp")
+        assert provider is not None
+        assert provider.name == "dblp"
+
     def test_get_all_providers(self):
         """get_all_providers returns registered providers."""
         providers = get_all_providers()
-        assert len(providers) >= 2
+        assert len(providers) >= 3
         names = [p.name for p in providers]
         assert "semantic_scholar" in names
         assert "openalex" in names
+        assert "dblp" in names
 
     def test_get_unknown_provider(self):
         """get_provider returns None for unknown providers."""
@@ -588,6 +726,200 @@ class TestOpenAlexIntegration:
             assert paper.source == "openalex"
         except Exception as e:
             pytest.skip(f"OpenAlex API unavailable: {e}")
+@
+
+
+\section{Testing DBLP provider}
+
+We test the DBLP provider with mocked API responses:
+
+<<test [[providers.py]]>>=
+class TestDBLPProvider:
+    """Tests for the DBLP provider."""
+
+    def test_search_converts_publications(self):
+        """search() converts API results to Paper objects."""
+        provider = DBLPProvider()
+
+        # Create mock API response (DBLP returns JSON)
+        mock_response = Mock()
+        mock_response.json.return_value = {
+            "result": {
+                "hits": {
+                    "hit": [{
+                        "info": {
+                            "title": "Test Paper",
+                            "authors": {
+                                "author": [
+                                    {"text": "Alice"},
+                                    {"text": "Bob"},
+                                ]
+                            },
+                            "year": "2024",
+                            "venue": "ICSE",
+                            "doi": "10.1234/test",
+                            "url": "https://dblp.org/rec/conf/icse/Test24",
+                        }
+                    }]
+                }
+            }
+        }
+        mock_response.raise_for_status = Mock()
+
+        with patch("requests.get") as mock_get:
+            mock_get.return_value = mock_response
+
+            results = provider.search("test query")
+
+            assert len(results) == 1
+            paper = results[0]
+            assert isinstance(paper, Paper)
+            assert paper.title == "Test Paper"
+            assert paper.authors == ["Alice", "Bob"]
+            assert paper.year == 2024
+            assert paper.doi == "10.1234/test"
+            assert paper.venue == "ICSE"
+            assert paper.source == "dblp"
+
+    def test_search_handles_single_author(self):
+        """search() handles single author as dict instead of list."""
+        provider = DBLPProvider()
+
+        mock_response = Mock()
+        mock_response.json.return_value = {
+            "result": {
+                "hits": {
+                    "hit": [{
+                        "info": {
+                            "title": "Solo Paper",
+                            "authors": {"author": {"text": "Solo Author"}},
+                            "year": "2024",
+                        }
+                    }]
+                }
+            }
+        }
+        mock_response.raise_for_status = Mock()
+
+        with patch("requests.get") as mock_get:
+            mock_get.return_value = mock_response
+
+            results = provider.search("test")
+
+            assert len(results) == 1
+            assert results[0].authors == ["Solo Author"]
+
+    def test_search_handles_empty_results(self):
+        """search() returns empty list when no results."""
+        provider = DBLPProvider()
+
+        mock_response = Mock()
+        mock_response.json.return_value = {
+            "result": {"hits": {"hit": []}}
+        }
+        mock_response.raise_for_status = Mock()
+
+        with patch("requests.get") as mock_get:
+            mock_get.return_value = mock_response
+
+            results = provider.search("obscure query")
+            assert results == []
+
+    def test_search_handles_api_error(self):
+        """search() returns empty list on API error."""
+        provider = DBLPProvider()
+
+        with patch("requests.get") as mock_get:
+            mock_get.side_effect = Exception("API error")
+
+            results = provider.search("test")
+            assert results == []
+
+    def test_handles_missing_fields(self):
+        """search() handles publications with missing optional fields."""
+        provider = DBLPProvider()
+
+        mock_response = Mock()
+        mock_response.json.return_value = {
+            "result": {
+                "hits": {
+                    "hit": [{
+                        "info": {"title": "Minimal Paper"}
+                    }]
+                }
+            }
+        }
+        mock_response.raise_for_status = Mock()
+
+        with patch("requests.get") as mock_get:
+            mock_get.return_value = mock_response
+
+            results = provider.search("test")
+
+            assert len(results) == 1
+            paper = results[0]
+            assert paper.title == "Minimal Paper"
+            assert paper.authors == []
+            assert paper.year is None
+            assert paper.doi is None
+            assert paper.abstract is None
+
+    def test_respects_limit_parameter(self):
+        """search() passes limit to API."""
+        provider = DBLPProvider()
+
+        mock_response = Mock()
+        mock_response.json.return_value = {"result": {"hits": {"hit": []}}}
+        mock_response.raise_for_status = Mock()
+
+        with patch("requests.get") as mock_get:
+            mock_get.return_value = mock_response
+
+            provider.search("test", limit=50)
+
+            mock_get.assert_called_once()
+            call_args = mock_get.call_args
+            assert call_args[1]["params"]["h"] == 50
+
+    def test_caps_limit_at_1000(self):
+        """search() caps limit at DBLP's maximum of 1000."""
+        provider = DBLPProvider()
+
+        mock_response = Mock()
+        mock_response.json.return_value = {"result": {"hits": {"hit": []}}}
+        mock_response.raise_for_status = Mock()
+
+        with patch("requests.get") as mock_get:
+            mock_get.return_value = mock_response
+
+            provider.search("test", limit=2000)
+
+            call_args = mock_get.call_args
+            assert call_args[1]["params"]["h"] == 1000
+@
+
+
+<<test [[providers.py]]>>=
+class TestDBLPIntegration:
+    """Integration test for the DBLP provider."""
+
+    @pytest.mark.integration
+    @pytest.mark.skip(reason="Skipped by default to avoid API calls")
+    def test_real_api_call(self):
+        """Make one real API call to verify the provider works."""
+        provider = DBLPProvider()
+
+        try:
+            papers = provider.search("machine learning", limit=1)
+
+            assert len(papers) >= 1, "Provider returned no results"
+
+            paper = papers[0]
+            assert isinstance(paper, Paper)
+            assert paper.title
+            assert paper.source == "dblp"
+        except Exception as e:
+            pytest.skip(f"DBLP API unavailable: {e}")
 @
 
 
