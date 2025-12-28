@@ -485,13 +485,16 @@ class PaperReviewApp(App):
         list_view = self.query_one("#paper-list", ListView)
         list_view.action_cursor_up()
     
-    async def action_view_abstract(self) -> None:
+    def action_view_abstract(self) -> None:
         """Show the abstract screen for current paper."""
         decision = self._get_current_decision()
         if decision:
-            await self.push_screen_wait(AbstractScreen(decision))
-            self._refresh_list()
-            self._update_status()
+            self.push_screen(AbstractScreen(decision), self._on_abstract_closed)
+    
+    def _on_abstract_closed(self, result: None) -> None:
+        """Called when abstract screen is closed."""
+        self._refresh_list()
+        self._update_status()
     
     def action_keep(self) -> None:
         """Mark current paper as kept."""
@@ -502,17 +505,23 @@ class PaperReviewApp(App):
             self._refresh_list()
             self._update_status()
     
-    async def action_discard(self) -> None:
+    def action_discard(self) -> None:
         """Open discard modal for current paper."""
         decision = self._get_current_decision()
         if decision:
-            await self.push_screen_wait(DiscardModal(decision))
-            self._refresh_list()
-            self._update_status()
+            self.push_screen(DiscardModal(decision), self._on_discard_closed)
     
-    async def action_sort(self) -> None:
+    def _on_discard_closed(self, result: bool | None) -> None:
+        """Called when discard modal is closed."""
+        self._refresh_list()
+        self._update_status()
+    
+    def action_sort(self) -> None:
         """Open sort modal."""
-        result = await self.push_screen_wait(SortModal())
+        self.push_screen(SortModal(), self._on_sort_closed)
+    
+    def _on_sort_closed(self, result: tuple[str, bool] | None) -> None:
+        """Called when sort modal is closed."""
         if result:
             key, reverse = result
             self.session.sort_by(key, reverse)
