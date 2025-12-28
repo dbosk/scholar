@@ -36,6 +36,7 @@ itself with the provider registry on import.
 <<provider protocol>>
 <<provider registry>>
 <<semantic scholar provider>>
+<<openalex provider>>
 @
 
 
@@ -188,15 +189,123 @@ We register the provider when this module is imported:
 register_provider(SemanticScholarProvider())
 @
 
+\section{Dependencies}
+
+<<semantic scholar imports>>=
+from semanticscholar import SemanticScholar
+@
+
+
+\chapter{OpenAlex Provider}
+
+OpenAlex is a free and open catalog of the world's scholarly works, authors,
+venues, institutions, and concepts.
+It covers over 250 million works and is fully open access.
+
+We use the [[pyalex]] Python package which provides a clean interface to the
+OpenAlex API.
+No API key is required, though providing an email address gives access to the
+\enquote{polite pool} with faster response times.
+
+\section{Provider implementation}
+
+<<openalex provider>>=
+class OpenAlexProvider:
+    """Search provider for OpenAlex."""
+
+    name = "openalex"
+
+    def __init__(self, email: str | None = None):
+        """
+        Initialize the OpenAlex provider.
+
+        Args:
+            email: Optional email for polite pool access (faster responses).
+                   If not provided, uses OPENALEX_EMAIL environment variable.
+        """
+        configured_email = email or os.environ.get("OPENALEX_EMAIL")
+        if configured_email:
+            pyalex.config.email = configured_email
+
+    def search(self, query: str, limit: int = 100) -> list[Paper]:
+        """Search OpenAlex for papers matching the query."""
+        try:
+            works = pyalex.Works().search(query).get(per_page=limit)
+            return [self._convert_work(w) for w in works]
+        except Exception:
+            return []
+
+    <<convert openalex work>>
+@
+
+\subsection{Converting work format}
+
+OpenAlex returns works as dictionaries.
+We extract the relevant fields and convert to our [[Paper]] type:
+
+<<convert openalex work>>=
+def _convert_work(self, work: dict) -> Paper:
+    """Convert an OpenAlex work to our Paper type."""
+    # Extract author names from authorships
+    authors = []
+    for authorship in work.get("authorships", []):
+        author_info = authorship.get("author", {})
+        name = author_info.get("display_name")
+        if name:
+            authors.append(name)
+
+    # Extract DOI (remove URL prefix if present)
+    doi = work.get("doi")
+    if doi and doi.startswith("https://doi.org/"):
+        doi = doi[16:]
+
+    # Extract venue from primary location
+    venue = None
+    primary_location = work.get("primary_location", {})
+    if primary_location:
+        source = primary_location.get("source", {})
+        if source:
+            venue = source.get("display_name")
+
+    return Paper(
+        title=work.get("title", ""),
+        authors=authors,
+        year=work.get("publication_year"),
+        doi=doi,
+        abstract=work.get("abstract"),
+        venue=venue,
+        url=work.get("id"),
+        source=self.name,
+    )
+@
+
+\section{Auto-registration}
+
+<<openalex provider>>=
+# Register the provider on module import
+register_provider(OpenAlexProvider())
+@
+
+\section{Dependencies}
+
+<<openalex imports>>=
+import pyalex
+@
+
 
 \chapter{Dependencies}
 
+We organize imports so each provider's dependencies are co-located with
+its implementation.
+If a provider is removed, its dependencies go with it.
+
 <<imports>>=
+import os
 from typing import Protocol
 
-from semanticscholar import SemanticScholar
-
 from scholar import Paper
+<<semantic scholar imports>>
+<<openalex imports>>
 @
 
 <<constants>>=
@@ -218,6 +327,7 @@ from unittest.mock import Mock, patch
 from scholar import Paper
 from scholar.providers import (
     SemanticScholarProvider,
+    OpenAlexProvider,
     register_provider,
     get_provider,
     get_all_providers,
@@ -240,12 +350,19 @@ class TestProviderRegistry:
         assert provider is not None
         assert provider.name == "semantic_scholar"
 
+    def test_openalex_registered(self):
+        """OpenAlex provider is auto-registered."""
+        provider = get_provider("openalex")
+        assert provider is not None
+        assert provider.name == "openalex"
+
     def test_get_all_providers(self):
         """get_all_providers returns registered providers."""
         providers = get_all_providers()
-        assert len(providers) >= 1
+        assert len(providers) >= 2
         names = [p.name for p in providers]
         assert "semantic_scholar" in names
+        assert "openalex" in names
 
     def test_get_unknown_provider(self):
         """get_provider returns None for unknown providers."""
@@ -356,6 +473,121 @@ class TestSemanticScholarIntegration:
             assert paper.source == "semantic_scholar"
         except Exception as e:
             pytest.skip(f"Semantic Scholar API unavailable: {e}")
+@
+
+
+\section{Testing OpenAlex provider}
+
+We test the OpenAlex provider with mocked API responses:
+
+<<test [[providers.py]]>>=
+class TestOpenAlexProvider:
+    """Tests for the OpenAlex provider."""
+
+    def test_search_converts_works(self):
+        """search() converts API results to Paper objects."""
+        provider = OpenAlexProvider()
+
+        # Create mock work (OpenAlex returns dicts)
+        mock_work = {
+            "title": "Test Paper",
+            "authorships": [
+                {"author": {"display_name": "Alice"}},
+                {"author": {"display_name": "Bob"}},
+            ],
+            "publication_year": 2024,
+            "doi": "https://doi.org/10.1234/test",
+            "abstract": "Test abstract",
+            "primary_location": {
+                "source": {"display_name": "Test Journal"}
+            },
+            "id": "https://openalex.org/W123456",
+        }
+
+        with patch("pyalex.Works") as mock_works:
+            mock_works.return_value.search.return_value.get.return_value = [
+                mock_work
+            ]
+
+            results = provider.search("test query")
+
+            assert len(results) == 1
+            paper = results[0]
+            assert isinstance(paper, Paper)
+            assert paper.title == "Test Paper"
+            assert paper.authors == ["Alice", "Bob"]
+            assert paper.year == 2024
+            assert paper.doi == "10.1234/test"
+            assert paper.venue == "Test Journal"
+            assert paper.source == "openalex"
+
+    def test_search_handles_empty_results(self):
+        """search() returns empty list when no results."""
+        provider = OpenAlexProvider()
+
+        with patch("pyalex.Works") as mock_works:
+            mock_works.return_value.search.return_value.get.return_value = []
+
+            results = provider.search("obscure query")
+            assert results == []
+
+    def test_search_handles_api_error(self):
+        """search() returns empty list on API error."""
+        provider = OpenAlexProvider()
+
+        with patch("pyalex.Works") as mock_works:
+            mock_works.return_value.search.side_effect = Exception("API error")
+
+            results = provider.search("test")
+            assert results == []
+
+    def test_handles_missing_fields(self):
+        """search() handles works with missing optional fields."""
+        provider = OpenAlexProvider()
+
+        # Minimal work with only required fields
+        mock_work = {
+            "title": "Minimal Paper",
+            "authorships": [],
+        }
+
+        with patch("pyalex.Works") as mock_works:
+            mock_works.return_value.search.return_value.get.return_value = [
+                mock_work
+            ]
+
+            results = provider.search("test")
+
+            assert len(results) == 1
+            paper = results[0]
+            assert paper.title == "Minimal Paper"
+            assert paper.authors == []
+            assert paper.year is None
+            assert paper.doi is None
+@
+
+
+<<test [[providers.py]]>>=
+class TestOpenAlexIntegration:
+    """Integration test for the OpenAlex provider."""
+
+    @pytest.mark.integration
+    @pytest.mark.skip(reason="Skipped by default to avoid API calls")
+    def test_real_api_call(self):
+        """Make one real API call to verify the provider works."""
+        provider = OpenAlexProvider()
+
+        try:
+            papers = provider.search("machine learning", limit=1)
+
+            assert len(papers) >= 1, "Provider returned no results"
+
+            paper = papers[0]
+            assert isinstance(paper, Paper)
+            assert paper.title
+            assert paper.source == "openalex"
+        except Exception as e:
+            pytest.skip(f"OpenAlex API unavailable: {e}")
 @
 
 

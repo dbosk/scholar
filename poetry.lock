@@ -710,6 +710,26 @@ dev = ["pre-commit", "tox"]
 testing = ["coverage", "pytest", "pytest-benchmark"]
 
 [[package]]
+name = "pyalex"
+version = "0.14"
+description = "Python interface to the OpenAlex database"
+optional = false
+python-versions = ">=3.8"
+groups = ["main"]
+files = [
+    {file = "pyalex-0.14-py3-none-any.whl", hash = "sha256:c6af5e043fb110b560e20bd1ae84d5494ee15837f82b84f40ae5143e6162c650"},
+    {file = "pyalex-0.14.tar.gz", hash = "sha256:c4f2047e984776147cda3ae1981a52b22ae82667c58b0fdc5bacec6be0cd5af9"},
+]
+
+[package.dependencies]
+requests = "*"
+urllib3 = "*"
+
+[package.extras]
+lint = ["ruff"]
+test = ["pytest", "pytest-xdist"]
+
+[[package]]
 name = "pygments"
 version = "2.19.2"
 description = "Pygments is a syntax highlighting package written in Python."
@@ -958,4 +978,4 @@ zstd = ["backports-zstd (>=1.0.0) ; python_version < \"3.14\""]
 [metadata]
 lock-version = "2.1"
 python-versions = "^3.10"
-content-hash = "f78574778a158bf11728190742c55a0356dde4410b74a33c3cd634f67a17ce5c"
+content-hash = "01f58cd1527da8f161b7f24cefd9afaa1a31b492bf7167857187dfc5c574c644"

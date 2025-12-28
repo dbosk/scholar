@@ -13,6 +13,7 @@ requests = "^2.31"
 typer = "^0.21"
 rich = "^13.0"
 semanticscholar = "^0.11"
+pyalex = "^0.14"
 
 [tool.poetry.scripts]
 scholar = "scholar.cli:main"
