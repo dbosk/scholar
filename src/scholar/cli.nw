@@ -202,7 +202,7 @@ from scholar.providers import get_all_providers
 
 console = Console()
 
-table = Table(title="Available Search Providers")
+table = Table(title="Available Search Providers", box=box.HORIZONTALS)
 table.add_column("Provider", style="cyan")
 table.add_column("API Key", style="yellow")
 table.add_column("Environment Variable", style="green")
@@ -295,7 +295,7 @@ def cache(
 
     elif action == "info":
         stats = get_cache_stats()
-        table = Table(title="Cache Statistics")
+        table = Table(title="Cache Statistics", box=box.HORIZONTALS)
         table.add_column("Metric", style="cyan")
         table.add_column("Value", style="green")
 
@@ -308,7 +308,7 @@ def cache(
 
         if stats["providers"]:
             console.print()
-            provider_table = Table(title="Entries per Provider")
+            provider_table = Table(title="Entries per Provider", box=box.HORIZONTALS)
             provider_table.add_column("Provider", style="cyan")
             provider_table.add_column("Cached queries", justify="right")
 
@@ -386,6 +386,7 @@ class TableFormatter:
             table = Table(
                 title=f"Results for: {result.query}",
                 caption=f"Provider: {result.provider} | {result.timestamp}",
+                box=box.HORIZONTALS,
             )
 
             table.add_column("Title", style="cyan", no_wrap=False)
@@ -729,6 +730,7 @@ from typing_extensions import Annotated
 import json
 
 import typer
+from rich import box
 from rich.console import Console
 from rich.table import Table
 @
