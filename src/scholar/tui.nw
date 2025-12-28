@@ -73,7 +73,7 @@ from textual.containers import Container, Horizontal, Vertical, VerticalScroll
 from textual.screen import Screen, ModalScreen
 from textual.widgets import (
     Button, DataTable, Footer, Header, Input, Label,
-    ListItem, ListView, Static, TextArea,
+    ListItem, ListView, OptionList, Static, TextArea,
 )
 from textual.message import Message
 from textual import work
