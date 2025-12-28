@@ -177,11 +177,17 @@ def get_cached_pdf_path(url: str) -> Path:
     return get_pdf_cache_dir() / f"{url_hash}.pdf"
 
 
-def download_pdf(url: str) -> Path | None:
+class PDFDownloadError(Exception):
+    """Exception raised when PDF download fails."""
+    pass
+
+
+def download_pdf(url: str) -> Path:
     """
     Download a PDF to the cache if not already cached.
     
-    Returns the path to the cached PDF, or None if download fails.
+    Returns the path to the cached PDF.
+    Raises PDFDownloadError with details if download fails.
     """
     cache_path = get_cached_pdf_path(url)
     
@@ -192,13 +198,25 @@ def download_pdf(url: str) -> Path | None:
         response = requests.get(url, timeout=30, stream=True)
         response.raise_for_status()
         
+        content_type = response.headers.get("content-type", "")
+        if "pdf" not in content_type.lower() and "octet-stream" not in content_type.lower():
+            raise PDFDownloadError(
+                f"URL did not return a PDF. Content-Type: {content_type}\nURL: {url}"
+            )
+        
         with open(cache_path, "wb") as f:
             for chunk in response.iter_content(chunk_size=8192):
                 f.write(chunk)
         
         return cache_path
-    except Exception:
-        return None
+    except requests.exceptions.HTTPError as e:
+        raise PDFDownloadError(f"HTTP error {e.response.status_code}: {e.response.reason}\nURL: {url}")
+    except requests.exceptions.ConnectionError as e:
+        raise PDFDownloadError(f"Connection error: {e}\nURL: {url}")
+    except requests.exceptions.Timeout:
+        raise PDFDownloadError(f"Request timed out after 30 seconds\nURL: {url}")
+    except requests.exceptions.RequestException as e:
+        raise PDFDownloadError(f"Request failed: {e}\nURL: {url}")
 
 
 def open_pdf(path: Path) -> bool:
@@ -328,14 +346,14 @@ class AbstractScreen(Screen[None]):
         status_widget.update("[yellow]Downloading PDF...[/yellow]")
         self.refresh()
         
-        pdf_path = download_pdf(paper.pdf_url)
-        if pdf_path:
+        try:
+            pdf_path = download_pdf(paper.pdf_url)
             if open_pdf(pdf_path):
                 status_widget.update(f"[green]PDF opened: {pdf_path}[/green]")
             else:
-                status_widget.update(f"[red]Failed to open PDF viewer[/red]")
-        else:
-            status_widget.update("[red]Failed to download PDF[/red]")
+                status_widget.update("[red]Failed to open PDF viewer[/red]")
+        except PDFDownloadError as e:
+            status_widget.update(f"[red]Download failed:\n{e}[/red]")
     
     async def action_dismiss_screen(self) -> None:
         """Return to the paper list."""
