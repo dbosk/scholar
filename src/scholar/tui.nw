@@ -341,34 +341,39 @@ class AbstractScreen(Screen[None]):
             yield Static("", id="pdf-status")
         yield Footer()
     
-    @work(exclusive=True)
-    async def action_open_pdf(self) -> None:
-        """Download and open the PDF in a background worker."""
+    @work(exclusive=True, thread=True)
+    def action_open_pdf(self) -> None:
+        """Download and open the PDF in a background worker thread."""
         paper = self.decision.paper
-        status_widget = self.query_one("#pdf-status", Static)
+        
+        def update_status(msg: str) -> None:
+            """Update status widget from worker thread."""
+            self.app.call_from_thread(
+                self.query_one("#pdf-status", Static).update, msg
+            )
         
         if not paper.pdf_url:
-            status_widget.update("[red]No PDF URL available[/red]")
+            update_status("[red]No PDF URL available[/red]")
             return
         
         cache_path = get_cached_pdf_path(paper.pdf_url)
         
         if cache_path.exists():
-            status_widget.update(f"[green]Using cached PDF: {cache_path}[/green]")
+            update_status(f"[green]Using cached PDF: {cache_path}[/green]")
         else:
-            status_widget.update(f"[yellow]Downloading PDF from {paper.pdf_url}...[/yellow]")
+            update_status(f"[yellow]Downloading PDF from {paper.pdf_url}...[/yellow]")
             try:
                 pdf_path = download_pdf(paper.pdf_url)
-                status_widget.update(f"[green]Downloaded to: {pdf_path}[/green]")
+                update_status(f"[green]Downloaded to: {pdf_path}[/green]")
             except PDFDownloadError as e:
-                status_widget.update(f"[red]Download failed:\n{e}[/red]")
+                update_status(f"[red]Download failed:\n{e}[/red]")
                 return
         
-        status_widget.update(f"[green]Opening PDF...[/green]")
+        update_status(f"[green]Opening PDF...[/green]")
         if open_pdf(cache_path):
-            status_widget.update(f"[green]PDF opened: {cache_path}[/green]")
+            update_status(f"[green]PDF opened: {cache_path}[/green]")
         else:
-            status_widget.update("[red]Failed to open PDF viewer[/red]")
+            update_status("[red]Failed to open PDF viewer[/red]")
     
     async def action_dismiss_screen(self) -> None:
         """Return to the paper list."""
