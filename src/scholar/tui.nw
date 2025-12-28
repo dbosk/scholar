@@ -384,7 +384,9 @@ class AbstractScreen(Screen[None]):
             if result:
                 self.dismiss(None)
         
-        self.app.push_screen(DiscardModal(self.decision, self.previous_motivations), handle_discard)
+        # Get unique previous motivations
+        unique_motivations = list(dict.fromkeys(self.previous_motivations))
+        self.app.push_screen(DiscardModal(self.decision, unique_motivations), handle_discard)
 @
 
 \chapter{Discard Modal}
@@ -401,56 +403,77 @@ class DiscardModal(ModalScreen[bool]):
         Binding("escape", "cancel", "Cancel"),
     ]
     
+    DEFAULT_CSS = """
+    DiscardModal {
+        align: center middle;
+    }
+    #discard-dialog {
+        width: 80;
+        height: auto;
+        max-height: 80%;
+        border: thick $primary;
+        background: $surface;
+        padding: 1 2;
+    }
+    #reason-list {
+        height: auto;
+        max-height: 15;
+        margin: 1 0;
+    }
+    #motivation-input {
+        margin: 1 0;
+    }
+    """
+    
     def __init__(self, decision: ReviewDecision, previous_motivations: list[str]) -> None:
         super().__init__()
         self.decision = decision
         self.previous_motivations = previous_motivations
     
     def compose(self) -> ComposeResult:
+        from textual.widgets import OptionList
+        from textual.widgets.option_list import Option
+        
         with Container(id="discard-dialog"):
             yield Static(
                 f"[bold]Discard:[/bold] {self.decision.paper.title[:50]}...",
                 id="discard-title"
             )
-            if self.previous_motivations:
-                yield Static("\n[bold]Previous reasons (click or type number):[/bold]")
-                for i, motivation in enumerate(self.previous_motivations[-5:], 1):
-                    short = motivation[:60] + "..." if len(motivation) > 60 else motivation
-                    yield Button(f"{i}. {short}", id=f"prev-{i-1}", variant="default")
-                yield Static("\n[bold]Or enter a new reason:[/bold]")
-            else:
-                yield Static("Why are you discarding this paper?")
-            yield Input(placeholder="Type reason and press Enter", id="motivation-input")
+            
+            # Create option list with previous reasons + "New reason" option
+            options = []
+            for motivation in self.previous_motivations[-5:]:
+                short = motivation[:70] + "..." if len(motivation) > 70 else motivation
+                options.append(Option(short, id=motivation))
+            options.append(Option("[italic]Enter new reason...[/italic]", id="__new__"))
+            
+            yield OptionList(*options, id="reason-list")
+            yield Input(
+                placeholder="Type new reason and press Enter",
+                id="motivation-input",
+                disabled=True
+            )
     
-    def on_button_pressed(self, event: Button.Pressed) -> None:
-        if event.button.id and event.button.id.startswith("prev-"):
-            idx = int(event.button.id.split("-")[1])
-            motivations = self.previous_motivations[-5:]
-            if idx < len(motivations):
-                self.decision.status = DecisionStatus.DISCARDED
-                self.decision.motivation = motivations[idx]
-                self.dismiss(True)
+    def on_option_list_option_selected(self, event: OptionList.OptionSelected) -> None:
+        """Handle selection from option list."""
+        if event.option.id == "__new__":
+            # Enable input and focus it
+            input_widget = self.query_one("#motivation-input", Input)
+            input_widget.disabled = False
+            input_widget.focus()
+        else:
+            # Use selected previous motivation
+            self.decision.status = DecisionStatus.DISCARDED
+            self.decision.motivation = str(event.option.id)
+            self.dismiss(True)
     
     def on_input_submitted(self, event: Input.Submitted) -> None:
         """Handle Enter key in input field."""
         motivation = event.value.strip()
-        # Check if it's a number selecting a previous motivation
-        if motivation.isdigit():
-            idx = int(motivation) - 1
-            motivations = self.previous_motivations[-5:]
-            if 0 <= idx < len(motivations):
-                self.decision.status = DecisionStatus.DISCARDED
-                self.decision.motivation = motivations[idx]
-                self.dismiss(True)
-                return
-        
         if motivation:
             self.decision.status = DecisionStatus.DISCARDED
             self.decision.motivation = motivation
             self.dismiss(True)
-        else:
-            # Flash the input to indicate required field
-            self.query_one("#motivation-input", Input).styles.background = "darkred"
     
     def action_cancel(self) -> None:
         self.dismiss(False)
@@ -697,9 +720,11 @@ class PaperReviewApp(App):
         """Open discard modal for current paper."""
         decision = self._get_current_decision()
         if decision:
-            # Collect previous motivations from discarded papers
-            previous = [d.motivation for d in self.session.decisions 
-                       if d.status == DecisionStatus.DISCARDED and d.motivation]
+            # Collect unique previous motivations from discarded papers
+            previous = list(dict.fromkeys(
+                d.motivation for d in self.session.decisions 
+                if d.status == DecisionStatus.DISCARDED and d.motivation
+            ))
             self.push_screen(DiscardModal(decision, previous), self._on_discard_closed)
     
     def _on_discard_closed(self, result: bool | None) -> None:
