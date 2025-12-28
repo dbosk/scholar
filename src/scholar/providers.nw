@@ -38,6 +38,7 @@ itself with the provider registry on import.
 <<semantic scholar provider>>
 <<openalex provider>>
 <<dblp provider>>
+<<wos provider>>
 @
 
 
@@ -421,6 +422,152 @@ DBLP_API_URL = "https://dblp.org/search/publ/api"
 @
 
 
+\chapter{Web of Science Provider}
+
+Web of Science (WoS) is a comprehensive citation index covering scholarly
+literature across sciences, social sciences, arts, and humanities.
+It is maintained by Clarivate and requires institutional access or an API key.
+
+\section{API options}
+
+Clarivate provides several API options:
+
+\begin{description}
+\item[Web of Science API Expanded] Full access with advanced features.
+  Requires institutional subscription.
+\item[Web of Science Starter API] Basic search with bibliographic metadata.
+  Has a free tier (50 requests/day) and institutional tiers (5,000--20,000
+  requests/day).
+\end{description}
+
+The official Python client ([[wosstarter_python_client]]) is only available
+from GitHub, not PyPI.
+For consistency with our DBLP implementation, we use the Starter API's REST
+endpoint directly via [[requests]].
+
+\section{Provider implementation}
+
+<<wos provider>>=
+class WebOfScienceProvider:
+    """Search provider for Web of Science."""
+
+    name = "wos"
+
+    def __init__(self, api_key: str | None = None):
+        """
+        Initialize the Web of Science provider.
+
+        Args:
+            api_key: API key for WoS Starter API.
+                     If not provided, uses WOS_API_KEY environment variable.
+        """
+        self.api_key = api_key or os.environ.get("WOS_API_KEY")
+
+    def search(self, query: str, limit: int = 100) -> list[Paper]:
+        """Search Web of Science for papers matching the query."""
+        if not self.api_key:
+            return []  # No API key configured
+
+        try:
+            # WoS Starter API has max 50 results per page
+            effective_limit = min(limit, 50)
+            response = requests.get(
+                WOS_API_URL,
+                params={
+                    "q": query,
+                    "db": "WOS",
+                    "limit": effective_limit,
+                    "page": 1,
+                },
+                headers={"X-ApiKey": self.api_key},
+                timeout=30,
+            )
+            response.raise_for_status()
+            data = response.json()
+
+            hits = data.get("hits", [])
+            return [self._convert_hit(hit) for hit in hits]
+        except Exception:
+            return []
+
+    <<convert wos hit>>
+@
+
+\subsection{Converting document format}
+
+The WoS Starter API returns documents with fields including:
+\begin{description}
+\item[uid] Unique WoS identifier.
+\item[title] The document title.
+\item[names] Object with [[authors]] array containing author names.
+\item[source] Source publication information including [[sourceTitle]].
+\item[links] Object with [[record]] URL to WoS page.
+\item[identifiers] Object with DOI and other identifiers.
+\item[keywords] Object with [[authorKeywords]] array.
+\end{description}
+
+We convert each hit to our common [[Paper]] type:
+
+<<convert wos hit>>=
+def _convert_hit(self, hit: dict) -> Paper:
+    """Convert a WoS API hit to our Paper type."""
+    # Extract publication year from source
+    source = hit.get("source", {})
+    year = None
+    pub_year = source.get("publishYear")
+    if pub_year:
+        try:
+            year = int(pub_year)
+        except (ValueError, TypeError):
+            pass
+
+    # Extract author names
+    authors = []
+    names = hit.get("names", {})
+    for author in names.get("authors", []):
+        name = author.get("displayName")
+        if name:
+            authors.append(name)
+
+    # Extract DOI from identifiers
+    doi = None
+    identifiers = hit.get("identifiers", {})
+    doi = identifiers.get("doi")
+
+    # Extract URL from links
+    url = None
+    links = hit.get("links", {})
+    url = links.get("record")
+
+    return Paper(
+        title=hit.get("title", "") or "",
+        authors=authors,
+        year=year,
+        doi=doi,
+        abstract=None,  # Not available in Starter API
+        venue=source.get("sourceTitle"),
+        url=url,
+        source=self.name,
+    )
+@
+
+\section{Auto-registration}
+
+<<wos provider>>=
+# Register the provider on module import
+register_provider(WebOfScienceProvider())
+@
+
+\section{Dependencies}
+
+Since the provider uses the same [[requests]] library as DBLP, we only need
+to define the API URL constant:
+
+<<wos constants>>=
+WOS_API_URL = "https://api.clarivate.com/apis/wos-starter/v1/documents"
+@
+
+
 \chapter{Dependencies}
 
 We organize imports so each provider's dependencies are co-located with
@@ -441,6 +588,7 @@ from scholar import Paper
 # Provider constants
 DEFAULT_LIMIT = 100
 <<dblp constants>>
+<<wos constants>>
 @
 
 
@@ -459,6 +607,7 @@ from scholar.providers import (
     SemanticScholarProvider,
     OpenAlexProvider,
     DBLPProvider,
+    WebOfScienceProvider,
     register_provider,
     get_provider,
     get_all_providers,
@@ -493,14 +642,21 @@ class TestProviderRegistry:
         assert provider is not None
         assert provider.name == "dblp"
 
+    def test_wos_registered(self):
+        """Web of Science provider is auto-registered."""
+        provider = get_provider("wos")
+        assert provider is not None
+        assert provider.name == "wos"
+
     def test_get_all_providers(self):
         """get_all_providers returns registered providers."""
         providers = get_all_providers()
-        assert len(providers) >= 3
+        assert len(providers) >= 4
         names = [p.name for p in providers]
         assert "semantic_scholar" in names
         assert "openalex" in names
         assert "dblp" in names
+        assert "wos" in names
 
     def test_get_unknown_provider(self):
         """get_provider returns None for unknown providers."""
@@ -920,6 +1076,172 @@ class TestDBLPIntegration:
             assert paper.source == "dblp"
         except Exception as e:
             pytest.skip(f"DBLP API unavailable: {e}")
+@
+
+
+\section{Testing Web of Science provider}
+
+We test the WoS provider with mocked API responses.
+Note that without an API key, the provider returns empty results:
+
+<<test [[providers.py]]>>=
+class TestWebOfScienceProvider:
+    """Tests for the Web of Science provider."""
+
+    def test_search_returns_empty_without_api_key(self):
+        """search() returns empty list when no API key is configured."""
+        provider = WebOfScienceProvider(api_key=None)
+        results = provider.search("test")
+        assert results == []
+
+    def test_search_converts_documents(self):
+        """search() converts API results to Paper objects."""
+        provider = WebOfScienceProvider(api_key="test_key")
+
+        # Create mock API response
+        mock_response = Mock()
+        mock_response.json.return_value = {
+            "hits": [{
+                "title": "Test Paper",
+                "names": {
+                    "authors": [
+                        {"displayName": "Alice Smith"},
+                        {"displayName": "Bob Jones"},
+                    ]
+                },
+                "source": {
+                    "sourceTitle": "Nature",
+                    "publishYear": "2024",
+                },
+                "identifiers": {"doi": "10.1234/test"},
+                "links": {"record": "https://wos.com/record/123"},
+            }]
+        }
+        mock_response.raise_for_status = Mock()
+
+        with patch("requests.get") as mock_get:
+            mock_get.return_value = mock_response
+
+            results = provider.search("test query")
+
+            assert len(results) == 1
+            paper = results[0]
+            assert isinstance(paper, Paper)
+            assert paper.title == "Test Paper"
+            assert paper.authors == ["Alice Smith", "Bob Jones"]
+            assert paper.year == 2024
+            assert paper.doi == "10.1234/test"
+            assert paper.venue == "Nature"
+            assert paper.source == "wos"
+
+    def test_search_handles_empty_results(self):
+        """search() returns empty list when no results."""
+        provider = WebOfScienceProvider(api_key="test_key")
+
+        mock_response = Mock()
+        mock_response.json.return_value = {"hits": []}
+        mock_response.raise_for_status = Mock()
+
+        with patch("requests.get") as mock_get:
+            mock_get.return_value = mock_response
+
+            results = provider.search("obscure query")
+            assert results == []
+
+    def test_search_handles_api_error(self):
+        """search() returns empty list on API error."""
+        provider = WebOfScienceProvider(api_key="test_key")
+
+        with patch("requests.get") as mock_get:
+            mock_get.side_effect = Exception("API error")
+
+            results = provider.search("test")
+            assert results == []
+
+    def test_handles_missing_fields(self):
+        """search() handles documents with missing optional fields."""
+        provider = WebOfScienceProvider(api_key="test_key")
+
+        mock_response = Mock()
+        mock_response.json.return_value = {
+            "hits": [{"title": "Minimal Paper"}]
+        }
+        mock_response.raise_for_status = Mock()
+
+        with patch("requests.get") as mock_get:
+            mock_get.return_value = mock_response
+
+            results = provider.search("test")
+
+            assert len(results) == 1
+            paper = results[0]
+            assert paper.title == "Minimal Paper"
+            assert paper.authors == []
+            assert paper.year is None
+            assert paper.doi is None
+            assert paper.abstract is None
+
+    def test_caps_limit_at_50(self):
+        """search() caps limit at WoS Starter API's maximum of 50."""
+        provider = WebOfScienceProvider(api_key="test_key")
+
+        mock_response = Mock()
+        mock_response.json.return_value = {"hits": []}
+        mock_response.raise_for_status = Mock()
+
+        with patch("requests.get") as mock_get:
+            mock_get.return_value = mock_response
+
+            provider.search("test", limit=100)
+
+            call_args = mock_get.call_args
+            assert call_args[1]["params"]["limit"] == 50
+
+    def test_sends_api_key_header(self):
+        """search() sends API key in header."""
+        provider = WebOfScienceProvider(api_key="my_secret_key")
+
+        mock_response = Mock()
+        mock_response.json.return_value = {"hits": []}
+        mock_response.raise_for_status = Mock()
+
+        with patch("requests.get") as mock_get:
+            mock_get.return_value = mock_response
+
+            provider.search("test")
+
+            call_args = mock_get.call_args
+            assert call_args[1]["headers"]["X-ApiKey"] == "my_secret_key"
+@
+
+
+<<test [[providers.py]]>>=
+class TestWebOfScienceIntegration:
+    """Integration test for the Web of Science provider."""
+
+    @pytest.mark.integration
+    @pytest.mark.skip(reason="Skipped by default; requires WOS_API_KEY")
+    def test_real_api_call(self):
+        """Make one real API call to verify the provider works."""
+        import os
+
+        api_key = os.environ.get("WOS_API_KEY")
+        if not api_key:
+            pytest.skip("WOS_API_KEY environment variable not set")
+
+        provider = WebOfScienceProvider(api_key=api_key)
+
+        try:
+            papers = provider.search("machine learning", limit=1)
+
+            assert len(papers) >= 1, "Provider returned no results"
+
+            paper = papers[0]
+            assert isinstance(paper, Paper)
+            assert paper.title
+            assert paper.source == "wos"
+        except Exception as e:
+            pytest.skip(f"Web of Science API unavailable: {e}")
 @
 
 
