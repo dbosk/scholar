@@ -309,23 +309,23 @@ class SortModal(ModalScreen[tuple[str, bool] | None]):
     
     BINDINGS = [
         Binding("escape", "cancel", "Cancel"),
-        Binding("t", "sort_title", "By Title"),
-        Binding("y", "sort_year", "By Year"),
-        Binding("a", "sort_author", "By Author"),
-        Binding("p", "sort_provider", "By Provider"),
+        Binding("t", "sort_title", "Title A-Z", priority=True),
+        Binding("T", "sort_title_rev", "Title Z-A", priority=True),
+        Binding("y", "sort_year", "Year ↑", priority=True),
+        Binding("Y", "sort_year_rev", "Year ↓", priority=True),
+        Binding("a", "sort_author", "Author A-Z", priority=True),
+        Binding("A", "sort_author_rev", "Author Z-A", priority=True),
+        Binding("p", "sort_provider", "Provider", priority=True),
     ]
     
     def compose(self) -> ComposeResult:
         with Container(id="sort-dialog"):
             yield Static("[bold]Sort Papers[/bold]", id="sort-title")
             yield Static("")
-            yield Static("[t] Title (A-Z)")
-            yield Static("[T] Title (Z-A)")
-            yield Static("[y] Year (oldest first)")
-            yield Static("[Y] Year (newest first)")
-            yield Static("[a] Author (A-Z)")
-            yield Static("[A] Author (Z-A)")
-            yield Static("[p] Provider (A-Z)")
+            yield Static("[t] Title (A-Z)   [T] Title (Z-A)")
+            yield Static("[y] Year (oldest) [Y] Year (newest)")
+            yield Static("[a] Author (A-Z)  [A] Author (Z-A)")
+            yield Static("[p] Provider")
             yield Static("")
             yield Static("[dim]Press Escape to cancel[/dim]")
     
@@ -335,25 +335,23 @@ class SortModal(ModalScreen[tuple[str, bool] | None]):
     def action_sort_title(self) -> None:
         self.dismiss(("title", False))
     
+    def action_sort_title_rev(self) -> None:
+        self.dismiss(("title", True))
+    
     def action_sort_year(self) -> None:
         self.dismiss(("year", False))
+    
+    def action_sort_year_rev(self) -> None:
+        self.dismiss(("year", True))
     
     def action_sort_author(self) -> None:
         self.dismiss(("author", False))
     
+    def action_sort_author_rev(self) -> None:
+        self.dismiss(("author", True))
+    
     def action_sort_provider(self) -> None:
         self.dismiss(("provider", False))
-    
-    def on_key(self, event) -> None:
-        """Handle uppercase keys for reverse sort."""
-        if event.key == "T":
-            self.dismiss(("title", True))
-        elif event.key == "Y":
-            self.dismiss(("year", True))
-        elif event.key == "A":
-            self.dismiss(("author", True))
-        elif event.key == "P":
-            self.dismiss(("provider", True))
 @
 
 \chapter{Main Application}
@@ -419,7 +417,6 @@ class PaperReviewApp(App):
         Binding("k", "cursor_up", "Up", show=False),
         Binding("down", "cursor_down", "Down", show=False),
         Binding("up", "cursor_up", "Up", show=False),
-        Binding("enter", "view_abstract", "Abstract"),
         Binding("K", "keep", "Keep"),
         Binding("d", "discard", "Discard"),
         Binding("s", "sort", "Sort"),
@@ -484,6 +481,10 @@ class PaperReviewApp(App):
     def action_cursor_up(self) -> None:
         list_view = self.query_one("#paper-list", ListView)
         list_view.action_cursor_up()
+    
+    def on_list_view_selected(self, event: ListView.Selected) -> None:
+        """Handle Enter key on ListView - show abstract."""
+        self.action_view_abstract()
     
     def action_view_abstract(self) -> None:
         """Show the abstract screen for current paper."""
