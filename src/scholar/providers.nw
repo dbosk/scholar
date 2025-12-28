@@ -39,6 +39,7 @@ itself with the provider registry on import.
 <<openalex provider>>
 <<dblp provider>>
 <<wos provider>>
+<<ieee provider>>
 @
 
 
@@ -568,6 +569,138 @@ WOS_API_URL = "https://api.clarivate.com/apis/wos-starter/v1/documents"
 @
 
 
+\chapter{IEEE Xplore Provider}
+
+IEEE Xplore is a research database providing access to scientific and technical
+content published by IEEE (Institute of Electrical and Electronics Engineers)
+and its publishing partners.
+It contains over 6 million documents including journals, conference proceedings,
+technical standards, and books.
+
+\section{API access}
+
+IEEE provides a Metadata API for searching and retrieving bibliographic data.
+The API requires registration and an API key, which can be obtained from the
+IEEE Developer Portal.
+
+The official Python SDK ([[xploreapi]]) is provided by IEEE but is not available
+on PyPI---it must be downloaded from the Developer Portal.
+For consistency with our other providers, we use the REST API directly via
+[[requests]].
+
+\section{Provider implementation}
+
+<<ieee provider>>=
+class IEEEXploreProvider:
+    """Search provider for IEEE Xplore."""
+
+    name = "ieee"
+
+    def __init__(self, api_key: str | None = None):
+        """
+        Initialize the IEEE Xplore provider.
+
+        Args:
+            api_key: API key for IEEE Xplore API.
+                     If not provided, uses IEEE_API_KEY environment variable.
+        """
+        self.api_key = api_key or os.environ.get("IEEE_API_KEY")
+
+    def search(self, query: str, limit: int = 100) -> list[Paper]:
+        """Search IEEE Xplore for papers matching the query."""
+        if not self.api_key:
+            return []  # No API key configured
+
+        try:
+            # IEEE API returns max 200 results per request
+            effective_limit = min(limit, 200)
+            response = requests.get(
+                IEEE_API_URL,
+                params={
+                    "querytext": query,
+                    "max_records": effective_limit,
+                    "apikey": self.api_key,
+                },
+                timeout=30,
+            )
+            response.raise_for_status()
+            data = response.json()
+
+            articles = data.get("articles", [])
+            return [self._convert_article(article) for article in articles]
+        except Exception:
+            return []
+
+    <<convert ieee article>>
+@
+
+\subsection{Converting article format}
+
+The IEEE Xplore API returns articles with fields including:
+\begin{description}
+\item[title] The document title.
+\item[authors] Object with [[authors]] array containing author details.
+\item[abstract] Brief summary of the document.
+\item[publication\_title] Journal or conference name.
+\item[publication\_year] Year of publication.
+\item[doi] Digital Object Identifier.
+\item[html\_url] URL to the article page.
+\end{description}
+
+We convert each article to our common [[Paper]] type:
+
+<<convert ieee article>>=
+def _convert_article(self, article: dict) -> Paper:
+    """Convert an IEEE Xplore article to our Paper type."""
+    # Extract publication year
+    year = None
+    pub_year = article.get("publication_year")
+    if pub_year:
+        try:
+            year = int(pub_year)
+        except (ValueError, TypeError):
+            pass
+
+    # Extract author names from authors object
+    authors = []
+    authors_data = article.get("authors", {}).get("authors", [])
+    for author in authors_data:
+        name = author.get("full_name")
+        if name:
+            authors.append(name)
+
+    # Prefer html_url, fall back to abstract_url
+    url = article.get("html_url") or article.get("abstract_url")
+
+    return Paper(
+        title=article.get("title", "") or "",
+        authors=authors,
+        year=year,
+        doi=article.get("doi"),
+        abstract=article.get("abstract"),
+        venue=article.get("publication_title"),
+        url=url,
+        source=self.name,
+    )
+@
+
+\section{Auto-registration}
+
+<<ieee provider>>=
+# Register the provider on module import
+register_provider(IEEEXploreProvider())
+@
+
+\section{Dependencies}
+
+Since the provider uses the same [[requests]] library as DBLP and WoS, we only
+need to define the API URL constant:
+
+<<ieee constants>>=
+IEEE_API_URL = "https://ieeexploreapi.ieee.org/api/v1/search/articles"
+@
+
+
 \chapter{Dependencies}
 
 We organize imports so each provider's dependencies are co-located with
@@ -589,6 +722,7 @@ from scholar import Paper
 DEFAULT_LIMIT = 100
 <<dblp constants>>
 <<wos constants>>
+<<ieee constants>>
 @
 
 
@@ -608,6 +742,7 @@ from scholar.providers import (
     OpenAlexProvider,
     DBLPProvider,
     WebOfScienceProvider,
+    IEEEXploreProvider,
     register_provider,
     get_provider,
     get_all_providers,
@@ -648,15 +783,22 @@ class TestProviderRegistry:
         assert provider is not None
         assert provider.name == "wos"
 
+    def test_ieee_registered(self):
+        """IEEE Xplore provider is auto-registered."""
+        provider = get_provider("ieee")
+        assert provider is not None
+        assert provider.name == "ieee"
+
     def test_get_all_providers(self):
         """get_all_providers returns registered providers."""
         providers = get_all_providers()
-        assert len(providers) >= 4
+        assert len(providers) >= 5
         names = [p.name for p in providers]
         assert "semantic_scholar" in names
         assert "openalex" in names
         assert "dblp" in names
         assert "wos" in names
+        assert "ieee" in names
 
     def test_get_unknown_provider(self):
         """get_provider returns None for unknown providers."""
@@ -1242,6 +1384,192 @@ class TestWebOfScienceIntegration:
             assert paper.source == "wos"
         except Exception as e:
             pytest.skip(f"Web of Science API unavailable: {e}")
+@
+
+
+\section{Testing IEEE Xplore provider}
+
+We test the IEEE Xplore provider with mocked API responses.
+Like WoS, without an API key the provider returns empty results:
+
+<<test [[providers.py]]>>=
+class TestIEEEXploreProvider:
+    """Tests for the IEEE Xplore provider."""
+
+    def test_search_returns_empty_without_api_key(self):
+        """search() returns empty list when no API key is configured."""
+        provider = IEEEXploreProvider(api_key=None)
+        results = provider.search("test")
+        assert results == []
+
+    def test_search_converts_articles(self):
+        """search() converts API results to Paper objects."""
+        provider = IEEEXploreProvider(api_key="test_key")
+
+        # Create mock API response
+        mock_response = Mock()
+        mock_response.json.return_value = {
+            "articles": [{
+                "title": "Test Paper on Neural Networks",
+                "authors": {
+                    "authors": [
+                        {"full_name": "Alice Smith", "author_order": 1},
+                        {"full_name": "Bob Jones", "author_order": 2},
+                    ]
+                },
+                "abstract": "This paper presents...",
+                "publication_title": "IEEE Trans. Neural Networks",
+                "publication_year": "2024",
+                "doi": "10.1109/TNN.2024.1234567",
+                "html_url": "https://ieeexplore.ieee.org/document/1234567",
+            }]
+        }
+        mock_response.raise_for_status = Mock()
+
+        with patch("requests.get") as mock_get:
+            mock_get.return_value = mock_response
+
+            results = provider.search("neural networks")
+
+            assert len(results) == 1
+            paper = results[0]
+            assert isinstance(paper, Paper)
+            assert paper.title == "Test Paper on Neural Networks"
+            assert paper.authors == ["Alice Smith", "Bob Jones"]
+            assert paper.year == 2024
+            assert paper.doi == "10.1109/TNN.2024.1234567"
+            assert paper.abstract == "This paper presents..."
+            assert paper.venue == "IEEE Trans. Neural Networks"
+            assert paper.source == "ieee"
+
+    def test_search_handles_empty_results(self):
+        """search() returns empty list when no results."""
+        provider = IEEEXploreProvider(api_key="test_key")
+
+        mock_response = Mock()
+        mock_response.json.return_value = {"articles": []}
+        mock_response.raise_for_status = Mock()
+
+        with patch("requests.get") as mock_get:
+            mock_get.return_value = mock_response
+
+            results = provider.search("obscure query")
+            assert results == []
+
+    def test_search_handles_api_error(self):
+        """search() returns empty list on API error."""
+        provider = IEEEXploreProvider(api_key="test_key")
+
+        with patch("requests.get") as mock_get:
+            mock_get.side_effect = Exception("API error")
+
+            results = provider.search("test")
+            assert results == []
+
+    def test_handles_missing_fields(self):
+        """search() handles articles with missing optional fields."""
+        provider = IEEEXploreProvider(api_key="test_key")
+
+        mock_response = Mock()
+        mock_response.json.return_value = {
+            "articles": [{"title": "Minimal Paper"}]
+        }
+        mock_response.raise_for_status = Mock()
+
+        with patch("requests.get") as mock_get:
+            mock_get.return_value = mock_response
+
+            results = provider.search("test")
+
+            assert len(results) == 1
+            paper = results[0]
+            assert paper.title == "Minimal Paper"
+            assert paper.authors == []
+            assert paper.year is None
+            assert paper.doi is None
+            assert paper.abstract is None
+
+    def test_caps_limit_at_200(self):
+        """search() caps limit at IEEE's maximum of 200."""
+        provider = IEEEXploreProvider(api_key="test_key")
+
+        mock_response = Mock()
+        mock_response.json.return_value = {"articles": []}
+        mock_response.raise_for_status = Mock()
+
+        with patch("requests.get") as mock_get:
+            mock_get.return_value = mock_response
+
+            provider.search("test", limit=500)
+
+            call_args = mock_get.call_args
+            assert call_args[1]["params"]["max_records"] == 200
+
+    def test_sends_api_key_as_parameter(self):
+        """search() sends API key as query parameter."""
+        provider = IEEEXploreProvider(api_key="my_ieee_key")
+
+        mock_response = Mock()
+        mock_response.json.return_value = {"articles": []}
+        mock_response.raise_for_status = Mock()
+
+        with patch("requests.get") as mock_get:
+            mock_get.return_value = mock_response
+
+            provider.search("test")
+
+            call_args = mock_get.call_args
+            assert call_args[1]["params"]["apikey"] == "my_ieee_key"
+
+    def test_uses_abstract_url_as_fallback(self):
+        """search() uses abstract_url when html_url is not available."""
+        provider = IEEEXploreProvider(api_key="test_key")
+
+        mock_response = Mock()
+        mock_response.json.return_value = {
+            "articles": [{
+                "title": "Paper",
+                "abstract_url": "https://ieeexplore.ieee.org/abstract/1234",
+            }]
+        }
+        mock_response.raise_for_status = Mock()
+
+        with patch("requests.get") as mock_get:
+            mock_get.return_value = mock_response
+
+            results = provider.search("test")
+
+            assert results[0].url == "https://ieeexplore.ieee.org/abstract/1234"
+@
+
+
+<<test [[providers.py]]>>=
+class TestIEEEXploreIntegration:
+    """Integration test for the IEEE Xplore provider."""
+
+    @pytest.mark.integration
+    @pytest.mark.skip(reason="Skipped by default; requires IEEE_API_KEY")
+    def test_real_api_call(self):
+        """Make one real API call to verify the provider works."""
+        import os
+
+        api_key = os.environ.get("IEEE_API_KEY")
+        if not api_key:
+            pytest.skip("IEEE_API_KEY environment variable not set")
+
+        provider = IEEEXploreProvider(api_key=api_key)
+
+        try:
+            papers = provider.search("machine learning", limit=1)
+
+            assert len(papers) >= 1, "Provider returned no results"
+
+            paper = papers[0]
+            assert isinstance(paper, Paper)
+            assert paper.title
+            assert paper.source == "ieee"
+        except Exception as e:
+            pytest.skip(f"IEEE Xplore API unavailable: {e}")
 @
 
 
