@@ -592,7 +592,7 @@ class TagSelectionModal(ModalScreen[list[str] | None]):
     
     BINDINGS = [
         Binding("escape", "cancel", "Cancel"),
-        Binding("enter", "confirm", "Confirm"),
+        Binding("enter", "confirm", "Confirm", priority=True),
     ]
     
     DEFAULT_CSS = """
