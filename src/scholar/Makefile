@@ -9,77 +9,26 @@ MODULES+=	pdf.py
 MODULES+=	review.py
 MODULES+=	__main__.py
 
-TEX+=		scholar.tex
-TEX+=		providers.tex
-TEX+=		cache.tex
-TEX+=		cli.tex
-TEX+=		tui.tex
-TEX+=		notes.tex
-TEX+=		pdf.tex
-TEX+=		review.tex
+DOC+=		scholar.tex
+DOC+=		providers.tex
+DOC+=		cache.tex
+DOC+=		cli.tex
+DOC+=		tui.tex
+DOC+=		notes.tex
+DOC+=		pdf.tex
+DOC+=		review.tex
 
 .PHONY: all clean distclean
 
-all: ${MODULES} ${TEX}
+all: ${MODULES} ${DOC}
 
 __init__.py: scholar.nw
 	${NOTANGLE.py}
-
-scholar.py: scholar.nw
-	${NOTANGLE.py}
-
-providers.py: providers.nw
-	${NOTANGLE.py}
-
-cache.py: cache.nw
-	${NOTANGLE.py}
-
-cli.py: cli.nw
-	${NOTANGLE.py}
-
-tui.py: tui.nw
-	${NOTANGLE.py}
-
-__main__.py: cli.nw
-	${NOTANGLE.py}
-
-scholar.tex: scholar.nw
-	${NOWEAVE.tex}
-
-providers.tex: providers.nw
-	${NOWEAVE.tex}
-
-cache.tex: cache.nw
-	${NOWEAVE.tex}
-
-cli.tex: cli.nw
-	${NOWEAVE.tex}
-
-tui.tex: tui.nw
-	${NOWEAVE.tex}
-
-notes.py: notes.nw
-	${NOTANGLE.py}
-
-notes.tex: notes.nw
-	${NOWEAVE.tex}
-
-pdf.py: pdf.nw
-	${NOTANGLE.py}
-
-pdf.tex: pdf.nw
-	${NOWEAVE.tex}
-
-review.py: review.nw
-	${NOTANGLE.py}
-
-review.tex: review.nw
-	${NOWEAVE.tex}
 
 INCLUDE_MAKEFILES=../../makefiles
 include ${INCLUDE_MAKEFILES}/noweb.mk
 
 clean:
-	${RM} ${MODULES} ${TEX}
+	${RM} ${MODULES} ${DOC}
 
 distclean:
