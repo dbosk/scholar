@@ -362,6 +362,18 @@ class AbstractScreen(Screen[None]):
                 yield Static("")
                 yield Static("[dim]No notes. Press [bold yellow]n[/bold yellow] to add notes.[/dim]")
             
+            # Show tags (themes for kept, motivations for discarded)
+            if self.decision.tags:
+                yield Static("")
+                if self.decision.status == DecisionStatus.KEPT:
+                    yield Static("[bold green]─── Themes ───[/bold green]")
+                elif self.decision.status == DecisionStatus.DISCARDED:
+                    yield Static("[bold red]─── Motivations ───[/bold red]")
+                else:
+                    yield Static("[bold yellow]─── Tags ───[/bold yellow]")
+                tags_text = ", ".join(self.decision.tags)
+                yield Static(tags_text)
+            
             yield Static("", id="pdf-status")
         yield Footer()
     
