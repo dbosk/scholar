@@ -52,9 +52,25 @@ Search decisions are per-query and help restore previous review state.
 
 
 \chapter{Data Structures}
+\label{ch:notes-data-structures}
 
 We define dataclasses to represent notes and decisions. These are serialized
 to JSON for storage.
+
+\section{Two Types of Persistent Data}
+
+The module manages two related but distinct types of data:
+\begin{description}
+\item[PaperNote] Global, per-paper notes that persist forever. If you take
+  notes on a paper, those notes should be available regardless of which
+  search found the paper.
+\item[ReviewDecisionRecord] Per-query decisions (keep/discard) with
+  motivations. These are tied to specific searches because the same paper
+  might be relevant to one query but not another.
+\end{description}
+
+The distinction matters: clearing decisions for one search shouldn't affect
+notes or decisions from other searches.
 
 <<notes imports>>=
 from dataclasses import dataclass, field, asdict
@@ -179,11 +195,32 @@ class SearchDecisions:
 
 
 \chapter{Paper Identity}
+\label{ch:paper-identity}
 
 To associate notes with papers across different searches and sessions, we need
 a stable identifier. DOI is ideal when available, but many papers lack DOIs.
 For papers without DOIs, we create a hash from the title and first author's
 last name.
+
+\section{Why Include First Author?}
+
+Using title alone would cause collisions for papers with the same title
+(surprisingly common in academia). Adding the first author's last name
+provides additional disambiguation. We don't use all authors because:
+\begin{itemize}
+\item Author order sometimes varies between databases
+\item Middle author names may be formatted differently
+\item First author is usually consistent and sufficient
+\end{itemize}
+
+\section{Hash Length Trade-off}
+
+We use 16 hex characters (64 bits) from SHA-256. This provides:
+\begin{itemize}
+\item Collision probability of $1/2^{32}$ per million papers (negligible)
+\item Short enough for readable filenames and JSON keys
+\item Deterministic---same paper always produces same ID
+\end{itemize}
 
 <<notes constants>>=
 # File names for persistent storage
@@ -862,9 +899,31 @@ def edit_note_in_editor(paper: Any) -> str | None:
 
 
 \chapter{Export and Import}
+\label{ch:export-import}
 
 Users may want to backup their notes or transfer them between machines.
 We provide export and import functions for this purpose.
+
+\section{Use Cases for Export/Import}
+
+These functions support several systematic review workflows:
+\begin{description}
+\item[Backup] Periodically export notes for safekeeping. Unlike search
+  caches, notes represent significant manual effort.
+\item[Collaboration] Export notes to share with co-reviewers, then import
+  their notes to merge perspectives.
+\item[Machine transfer] Move notes between a laptop and desktop, or when
+  switching computers.
+\item[Archival] Include exported notes with published research for
+  reproducibility.
+\end{description}
+
+\section{Merge Semantics}
+
+When importing with [[merge=True]] (the default), existing notes take
+precedence. This prevents accidentally overwriting recent changes with
+an older export. The import fills in gaps---papers that don't have notes
+locally will get the imported notes.
 
 <<paper notes functions>>=
 def export_notes(output_path: Path) -> int:

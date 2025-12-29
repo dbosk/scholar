@@ -275,9 +275,25 @@ for provider in get_all_providers():
 
 
 \chapter{Cache Management}
+\label{ch:cache-cli}
 
 Search results are cached to avoid redundant API calls.
 Users can inspect and manage the cache using the [[cache]] command.
+
+\section{Action-Based Design}
+
+We use an action argument ([[clear]], [[info]], [[path]]) rather than
+subcommands for cache management. This keeps the interface simpler for
+a small set of related operations:
+\begin{description}
+\item[clear] Delete all cached results---useful when API data has changed
+\item[info] Show statistics---helpful for debugging or quota planning
+\item[path] Print directory---for scripting or manual inspection
+\end{description}
+
+If cache management grew more complex (e.g., per-provider clearing,
+expiration policies), we might refactor to subcommands like the [[notes]]
+command uses.
 
 <<cache command>>=
 @app.command()
@@ -339,12 +355,33 @@ def cache(
 
 
 \chapter{Notes Management}
+\label{ch:notes-cli}
 
 Paper notes are stored persistently and can be browsed, exported, and imported.
 The [[notes]] command provides access to these features.
 
-When invoked without a subcommand, [[scholar notes]] launches a TUI for browsing
-all papers that have notes attached.
+\section{Subcommand Hierarchy}
+
+Unlike the [[cache]] command which uses a single action argument, [[notes]]
+uses Typer subcommands because it has more operations with different
+argument patterns:
+\begin{description}
+\item[notes] (no subcommand) Launch TUI for browsing papers with notes
+\item[notes list] List papers with notes (table or JSON output)
+\item[notes show] Display a specific paper's notes
+\item[notes export] Save all notes to a JSON file for backup or sharing
+\item[notes import] Load notes from a JSON file, merging with existing
+\item[notes clear] Delete all notes (with confirmation)
+\end{description}
+
+The subcommand structure scales better and allows each operation to have
+its own arguments and help text.
+
+\section{Default Behavior}
+
+When invoked without a subcommand, [[scholar notes]] launches a TUI for
+browsing all papers that have notes attached. This uses Typer's
+[[invoke_without_command=True]] callback pattern.
 
 <<notes command>>=
 notes_app = typer.Typer(
@@ -545,13 +582,29 @@ def notes_clear(
 
 
 \chapter{Output Formatting}
+\label{ch:output-formatting}
 
 Different use cases require different output formats:
 \begin{description}
 \item[table] Human-readable Rich tables for interactive use.
+\item[csv] Comma-separated values for spreadsheets and data processing.
 \item[json] Machine-readable format for scripting and pipelines.
 \item[bibtex] Citation format for integration with \LaTeX{} documents.
 \end{description}
+
+\section{Automatic Format Detection}
+
+The [[auto]] format (the default) detects whether output goes to a terminal
+or a pipe, selecting the appropriate format:
+\begin{itemize}
+\item Terminal (TTY): Use [[table]] for human readability
+\item Pipe/file: Use [[csv]] for machine processing
+\end{itemize}
+
+This UX pattern means [[scholar search "query"]] shows pretty tables for
+humans, while [[scholar search "query" | wc -l]] counts lines correctly.
+
+\section{Formatter Architecture}
 
 We implement a formatter for each and dispatch based on the user's choice.
 

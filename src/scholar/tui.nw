@@ -22,13 +22,61 @@ The TUI supports two modes:
   disabled but note editing still available.
 \end{description}
 
-The interface is built using Textual, a modern Python TUI framework that 
+The interface is built using Textual, a modern Python TUI framework that
 provides rich terminal interfaces with mouse support and responsive layouts.
+
+\section{Architecture Overview}
+\label{sec:tui-architecture}
+
+Before diving into implementation, it helps to understand Textual's
+architecture and how our components fit together.
+
+Textual applications follow a hierarchical structure:
+\begin{description}
+\item[App] The root container that manages screens, keybindings, and
+  application lifecycle. Our [[PaperReviewApp]] inherits from this.
+\item[Screen] A full-screen view that can be pushed onto a stack. We use
+  [[AbstractScreen]] for viewing paper details, and return to the main
+  screen when dismissed.
+\item[ModalScreen] A screen that overlays the current screen rather than
+  replacing it. We use modals for [[DiscardModal]], [[SortModal]], and
+  [[FilterModal]] to capture user input while keeping context visible.
+\item[Widget] Reusable UI components that compose to form screens. Our
+  [[PaperListItem]] is a custom widget displaying paper metadata.
+\end{description}
+
+The data flow through these components follows a clear pattern:
+\begin{enumerate}
+\item Search results arrive as [[SearchResult]] objects (from [[scholar.py]])
+\item We convert them to [[ReviewDecision]] objects tracking review state
+\item The TUI displays and allows modification of these decisions
+\item On exit, decisions are persisted via [[notes.py]] functions
+\end{enumerate}
+
+This separation keeps the TUI focused on presentation while delegating
+persistence to the [[notes]] module (see \autoref{notes-module}).
+
+\section{User Workflow}
+
+A typical review session proceeds as follows:
+\begin{enumerate}
+\item User runs [[scholar search --review "query"]]
+\item Papers appear in a scrollable list with vim-style navigation
+\item User selects papers to view abstracts (Enter key)
+\item For each paper, user decides: Keep (\texttt{K}) or Discard (\texttt{d})
+\item Discards require a motivation (for audit trail)
+\item After reviewing, user can filter to see only kept/discarded/pending
+\item On exit, a \LaTeX\ report can be generated documenting decisions
+\end{enumerate}
 
 \chapter{Module Structure}
 
-The TUI module exports functions for launching the interactive review interface 
+The TUI module exports functions for launching the interactive review interface
 and generating reports from review sessions.
+
+The module is organized to mirror the screen hierarchy described above.
+We define data structures first (needed by all components), then build up
+from simple widgets to complex screens, culminating in the main application:
 
 <<[[tui.py]]>>=
 """Interactive TUI for reviewing academic papers."""
@@ -77,12 +125,13 @@ from textual.widgets import (
 from textual.message import Message
 from textual import work
 from rich.text import Text
+from rich.console import Console
 
 from scholar.scholar import Paper, SearchResult
 from scholar.notes import (
     get_note, save_note, has_note, edit_note_in_editor,
     load_search_decisions, save_search_decisions, get_previous_decision,
-    get_paper_id,
+    get_paper_id, list_papers_with_notes,
 )
 @
 
@@ -263,10 +312,28 @@ class TestReviewSession:
 
 
 \chapter{PDF Caching}
+\label{ch:pdf-cache}
 
-When a paper has no abstract, we can download and open the PDF instead. PDFs are
-cached locally to avoid redundant downloads. The cache uses the same directory
-structure as the search cache.
+When a paper has no abstract, we can download and open the PDF instead. This
+happens frequently with older papers or certain databases that don't include
+abstracts in their API responses.
+
+\section{Why a Separate PDF Cache?}
+
+PDFs are cached separately from search results for several reasons:
+\begin{description}
+\item[Size] PDFs are typically megabytes, while search metadata is kilobytes.
+  Mixing them would bloat the search cache and slow down cache operations.
+\item[Lifecycle] Search caches may be cleared to refresh results, but
+  downloaded PDFs should persist---re-downloading is slow and wastes bandwidth.
+\item[Sharing] The same PDF may appear in multiple searches. A content-addressed
+  cache (keyed by URL hash) naturally deduplicates across sessions.
+\end{description}
+
+The cache uses SHA-256 hashes of URLs as filenames, ensuring unique storage
+regardless of URL length or special characters.
+
+\section{Implementation}
 
 <<tui pdf cache>>=
 def get_pdf_cache_dir() -> Path:
@@ -349,9 +416,33 @@ def open_pdf(path: Path) -> bool:
 @
 
 \chapter{Paper List Widget}
+\label{ch:paper-list-widget}
 
-The main interface displays papers in a navigable list. Each paper shows its 
+The main interface displays papers in a navigable list. Each paper shows its
 title, authors, year, and current review status using color coding.
+
+\section{Widget Composition in Textual}
+
+Textual uses a composition model where complex interfaces are built from
+simple widgets. Our [[PaperListItem]] extends [[ListItem]] (a built-in widget)
+and yields [[Static]] widgets containing formatted text.
+
+The [[compose]] method is Textual's pattern for declarative UI: rather than
+imperatively creating and adding widgets, we yield the widgets we want and
+Textual handles layout and rendering.
+
+\section{Visual Feedback Through Color}
+
+Color coding provides immediate visual feedback about review progress:
+\begin{description}
+\item[Green checkmark (\texttt{✓})] Paper marked as kept
+\item[Red cross (\texttt{✗})] Paper marked as discarded
+\item[Dim circle (\texttt{○})] Paper still pending review
+\item[Yellow notepad (\texttt{📝})] Paper has attached notes
+\end{description}
+
+In notes-only mode, we hide the status indicator since keep/discard
+doesn't apply---the user is just browsing papers with notes.
 
 <<tui paper list widget>>=
 class PaperListItem(ListItem):
@@ -396,10 +487,34 @@ class PaperListItem(ListItem):
 @
 
 \chapter{Abstract Viewing Screen}
+\label{ch:abstract-screen}
 
-When the user presses Enter on a paper, we show a full-screen view of the 
-abstract along with all paper metadata. This screen allows the user to read 
+When the user presses Enter on a paper, we show a full-screen view of the
+abstract along with all paper metadata. This screen allows the user to read
 the full abstract and make a decision about the paper.
+
+\section{Screen Lifecycle and Navigation}
+
+Textual screens form a stack. When we [[push_screen]], the new screen
+appears on top; when we [[dismiss]], we return to the previous screen.
+This matches the natural mental model: drilling into a paper (push),
+then returning to the list (dismiss).
+
+The abstract screen provides several actions:
+\begin{description}
+\item[Keep (\texttt{K})] Mark paper as kept, return to list
+\item[Discard (\texttt{d})] Open discard modal for motivation, then return
+\item[Notes (\texttt{n})] Open external editor for paper notes
+\item[PDF (\texttt{p})] Download and open the paper's PDF
+\item[Back (Escape/q)] Return to list without changing status
+\end{description}
+
+\section{External Editor Integration}
+
+For note editing, we use [[self.app.suspend()]] which temporarily releases
+the terminal back to the shell, allowing the user's preferred editor (from
+[[VISUAL]] or [[EDITOR]] environment variables) to run. This leverages
+familiar tools rather than implementing a text editor in the TUI.
 
 <<tui abstract screen>>=
 class AbstractScreen(Screen[None]):
@@ -525,10 +640,31 @@ class AbstractScreen(Screen[None]):
 @
 
 \chapter{Discard Modal}
+\label{ch:discard-modal}
 
-When discarding a paper, the user must provide a motivation. This modal 
-captures that motivation before marking the paper as discarded. This 
-requirement ensures reviewers document their decision-making process.
+When discarding a paper, the user must provide a motivation. This requirement
+is central to systematic literature review methodology: exclusion criteria
+must be documented and reproducible.
+
+\section{Why Mandatory Motivations?}
+
+The motivation requirement serves several purposes in systematic reviews:
+\begin{description}
+\item[Reproducibility] Other researchers can understand why papers were excluded
+\item[Audit trail] The review process becomes transparent and defensible
+\item[Consistency] Writing reasons helps reviewers apply criteria uniformly
+\item[Quality] Forcing articulation catches hasty or unconsidered rejections
+\end{description}
+
+Without this requirement, reviewers might reject papers with a quick keystroke,
+leading to inconsistent application of inclusion/exclusion criteria.
+
+\section{Reusing Previous Motivations}
+
+To reduce typing for common exclusion reasons (e.g., \enquote{wrong domain},
+\enquote{not peer-reviewed}), the modal shows recently used motivations.
+Users can select a previous reason or type a new one. This speeds up
+batch processing while still requiring conscious acknowledgment of the reason.
 
 <<tui discard modal>>=
 class DiscardModal(ModalScreen[bool]):
@@ -612,9 +748,36 @@ class DiscardModal(ModalScreen[bool]):
 @
 
 \chapter{Sort Modal}
+\label{ch:sort-modal}
 
-The sort modal allows users to change the sort order of papers. Sorting helps 
+The sort modal allows users to change the sort order of papers. Sorting helps
 users organize papers by relevance criteria like year or author.
+
+\section{Why Sorting Matters for Review}
+
+Different sorting strategies support different review workflows:
+\begin{description}
+\item[By year (newest first)] Review recent work first to understand current
+  state of the art before examining older foundational papers
+\item[By year (oldest first)] Trace historical development of a field,
+  understanding how ideas evolved over time
+\item[By author] Group papers by research group, helpful when tracking
+  specific authors' contributions to a topic
+\item[By title] Alphabetical ordering for systematic comparison with
+  existing bibliographies or reference lists
+\item[By provider] See which databases contributed which papers, useful
+  for understanding search coverage
+\end{description}
+
+\section{Keyboard-First Design}
+
+We use single-letter shortcuts (case-sensitive) for immediate action:
+lowercase for ascending order, uppercase for descending. This follows
+the vim philosophy of mnemonic keys: \texttt{t} for title, \texttt{y}
+for year, \texttt{a} for author.
+
+The case distinction (e.g., \texttt{y} vs \texttt{Y}) provides a natural
+way to express ascending/descending without additional modifier keys.
 
 <<tui sort modal>>=
 class SortModal(ModalScreen[tuple[str, bool] | None]):
@@ -774,9 +937,26 @@ class FilterModal(ModalScreen[str | None]):
 @
 
 \chapter{Main Application}
+\label{ch:main-app}
 
-The main TUI application coordinates all the screens and manages the review 
+The main TUI application coordinates all the screens and manages the review
 session state. It provides vim-style keybindings for efficient navigation.
+
+\section{Application Architecture}
+
+The [[PaperReviewApp]] class serves as the orchestrator, responsible for:
+\begin{description}
+\item[State management] Tracking the [[ReviewSession]] with all decisions
+\item[Screen coordination] Pushing/popping screens and modals as users navigate
+\item[Callback handling] Processing results when screens are dismissed
+\item[View filtering] Maintaining which subset of papers is currently displayed
+\end{description}
+
+The app maintains two key state variables beyond the session:
+\begin{itemize}
+\item [[current_index]]: Which paper is selected (for restoring position)
+\item [[current_filter]]: Which papers are shown (all/kept/discarded/pending)
+\end{itemize}
 
 \section{Filtering by Decision Status}
 
@@ -1060,12 +1240,52 @@ class PaperReviewApp(App):
 @
 
 \chapter{Report Generation}
+\label{ch:report-generation}
 
-After the review session, we generate a LaTeX report documenting the search 
-parameters, review decisions, motivations, and any notes. This provides an 
+After the review session, we generate a \LaTeX\ report documenting the search
+parameters, review decisions, motivations, and any notes. This provides an
 audit trail for systematic literature reviews.
 
-Notes are stored as Markdown and converted to LaTeX using pypandoc for proper
+\section{Why \LaTeX\ Output?}
+
+We generate \LaTeX\ (with biblatex) rather than plain text or Markdown because:
+\begin{description}
+\item[Citation management] Biblatex provides proper bibliographic formatting
+  with [[fullcite]] for complete references inline
+\item[Academic integration] \LaTeX\ output integrates directly into papers,
+  theses, and reports without conversion
+\item[Professional formatting] Proper typesetting of titles, authors, and
+  structure for formal documentation
+\item[Reproducibility] The generated files capture the exact state of the
+  review for archival purposes
+\end{description}
+
+\section{Output Structure}
+
+The generator produces two files with the same base name:
+\begin{description}
+\item[.tex file] The main document with sections for search parameters,
+  summary statistics, kept papers, and discarded papers with motivations
+\item[.bib file] BibTeX entries for all reviewed papers, enabling proper
+  citations in the \LaTeX\ document
+\end{description}
+
+We use [[fullcite]] from biblatex to render complete citations inline,
+avoiding the need for a separate bibliography section.
+
+\section{Character Escaping}
+
+Both \LaTeX\ and BibTeX have special characters that must be escaped.
+We handle these separately because the escaping rules differ:
+\begin{itemize}
+\item BibTeX: Escape [[&]], [[\%]], [[$]], [[#]], [[_]]
+\item \LaTeX: Same plus [[{]], [[}]], [[~]], [[\^{}]], and backslash itself
+\end{itemize}
+
+The order of escaping matters: backslashes must be escaped first to avoid
+double-escaping the backslashes introduced by other replacements.
+
+Notes are stored as Markdown and converted to \LaTeX\ using pypandoc for proper
 rendering in the report.
 
 <<tui report generation>>=
@@ -1348,9 +1568,35 @@ class TestLatexReport:
 
 
 \chapter{Entry Point}
+\label{ch:entry-point}
 
-The main entry point creates a review session from search results and launches 
+The main entry point creates a review session from search results and launches
 the TUI application.
+
+\section{Session Reconstruction}
+
+A key feature is the ability to resume interrupted review sessions. When a user
+runs the same query again (or uses a named session), we:
+\begin{enumerate}
+\item Load previously saved decisions from [[notes.py]] storage
+\item Match papers by ID (DOI or title hash) to restore their status
+\item Merge any new papers from the current search with existing decisions
+\item Preserve papers from previous sessions even if not in current results
+\end{enumerate}
+
+This merging behavior supports iterative workflows: a reviewer might run
+multiple related queries over time, accumulating papers into a single
+named session.
+
+\section{Two Operating Modes}
+
+The entry point supports two distinct modes:
+\begin{description}
+\item[Review mode] ([[run_review]]) For reviewing search results with
+  keep/discard functionality. Decisions are persisted and reports generated.
+\item[Notes mode] ([[run_notes_browser]]) For browsing papers that have notes
+  attached, without keep/discard. Useful for revisiting annotated papers.
+\end{description}
 
 <<tui entry point>>=
 def run_review(results: list[SearchResult], query: str, 
@@ -1512,9 +1758,13 @@ def run_notes_browser() -> None:
 @
 
 \chapter{Tests}
+\label{ch:tui-tests}
 
 Tests are distributed throughout this document, appearing after each
-implementation section they verify.
+implementation section they verify. This follows literate programming
+best practice: tests serve as proof of correctness and examples of usage,
+so they belong near the code they verify.
+
 The test file collects all distributed test chunks:
 
 <<test [[tui.py]]>>=

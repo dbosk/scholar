@@ -71,11 +71,26 @@ __all__ = [
 
 
 \chapter{Data model}
+\label{ch:data-model}
 
 Before implementing search functionality, we establish the data structures that
 represent papers and search results.
 Getting these abstractions right is crucial: they determine how papers from
 different sources are unified and how results can be exported.
+
+\section{Why Dataclasses?}
+
+We use Python dataclasses rather than named tuples, dictionaries, or plain
+classes because:
+\begin{description}
+\item[Conciseness] Automatic [[__init__]], [[__repr__]], and [[__eq__]]
+  generation reduces boilerplate.
+\item[Type hints] Field annotations serve as documentation and enable IDE
+  support.
+\item[Mutability] Unlike frozen dataclasses or named tuples, we can update
+  fields when merging papers from different sources.
+\item[Serializability] Works with [[asdict()]] for easy JSON/dict conversion.
+\end{description}
 
 \section{Representing papers}
 
@@ -242,7 +257,16 @@ class TestSearchResult:
 
 \section{Search abstraction}
 
-The [[Search]] class provides the main interface for conducting searches:
+The [[Search]] class provides the main interface for conducting searches.
+It follows a builder-like pattern: create a [[Search]] object, optionally
+configure it, then call [[execute()]] to run the search.
+
+The class accumulates results in [[self.results]], allowing:
+\begin{itemize}
+\item Multiple calls to [[execute()]] with different provider subsets
+\item Inspection of per-provider results before merging
+\item Iterative refinement of searches
+\end{itemize}
 
 <<classes>>=
 class Search:
@@ -288,7 +312,16 @@ def search(query: str) -> SearchResult:
 \section{Executing searches}
 
 The [[Search]] class orchestrates queries across providers.
-We import the provider registry lazily to avoid circular imports:
+
+\subsection{Lazy Import Pattern}
+
+We import the provider registry inside [[execute()]] rather than at module
+level. This avoids circular imports: [[providers.py]] imports [[Paper]] from
+this module, so if we imported [[providers]] here at module level, Python
+would encounter an import cycle.
+
+The lazy import pattern has a small runtime cost (import check on each call)
+but is negligible compared to API call latency.
 
 <<search methods>>=
 def execute(self, providers: list[str] | None = None) -> list[SearchResult]:

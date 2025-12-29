@@ -106,18 +106,46 @@ class TestGetCacheDir:
 
 
 \chapter{Loading and saving caches}
+\label{ch:cache-load-save}
 
 Each provider has its own cache file, named after the provider.
-We use [[pickle]] for serialization because it handles the [[Paper]] dataclass
-objects without any additional configuration.
+We use Python's native binary serialization because it handles the [[Paper]]
+dataclass objects without any additional configuration.
+
+\section{Why Not JSON?}
+
+We considered JSON for human-readable cache files, but chose binary
+serialization because:
+\begin{description}
+\item[Dataclass support] Binary format handles [[Paper]] objects natively.
+  JSON would require custom encoder/decoder classes.
+\item[Type preservation] Binary format preserves Python types (datetime, etc.)
+  exactly. JSON would require type annotations or conventions.
+\item[Simplicity] No need to maintain JSON schemas as data structures evolve.
+\end{description}
+
+The tradeoff is that cache files aren't human-readable, but since they're
+only for performance optimization (not user data), this is acceptable.
+User-generated content (notes) uses JSON for the opposite reasons.
+
+\section{Atomic Writes (Not Implemented)}
+
+Ideally, we'd use atomic writes (write to temp file, then rename) to
+prevent corruption during crashes. For simplicity, we write directly.
+The worst case is a corrupted cache file, which just means a cache miss---the
+[[load_cache]] function gracefully returns an empty dictionary.
+
+\section{Dependencies}
 
 <<imports>>=
 import pickle
 from typing import Any
 @
 
-When loading a cache, we return an empty dictionary if the file doesn't exist
-or is corrupted.
+\section{Graceful Degradation}
+
+When loading a cache, we return an empty dictionary if the file doesn't
+exist or is corrupted.
 This ensures the application continues working even if cache files are damaged.
 
 <<cache load and save functions>>=

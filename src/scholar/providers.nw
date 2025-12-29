@@ -51,10 +51,28 @@ itself with the provider registry on import.
 
 
 \chapter{Provider Protocol}
+\label{ch:provider-protocol}
 
 We define a protocol (structural typing) rather than an abstract base class.
-This allows providers to be implemented without inheritance, which is more
-Pythonic and easier to test.
+This design choice reflects Python's \enquote{duck typing} philosophy: if an
+object has a [[name]] attribute and a [[search]] method with the right
+signature, it \emph{is} a provider---no inheritance required.
+
+\section{Why Protocol Over ABC?}
+
+Using [[Protocol]] from [[typing]] has several advantages over
+[[abc.ABC]]:
+\begin{description}
+\item[No inheritance required] Providers don't need to inherit from a base
+  class. This simplifies testing (mock objects work without setup) and allows
+  third-party classes to be providers without modification.
+\item[Explicit contracts] The protocol documents exactly what's required.
+  Unlike duck typing alone, static type checkers can verify implementations.
+\item[Flexibility] A class from another library could satisfy this protocol
+  without knowing about Scholar, enabling future extensibility.
+\end{description}
+
+\section{Required Interface}
 
 A provider must have:
 \begin{description}
@@ -84,10 +102,27 @@ class SearchProvider(Protocol):
 
 
 \chapter{Provider Registry}
+\label{ch:provider-registry}
 
-Providers register themselves when imported.
-This allows the [[Search]] class to discover available providers without
+Providers register themselves when imported. This \emph{self-registration}
+pattern allows the [[Search]] class to discover available providers without
 hardcoding them.
+
+\section{Why Self-Registration?}
+
+The registry pattern provides plugin-like architecture:
+\begin{description}
+\item[Decoupling] The core search logic doesn't need to know about specific
+  providers. Adding a new database is as simple as creating a new provider
+  class and calling [[register_provider]].
+\item[Lazy loading] Providers register at module import time. If a provider's
+  dependencies aren't installed (e.g., missing API key), it simply won't
+  register, and searches proceed with available providers.
+\item[Discoverability] CLI commands can query the registry to show users
+  which providers are available and configured.
+\end{description}
+
+\section{Implementation}
 
 <<provider registry>>=
 PROVIDERS: dict[str, SearchProvider] = {}
@@ -110,13 +145,40 @@ def get_all_providers() -> list[SearchProvider]:
 
 
 \chapter{Semantic Scholar Provider}
+\label{ch:semantic-scholar}
 
 Semantic Scholar is an AI-powered research tool that provides free access to
 over 200 million academic papers.
 Their API allows searching papers by keyword, author, venue, and more.
 
-We use the [[semanticscholar]] Python package which handles API communication,
-rate limiting, and pagination.
+\section{Package Choice}
+
+We use the [[semanticscholar]] Python package rather than calling the REST API
+directly. This package provides:
+\begin{itemize}
+\item Automatic rate limiting and retry logic
+\item Pagination handling for large result sets
+\item Type-safe access to paper fields
+\item API key management from environment variables
+\end{itemize}
+
+An optional API key ([[S2_API_KEY]]) increases rate limits from 100 to 10,000
+requests per minute.
+
+\section{Error Handling Philosophy}
+
+All providers silently return an empty list on errors rather than raising
+exceptions. This design choice ensures:
+\begin{description}
+\item[Partial results] If one provider fails (network issue, rate limit),
+  other providers can still contribute results.
+\item[Robustness] Transient errors don't crash the entire search.
+\item[Simplicity] Callers don't need complex exception handling.
+\end{description}
+
+The tradeoff is that failures are invisible. Users may not notice a provider
+is misconfigured until they wonder why results are sparse. The CLI's
+[[providers]] command helps diagnose such issues.
 
 \section{Provider implementation}
 
@@ -301,15 +363,26 @@ class TestSemanticScholarIntegration:
 
 
 \chapter{OpenAlex Provider}
+\label{ch:openalex}
 
 OpenAlex is a free and open catalog of the world's scholarly works, authors,
 venues, institutions, and concepts.
 It covers over 250 million works and is fully open access.
 
+\section{Package Choice}
+
 We use the [[pyalex]] Python package which provides a clean interface to the
-OpenAlex API.
-No API key is required, though providing an email address gives access to the
-\enquote{polite pool} with faster response times.
+OpenAlex API. Unlike Semantic Scholar's package, [[pyalex]] returns raw
+dictionaries rather than typed objects, requiring manual field extraction.
+
+\section{Authentication}
+
+No API key is required, but providing an email address (via [[OPENALEX_EMAIL]]
+environment variable) gives access to the \enquote{polite pool}---a separate
+pool of API resources with faster response times for identified users.
+
+This is OpenAlex's approach to encouraging good API citizenship without
+creating barriers to access.
 
 \section{Provider implementation}
 
