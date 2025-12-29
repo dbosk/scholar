@@ -696,12 +696,14 @@ afterward, ready for additional tags.
         selection_list = self.query_one("#tag-list", SelectionList)
         
         # Check if tag already exists (user might not have noticed it)
-        existing_values = [sel.value for sel in selection_list._values]
-        if tag in existing_values:
-            # Just select it if not already selected
-            if tag not in selection_list.selected:
-                selection_list.select(tag)
-            return
+        # Use public API: iterate with get_option_at_index
+        for i in range(selection_list.option_count):
+            option = selection_list.get_option_at_index(i)
+            if option.value == tag:
+                # Tag exists - just select it if not already selected
+                if tag not in selection_list.selected:
+                    selection_list.select(tag)
+                return
         
         # Add new tag (no count since it's new to this session)
         selection_list.add_option(Selection(tag, tag, initial_state=True))
