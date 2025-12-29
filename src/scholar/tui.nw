@@ -134,8 +134,9 @@ from textual.containers import Container, Horizontal, Vertical, VerticalScroll
 from textual.screen import Screen, ModalScreen
 from textual.widgets import (
     Button, DataTable, Footer, Header, Input, Label,
-    ListItem, ListView, Markdown, OptionList, Static, TextArea,
+    ListItem, ListView, Markdown, OptionList, SelectionList, Static, TextArea,
 )
+from textual.widgets.selection_list import Selection
 from textual.message import Message
 from textual import work
 from rich.text import Text
@@ -279,12 +280,18 @@ then returning to the list (dismiss).
 
 The abstract screen provides several actions:
 \begin{description}
-\item[Keep (\texttt{K})] Mark paper as kept, return to list
-\item[Discard (\texttt{d})] Open discard modal for motivation, then return
+\item[Keep (\texttt{K})] Quick keep---mark paper as kept without themes, return to list
+\item[Themes (\texttt{T})] Keep with themes---open theme selection modal, then return
+\item[Discard (\texttt{d})] Open motivation selection modal, then return
 \item[Notes (\texttt{n})] Open external editor for paper notes
 \item[PDF (\texttt{p})] Download and open the paper's PDF
 \item[Back (Escape/q)] Return to list without changing status
 \end{description}
+
+The distinction between \texttt{K} (quick keep) and \texttt{T} (keep with themes)
+supports different workflows. During initial screening, reviewers often want to
+quickly mark obviously relevant papers. Later, when organizing kept papers for
+thematic analysis, they can use \texttt{T} to add themes.
 
 \subsection{External Editor Integration}
 
@@ -301,15 +308,16 @@ class AbstractScreen(Screen[None]):
         Binding("escape", "dismiss_screen", "Back"),
         Binding("q", "dismiss_screen", "Back"),
         Binding("K", "keep", "Keep"),
+        Binding("T", "keep_with_themes", "Themes"),
         Binding("d", "discard", "Discard"),
         Binding("p", "open_pdf", "Open PDF"),
         Binding("n", "edit_notes", "Notes"),
     ]
     
-    def __init__(self, decision: ReviewDecision, previous_motivations: list[str], review_mode: bool = True) -> None:
+    def __init__(self, decision: ReviewDecision, session: ReviewSession, review_mode: bool = True) -> None:
         super().__init__()
         self.decision = decision
-        self.previous_motivations = previous_motivations
+        self.session = session
         self.review_mode = review_mode
         self.pdf_status: str = ""
     
@@ -396,132 +404,306 @@ class AbstractScreen(Screen[None]):
         self.dismiss(None)
     
     def action_keep(self) -> None:
-        """Mark paper as kept and return."""
+        """Quick keep---mark paper as kept without themes."""
         if not self.review_mode:
             self.notify("Keep/discard disabled in notes mode", severity="warning")
             return
         self.decision.status = DecisionStatus.KEPT
-        self.decision.motivation = ""
+        self.decision.clear_tags()
         self.dismiss(None)
     
-    def action_discard(self) -> None:
-        """Open discard modal to get motivation."""
+    def action_keep_with_themes(self) -> None:
+        """Keep with themes---open theme selection modal."""
         if not self.review_mode:
             self.notify("Keep/discard disabled in notes mode", severity="warning")
             return
-        def handle_discard(result: bool | None) -> None:
-            if result:
+        
+        def handle_themes(result: list[str] | None) -> None:
+            if result is not None:  # None means cancelled
+                self.decision.status = DecisionStatus.KEPT
+                self.decision.tags = result
                 self.dismiss(None)
         
-        self.app.push_screen(DiscardModal(self.decision, self.previous_motivations), handle_discard)
+        self.app.push_screen(
+            TagSelectionModal(
+                title=f"Themes: {self.decision.paper.title[:50]}...",
+                available_tags=list(self.session.all_themes()),
+                tag_counts=self.session.theme_counts(),
+                selected_tags=self.decision.tags,
+                require_at_least_one=False,
+            ),
+            handle_themes,
+        )
+    
+    def action_discard(self) -> None:
+        """Open motivation selection modal."""
+        if not self.review_mode:
+            self.notify("Keep/discard disabled in notes mode", severity="warning")
+            return
+        
+        def handle_discard(result: list[str] | None) -> None:
+            if result is not None:  # None means cancelled
+                self.decision.status = DecisionStatus.DISCARDED
+                self.decision.tags = result
+                self.dismiss(None)
+        
+        self.app.push_screen(
+            TagSelectionModal(
+                title=f"Motivations: {self.decision.paper.title[:50]}...",
+                available_tags=list(self.session.all_motivations()),
+                tag_counts=self.session.motivation_counts(),
+                selected_tags=self.decision.tags,
+                require_at_least_one=True,
+            ),
+            handle_discard,
+        )
 @
 
-\section{Discard Modal}
-\label{sec:discard-modal}
+\section{Tag Selection Modal}
+\label{sec:tag-selection-modal}
 
-When discarding a paper, the user must provide a motivation. This requirement
-is central to systematic literature review methodology: exclusion criteria
-must be documented and reproducible.
+Systematic literature reviews require careful documentation of decisions.
+When excluding a paper, reviewers must record \emph{why}---this creates an
+audit trail that other researchers can verify. When including a paper,
+tagging it with themes helps organize the final synthesis.
 
-\subsection{Why Mandatory Motivations?}
+The original design used separate interfaces: a simple input for discard
+motivations, and no interface for themes. This created two problems:
+\begin{enumerate}
+\item Reviewers typed the same motivations repeatedly (e.g., \enquote{not 
+  peer-reviewed}, \enquote{wrong domain})
+\item Kept papers had no organizational structure for thematic analysis
+\end{enumerate}
 
-The motivation requirement serves several purposes in systematic reviews:
+Our solution is a unified \emph{tag selection modal} that serves both purposes.
+By reusing the same component, we ensure consistent UX and reduce code
+duplication.
+
+\subsection{Design: Checklist with Counts}
+
+We chose a checklist interface over single-selection for several reasons:
 \begin{description}
-\item[Reproducibility] Other researchers can understand why papers were excluded
-\item[Audit trail] The review process becomes transparent and defensible
-\item[Consistency] Writing reasons helps reviewers apply criteria uniformly
-\item[Quality] Forcing articulation catches hasty or unconsidered rejections
+\item[Multiple motivations] A paper might be excluded for several reasons
+  (e.g., both \enquote{not peer-reviewed} AND \enquote{wrong methodology}).
+  Recording all reasons improves the audit trail.
+\item[Multiple themes] Kept papers often span multiple research themes.
+  A paper on \enquote{authentication} might also relate to \enquote{usability}.
+\item[Reuse existing tags] Showing previously used tags with counts
+  (e.g., \enquote{off-topic (12)}) helps reviewers maintain consistency
+  and see which exclusion criteria are most common.
 \end{description}
 
-Without this requirement, reviewers might reject papers with a quick keystroke,
-leading to inconsistent application of inclusion/exclusion criteria.
+The modal uses Textual's [[SelectionList]] widget, which renders as a
+scrollable list of checkboxes. Each tag displays its usage count in
+parentheses, helping reviewers understand the distribution of decisions.
 
-\subsection{Reusing Previous Motivations}
+\subsection{Interaction Design}
 
-To reduce typing for common exclusion reasons (e.g., \enquote{wrong domain},
-\enquote{not peer-reviewed}), the modal shows recently used motivations.
-Users can select a previous reason or type a new one. This speeds up
-batch processing while still requiring conscious acknowledgment of the reason.
+The modal supports three key interactions:
+\begin{description}
+\item[Toggle existing tags] Press Space or click to check/uncheck tags
+  in the list. Multiple tags can be selected simultaneously.
+\item[Add new tags] Type in the input field and press Enter. The new
+  tag appears in the list and is automatically selected. The input
+  clears so users can add more tags without extra keystrokes.
+\item[Confirm selection] Press Enter on an empty input field to confirm
+  and close the modal. This \enquote{Enter twice to confirm} pattern
+  is intentional: it prevents accidental submission while adding tags.
+\end{description}
+
+For discarding papers, the modal enforces that at least one motivation
+must be selected---we pass [[require_at_least_one=True]]. For keeping
+papers with themes, selection is optional.
+
+\subsection{Code Reuse Through Parameterization}
+
+Rather than creating separate [[DiscardModal]] and [[ThemeModal]] classes,
+we parameterize a single [[TagSelectionModal]]:
+\begin{description}
+\item[title] Describes the action (\enquote{Select motivations...} vs
+  \enquote{Select themes...})
+\item[available\_tags] Previous motivations or themes from the session
+\item[tag\_counts] How many papers use each tag (for display)
+\item[selected\_tags] Pre-selected tags (when editing an existing decision)
+\item[require\_at\_least\_one] Enforces selection for discards
+\end{description}
+
+This approach follows the DRY principle while maintaining semantic clarity
+at each call site.
 
 <<tui discard modal>>=
-class DiscardModal(ModalScreen[bool]):
-    """Modal dialog to capture discard motivation."""
+class TagSelectionModal(ModalScreen[list[str] | None]):
+    """Modal for selecting multiple tags from a checklist.
+    
+    Used for both motivations (discarding) and themes (keeping).
+    Shows a SelectionList of existing tags with checkboxes,
+    plus an Input to add new tags.
+    
+    Args:
+        title: Modal title displayed at the top.
+        available_tags: List of existing tags to show.
+        tag_counts: Optional dict mapping tags to usage counts.
+        selected_tags: Tags that should be pre-selected.
+        require_at_least_one: If True, dismissal requires selection.
+    
+    Returns:
+        List of selected tag strings, or None if cancelled.
+    """
     
     BINDINGS = [
         Binding("escape", "cancel", "Cancel"),
     ]
     
     DEFAULT_CSS = """
-    DiscardModal {
+    TagSelectionModal {
         align: center middle;
     }
-    #discard-dialog {
-        width: 60;
+    #tag-dialog {
+        width: 70;
         height: auto;
+        max-height: 80%;
         padding: 1 2;
         border: thick $primary;
         background: $surface;
     }
-    #reason-list {
-        height: auto;
-        max-height: 10;
+    #tag-title {
         margin-bottom: 1;
+    }
+    #tag-list {
+        height: auto;
+        max-height: 15;
+        margin-bottom: 1;
+        border: solid $primary-darken-2;
+    }
+    #tag-input {
+        margin-top: 1;
+    }
+    #tag-help {
+        margin-top: 1;
+        color: $text-muted;
     }
     """
     
-    def __init__(self, decision: ReviewDecision, previous_motivations: list[str]) -> None:
+    def __init__(
+        self,
+        title: str,
+        available_tags: list[str],
+        tag_counts: dict[str, int] | None = None,
+        selected_tags: list[str] | None = None,
+        require_at_least_one: bool = False,
+    ) -> None:
         super().__init__()
-        self.decision = decision
-        # Deduplicate motivations here so callers don't need to
-        self.previous_motivations = list(dict.fromkeys(previous_motivations))
-    
+        self.title_text = title
+        # Deduplicate while preserving order
+        self.available_tags = list(dict.fromkeys(available_tags))
+        self.tag_counts = tag_counts or {}
+        self.selected_tags = set(selected_tags or [])
+        self.require_at_least_one = require_at_least_one
+@
+
+\subsection{Building the Selection List}
+
+The [[compose]] method builds the modal's widget tree. We create a
+[[Selection]] object for each available tag, incorporating the usage
+count into the display label. Tags that were previously selected
+(passed via [[selected_tags]]) start in the checked state.
+
+<<tui discard modal>>=
     def compose(self) -> ComposeResult:
-        from textual.widgets import OptionList
-        from textual.widgets.option_list import Option
-        
-        with Container(id="discard-dialog"):
-            yield Static(
-                f"[bold]Discard:[/bold] {self.decision.paper.title[:50]}...",
-                id="discard-title"
-            )
+        with Container(id="tag-dialog"):
+            yield Static(f"[bold]{self.title_text}[/bold]", id="tag-title")
             
-            # Create option list with previous reasons + "New reason" option
-            options = []
-            for motivation in self.previous_motivations[-5:]:
-                short = motivation[:70] + "..." if len(motivation) > 70 else motivation
-                options.append(Option(short, id=motivation))
-            options.append(Option("[italic]Enter new reason...[/italic]", id="__new__"))
+            # Build selection list with counts
+            selections = []
+            for tag in self.available_tags:
+                count = self.tag_counts.get(tag, 0)
+                label = f"{tag} ({count})" if count > 0 else tag
+                is_selected = tag in self.selected_tags
+                selections.append(Selection(label, tag, initial_state=is_selected))
             
-            yield OptionList(*options, id="reason-list")
+            yield SelectionList[str](*selections, id="tag-list")
             yield Input(
-                placeholder="Type new reason and press Enter",
-                id="motivation-input",
-                disabled=True
+                placeholder="Type new tag and press Enter (empty to confirm)",
+                id="tag-input",
             )
+            
+            # Show contextual help, noting if selection is required
+            help_text = "[dim]Space: toggle, Enter: add/confirm, Escape: cancel[/dim]"
+            if self.require_at_least_one:
+                help_text = "[dim]At least one required. " + help_text[5:]
+            yield Static(help_text, id="tag-help")
     
-    def on_option_list_option_selected(self, event: OptionList.OptionSelected) -> None:
-        """Handle selection from option list."""
-        if event.option.id == "__new__":
-            # Enable input and focus it
-            input_widget = self.query_one("#motivation-input", Input)
-            input_widget.disabled = False
-            input_widget.focus()
-        else:
-            # Use selected previous motivation
-            self.decision.status = DecisionStatus.DISCARDED
-            self.decision.motivation = str(event.option.id)
-            self.dismiss(True)
-    
+    def on_mount(self) -> None:
+        """Focus the selection list on mount."""
+        try:
+            self.query_one("#tag-list", SelectionList).focus()
+        except Exception:
+            pass
+@
+
+\subsection{Handling Input}
+
+The input field serves dual purposes: adding new tags and confirming
+selection. We distinguish these by checking whether the input is empty.
+
+When adding a new tag, we check if it already exists in the list. If so,
+we simply select it (in case the user didn't notice it). If not, we add
+it to the [[SelectionList]] and mark it as selected. The input clears
+afterward, ready for additional tags.
+
+<<tui discard modal>>=
     def on_input_submitted(self, event: Input.Submitted) -> None:
-        """Handle Enter key in input field."""
-        motivation = event.value.strip()
-        if motivation:
-            self.decision.status = DecisionStatus.DISCARDED
-            self.decision.motivation = motivation
-            self.dismiss(True)
+        """Handle Enter in input field."""
+        tag = event.value.strip()
+        if tag:
+            # Add new tag to list and auto-select it
+            self._add_and_select_tag(tag)
+            event.input.value = ""  # Clear for more input
+        else:
+            # Empty input = confirm selection
+            self._confirm_selection()
+    
+    def _add_and_select_tag(self, tag: str) -> None:
+        """Add a new tag to the list and select it."""
+        selection_list = self.query_one("#tag-list", SelectionList)
+        
+        # Check if tag already exists (user might not have noticed it)
+        existing_values = [sel.value for sel in selection_list._values]
+        if tag in existing_values:
+            # Just select it if not already selected
+            if tag not in selection_list.selected:
+                selection_list.select(tag)
+            return
+        
+        # Add new tag (no count since it's new to this session)
+        selection_list.add_option(Selection(tag, tag, initial_state=True))
+@
+
+\subsection{Confirmation and Cancellation}
+
+When confirming, we validate that at least one tag is selected if
+[[require_at_least_one]] is set. This enforces the systematic review
+requirement that exclusions must be justified.
+
+The modal returns [[None]] on cancellation, allowing callers to
+distinguish between \enquote{user cancelled} and \enquote{user selected
+zero tags} (the latter only valid when [[require_at_least_one=False]]).
+
+<<tui discard modal>>=
+    def _confirm_selection(self) -> None:
+        """Confirm the current selection and dismiss."""
+        selection_list = self.query_one("#tag-list", SelectionList)
+        selected = list(selection_list.selected)
+        
+        if self.require_at_least_one and not selected:
+            self.notify("At least one selection required", severity="warning")
+            return
+        
+        self.dismiss(selected)
     
     def action_cancel(self) -> None:
-        self.dismiss(False)
+        """Cancel without making changes."""
+        self.dismiss(None)
 @
 
 \section{Sort Modal}
@@ -819,6 +1001,7 @@ class PaperReviewApp(App):
         Binding("down", "cursor_down", "Down", show=False),
         Binding("up", "cursor_up", "Up", show=False),
         Binding("K", "keep", "Keep"),
+        Binding("T", "keep_with_themes", "Themes"),
         Binding("d", "discard", "Discard"),
         Binding("s", "sort", "Sort"),
         Binding("f", "filter", "Filter"),
@@ -926,10 +1109,8 @@ class PaperReviewApp(App):
         """Show the abstract screen for current paper."""
         decision = self._get_current_decision()
         if decision:
-            previous = [d.motivation for d in self.session.decisions 
-                       if d.status == DecisionStatus.DISCARDED and d.motivation]
             self.push_screen(
-                AbstractScreen(decision, previous, self.review_mode), 
+                AbstractScreen(decision, self.session, self.review_mode), 
                 self._on_abstract_closed
             )
     
@@ -948,33 +1129,71 @@ class PaperReviewApp(App):
             self._refresh_list()
     
     def action_keep(self) -> None:
-        """Mark current paper as kept."""
+        """Quick keep---mark current paper as kept without themes."""
         if not self.review_mode:
             self.notify("Keep/discard disabled in notes mode", severity="warning")
             return
         decision = self._get_current_decision()
         if decision:
             decision.status = DecisionStatus.KEPT
-            decision.motivation = ""
+            decision.clear_tags()
             self._refresh_list()
             self._update_status()
     
-    def action_discard(self) -> None:
-        """Open discard modal for current paper."""
+    def action_keep_with_themes(self) -> None:
+        """Keep with themes---open theme selection modal."""
         if not self.review_mode:
             self.notify("Keep/discard disabled in notes mode", severity="warning")
             return
         decision = self._get_current_decision()
         if decision:
-            # Collect previous motivations from discarded papers
-            previous = [
-                d.motivation for d in self.session.decisions 
-                if d.status == DecisionStatus.DISCARDED and d.motivation
-            ]
-            self.push_screen(DiscardModal(decision, previous), self._on_discard_closed)
+            self.push_screen(
+                TagSelectionModal(
+                    title=f"Themes: {decision.paper.title[:50]}...",
+                    available_tags=list(self.session.all_themes()),
+                    tag_counts=self.session.theme_counts(),
+                    selected_tags=decision.tags,
+                    require_at_least_one=False,
+                ),
+                self._on_themes_closed,
+            )
     
-    def _on_discard_closed(self, result: bool | None) -> None:
-        """Called when discard modal is closed."""
+    def _on_themes_closed(self, result: list[str] | None) -> None:
+        """Called when theme selection modal is closed."""
+        if result is not None:  # None means cancelled
+            decision = self._get_current_decision()
+            if decision:
+                decision.status = DecisionStatus.KEPT
+                decision.tags = result
+        self._refresh_list()
+        self._update_status()
+        self.query_one("#paper-list", ListView).focus()
+    
+    def action_discard(self) -> None:
+        """Open motivation selection modal for current paper."""
+        if not self.review_mode:
+            self.notify("Keep/discard disabled in notes mode", severity="warning")
+            return
+        decision = self._get_current_decision()
+        if decision:
+            self.push_screen(
+                TagSelectionModal(
+                    title=f"Motivations: {decision.paper.title[:50]}...",
+                    available_tags=list(self.session.all_motivations()),
+                    tag_counts=self.session.motivation_counts(),
+                    selected_tags=decision.tags,
+                    require_at_least_one=True,
+                ),
+                self._on_discard_closed,
+            )
+    
+    def _on_discard_closed(self, result: list[str] | None) -> None:
+        """Called when motivation selection modal is closed."""
+        if result is not None:  # None means cancelled
+            decision = self._get_current_decision()
+            if decision:
+                decision.status = DecisionStatus.DISCARDED
+                decision.tags = result
         self._refresh_list()
         self._update_status()
         self.query_one("#paper-list", ListView).focus()

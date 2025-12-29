@@ -25,6 +25,9 @@ all: ${MODULES} ${DOC}
 __init__.py: scholar.nw
 	${NOTANGLE.py}
 
+__main__.py: cli.nw
+	${NOTANGLE.py}
+
 INCLUDE_MAKEFILES=../../makefiles
 include ${INCLUDE_MAKEFILES}/noweb.mk
 
