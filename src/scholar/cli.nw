@@ -796,7 +796,10 @@ def sessions_show(
     Show details of a saved review session.
 
     Displays all papers with their decisions, themes, and motivations.
+    Uses a pager for interactive viewing when output is a terminal.
     """
+    import sys
+    from rich.pager import Pager
     from scholar.review import load_session
 
     console = Console()
@@ -825,35 +828,52 @@ def sessions_show(
         }
         print(json.dumps(output, indent=2))
     else:
-        console.print(f"[bold]Session: {session.query}[/bold]")
-        console.print(f"[dim]Date: {session.timestamp.strftime('%Y-%m-%d %H:%M')}[/dim]")
-        console.print(f"[dim]Providers: {', '.join(session.providers)}[/dim]")
-        console.print()
+        # Build rich output, use pager if TTY
+        from io import StringIO
+        from rich.console import Console as RichConsole
+        
+        # Render to string first to check if pager needed
+        string_io = StringIO()
+        render_console = RichConsole(file=string_io, force_terminal=True)
+        
+        render_console.print(f"[bold]Session: {session.query}[/bold]")
+        render_console.print(f"[dim]Date: {session.timestamp.strftime('%Y-%m-%d %H:%M')}[/dim]")
+        render_console.print(f"[dim]Providers: {', '.join(session.providers)}[/dim]")
+        render_console.print()
 
         # Show kept papers
         kept = session.kept_papers
         if kept:
-            console.print(f"[green bold]Kept ({len(kept)}):[/green bold]")
+            render_console.print(f"[green bold]Kept ({len(kept)}):[/green bold]")
             for d in kept:
-                tags = f" [{', '.join(d.tags)}]" if d.tags else ""
-                console.print(f"  - {d.paper.title}{tags}")
-            console.print()
+                tags = f" [dim]\\[{', '.join(d.tags)}][/dim]" if d.tags else ""
+                render_console.print(f"  • {d.paper.title}{tags}")
+            render_console.print()
 
         # Show discarded papers
         discarded = session.discarded_papers
         if discarded:
-            console.print(f"[red bold]Discarded ({len(discarded)}):[/red bold]")
+            render_console.print(f"[red bold]Discarded ({len(discarded)}):[/red bold]")
             for d in discarded:
-                tags = f" [{', '.join(d.tags)}]" if d.tags else ""
-                console.print(f"  - {d.paper.title}{tags}")
-            console.print()
+                tags = f" [dim]\\[{', '.join(d.tags)}][/dim]" if d.tags else ""
+                render_console.print(f"  • {d.paper.title}{tags}")
+            render_console.print()
 
         # Show pending papers
         pending = session.pending_papers
         if pending:
-            console.print(f"[yellow bold]Pending ({len(pending)}):[/yellow bold]")
+            render_console.print(f"[yellow bold]Pending ({len(pending)}):[/yellow bold]")
             for d in pending:
-                console.print(f"  - {d.paper.title}")
+                render_console.print(f"  • {d.paper.title}")
+        
+        output_text = string_io.getvalue()
+        
+        # Use pager if TTY, otherwise just print
+        if sys.stdout.isatty():
+            with console.pager(styles=True):
+                console.print(output_text, end="")
+        else:
+            print(output_text, end="")
 
 
 @sessions_app.command("export")
