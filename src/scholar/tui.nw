@@ -121,22 +121,12 @@ from scholar.tui import *
 
 We need data structures to track the review state of each paper. The 
 [[ReviewDecision]] captures whether a paper is kept, discarded, or still 
-pending review, along with the motivation for discards.
+pending review, along with the motivation for discards. These data structures
+are now provided by the [[review]] module.
 
 <<tui imports>>=
-from dataclasses import dataclass, field
 from datetime import datetime
-from enum import Enum
 from pathlib import Path
-from typing import Callable
-import hashlib
-import os
-import subprocess
-import sys
-import tempfile
-
-import platformdirs
-import requests
 
 from textual.app import App, ComposeResult
 from textual.binding import Binding
@@ -153,290 +143,53 @@ from rich.console import Console
 
 from scholar.scholar import Paper, SearchResult
 from scholar.notes import (
-    get_note, save_note, has_note, edit_note_in_editor,
-    load_search_decisions, save_search_decisions, get_previous_decision,
-    get_paper_id, list_papers_with_notes,
+    get_note, has_note, edit_note_in_editor,
+)
+from scholar.review import (
+    DecisionStatus, ReviewDecision, ReviewSession,
+    create_review_session, save_search_decisions,
+    escape_latex,
+)
+from scholar.pdf import (
+    get_pdf_cache_dir, get_cached_pdf_path, download_pdf, open_pdf, PDFDownloadError,
 )
 @
 
-The decision status uses an enum to ensure type safety and clear semantics.
+The data structures for review decisions ([[DecisionStatus]], [[ReviewDecision]], 
+and [[ReviewSession]]) are now provided by the [[review]] module 
+(\autoref{review-module}). The TUI imports and uses these directly, enabling
+the same review logic to be used programmatically without the TUI.
 
 <<tui data structures>>=
-class DecisionStatus(Enum):
-    """Status of a paper review decision."""
-    PENDING = "pending"
-    KEPT = "kept"
-    DISCARDED = "discarded"
-
-
-@dataclass
-class ReviewDecision:
-    """
-    A review decision for a single paper.
-    
-    Tracks whether the paper was kept or discarded during review,
-    along with the source provider and motivation for discards.
-    """
-    paper: Paper
-    provider: str
-    status: DecisionStatus = DecisionStatus.PENDING
-    motivation: str = ""
-    
-    @property
-    def is_decided(self) -> bool:
-        """Check if a decision has been made."""
-        return self.status != DecisionStatus.PENDING
-
-
-@dataclass 
-class ReviewSession:
-    """
-    A complete review session with all papers and decisions.
-    
-    Maintains the search parameters and all review decisions,
-    supporting sorting and filtering operations.
-    """
-    query: str
-    providers: list[str]
-    timestamp: datetime
-    decisions: list[ReviewDecision] = field(default_factory=list)
-    
-    @property
-    def kept_papers(self) -> list[ReviewDecision]:
-        """Get all papers marked as kept."""
-        return [d for d in self.decisions if d.status == DecisionStatus.KEPT]
-    
-    @property
-    def discarded_papers(self) -> list[ReviewDecision]:
-        """Get all papers marked as discarded."""
-        return [d for d in self.decisions if d.status == DecisionStatus.DISCARDED]
-    
-    @property
-    def pending_papers(self) -> list[ReviewDecision]:
-        """Get all papers still pending review."""
-        return [d for d in self.decisions if d.status == DecisionStatus.PENDING]
-    
-    def sort_by(self, key: str, reverse: bool = False) -> None:
-        """
-        Sort decisions by a paper attribute.
-        
-        Supported keys: title, year, author, provider
-        """
-        if key == "title":
-            self.decisions.sort(key=lambda d: d.paper.title.lower(), reverse=reverse)
-        elif key == "year":
-            self.decisions.sort(key=lambda d: d.paper.year or 0, reverse=reverse)
-        elif key == "author":
-            self.decisions.sort(
-                key=lambda d: d.paper.authors[0].lower() if d.paper.authors else "",
-                reverse=reverse
-            )
-        elif key == "provider":
-            self.decisions.sort(key=lambda d: d.provider.lower(), reverse=reverse)
+# Data structures imported from scholar.review:
+# - DecisionStatus: Enum for pending/kept/discarded
+# - ReviewDecision: Decision for a single paper with tags
+# - ReviewSession: Complete review session with all decisions
+#
+# The review module's ReviewDecision uses tags: list[str] instead of motivation: str,
+# with a backward-compatible motivation property that accesses the first tag.
 @
-
-\subsection{Testing the data structures}
-
-Let's verify that our review data structures work correctly.
-
-<<test functions>>=
-class TestReviewDecision:
-    """Tests for ReviewDecision dataclass."""
-
-    def test_default_status_is_pending(self):
-        """New decisions should be pending."""
-        paper = Paper(title="Test", authors=["Author"], year=2024)
-        decision = ReviewDecision(paper=paper, provider="test")
-        assert decision.status == DecisionStatus.PENDING
-        assert not decision.is_decided
-
-    def test_kept_is_decided(self):
-        """Kept papers are decided."""
-        paper = Paper(title="Test", authors=["Author"], year=2024)
-        decision = ReviewDecision(
-            paper=paper,
-            provider="test",
-            status=DecisionStatus.KEPT
-        )
-        assert decision.is_decided
-
-    def test_discarded_requires_motivation(self):
-        """Discarded papers should have motivation."""
-        paper = Paper(title="Test", authors=["Author"], year=2024)
-        decision = ReviewDecision(
-            paper=paper,
-            provider="test",
-            status=DecisionStatus.DISCARDED,
-            motivation="Not relevant"
-        )
-        assert decision.is_decided
-        assert decision.motivation == "Not relevant"
-
-
-class TestReviewSession:
-    """Tests for ReviewSession dataclass."""
-
-    @pytest.fixture
-    def sample_session(self):
-        """Create a sample session with mixed decisions."""
-        papers = [
-            Paper(title="Paper A", authors=["Author A"], year=2020),
-            Paper(title="Paper B", authors=["Author B"], year=2022),
-            Paper(title="Paper C", authors=["Author C"], year=2021),
-        ]
-        session = ReviewSession(
-            query="test query",
-            providers=["provider1"],
-            timestamp=datetime.now(),
-        )
-        session.decisions = [
-            ReviewDecision(paper=papers[0], provider="p1", status=DecisionStatus.KEPT),
-            ReviewDecision(paper=papers[1], provider="p1", status=DecisionStatus.DISCARDED, motivation="Off topic"),
-            ReviewDecision(paper=papers[2], provider="p1", status=DecisionStatus.PENDING),
-        ]
-        return session
-
-    def test_kept_papers(self, sample_session):
-        """Test filtering kept papers."""
-        kept = sample_session.kept_papers
-        assert len(kept) == 1
-        assert kept[0].paper.title == "Paper A"
-
-    def test_discarded_papers(self, sample_session):
-        """Test filtering discarded papers."""
-        discarded = sample_session.discarded_papers
-        assert len(discarded) == 1
-        assert discarded[0].paper.title == "Paper B"
-        assert discarded[0].motivation == "Off topic"
-
-    def test_pending_papers(self, sample_session):
-        """Test filtering pending papers."""
-        pending = sample_session.pending_papers
-        assert len(pending) == 1
-        assert pending[0].paper.title == "Paper C"
-
-    def test_sort_by_year(self, sample_session):
-        """Test sorting by year."""
-        sample_session.sort_by("year")
-        years = [d.paper.year for d in sample_session.decisions]
-        assert years == [2020, 2021, 2022]
-
-    def test_sort_by_year_reverse(self, sample_session):
-        """Test sorting by year descending."""
-        sample_session.sort_by("year", reverse=True)
-        years = [d.paper.year for d in sample_session.decisions]
-        assert years == [2022, 2021, 2020]
-
-    def test_sort_by_title(self, sample_session):
-        """Test sorting by title."""
-        sample_session.sort_by("title")
-        titles = [d.paper.title for d in sample_session.decisions]
-        assert titles == ["Paper A", "Paper B", "Paper C"]
-@
-
 
 \section{PDF Caching}
 \label{sec:pdf-cache}
 
-When a paper has no abstract, we can download and open the PDF instead. This
-happens frequently with older papers or certain databases that don't include
-abstracts in their API responses.
-
-\subsection{Why a Separate PDF Cache?}
-
-PDFs are cached separately from search results for several reasons:
+PDF caching functionality is provided by the [[pdf]] module 
+(\autoref{pdf-module}). The TUI imports and uses these functions directly:
 \begin{description}
-\item[Size] PDFs are typically megabytes, while search metadata is kilobytes.
-  Mixing them would bloat the search cache and slow down cache operations.
-\item[Lifecycle] Search caches may be cleared to refresh results, but
-  downloaded PDFs should persist---re-downloading is slow and wastes bandwidth.
-\item[Sharing] The same PDF may appear in multiple searches. A content-addressed
-  cache (keyed by URL hash) naturally deduplicates across sessions.
+\item[\texttt{get\_pdf\_cache\_dir()}] Returns the cache directory path.
+\item[\texttt{get\_cached\_pdf\_path(url)}] Returns the cache path for a URL.
+\item[\texttt{download\_pdf(url)}] Downloads a PDF to the cache.
+\item[\texttt{open\_pdf(path)}] Opens a PDF with the system viewer.
+\item[\texttt{PDFDownloadError}] Exception for download failures.
 \end{description}
 
-The cache uses SHA-256 hashes of URLs as filenames, ensuring unique storage
-regardless of URL length or special characters.
-
-\subsection{Implementation}
-
 <<tui pdf cache>>=
-def get_pdf_cache_dir() -> Path:
-    """Get the PDF cache directory, creating it if needed."""
-    cache_dir = Path(platformdirs.user_cache_dir("scholar")) / "pdfs"
-    cache_dir.mkdir(parents=True, exist_ok=True)
-    return cache_dir
-
-
-def get_cached_pdf_path(url: str) -> Path:
-    """Get the cache path for a PDF URL."""
-    url_hash = hashlib.sha256(url.encode()).hexdigest()[:16]
-    return get_pdf_cache_dir() / f"{url_hash}.pdf"
-
-
-class PDFDownloadError(Exception):
-    """Exception raised when PDF download fails."""
-    pass
-
-
-def download_pdf(url: str, console_print: Callable[[str], None] | None = None) -> Path:
-    """
-    Download a PDF to the cache if not already cached.
-    
-    Returns the path to the cached PDF.
-    Raises PDFDownloadError with details if download fails.
-    console_print is an optional callback to print status messages.
-    """
-    cache_path = get_cached_pdf_path(url)
-    
-    if cache_path.exists():
-        if console_print:
-            console_print(f"Using cached PDF: {cache_path}")
-        return cache_path
-    
-    if console_print:
-        console_print(f"Downloading PDF from {url}...")
-    
-    try:
-        response = requests.get(url, timeout=30, stream=True)
-        response.raise_for_status()
-        
-        content_type = response.headers.get("content-type", "")
-        if "pdf" not in content_type.lower() and "octet-stream" not in content_type.lower():
-            raise PDFDownloadError(
-                f"URL did not return a PDF. Content-Type: {content_type}\nURL: {url}"
-            )
-        
-        with open(cache_path, "wb") as f:
-            for chunk in response.iter_content(chunk_size=8192):
-                f.write(chunk)
-        
-        return cache_path
-    except requests.exceptions.HTTPError as e:
-        raise PDFDownloadError(f"HTTP error {e.response.status_code}: {e.response.reason}\nURL: {url}")
-    except requests.exceptions.ConnectionError as e:
-        raise PDFDownloadError(f"Connection error: {e}\nURL: {url}")
-    except requests.exceptions.Timeout:
-        raise PDFDownloadError(f"Request timed out after 30 seconds\nURL: {url}")
-    except requests.exceptions.RequestException as e:
-        raise PDFDownloadError(f"Request failed: {e}\nURL: {url}")
-
-
-def open_pdf(path: Path) -> bool:
-    """
-    Open a PDF with the system default viewer.
-    
-    Returns True if successful, False otherwise.
-    """
-    try:
-        if sys.platform == "darwin":
-            subprocess.run(["open", str(path)], check=True)
-        elif sys.platform == "win32":
-            os.startfile(str(path))  # type: ignore
-        else:
-            subprocess.run(["xdg-open", str(path)], check=True)
-        return True
-    except Exception:
-        return False
+# PDF caching functions imported from scholar.pdf:
+# - get_pdf_cache_dir(): Get cache directory
+# - get_cached_pdf_path(url): Get cache path for URL
+# - download_pdf(url): Download PDF to cache
+# - open_pdf(path): Open PDF with system viewer
+# - PDFDownloadError: Exception for download failures
 @
 
 \section{Paper List Widget}
@@ -1350,29 +1103,7 @@ def generate_latex_report(session: ReviewSession, output_path: Path) -> None:
         text = text.replace('_', r'\_')
         return text
     
-    def escape_latex(text: str) -> str:
-        """Escape special LaTeX characters.
-        
-        Order matters: backslash must be escaped first to avoid double-escaping
-        the backslashes introduced by other replacements.
-        """
-        # First escape backslashes
-        text = text.replace('\\', r'\textbackslash{}')
-        # Then escape other special characters
-        replacements = {
-            '&': r'\&',
-            '%': r'\%',
-            '$': r'\$',
-            '#': r'\#',
-            '_': r'\_',
-            '{': r'\{',
-            '}': r'\}',
-            '~': r'\textasciitilde{}',
-            '^': r'\textasciicircum{}',
-        }
-        for char, replacement in replacements.items():
-            text = text.replace(char, replacement)
-        return text
+    # escape_latex is imported from scholar.review
     
     def make_cite_key(paper: Paper, index: int) -> str:
         """Generate a unique citation key for a paper."""
@@ -1642,85 +1373,8 @@ def run_review(results: list[SearchResult], query: str,
     # Use session_name for persistence, fall back to query
     persistence_key = session_name if session_name else query
     
-    # Load previous decisions for this session
-    previous_decisions = load_search_decisions(persistence_key)
-    
-    # Create review session
-    providers = list(set(r.provider for r in results))
-    session = ReviewSession(
-        query=query,
-        providers=providers,
-        timestamp=datetime.now(),
-    )
-    
-    # Track existing paper IDs to handle merging
-    existing_paper_ids: set[str] = set()
-    if previous_decisions:
-        existing_paper_ids = set(previous_decisions.decisions.keys())
-        
-        # First, restore decisions for papers from previous session
-        # that are NOT in the current search results
-        current_paper_ids = set()
-        for result in results:
-            for paper in result.papers:
-                current_paper_ids.add(get_paper_id(paper))
-        
-        # Add papers from previous session that aren't in current results
-        for paper_id, prev in previous_decisions.decisions.items():
-            if paper_id not in current_paper_ids:
-                # Reconstruct paper from stored data
-                paper = Paper(
-                    title=prev.title,
-                    authors=prev.authors if prev.authors else [],
-                    year=prev.year,
-                    doi=prev.doi,
-                    abstract=None,
-                    venue=prev.venue,
-                    url=prev.url,
-                    pdf_url=prev.pdf_url,
-                    source=prev.source if hasattr(prev, 'source') else "previous",
-                )
-                status = DecisionStatus.PENDING
-                if prev.status == "keep":
-                    status = DecisionStatus.KEPT
-                elif prev.status == "discard":
-                    status = DecisionStatus.DISCARDED
-                session.decisions.append(
-                    ReviewDecision(
-                        paper=paper,
-                        provider=prev.provider if hasattr(prev, 'provider') else "previous",
-                        status=status,
-                        motivation=prev.motivation,
-                    )
-                )
-    
-    # Convert search results to review decisions
-    for result in results:
-        for paper in result.papers:
-            paper_id = get_paper_id(paper)
-            
-            # Check for previous decision
-            prev = None
-            if previous_decisions:
-                prev = get_previous_decision(persistence_key, paper)
-            
-            status = DecisionStatus.PENDING
-            motivation = ""
-            if prev:
-                if prev.status == "keep":
-                    status = DecisionStatus.KEPT
-                elif prev.status == "discard":
-                    status = DecisionStatus.DISCARDED
-                motivation = prev.motivation
-            
-            session.decisions.append(
-                ReviewDecision(
-                    paper=paper,
-                    provider=result.provider,
-                    status=status,
-                    motivation=motivation,
-                )
-            )
+    # Create review session using the review module
+    session = create_review_session(results, query, session_name)
     
     # Run the TUI in review mode
     app = PaperReviewApp(session, review_mode=True)
@@ -1742,39 +1396,15 @@ def run_notes_browser() -> None:
     This launches the TUI in notes-only mode (no keep/discard functionality),
     showing all papers that have notes attached.
     """
-    # Get all papers with notes
-    papers_with_notes = list_papers_with_notes()
+    from scholar.review import create_notes_session
     
-    if not papers_with_notes:
+    session = create_notes_session()
+    
+    if not session.decisions:
         console = Console()
         console.print("[yellow]No papers with notes found.[/yellow]")
         console.print("Use 'scholar search --review' to review papers and add notes.")
         return
-    
-    # Create a session with these papers (no query, notes-only mode)
-    session = ReviewSession(
-        query="",
-        providers=[],
-        timestamp=datetime.now(),
-    )
-    
-    # Convert paper notes to review decisions for display
-    for paper_note in papers_with_notes:
-        # Create a minimal Paper object from the note
-        paper = Paper(
-            title=paper_note.title,
-            authors=paper_note.authors if hasattr(paper_note, 'authors') else [],
-            year=paper_note.year if hasattr(paper_note, 'year') else None,
-            doi=paper_note.doi if hasattr(paper_note, 'doi') else None,
-            abstract=None,
-            venue=paper_note.venue if hasattr(paper_note, 'venue') else None,
-            url=paper_note.url if hasattr(paper_note, 'url') else None,
-            pdf_url=paper_note.pdf_url if hasattr(paper_note, 'pdf_url') else None,
-            source="notes",
-        )
-        session.decisions.append(
-            ReviewDecision(paper=paper, provider="notes")
-        )
     
     # Run the TUI in notes-only mode (no keep/discard)
     app = PaperReviewApp(session, review_mode=False)
