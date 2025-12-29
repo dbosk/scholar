@@ -99,10 +99,21 @@ class ReviewDecisionRecord:
     """
     A single review decision for a paper within a search.
     
-    Stores the status (keep/discard/pending) and motivation.
+    Stores the status (keep/discard/pending), motivation, and paper details
+    needed for reconstruction when merging sessions.
     """
     status: str  # "kept", "discarded", "pending"
     motivation: str = ""
+    # Paper details for reconstruction
+    title: str = ""
+    authors: list[str] = field(default_factory=list)
+    year: int | None = None
+    doi: str | None = None
+    abstract: str | None = None
+    venue: str | None = None
+    url: str | None = None
+    pdf_url: str | None = None
+    provider: str = ""
     
     def to_dict(self) -> dict[str, Any]:
         """Convert to dictionary for JSON serialization."""
@@ -111,7 +122,20 @@ class ReviewDecisionRecord:
     @classmethod
     def from_dict(cls, data: dict[str, Any]) -> "ReviewDecisionRecord":
         """Create from dictionary."""
-        return cls(**data)
+        # Handle older records that don't have paper details
+        return cls(
+            status=data.get("status", "pending"),
+            motivation=data.get("motivation", ""),
+            title=data.get("title", ""),
+            authors=data.get("authors", []),
+            year=data.get("year"),
+            doi=data.get("doi"),
+            abstract=data.get("abstract"),
+            venue=data.get("venue"),
+            url=data.get("url"),
+            pdf_url=data.get("pdf_url"),
+            provider=data.get("provider", ""),
+        )
 
 
 @dataclass

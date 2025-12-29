@@ -147,7 +147,15 @@ review: Annotated[
         "--review", "-r",
         help="Launch interactive TUI to review and filter results.",
     ),
-] = False
+] = False,
+name: Annotated[
+    Optional[str],
+    typer.Option(
+        "--name", "-n",
+        help="Session name for review. Use same name to append results from "
+             "multiple searches. Defaults to query string.",
+    ),
+] = None
 @
 
 \section{Executing the search}
@@ -165,7 +173,8 @@ results = s.execute(providers=provider)
 # If review mode, launch TUI instead of displaying results
 if review:
     from scholar.tui import run_review
-    run_review(results, query)
+    session_name = name if name else query
+    run_review(results, query, session_name)
     return
 
 # Auto-detect format based on TTY

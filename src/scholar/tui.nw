@@ -39,6 +39,7 @@ and generating reports from review sessions.
 <<tui abstract screen>>
 <<tui discard modal>>
 <<tui sort modal>>
+<<tui filter modal>>
 <<tui main app>>
 <<tui report generation>>
 <<tui entry point>>
@@ -691,10 +692,116 @@ class SortModal(ModalScreen[tuple[str, bool] | None]):
         self.dismiss(("provider", False))
 @
 
+\chapter{Filter Modal}
+\label{FilterModal}
+
+When reviewing large search results, users often want to focus on specific 
+subsets of papers. For example, after an initial pass through all papers, a 
+reviewer might want to revisit only the kept papers to write detailed notes, or 
+focus exclusively on pending papers to complete the review.
+
+The filter modal provides four filter options:
+\begin{description}
+\item[All] Shows all papers regardless of decision status (the default view).
+\item[Kept] Shows only papers marked for keeping, useful for focused note-taking 
+  or generating a report of selected papers.
+\item[Discarded] Shows only discarded papers, helpful for reconsidering previous 
+  rejections.
+\item[Pending] Shows only papers awaiting decision, enabling efficient 
+  batch-processing of unreviewed items.
+\end{description}
+
+We use the same keybindings as the main decision actions for consistency: 
+\texttt{K} for kept (matching the keep action) and \texttt{d} for discarded 
+(matching the discard action). This reduces cognitive load by maintaining a 
+consistent mental model throughout the interface.
+
+<<tui filter modal>>=
+class FilterModal(ModalScreen[str | None]):
+    """Modal dialog to select paper filter by decision status."""
+    
+    BINDINGS = [
+        Binding("escape", "cancel", "Cancel"),
+        Binding("a", "filter_all", "All", priority=True),
+        Binding("K", "filter_kept", "Kept", priority=True),
+        Binding("d", "filter_discarded", "Discarded", priority=True),
+        Binding("p", "filter_pending", "Pending", priority=True),
+    ]
+    
+    DEFAULT_CSS = """
+    FilterModal {
+        align: center middle;
+    }
+    #filter-dialog {
+        width: 40;
+        height: auto;
+        border: thick $primary;
+        background: $surface;
+        padding: 1 2;
+    }
+    #filter-title {
+        text-align: center;
+        width: 100%;
+        margin-bottom: 1;
+    }
+    """
+    
+    def compose(self) -> ComposeResult:
+        with Container(id="filter-dialog"):
+            yield Static("[bold]Filter Papers[/bold]", id="filter-title")
+            yield Static("")
+            yield Static("[bold yellow]a[/] All papers")
+            yield Static("[bold yellow]K[/] Kept only")
+            yield Static("[bold yellow]d[/] Discarded only")
+            yield Static("[bold yellow]p[/] Pending only")
+            yield Static("")
+            yield Static("[dim]Press [bold]Escape[/bold] to cancel[/dim]")
+    
+    def action_cancel(self) -> None:
+        self.dismiss(None)
+    
+    def action_filter_all(self) -> None:
+        self.dismiss("all")
+    
+    def action_filter_kept(self) -> None:
+        self.dismiss("kept")
+    
+    def action_filter_discarded(self) -> None:
+        self.dismiss("discarded")
+    
+    def action_filter_pending(self) -> None:
+        self.dismiss("pending")
+@
+
 \chapter{Main Application}
 
 The main TUI application coordinates all the screens and manages the review 
 session state. It provides vim-style keybindings for efficient navigation.
+
+\section{Filtering by Decision Status}
+
+When working with large search results, users need the ability to focus on 
+specific subsets of papers. The application maintains a \emph{current filter} 
+state that determines which papers are displayed in the list view. This filter 
+can be set to:
+\begin{description}
+\item[all] Display all papers regardless of status (the default).
+\item[kept] Display only papers marked for keeping---useful for reviewing 
+  selections before generating a report or for focused note-taking on accepted 
+  papers.
+\item[discarded] Display only discarded papers---helpful when reconsidering 
+  previous rejections or documenting reasons for exclusion.
+\item[pending] Display only papers awaiting decision---enables efficient 
+  batch-processing when returning to an incomplete review session.
+\end{description}
+
+The filtering works by maintaining the full session data unchanged while 
+presenting a filtered \emph{view} of the decisions list. This means changing 
+the filter never loses data; it simply changes what is currently visible.
+
+When a filter is active, the status bar displays the current filter name and 
+the count of matching papers, providing clear feedback about what subset is 
+being viewed.
 
 <<tui main app>>=
 class PaperReviewApp(App):
@@ -757,6 +864,7 @@ class PaperReviewApp(App):
         Binding("K", "keep", "Keep"),
         Binding("d", "discard", "Discard"),
         Binding("s", "sort", "Sort"),
+        Binding("f", "filter", "Filter"),
         Binding("n", "edit_notes", "Notes"),
     ]
     
@@ -765,6 +873,7 @@ class PaperReviewApp(App):
         self.session = session
         self.review_mode = review_mode
         self.current_index = 0
+        self.current_filter = "all"
     
     def compose(self) -> ComposeResult:
         yield Header()
@@ -777,17 +886,30 @@ class PaperReviewApp(App):
         self._refresh_list()
         self._update_status()
     
+    def _get_filtered_decisions(self) -> list[ReviewDecision]:
+        """Get decisions filtered by current filter."""
+        if self.current_filter == "all":
+            return self.session.decisions
+        elif self.current_filter == "kept":
+            return self.session.kept_papers
+        elif self.current_filter == "discarded":
+            return self.session.discarded_papers
+        elif self.current_filter == "pending":
+            return self.session.pending_papers
+        return self.session.decisions
+    
     def _refresh_list(self) -> None:
         """Refresh the paper list display."""
         list_view = self.query_one("#paper-list", ListView)
         list_view.clear()
         
-        for i, decision in enumerate(self.session.decisions):
+        filtered = self._get_filtered_decisions()
+        for i, decision in enumerate(filtered):
             list_view.append(PaperListItem(decision, i, self.review_mode))
         
         # Restore selection and focus after UI updates complete
-        if self.session.decisions:
-            list_view.index = min(self.current_index, len(self.session.decisions) - 1)
+        if filtered:
+            list_view.index = min(self.current_index, len(filtered) - 1)
         self.call_later(list_view.focus)
     
     def _update_status(self) -> None:
@@ -796,6 +918,12 @@ class PaperReviewApp(App):
         discarded = len(self.session.discarded_papers)
         pending = len(self.session.pending_papers)
         total = len(self.session.decisions)
+        filtered_count = len(self._get_filtered_decisions())
+        
+        # Build filter indicator
+        filter_text = ""
+        if self.current_filter != "all":
+            filter_text = f" | [yellow]Filter: {self.current_filter} ({filtered_count})[/yellow]"
         
         status = self.query_one("#status-bar", Static)
         if self.review_mode:
@@ -805,6 +933,7 @@ class PaperReviewApp(App):
                 f"[red]Discarded: {discarded}[/red] | "
                 f"Pending: {pending} | "
                 f"Total: {total}"
+                f"{filter_text}"
             )
         else:
             # Notes mode - simpler status
@@ -812,14 +941,16 @@ class PaperReviewApp(App):
                 f"Papers with notes: {total} | "
                 f"Press [bold yellow]n[/bold yellow] to edit notes, "
                 f"[bold yellow]p[/bold yellow] to open PDF"
+                f"{filter_text}"
             )
     
     def _get_current_decision(self) -> ReviewDecision | None:
-        """Get the currently selected decision."""
+        """Get the currently selected decision from filtered list."""
         list_view = self.query_one("#paper-list", ListView)
-        if list_view.index is not None and list_view.index < len(self.session.decisions):
+        filtered = self._get_filtered_decisions()
+        if list_view.index is not None and list_view.index < len(filtered):
             self.current_index = list_view.index
-            return self.session.decisions[list_view.index]
+            return filtered[list_view.index]
         return None
     
     def action_cursor_down(self) -> None:
@@ -901,6 +1032,30 @@ class PaperReviewApp(App):
             key, reverse = result
             self.session.sort_by(key, reverse)
             self._refresh_list()
+        self.query_one("#paper-list", ListView).focus()
+    
+    def action_filter(self) -> None:
+        """Open filter modal to select which papers to display.
+        
+        Filtering helps manage large result sets by focusing on papers with
+        a specific status. This is particularly useful when:
+        - Resuming a partially completed review (filter to pending)
+        - Double-checking kept papers before report generation
+        - Reviewing discard motivations for consistency
+        """
+        self.push_screen(FilterModal(), self._on_filter_closed)
+    
+    def _on_filter_closed(self, result: str | None) -> None:
+        """Apply the selected filter and refresh the display.
+        
+        When changing filters, we reset to the first item in the filtered list
+        to avoid index-out-of-bounds issues and give users a clear starting point.
+        """
+        if result:
+            self.current_filter = result
+            self.current_index = 0
+            self._refresh_list()
+            self._update_status()
         self.query_one("#paper-list", ListView).focus()
 @
 
@@ -1198,15 +1353,27 @@ The main entry point creates a review session from search results and launches
 the TUI application.
 
 <<tui entry point>>=
-def run_review(results: list[SearchResult], query: str) -> ReviewSession:
+def run_review(results: list[SearchResult], query: str, 
+               session_name: str | None = None) -> ReviewSession:
     """
     Run the interactive review TUI for search results.
     
     Converts SearchResult objects into a ReviewSession, launches the TUI,
     and returns the session with all decisions after the user exits.
+    
+    Args:
+        results: Search results to review
+        query: The search query (for display)
+        session_name: Name for decision persistence. If provided, decisions are
+                      stored under this name instead of the query. This allows
+                      the same query with different names (different purposes)
+                      or multiple queries with the same name (appending results).
     """
-    # Load previous decisions for this query
-    previous_decisions = load_search_decisions(query)
+    # Use session_name for persistence, fall back to query
+    persistence_key = session_name if session_name else query
+    
+    # Load previous decisions for this session
+    previous_decisions = load_search_decisions(persistence_key)
     
     # Create review session
     providers = list(set(r.provider for r in results))
@@ -1216,13 +1383,56 @@ def run_review(results: list[SearchResult], query: str) -> ReviewSession:
         timestamp=datetime.now(),
     )
     
+    # Track existing paper IDs to handle merging
+    existing_paper_ids: set[str] = set()
+    if previous_decisions:
+        existing_paper_ids = set(previous_decisions.decisions.keys())
+        
+        # First, restore decisions for papers from previous session
+        # that are NOT in the current search results
+        current_paper_ids = set()
+        for result in results:
+            for paper in result.papers:
+                current_paper_ids.add(get_paper_id(paper))
+        
+        # Add papers from previous session that aren't in current results
+        for paper_id, prev in previous_decisions.decisions.items():
+            if paper_id not in current_paper_ids:
+                # Reconstruct paper from stored data
+                paper = Paper(
+                    title=prev.title,
+                    authors=prev.authors if prev.authors else [],
+                    year=prev.year,
+                    doi=prev.doi,
+                    abstract=None,
+                    venue=prev.venue,
+                    url=prev.url,
+                    pdf_url=prev.pdf_url,
+                    source=prev.source if hasattr(prev, 'source') else "previous",
+                )
+                status = DecisionStatus.PENDING
+                if prev.status == "keep":
+                    status = DecisionStatus.KEPT
+                elif prev.status == "discard":
+                    status = DecisionStatus.DISCARDED
+                session.decisions.append(
+                    ReviewDecision(
+                        paper=paper,
+                        provider=prev.provider if hasattr(prev, 'provider') else "previous",
+                        status=status,
+                        motivation=prev.motivation,
+                    )
+                )
+    
     # Convert search results to review decisions
     for result in results:
         for paper in result.papers:
+            paper_id = get_paper_id(paper)
+            
             # Check for previous decision
             prev = None
             if previous_decisions:
-                prev = get_previous_decision(query, paper)
+                prev = get_previous_decision(persistence_key, paper)
             
             status = DecisionStatus.PENDING
             motivation = ""
@@ -1246,8 +1456,8 @@ def run_review(results: list[SearchResult], query: str) -> ReviewSession:
     app = PaperReviewApp(session, review_mode=True)
     app.run()
     
-    # Save decisions for this query
-    save_search_decisions(query, session.decisions)
+    # Save decisions for this session
+    save_search_decisions(persistence_key, session.decisions)
     
     # Prompt for report
     prompt_for_report(session)
