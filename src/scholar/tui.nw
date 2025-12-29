@@ -148,7 +148,7 @@ from scholar.notes import (
 )
 from scholar.review import (
     DecisionStatus, ReviewDecision, ReviewSession,
-    create_review_session, save_search_decisions,
+    create_review_session, save_search_decisions, save_session,
     escape_latex,
     generate_csv_report, generate_latex_report,
 )
@@ -1466,8 +1466,11 @@ def run_review(results: list[SearchResult], query: str,
     app = PaperReviewApp(session, review_mode=True)
     app.run()
     
-    # Save decisions for this session
+    # Save decisions for this session (legacy per-query storage)
     save_search_decisions(persistence_key, session.decisions)
+    
+    # Save the complete session for `scholar sessions` commands
+    save_session(session)
     
     # Prompt for report
     prompt_for_report(session)
