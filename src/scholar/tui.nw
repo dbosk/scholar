@@ -1090,9 +1090,14 @@ class PaperReviewApp(App):
         for i, decision in enumerate(filtered):
             list_view.append(PaperListItem(decision, i, self.review_mode))
         
-        # Restore selection and focus after UI updates complete
+        # Restore selection and focus after UI updates complete.
+        # We must reset index to None first, then set desired value.
+        # Otherwise, if the index value is unchanged (e.g., still 0),
+        # the reactive watcher doesn't fire and highlight isn't updated.
         if filtered:
-            list_view.index = min(self.current_index, len(filtered) - 1)
+            target_index = min(self.current_index, len(filtered) - 1)
+            list_view.index = None
+            list_view.index = target_index
         self.call_later(list_view.focus)
     
     def _update_status(self) -> None:
