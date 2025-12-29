@@ -1,0 +1,42 @@
+\documentclass[a4paper,oneside]{memoir}
+\input{preamble}
+
+\title{Scholar: A Tool for Structured Literature Searches}
+\author{Daniel Bosk \and Dan-Claude Opus van Thropic}
+\date{\today}
+
+\begin{document}
+\frontmatter
+\maketitle
+
+\begin{abstract}
+Scholar is a command-line tool for conducting structured literature searches
+across multiple academic databases. It provides a unified interface for
+searching Semantic Scholar, OpenAlex, DBLP, Web of Science, and IEEE Xplore,
+with caching to manage API rate limits and an interactive TUI for reviewing
+results.
+
+This document is the complete literate source of Scholar, combining
+documentation and implementation in a single narrative.
+\end{abstract}
+
+\clearpage
+\tableofcontents*
+
+\mainmatter
+
+\part{Core Functionality}
+
+\input{../src/scholar/scholar.tex}
+\input{../src/scholar/cache.tex}
+
+\input{../src/scholar/providers.tex}
+
+\part{User Interface}
+
+\input{../src/scholar/cli.tex}
+\input{../src/scholar/tui.tex}
+
+\backmatter
+
+\end{document}

@@ -1,10 +1,7 @@
-\input{preamble.tex}
+\chapter{Search Providers}
+\label{providers-module}
 
-\begin{document}
-\maketitle
-\tableofcontents
-
-\chapter{Introduction}
+\section{Introduction}
 
 This module implements search providers---adapters that connect Scholar to
 various bibliographic databases.
@@ -53,11 +50,49 @@ itself with the provider registry on import.
 @
 
 
-\chapter{Provider Protocol}
+\section{Testing}
+\label{sec:providers-testing}
+
+Tests are distributed throughout this document, appearing immediately after
+each provider's implementation.
+The test file collects all distributed test chunks:
+
+<<test [[providers.py]]>>=
+"""Tests for the providers module."""
+import pytest
+from unittest.mock import Mock, patch
+
+from scholar import *
+from scholar.providers import *
+
+
+<<test functions>>
+@
+
+
+\section{Provider Protocol}
+\label{sec:provider-protocol}
 
 We define a protocol (structural typing) rather than an abstract base class.
-This allows providers to be implemented without inheritance, which is more
-Pythonic and easier to test.
+This design choice reflects Python's \enquote{duck typing} philosophy: if an
+object has a [[name]] attribute and a [[search]] method with the right
+signature, it \emph{is} a provider---no inheritance required.
+
+\subsection{Why Protocol Over ABC?}
+
+Using [[Protocol]] from [[typing]] has several advantages over
+[[abc.ABC]]:
+\begin{description}
+\item[No inheritance required] Providers don't need to inherit from a base
+  class. This simplifies testing (mock objects work without setup) and allows
+  third-party classes to be providers without modification.
+\item[Explicit contracts] The protocol documents exactly what's required.
+  Unlike duck typing alone, static type checkers can verify implementations.
+\item[Flexibility] A class from another library could satisfy this protocol
+  without knowing about Scholar, enabling future extensibility.
+\end{description}
+
+\subsection{Required Interface}
 
 A provider must have:
 \begin{description}
@@ -86,11 +121,28 @@ class SearchProvider(Protocol):
 @
 
 
-\chapter{Provider Registry}
+\section{Provider Registry}
+\label{sec:provider-registry}
 
-Providers register themselves when imported.
-This allows the [[Search]] class to discover available providers without
+Providers register themselves when imported. This \emph{self-registration}
+pattern allows the [[Search]] class to discover available providers without
 hardcoding them.
+
+\subsection{Why Self-Registration?}
+
+The registry pattern provides plugin-like architecture:
+\begin{description}
+\item[Decoupling] The core search logic doesn't need to know about specific
+  providers. Adding a new database is as simple as creating a new provider
+  class and calling [[register_provider]].
+\item[Lazy loading] Providers register at module import time. If a provider's
+  dependencies aren't installed (e.g., missing API key), it simply won't
+  register, and searches proceed with available providers.
+\item[Discoverability] CLI commands can query the registry to show users
+  which providers are available and configured.
+\end{description}
+
+\subsection{Implementation}
 
 <<provider registry>>=
 PROVIDERS: dict[str, SearchProvider] = {}
@@ -111,682 +163,11 @@ def get_all_providers() -> list[SearchProvider]:
     return list(PROVIDERS.values())
 @
 
-
-\chapter{Semantic Scholar Provider}
-
-Semantic Scholar is an AI-powered research tool that provides free access to
-over 200 million academic papers.
-Their API allows searching papers by keyword, author, venue, and more.
-
-We use the [[semanticscholar]] Python package which handles API communication,
-rate limiting, and pagination.
-
-\section{Provider implementation}
-
-<<semantic scholar provider>>=
-class SemanticScholarProvider:
-    """Search provider for Semantic Scholar."""
-
-    name = "semantic_scholar"
-
-    def __init__(self, api_key: str | None = None):
-        """
-        Initialize the Semantic Scholar provider.
-
-        Args:
-            api_key: Optional API key for higher rate limits.
-                     If not provided, uses S2_API_KEY environment variable.
-        """
-        self.client = SemanticScholar(api_key=api_key)
-        self._cache: dict = load_cache(self.name)
-        register_cache(self.name, self._cache)
-
-    @cachedmethod(lambda self: self._cache)
-    def search(self, query: str, limit: int = 100) -> list[Paper]:
-        """Search Semantic Scholar for papers matching the query."""
-        try:
-            results = self.client.search_paper(
-                query,
-                limit=limit,
-                fields=[
-                    "title",
-                    "authors",
-                    "year",
-                    "abstract",
-                    "venue",
-                    "externalIds",
-                    "url",
-                ],
-            )
-            return [self._convert_paper(p) for p in results]
-        except Exception:
-            # Return empty list on API errors
-            return []
-
-    <<convert semantic scholar paper>>
-@
-
-\subsection{Converting paper format}
-
-Semantic Scholar returns papers in their own format.
-We convert them to our common [[Paper]] type:
-
-<<convert semantic scholar paper>>=
-def _convert_paper(self, ss_paper) -> Paper:
-    """Convert a Semantic Scholar paper to our Paper type."""
-    # Extract DOI from externalIds if available
-    doi = None
-    if ss_paper.externalIds:
-        doi = ss_paper.externalIds.get("DOI")
-
-    # Extract author names
-    authors = []
-    if ss_paper.authors:
-        authors = [a.name for a in ss_paper.authors if a.name]
-
-    return Paper(
-        title=ss_paper.title or "",
-        authors=authors,
-        year=ss_paper.year,
-        doi=doi,
-        abstract=ss_paper.abstract,
-        venue=ss_paper.venue,
-        url=ss_paper.url,
-        source=self.name,
-    )
-@
-
-\section{Auto-registration}
-
-We register the provider when this module is imported:
-
-<<semantic scholar provider>>=
-# Register the provider on module import
-register_provider(SemanticScholarProvider())
-@
-
-\section{Dependencies}
-
-<<semantic scholar imports>>=
-from semanticscholar import SemanticScholar
-@
-
-
-\chapter{OpenAlex Provider}
-
-OpenAlex is a free and open catalog of the world's scholarly works, authors,
-venues, institutions, and concepts.
-It covers over 250 million works and is fully open access.
-
-We use the [[pyalex]] Python package which provides a clean interface to the
-OpenAlex API.
-No API key is required, though providing an email address gives access to the
-\enquote{polite pool} with faster response times.
-
-\section{Provider implementation}
-
-<<openalex provider>>=
-class OpenAlexProvider:
-    """Search provider for OpenAlex."""
-
-    name = "openalex"
-
-    def __init__(self, email: str | None = None):
-        """
-        Initialize the OpenAlex provider.
-
-        Args:
-            email: Optional email for polite pool access (faster responses).
-                   If not provided, uses OPENALEX_EMAIL environment variable.
-        """
-        configured_email = email or os.environ.get("OPENALEX_EMAIL")
-        if configured_email:
-            pyalex.config.email = configured_email
-        self._cache: dict = load_cache(self.name)
-        register_cache(self.name, self._cache)
-
-    @cachedmethod(lambda self: self._cache)
-    def search(self, query: str, limit: int = 100) -> list[Paper]:
-        """Search OpenAlex for papers matching the query."""
-        try:
-            works = pyalex.Works().search(query).get(per_page=limit)
-            return [self._convert_work(w) for w in works]
-        except Exception:
-            return []
-
-    <<convert openalex work>>
-@
-
-\subsection{Converting work format}
-
-OpenAlex returns works as dictionaries.
-We extract the relevant fields and convert to our [[Paper]] type:
-
-<<convert openalex work>>=
-def _convert_work(self, work: dict) -> Paper:
-    """Convert an OpenAlex work to our Paper type."""
-    # Extract author names from authorships
-    authors = []
-    for authorship in work.get("authorships", []):
-        author_info = authorship.get("author", {})
-        name = author_info.get("display_name")
-        if name:
-            authors.append(name)
-
-    # Extract DOI (remove URL prefix if present)
-    doi = work.get("doi")
-    if doi and doi.startswith("https://doi.org/"):
-        doi = doi[16:]
-
-    # Extract venue from primary location
-    venue = None
-    primary_location = work.get("primary_location", {})
-    if primary_location:
-        source = primary_location.get("source", {})
-        if source:
-            venue = source.get("display_name")
-
-    return Paper(
-        title=work.get("title", ""),
-        authors=authors,
-        year=work.get("publication_year"),
-        doi=doi,
-        abstract=work.get("abstract"),
-        venue=venue,
-        url=work.get("id"),
-        source=self.name,
-    )
-@
-
-\section{Auto-registration}
-
-<<openalex provider>>=
-# Register the provider on module import
-register_provider(OpenAlexProvider())
-@
-
-\section{Dependencies}
-
-<<openalex imports>>=
-import pyalex
-@
-
-
-\chapter{DBLP Provider}
-
-DBLP is a computer science bibliography database hosted at the University of
-Trier and Schloss Dagstuhl.
-It provides comprehensive coverage of major computer science journals and
-conference proceedings.
-
-\section{Package evaluation}
-
-We evaluated several Python packages for DBLP access:
-
-\begin{description}
-\item[dblpy-lib (0.1.3)] Appeared well-maintained with a clean API
-  ([[get_publications(q, max_results)]]).
-  However, it requires [[requests>=2.27.1,<2.28.0]], which conflicts with our
-  [[requests^2.31]] dependency.
-\item[dblp (0.1.0)] Returns pandas DataFrames, which seemed convenient.
-  However, it fails to install due to a bug in its setup script---it passes a
-  list where a string is expected ([[TypeError: expected string or bytes-like
-  object, got 'list']]).
-\end{description}
-
-Given these issues, we use the DBLP public API directly via [[requests]], which
-we already depend on.
-No API key is required.
-The API returns JSON with publication data that we parse directly.
-
-\section{Provider implementation}
-
-<<dblp provider>>=
-class DBLPProvider:
-    """Search provider for DBLP."""
-
-    name = "dblp"
-
-    def __init__(self):
-        """Initialize the DBLP provider."""
-        self._cache: dict = load_cache(self.name)
-        register_cache(self.name, self._cache)
-
-    @cachedmethod(lambda self: self._cache)
-    def search(self, query: str, limit: int = 100) -> list[Paper]:
-        """Search DBLP for papers matching the query."""
-        try:
-            # DBLP API caps at 1000 results per request
-            effective_limit = min(limit, 1000)
-            response = requests.get(
-                DBLP_API_URL,
-                params={"q": query, "format": "json", "h": effective_limit},
-                timeout=30,
-            )
-            response.raise_for_status()
-            data = response.json()
-
-            hits = data.get("result", {}).get("hits", {}).get("hit", [])
-            return [self._convert_hit(hit) for hit in hits]
-        except Exception:
-            return []
-
-    <<convert dblp hit>>
-@
-
-\subsection{Converting publication format}
-
-The DBLP API returns each publication as a JSON object with an [[info]] field
-containing:
-\begin{description}
-\item[authors] Object with [[author]] array, each having a [[text]] field.
-\item[title] The publication title.
-\item[venue] The venue (conference or journal).
-\item[year] Publication year as string.
-\item[doi] The DOI (if available).
-\item[ee] Electronic edition URL.
-\item[url] URL to the DBLP record.
-\end{description}
-
-We convert each hit to our common [[Paper]] type:
-
-<<convert dblp hit>>=
-def _convert_hit(self, hit: dict) -> Paper:
-    """Convert a DBLP API hit to our Paper type."""
-    info = hit.get("info", {})
-
-    # Extract year as integer if available
-    year = None
-    year_str = info.get("year")
-    if year_str:
-        try:
-            year = int(year_str)
-        except (ValueError, TypeError):
-            pass
-
-    # Extract author names from nested structure
-    authors = []
-    authors_data = info.get("authors", {}).get("author", [])
-    # Handle single author (dict) vs multiple authors (list)
-    if isinstance(authors_data, dict):
-        authors_data = [authors_data]
-    for author in authors_data:
-        name = author.get("text") if isinstance(author, dict) else author
-        if name:
-            authors.append(name)
-
-    return Paper(
-        title=info.get("title", "") or "",
-        authors=authors,
-        year=year,
-        doi=info.get("doi"),
-        abstract=None,  # DBLP doesn't provide abstracts
-        venue=info.get("venue"),
-        url=info.get("url") or info.get("ee"),
-        source=self.name,
-    )
-@
-
-\section{Auto-registration}
-
-<<dblp provider>>=
-# Register the provider on module import
-register_provider(DBLPProvider())
-@
-
-\section{Dependencies}
-
-<<dblp imports>>=
-import requests
-@
-
-<<dblp constants>>=
-DBLP_API_URL = "https://dblp.org/search/publ/api"
-@
-
-
-\chapter{Web of Science Provider}
-
-Web of Science (WoS) is a comprehensive citation index covering scholarly
-literature across sciences, social sciences, arts, and humanities.
-It is maintained by Clarivate and requires institutional access or an API key.
-
-\section{API options}
-
-Clarivate provides several API options:
-
-\begin{description}
-\item[Web of Science API Expanded] Full access with advanced features.
-  Requires institutional subscription.
-\item[Web of Science Starter API] Basic search with bibliographic metadata.
-  Has a free tier (50 requests/day) and institutional tiers (5,000--20,000
-  requests/day).
-\end{description}
-
-The official Python client ([[wosstarter_python_client]]) is only available
-from GitHub, not PyPI.
-For consistency with our DBLP implementation, we use the Starter API's REST
-endpoint directly via [[requests]].
-
-\section{Provider implementation}
-
-<<wos provider>>=
-class WebOfScienceProvider:
-    """Search provider for Web of Science."""
-
-    name = "wos"
-
-    def __init__(self, api_key: str | None = None):
-        """
-        Initialize the Web of Science provider.
-
-        Args:
-            api_key: API key for WoS Starter API.
-                     If not provided, uses WOS_API_KEY environment variable.
-        """
-        self.api_key = api_key or os.environ.get("WOS_API_KEY")
-        self._cache: dict = load_cache(self.name)
-        register_cache(self.name, self._cache)
-
-    @cachedmethod(lambda self: self._cache)
-    def search(self, query: str, limit: int = 100) -> list[Paper]:
-        """Search Web of Science for papers matching the query."""
-        if not self.api_key:
-            return []  # No API key configured
-
-        try:
-            # WoS Starter API has max 50 results per page
-            effective_limit = min(limit, 50)
-            response = requests.get(
-                WOS_API_URL,
-                params={
-                    "q": query,
-                    "db": "WOS",
-                    "limit": effective_limit,
-                    "page": 1,
-                },
-                headers={"X-ApiKey": self.api_key},
-                timeout=30,
-            )
-            response.raise_for_status()
-            data = response.json()
-
-            hits = data.get("hits", [])
-            return [self._convert_hit(hit) for hit in hits]
-        except Exception:
-            return []
-
-    <<convert wos hit>>
-@
-
-\subsection{Converting document format}
-
-The WoS Starter API returns documents with fields including:
-\begin{description}
-\item[uid] Unique WoS identifier.
-\item[title] The document title.
-\item[names] Object with [[authors]] array containing author names.
-\item[source] Source publication information including [[sourceTitle]].
-\item[links] Object with [[record]] URL to WoS page.
-\item[identifiers] Object with DOI and other identifiers.
-\item[keywords] Object with [[authorKeywords]] array.
-\end{description}
-
-We convert each hit to our common [[Paper]] type:
-
-<<convert wos hit>>=
-def _convert_hit(self, hit: dict) -> Paper:
-    """Convert a WoS API hit to our Paper type."""
-    # Extract publication year from source
-    source = hit.get("source", {})
-    year = None
-    pub_year = source.get("publishYear")
-    if pub_year:
-        try:
-            year = int(pub_year)
-        except (ValueError, TypeError):
-            pass
-
-    # Extract author names
-    authors = []
-    names = hit.get("names", {})
-    for author in names.get("authors", []):
-        name = author.get("displayName")
-        if name:
-            authors.append(name)
-
-    # Extract DOI from identifiers
-    doi = None
-    identifiers = hit.get("identifiers", {})
-    doi = identifiers.get("doi")
-
-    # Extract URL from links
-    url = None
-    links = hit.get("links", {})
-    url = links.get("record")
-
-    return Paper(
-        title=hit.get("title", "") or "",
-        authors=authors,
-        year=year,
-        doi=doi,
-        abstract=None,  # Not available in Starter API
-        venue=source.get("sourceTitle"),
-        url=url,
-        source=self.name,
-    )
-@
-
-\section{Auto-registration}
-
-<<wos provider>>=
-# Register the provider on module import
-register_provider(WebOfScienceProvider())
-@
-
-\section{Dependencies}
-
-Since the provider uses the same [[requests]] library as DBLP, we only need
-to define the API URL constant:
-
-<<wos constants>>=
-WOS_API_URL = "https://api.clarivate.com/apis/wos-starter/v1/documents"
-@
-
-
-\chapter{IEEE Xplore Provider}
-
-IEEE Xplore is a research database providing access to scientific and technical
-content published by IEEE (Institute of Electrical and Electronics Engineers)
-and its publishing partners.
-It contains over 6 million documents including journals, conference proceedings,
-technical standards, and books.
-
-\section{API access}
-
-IEEE provides a Metadata API for searching and retrieving bibliographic data.
-The API requires registration and an API key, which can be obtained from the
-IEEE Developer Portal.
-
-The official Python SDK ([[xploreapi]]) is provided by IEEE but is not available
-on PyPI---it must be downloaded from the Developer Portal.
-For consistency with our other providers, we use the REST API directly via
-[[requests]].
-
-\section{Provider implementation}
-
-<<ieee provider>>=
-class IEEEXploreProvider:
-    """Search provider for IEEE Xplore."""
-
-    name = "ieee"
-
-    def __init__(self, api_key: str | None = None):
-        """
-        Initialize the IEEE Xplore provider.
-
-        Args:
-            api_key: API key for IEEE Xplore API.
-                     If not provided, uses IEEE_API_KEY environment variable.
-        """
-        self.api_key = api_key or os.environ.get("IEEE_API_KEY")
-        self._cache: dict = load_cache(self.name)
-        register_cache(self.name, self._cache)
-
-    @cachedmethod(lambda self: self._cache)
-    def search(self, query: str, limit: int = 100) -> list[Paper]:
-        """Search IEEE Xplore for papers matching the query."""
-        if not self.api_key:
-            return []  # No API key configured
-
-        try:
-            # IEEE API returns max 200 results per request
-            effective_limit = min(limit, 200)
-            response = requests.get(
-                IEEE_API_URL,
-                params={
-                    "querytext": query,
-                    "max_records": effective_limit,
-                    "apikey": self.api_key,
-                },
-                timeout=30,
-            )
-            response.raise_for_status()
-            data = response.json()
-
-            articles = data.get("articles", [])
-            return [self._convert_article(article) for article in articles]
-        except Exception:
-            return []
-
-    <<convert ieee article>>
-@
-
-\subsection{Converting article format}
-
-The IEEE Xplore API returns articles with fields including:
-\begin{description}
-\item[title] The document title.
-\item[authors] Object with [[authors]] array containing author details.
-\item[abstract] Brief summary of the document.
-\item[publication\_title] Journal or conference name.
-\item[publication\_year] Year of publication.
-\item[doi] Digital Object Identifier.
-\item[html\_url] URL to the article page.
-\end{description}
-
-We convert each article to our common [[Paper]] type:
-
-<<convert ieee article>>=
-def _convert_article(self, article: dict) -> Paper:
-    """Convert an IEEE Xplore article to our Paper type."""
-    # Extract publication year
-    year = None
-    pub_year = article.get("publication_year")
-    if pub_year:
-        try:
-            year = int(pub_year)
-        except (ValueError, TypeError):
-            pass
-
-    # Extract author names from authors object
-    authors = []
-    authors_data = article.get("authors", {}).get("authors", [])
-    for author in authors_data:
-        name = author.get("full_name")
-        if name:
-            authors.append(name)
-
-    # Prefer html_url, fall back to abstract_url
-    url = article.get("html_url") or article.get("abstract_url")
-
-    return Paper(
-        title=article.get("title", "") or "",
-        authors=authors,
-        year=year,
-        doi=article.get("doi"),
-        abstract=article.get("abstract"),
-        venue=article.get("publication_title"),
-        url=url,
-        source=self.name,
-    )
-@
-
-\section{Auto-registration}
-
-<<ieee provider>>=
-# Register the provider on module import
-register_provider(IEEEXploreProvider())
-@
-
-\section{Dependencies}
-
-Since the provider uses the same [[requests]] library as DBLP and WoS, we only
-need to define the API URL constant:
-
-<<ieee constants>>=
-IEEE_API_URL = "https://ieeexploreapi.ieee.org/api/v1/search/articles"
-@
-
-
-\chapter{Dependencies}
-
-We organize imports so each provider's dependencies are co-located with
-its implementation.
-If a provider is removed, its dependencies go with it.
-
-<<imports>>=
-import os
-from typing import Protocol
-
-from cachetools import cachedmethod
-
-from scholar import Paper
-from scholar.cache import load_cache, register_cache
-<<semantic scholar imports>>
-<<openalex imports>>
-<<dblp imports>>
-@
-
-<<constants>>=
-# Provider constants
-DEFAULT_LIMIT = 100
-<<dblp constants>>
-<<wos constants>>
-<<ieee constants>>
-@
-
-
-\chapter{Testing}
-\label{ch:providers-testing}
-
-We test both the registry and the Semantic Scholar provider.
-
-<<test [[providers.py]]>>=
-"""Tests for the providers module."""
-import pytest
-from unittest.mock import Mock, patch
-
-from scholar import Paper
-from scholar.providers import (
-    SemanticScholarProvider,
-    OpenAlexProvider,
-    DBLPProvider,
-    WebOfScienceProvider,
-    IEEEXploreProvider,
-    register_provider,
-    get_provider,
-    get_all_providers,
-    PROVIDERS,
-)
-@
-
-
-\section{Testing the registry}
+\subsection{Testing the registry}
 
 The registry should store and retrieve providers:
 
-<<test [[providers.py]]>>=
+<<test functions>>=
 class TestProviderRegistry:
     """Tests for the provider registry."""
 
@@ -837,11 +218,137 @@ class TestProviderRegistry:
 @
 
 
-\section{Testing Semantic Scholar provider}
+\section{Semantic Scholar Provider}
+\label{sec:semantic-scholar}
+
+Semantic Scholar is an AI-powered research tool that provides free access to
+over 200 million academic papers.
+Their API allows searching papers by keyword, author, venue, and more.
+
+\subsection{Package Choice}
+
+We use the [[semanticscholar]] Python package rather than calling the REST API
+directly. This package provides:
+\begin{itemize}
+\item Automatic rate limiting and retry logic
+\item Pagination handling for large result sets
+\item Type-safe access to paper fields
+\item API key management from environment variables
+\end{itemize}
+
+An optional API key ([[S2_API_KEY]]) increases rate limits from 100 to 10,000
+requests per minute.
+
+\subsection{Error Handling Philosophy}
+
+All providers silently return an empty list on errors rather than raising
+exceptions. This design choice ensures:
+\begin{description}
+\item[Partial results] If one provider fails (network issue, rate limit),
+  other providers can still contribute results.
+\item[Robustness] Transient errors don't crash the entire search.
+\item[Simplicity] Callers don't need complex exception handling.
+\end{description}
+
+The tradeoff is that failures are invisible. Users may not notice a provider
+is misconfigured until they wonder why results are sparse. The CLI's
+[[providers]] command helps diagnose such issues.
+
+\subsection{Provider implementation}
+
+<<semantic scholar provider>>=
+class SemanticScholarProvider:
+    """Search provider for Semantic Scholar."""
+
+    name = "semantic_scholar"
+
+    def __init__(self, api_key: str | None = None):
+        """
+        Initialize the Semantic Scholar provider.
+
+        Args:
+            api_key: Optional API key for higher rate limits.
+                     If not provided, uses S2_API_KEY environment variable.
+        """
+        self.client = SemanticScholar(api_key=api_key)
+        self._cache: dict = load_cache(self.name)
+        register_cache(self.name, self._cache)
+
+    @cachedmethod(lambda self: self._cache)
+    def search(self, query: str, limit: int = 100) -> list[Paper]:
+        """Search Semantic Scholar for papers matching the query."""
+        try:
+            results = self.client.search_paper(
+                query,
+                limit=limit,
+                fields=[
+                    "title",
+                    "authors",
+                    "year",
+                    "abstract",
+                    "venue",
+                    "externalIds",
+                    "url",
+                ],
+            )
+            return [self._convert_paper(p) for p in results]
+        except Exception:
+            # Return empty list on API errors
+            return []
+
+    <<convert semantic scholar paper>>
+@
+
+\subsubsection{Converting paper format}
+
+Semantic Scholar returns papers in their own format.
+We convert them to our common [[Paper]] type:
+
+<<convert semantic scholar paper>>=
+def _convert_paper(self, ss_paper) -> Paper:
+    """Convert a Semantic Scholar paper to our Paper type."""
+    # Extract DOI from externalIds if available
+    doi = None
+    if ss_paper.externalIds:
+        doi = ss_paper.externalIds.get("DOI")
+
+    # Extract author names
+    authors = []
+    if ss_paper.authors:
+        authors = [a.name for a in ss_paper.authors if a.name]
+
+    return Paper(
+        title=ss_paper.title or "",
+        authors=authors,
+        year=ss_paper.year,
+        doi=doi,
+        abstract=ss_paper.abstract,
+        venue=ss_paper.venue,
+        url=ss_paper.url,
+        source=self.name,
+    )
+@
+
+\subsection{Auto-registration}
+
+We register the provider when this module is imported:
+
+<<semantic scholar provider>>=
+# Register the provider on module import
+register_provider(SemanticScholarProvider())
+@
+
+\subsection{Dependencies}
+
+<<semantic scholar imports>>=
+from semanticscholar import SemanticScholar
+@
+
+\subsection{Testing Semantic Scholar provider}
 
 We mock the API client to avoid real network calls in tests:
 
-<<test [[providers.py]]>>=
+<<test functions>>=
 class TestSemanticScholarProvider:
     """Tests for the SemanticScholar provider."""
 
@@ -891,22 +398,8 @@ class TestSemanticScholarProvider:
 
             results = provider.search("test")
             assert results == []
-@
 
 
-\section{Integration test}
-
-We include a single integration test that makes one real API call to verify
-the provider works with the actual Semantic Scholar API.
-This test is marked with \texttt{@pytest.mark.integration} and skipped by
-default because Semantic Scholar has strict rate limits.
-
-To run integration tests explicitly:
-\begin{verbatim}
-pytest -m integration
-\end{verbatim}
-
-<<test [[providers.py]]>>=
 class TestSemanticScholarIntegration:
     """Integration test for the SemanticScholar provider."""
 
@@ -943,11 +436,130 @@ class TestSemanticScholarIntegration:
 @
 
 
-\section{Testing OpenAlex provider}
+\section{OpenAlex Provider}
+\label{sec:openalex}
+
+OpenAlex is a free and open catalog of the world's scholarly works, authors,
+venues, institutions, and concepts.
+It covers over 250 million works and is fully open access.
+
+\subsection{Package Choice}
+
+We use the [[pyalex]] Python package which provides a clean interface to the
+OpenAlex API. Unlike Semantic Scholar's package, [[pyalex]] returns raw
+dictionaries rather than typed objects, requiring manual field extraction.
+
+\subsection{Authentication}
+
+No API key is required, but providing an email address (via [[OPENALEX_EMAIL]]
+environment variable) gives access to the \enquote{polite pool}---a separate
+pool of API resources with faster response times for identified users.
+
+This is OpenAlex's approach to encouraging good API citizenship without
+creating barriers to access.
+
+\subsection{Provider implementation}
+
+<<openalex provider>>=
+class OpenAlexProvider:
+    """Search provider for OpenAlex."""
+
+    name = "openalex"
+
+    def __init__(self, email: str | None = None):
+        """
+        Initialize the OpenAlex provider.
+
+        Args:
+            email: Optional email for polite pool access (faster responses).
+                   If not provided, uses OPENALEX_EMAIL environment variable.
+        """
+        configured_email = email or os.environ.get("OPENALEX_EMAIL")
+        if configured_email:
+            pyalex.config.email = configured_email
+        self._cache: dict = load_cache(self.name)
+        register_cache(self.name, self._cache)
+
+    @cachedmethod(lambda self: self._cache)
+    def search(self, query: str, limit: int = 100) -> list[Paper]:
+        """Search OpenAlex for papers matching the query."""
+        try:
+            works = pyalex.Works().search(query).get(per_page=limit)
+            return [self._convert_work(w) for w in works]
+        except Exception:
+            return []
+
+    <<convert openalex work>>
+@
+
+\subsubsection{Converting work format}
+
+OpenAlex returns works as dictionaries.
+We extract the relevant fields and convert to our [[Paper]] type:
+
+<<convert openalex work>>=
+def _convert_work(self, work: dict) -> Paper:
+    """Convert an OpenAlex work to our Paper type."""
+    # Extract author names from authorships
+    authors = []
+    for authorship in work.get("authorships", []):
+        author_info = authorship.get("author", {})
+        name = author_info.get("display_name")
+        if name:
+            authors.append(name)
+
+    # Extract DOI (remove URL prefix if present)
+    doi = work.get("doi")
+    if doi and doi.startswith("https://doi.org/"):
+        doi = doi[16:]
+
+    # Extract venue from primary location
+    venue = None
+    primary_location = work.get("primary_location", {})
+    if primary_location:
+        source = primary_location.get("source", {})
+        if source:
+            venue = source.get("display_name")
+
+    # Extract PDF URL from open_access or primary_location
+    pdf_url = None
+    open_access = work.get("open_access", {})
+    if open_access:
+        pdf_url = open_access.get("oa_url")
+    if not pdf_url and primary_location:
+        pdf_url = primary_location.get("pdf_url")
+
+    return Paper(
+        title=work.get("title", ""),
+        authors=authors,
+        year=work.get("publication_year"),
+        doi=doi,
+        abstract=work.get("abstract"),
+        venue=venue,
+        url=work.get("id"),
+        pdf_url=pdf_url,
+        source=self.name,
+    )
+@
+
+\subsection{Auto-registration}
+
+<<openalex provider>>=
+# Register the provider on module import
+register_provider(OpenAlexProvider())
+@
+
+\subsection{Dependencies}
+
+<<openalex imports>>=
+import pyalex
+@
+
+\subsection{Testing OpenAlex provider}
 
 We test the OpenAlex provider with mocked API responses:
 
-<<test [[providers.py]]>>=
+<<test functions>>=
 class TestOpenAlexProvider:
     """Tests for the OpenAlex provider."""
 
@@ -1031,10 +643,8 @@ class TestOpenAlexProvider:
             assert paper.authors == []
             assert paper.year is None
             assert paper.doi is None
-@
 
 
-<<test [[providers.py]]>>=
 class TestOpenAlexIntegration:
     """Integration test for the OpenAlex provider."""
 
@@ -1058,11 +668,143 @@ class TestOpenAlexIntegration:
 @
 
 
-\section{Testing DBLP provider}
+\section{DBLP Provider}
+
+DBLP is a computer science bibliography database hosted at the University of
+Trier and Schloss Dagstuhl.
+It provides comprehensive coverage of major computer science journals and
+conference proceedings.
+
+\subsection{Package evaluation}
+
+We evaluated several Python packages for DBLP access:
+
+\begin{description}
+\item[dblpy-lib (0.1.3)] Appeared well-maintained with a clean API
+  ([[get_publications(q, max_results)]]).
+  However, it requires [[requests>=2.27.1,<2.28.0]], which conflicts with our
+  [[requests^2.31]] dependency.
+\item[dblp (0.1.0)] Returns pandas DataFrames, which seemed convenient.
+  However, it fails to install due to a bug in its setup script---it passes a
+  list where a string is expected ([[TypeError: expected string or bytes-like
+  object, got 'list']]).
+\end{description}
+
+Given these issues, we use the DBLP public API directly via [[requests]], which
+we already depend on.
+No API key is required.
+The API returns JSON with publication data that we parse directly.
+
+\subsection{Provider implementation}
+
+<<dblp provider>>=
+class DBLPProvider:
+    """Search provider for DBLP."""
+
+    name = "dblp"
+
+    def __init__(self):
+        """Initialize the DBLP provider."""
+        self._cache: dict = load_cache(self.name)
+        register_cache(self.name, self._cache)
+
+    @cachedmethod(lambda self: self._cache)
+    def search(self, query: str, limit: int = 100) -> list[Paper]:
+        """Search DBLP for papers matching the query."""
+        try:
+            # DBLP API caps at 1000 results per request
+            effective_limit = min(limit, 1000)
+            response = requests.get(
+                DBLP_API_URL,
+                params={"q": query, "format": "json", "h": effective_limit},
+                timeout=30,
+            )
+            response.raise_for_status()
+            data = response.json()
+
+            hits = data.get("result", {}).get("hits", {}).get("hit", [])
+            return [self._convert_hit(hit) for hit in hits]
+        except Exception:
+            return []
+
+    <<convert dblp hit>>
+@
+
+\subsubsection{Converting publication format}
+
+The DBLP API returns each publication as a JSON object with an [[info]] field
+containing:
+\begin{description}
+\item[authors] Object with [[author]] array, each having a [[text]] field.
+\item[title] The publication title.
+\item[venue] The venue (conference or journal).
+\item[year] Publication year as string.
+\item[doi] The DOI (if available).
+\item[ee] Electronic edition URL.
+\item[url] URL to the DBLP record.
+\end{description}
+
+We convert each hit to our common [[Paper]] type:
+
+<<convert dblp hit>>=
+def _convert_hit(self, hit: dict) -> Paper:
+    """Convert a DBLP API hit to our Paper type."""
+    info = hit.get("info", {})
+
+    # Extract year as integer if available
+    year = None
+    year_str = info.get("year")
+    if year_str:
+        try:
+            year = int(year_str)
+        except (ValueError, TypeError):
+            pass
+
+    # Extract author names from nested structure
+    authors = []
+    authors_data = info.get("authors", {}).get("author", [])
+    # Handle single author (dict) vs multiple authors (list)
+    if isinstance(authors_data, dict):
+        authors_data = [authors_data]
+    for author in authors_data:
+        name = author.get("text") if isinstance(author, dict) else author
+        if name:
+            authors.append(name)
+
+    return Paper(
+        title=info.get("title", "") or "",
+        authors=authors,
+        year=year,
+        doi=info.get("doi"),
+        abstract=None,  # DBLP doesn't provide abstracts
+        venue=info.get("venue"),
+        url=info.get("url") or info.get("ee"),
+        source=self.name,
+    )
+@
+
+\subsection{Auto-registration}
+
+<<dblp provider>>=
+# Register the provider on module import
+register_provider(DBLPProvider())
+@
+
+\subsection{Dependencies}
+
+<<dblp imports>>=
+import requests
+@
+
+<<dblp constants>>=
+DBLP_API_URL = "https://dblp.org/search/publ/api"
+@
+
+\subsection{Testing DBLP provider}
 
 We test the DBLP provider with mocked API responses:
 
-<<test [[providers.py]]>>=
+<<test functions>>=
 class TestDBLPProvider:
     """Tests for the DBLP provider."""
 
@@ -1070,7 +812,6 @@ class TestDBLPProvider:
         """search() converts API results to Paper objects."""
         provider = DBLPProvider()
 
-        # Create mock API response (DBLP returns JSON)
         mock_response = Mock()
         mock_response.json.return_value = {
             "result": {
@@ -1225,10 +966,8 @@ class TestDBLPProvider:
 
             call_args = mock_get.call_args
             assert call_args[1]["params"]["h"] == 1000
-@
 
 
-<<test [[providers.py]]>>=
 class TestDBLPIntegration:
     """Integration test for the DBLP provider."""
 
@@ -1252,12 +991,160 @@ class TestDBLPIntegration:
 @
 
 
-\section{Testing Web of Science provider}
+\section{Web of Science Provider}
+
+Web of Science (WoS) is a comprehensive citation index covering scholarly
+literature across sciences, social sciences, arts, and humanities.
+It is maintained by Clarivate and requires institutional access or an API key.
+
+\subsection{API options}
+
+Clarivate provides several API options:
+
+\begin{description}
+\item[Web of Science API Expanded] Full access with advanced features.
+  Requires institutional subscription.
+\item[Web of Science Starter API] Basic search with bibliographic metadata.
+  Has a free tier (50 requests/day) and institutional tiers (5,000--20,000
+  requests/day).
+\end{description}
+
+The official Python client ([[wosstarter_python_client]]) is only available
+from GitHub, not PyPI.
+For consistency with our DBLP implementation, we use the Starter API's REST
+endpoint directly via [[requests]].
+
+\subsection{Provider implementation}
+
+<<wos provider>>=
+class WebOfScienceProvider:
+    """Search provider for Web of Science."""
+
+    name = "wos"
+
+    def __init__(self, api_key: str | None = None):
+        """
+        Initialize the Web of Science provider.
+
+        Args:
+            api_key: API key for WoS Starter API.
+                     If not provided, uses WOS_API_KEY environment variable.
+        """
+        self.api_key = api_key or os.environ.get("WOS_API_KEY")
+        self._cache: dict = load_cache(self.name)
+        register_cache(self.name, self._cache)
+
+    @cachedmethod(lambda self: self._cache)
+    def search(self, query: str, limit: int = 100) -> list[Paper]:
+        """Search Web of Science for papers matching the query."""
+        if not self.api_key:
+            return []  # No API key configured
+
+        try:
+            # WoS Starter API has max 50 results per page
+            effective_limit = min(limit, 50)
+            response = requests.get(
+                WOS_API_URL,
+                params={
+                    "q": query,
+                    "db": "WOS",
+                    "limit": effective_limit,
+                    "page": 1,
+                },
+                headers={"X-ApiKey": self.api_key},
+                timeout=30,
+            )
+            response.raise_for_status()
+            data = response.json()
+
+            hits = data.get("hits", [])
+            return [self._convert_hit(hit) for hit in hits]
+        except Exception:
+            return []
+
+    <<convert wos hit>>
+@
+
+\subsubsection{Converting document format}
+
+The WoS Starter API returns documents with fields including:
+\begin{description}
+\item[uid] Unique WoS identifier.
+\item[title] The document title.
+\item[names] Object with [[authors]] array containing author names.
+\item[source] Source publication information including [[sourceTitle]].
+\item[links] Object with [[record]] URL to WoS page.
+\item[identifiers] Object with DOI and other identifiers.
+\item[keywords] Object with [[authorKeywords]] array.
+\end{description}
+
+We convert each hit to our common [[Paper]] type:
+
+<<convert wos hit>>=
+def _convert_hit(self, hit: dict) -> Paper:
+    """Convert a WoS API hit to our Paper type."""
+    # Extract publication year from source
+    source = hit.get("source", {})
+    year = None
+    pub_year = source.get("publishYear")
+    if pub_year:
+        try:
+            year = int(pub_year)
+        except (ValueError, TypeError):
+            pass
+
+    # Extract author names
+    authors = []
+    names = hit.get("names", {})
+    for author in names.get("authors", []):
+        name = author.get("displayName")
+        if name:
+            authors.append(name)
+
+    # Extract DOI from identifiers
+    doi = None
+    identifiers = hit.get("identifiers", {})
+    doi = identifiers.get("doi")
+
+    # Extract URL from links
+    url = None
+    links = hit.get("links", {})
+    url = links.get("record")
+
+    return Paper(
+        title=hit.get("title", "") or "",
+        authors=authors,
+        year=year,
+        doi=doi,
+        abstract=None,  # Not available in Starter API
+        venue=source.get("sourceTitle"),
+        url=url,
+        source=self.name,
+    )
+@
+
+\subsection{Auto-registration}
+
+<<wos provider>>=
+# Register the provider on module import
+register_provider(WebOfScienceProvider())
+@
+
+\subsection{Dependencies}
+
+Since the provider uses the same [[requests]] library as DBLP, we only need
+to define the API URL constant:
+
+<<wos constants>>=
+WOS_API_URL = "https://api.clarivate.com/apis/wos-starter/v1/documents"
+@
+
+\subsection{Testing Web of Science provider}
 
 We test the WoS provider with mocked API responses.
 Note that without an API key, the provider returns empty results:
 
-<<test [[providers.py]]>>=
+<<test functions>>=
 class TestWebOfScienceProvider:
     """Tests for the Web of Science provider."""
 
@@ -1271,7 +1158,6 @@ class TestWebOfScienceProvider:
         """search() converts API results to Paper objects."""
         provider = WebOfScienceProvider(api_key="test_key")
 
-        # Create mock API response
         mock_response = Mock()
         mock_response.json.return_value = {
             "hits": [{
@@ -1385,10 +1271,8 @@ class TestWebOfScienceProvider:
 
             call_args = mock_get.call_args
             assert call_args[1]["headers"]["X-ApiKey"] == "my_secret_key"
-@
 
 
-<<test [[providers.py]]>>=
 class TestWebOfScienceIntegration:
     """Integration test for the Web of Science provider."""
 
@@ -1418,12 +1302,146 @@ class TestWebOfScienceIntegration:
 @
 
 
-\section{Testing IEEE Xplore provider}
+\section{IEEE Xplore Provider}
+
+IEEE Xplore is a research database providing access to scientific and technical
+content published by IEEE (Institute of Electrical and Electronics Engineers)
+and its publishing partners.
+It contains over 6 million documents including journals, conference proceedings,
+technical standards, and books.
+
+\subsection{API access}
+
+IEEE provides a Metadata API for searching and retrieving bibliographic data.
+The API requires registration and an API key, which can be obtained from the
+IEEE Developer Portal.
+
+The official Python SDK ([[xploreapi]]) is provided by IEEE but is not available
+on PyPI---it must be downloaded from the Developer Portal.
+For consistency with our other providers, we use the REST API directly via
+[[requests]].
+
+\subsection{Provider implementation}
+
+<<ieee provider>>=
+class IEEEXploreProvider:
+    """Search provider for IEEE Xplore."""
+
+    name = "ieee"
+
+    def __init__(self, api_key: str | None = None):
+        """
+        Initialize the IEEE Xplore provider.
+
+        Args:
+            api_key: API key for IEEE Xplore API.
+                     If not provided, uses IEEE_API_KEY environment variable.
+        """
+        self.api_key = api_key or os.environ.get("IEEE_API_KEY")
+        self._cache: dict = load_cache(self.name)
+        register_cache(self.name, self._cache)
+
+    @cachedmethod(lambda self: self._cache)
+    def search(self, query: str, limit: int = 100) -> list[Paper]:
+        """Search IEEE Xplore for papers matching the query."""
+        if not self.api_key:
+            return []  # No API key configured
+
+        try:
+            # IEEE API returns max 200 results per request
+            effective_limit = min(limit, 200)
+            response = requests.get(
+                IEEE_API_URL,
+                params={
+                    "querytext": query,
+                    "max_records": effective_limit,
+                    "apikey": self.api_key,
+                },
+                timeout=30,
+            )
+            response.raise_for_status()
+            data = response.json()
+
+            articles = data.get("articles", [])
+            return [self._convert_article(article) for article in articles]
+        except Exception:
+            return []
+
+    <<convert ieee article>>
+@
+
+\subsubsection{Converting article format}
+
+The IEEE Xplore API returns articles with fields including:
+\begin{description}
+\item[title] The document title.
+\item[authors] Object with [[authors]] array containing author details.
+\item[abstract] Brief summary of the document.
+\item[publication\_title] Journal or conference name.
+\item[publication\_year] Year of publication.
+\item[doi] Digital Object Identifier.
+\item[html\_url] URL to the article page.
+\end{description}
+
+We convert each article to our common [[Paper]] type:
+
+<<convert ieee article>>=
+def _convert_article(self, article: dict) -> Paper:
+    """Convert an IEEE Xplore article to our Paper type."""
+    # Extract publication year
+    year = None
+    pub_year = article.get("publication_year")
+    if pub_year:
+        try:
+            year = int(pub_year)
+        except (ValueError, TypeError):
+            pass
+
+    # Extract author names from authors object
+    authors = []
+    authors_data = article.get("authors", {}).get("authors", [])
+    for author in authors_data:
+        name = author.get("full_name")
+        if name:
+            authors.append(name)
+
+    # Prefer html_url, fall back to abstract_url
+    url = article.get("html_url") or article.get("abstract_url")
+
+    return Paper(
+        title=article.get("title", "") or "",
+        authors=authors,
+        year=year,
+        doi=article.get("doi"),
+        abstract=article.get("abstract"),
+        venue=article.get("publication_title"),
+        url=url,
+        source=self.name,
+    )
+@
+
+\subsection{Auto-registration}
+
+<<ieee provider>>=
+# Register the provider on module import
+register_provider(IEEEXploreProvider())
+@
+
+\subsection{Dependencies}
+
+Since the provider uses the same [[requests]] library as DBLP and WoS, we only
+need to define the API URL constant:
+
+<<ieee constants>>=
+IEEE_API_URL = "https://ieeexploreapi.ieee.org/api/v1/search/articles"
+@
+
+\subsection{Testing IEEE Xplore provider}
 
 We test the IEEE Xplore provider with mocked API responses.
 Like WoS, without an API key the provider returns empty results:
 
-<<test [[providers.py]]>>=
+<<test functions>>=
 class TestIEEEXploreProvider:
     """Tests for the IEEE Xplore provider."""
 
@@ -1437,7 +1455,6 @@ class TestIEEEXploreProvider:
         """search() converts API results to Paper objects."""
         provider = IEEEXploreProvider(api_key="test_key")
 
-        # Create mock API response
         mock_response = Mock()
         mock_response.json.return_value = {
             "articles": [{
@@ -1571,10 +1588,8 @@ class TestIEEEXploreProvider:
             results = provider.search("test")
 
             assert results[0].url == "https://ieeexplore.ieee.org/abstract/1234"
-@
 
 
-<<test [[providers.py]]>>=
 class TestIEEEXploreIntegration:
     """Integration test for the IEEE Xplore provider."""
 
@@ -1604,4 +1619,29 @@ class TestIEEEXploreIntegration:
 @
 
 
-\end{document}
+\section{Dependencies}
+
+We organize imports so each provider's dependencies are co-located with
+its implementation.
+If a provider is removed, its dependencies go with it.
+
+<<imports>>=
+import os
+from typing import Protocol
+
+from cachetools import cachedmethod
+
+from scholar import Paper
+from scholar.cache import load_cache, register_cache
+<<semantic scholar imports>>
+<<openalex imports>>
+<<dblp imports>>
+@
+
+<<constants>>=
+# Provider constants
+DEFAULT_LIMIT = 100
+<<dblp constants>>
+<<wos constants>>
+<<ieee constants>>
+@
