@@ -5,6 +5,7 @@ MODULES+=	cache.py
 MODULES+=	cli.py
 MODULES+=	tui.py
 MODULES+=	notes.py
+MODULES+=	pdf.py
 MODULES+=	__main__.py
 
 TEX+=		scholar.tex
@@ -13,6 +14,7 @@ TEX+=		cache.tex
 TEX+=		cli.tex
 TEX+=		tui.tex
 TEX+=		notes.tex
+TEX+=		pdf.tex
 
 .PHONY: all clean distclean
 
@@ -58,6 +60,12 @@ notes.py: notes.nw
 	${NOTANGLE.py}
 
 notes.tex: notes.nw
+	${NOWEAVE.tex}
+
+pdf.py: pdf.nw
+	${NOTANGLE.py}
+
+pdf.tex: pdf.nw
 	${NOWEAVE.tex}
 
 INCLUDE_MAKEFILES=../../makefiles

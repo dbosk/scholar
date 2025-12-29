@@ -1,0 +1,518 @@
+\chapter{PDF Management}
+\label{pdf-module}
+
+\section{Introduction}
+
+When reviewing papers, researchers often need to view the full PDF, especially
+when the abstract is missing or insufficient. This module provides PDF
+download and caching functionality that can be used both programmatically
+and through the TUI.
+
+\subsection{Design Goals}
+
+The PDF management module is designed with these goals:
+\begin{description}
+\item[Separation from TUI] PDF functionality should be usable from Python
+  code without any TUI dependencies, enabling automation and scripting.
+\item[Content-addressed caching] PDFs are cached by URL hash, providing
+  automatic deduplication across searches.
+\item[Graceful error handling] Download failures are reported clearly
+  with actionable error messages.
+\item[Platform independence] Works on Linux, macOS, and Windows.
+\end{description}
+
+\subsection{Why a Separate PDF Cache?}
+
+PDFs are cached separately from search results for several reasons:
+\begin{description}
+\item[Size] PDFs are typically megabytes, while search metadata is kilobytes.
+  Mixing them would bloat the search cache and slow down cache operations.
+\item[Lifecycle] Search caches may be cleared to refresh results, but
+  downloaded PDFs should persist---re-downloading is slow and wastes bandwidth.
+\item[Sharing] The same PDF may appear in multiple searches. A content-addressed
+  cache (keyed by URL hash) naturally deduplicates across sessions.
+\end{description}
+
+\section{Module Structure}
+
+<<[[pdf.py]]>>=
+"""
+PDF download and caching for academic papers.
+
+Provides functions to download, cache, and open PDFs from paper URLs.
+The cache is content-addressed using SHA-256 hashes of URLs.
+"""
+<<pdf imports>>
+<<pdf constants>>
+<<pdf cache functions>>
+<<pdf download functions>>
+<<pdf open functions>>
+@
+
+
+\section{Testing}
+\label{sec:pdf-tests}
+
+Tests are distributed throughout this document, appearing after each
+implementation section they verify.
+
+<<test [[pdf.py]]>>=
+"""Tests for the PDF module."""
+import pytest
+from pathlib import Path
+from unittest.mock import Mock, patch, MagicMock
+
+from scholar.pdf import *
+
+
+<<test functions>>
+@
+
+
+\section{Imports and Constants}
+
+<<pdf imports>>=
+from pathlib import Path
+from typing import Any, Callable
+import hashlib
+import os
+import subprocess
+import sys
+
+import platformdirs
+import requests
+@
+
+We define a constant for the subdirectory name within the cache directory.
+
+<<pdf constants>>=
+PDF_CACHE_SUBDIR = "pdfs"
+@
+
+
+\section{Cache Directory Management}
+
+The PDF cache lives in the user's cache directory under a \enquote{pdfs}
+subdirectory. This keeps PDFs separate from search result caches.
+
+<<pdf cache functions>>=
+def get_pdf_cache_dir() -> Path:
+    """
+    Get the PDF cache directory, creating it if needed.
+    
+    The cache location can be overridden with the SCHOLAR_CACHE_DIR
+    environment variable.
+    
+    Returns:
+        Path to the PDF cache directory.
+    """
+    base_cache = os.environ.get("SCHOLAR_CACHE_DIR")
+    if base_cache:
+        cache_dir = Path(base_cache) / PDF_CACHE_SUBDIR
+    else:
+        cache_dir = Path(platformdirs.user_cache_dir("scholar")) / PDF_CACHE_SUBDIR
+    cache_dir.mkdir(parents=True, exist_ok=True)
+    return cache_dir
+
+
+def get_cached_pdf_path(url: str) -> Path:
+    """
+    Get the cache path for a PDF URL.
+    
+    Uses SHA-256 hash of the URL (truncated to 16 hex chars) as filename.
+    This provides sufficient uniqueness while keeping paths readable.
+    
+    Args:
+        url: The PDF URL.
+    
+    Returns:
+        Path where this PDF would be cached.
+    """
+    url_hash = hashlib.sha256(url.encode()).hexdigest()[:16]
+    return get_pdf_cache_dir() / f"{url_hash}.pdf"
+
+
+def clear_pdf_cache() -> int:
+    """
+    Delete all cached PDFs.
+    
+    Returns:
+        Number of PDF files deleted.
+    """
+    cache_dir = get_pdf_cache_dir()
+    count = 0
+    for pdf_file in cache_dir.glob("*.pdf"):
+        try:
+            pdf_file.unlink()
+            count += 1
+        except OSError:
+            pass
+    return count
+
+
+def get_pdf_cache_info() -> dict[str, int]:
+    """
+    Get information about the PDF cache.
+    
+    Returns:
+        Dictionary with 'count' (number of files) and 'size_bytes' (total size).
+    """
+    cache_dir = get_pdf_cache_dir()
+    count = 0
+    size_bytes = 0
+    for pdf_file in cache_dir.glob("*.pdf"):
+        count += 1
+        try:
+            size_bytes += pdf_file.stat().st_size
+        except OSError:
+            pass
+    return {"count": count, "size_bytes": size_bytes}
+@
+
+\subsection{Testing cache functions}
+
+<<test functions>>=
+class TestPDFCache:
+    """Tests for PDF cache functions."""
+
+    def test_get_pdf_cache_dir_creates_directory(self, tmp_path, monkeypatch):
+        """Cache directory is created if it doesn't exist."""
+        cache_dir = tmp_path / "scholar_cache"
+        monkeypatch.setenv("SCHOLAR_CACHE_DIR", str(cache_dir))
+        
+        result = get_pdf_cache_dir()
+        
+        assert result == cache_dir / PDF_CACHE_SUBDIR
+        assert result.exists()
+
+    def test_get_cached_pdf_path_deterministic(self):
+        """Same URL always produces same cache path."""
+        url = "https://example.com/paper.pdf"
+        path1 = get_cached_pdf_path(url)
+        path2 = get_cached_pdf_path(url)
+        assert path1 == path2
+
+    def test_get_cached_pdf_path_different_urls(self):
+        """Different URLs produce different cache paths."""
+        url1 = "https://example.com/paper1.pdf"
+        url2 = "https://example.com/paper2.pdf"
+        path1 = get_cached_pdf_path(url1)
+        path2 = get_cached_pdf_path(url2)
+        assert path1 != path2
+
+    def test_clear_pdf_cache(self, tmp_path, monkeypatch):
+        """Can clear all cached PDFs."""
+        monkeypatch.setenv("SCHOLAR_CACHE_DIR", str(tmp_path))
+        
+        cache_dir = get_pdf_cache_dir()
+        (cache_dir / "test1.pdf").write_bytes(b"pdf1")
+        (cache_dir / "test2.pdf").write_bytes(b"pdf2")
+        
+        count = clear_pdf_cache()
+        
+        assert count == 2
+        assert len(list(cache_dir.glob("*.pdf"))) == 0
+
+    def test_get_pdf_cache_info(self, tmp_path, monkeypatch):
+        """Can get cache statistics."""
+        monkeypatch.setenv("SCHOLAR_CACHE_DIR", str(tmp_path))
+        
+        cache_dir = get_pdf_cache_dir()
+        (cache_dir / "test1.pdf").write_bytes(b"x" * 100)
+        (cache_dir / "test2.pdf").write_bytes(b"y" * 200)
+        
+        info = get_pdf_cache_info()
+        
+        assert info["count"] == 2
+        assert info["size_bytes"] == 300
+@
+
+
+\section{PDF Download}
+
+The download function handles HTTP requests with proper error handling and
+content-type validation. We verify the response is actually a PDF before
+saving it.
+
+<<pdf download functions>>=
+class PDFDownloadError(Exception):
+    """
+    Exception raised when PDF download fails.
+    
+    Contains a descriptive error message suitable for display to users.
+    """
+    pass
+
+
+def download_pdf(
+    url: str,
+    progress_callback: Callable[[str], None] | None = None,
+) -> Path:
+    """
+    Download a PDF to the cache if not already cached.
+    
+    Args:
+        url: URL of the PDF to download.
+        progress_callback: Optional callback for status messages.
+    
+    Returns:
+        Path to the cached PDF file.
+    
+    Raises:
+        PDFDownloadError: If download fails with descriptive message.
+    """
+    cache_path = get_cached_pdf_path(url)
+    
+    if cache_path.exists():
+        if progress_callback:
+            progress_callback(f"Using cached PDF: {cache_path}")
+        return cache_path
+    
+    if progress_callback:
+        progress_callback(f"Downloading PDF from {url}...")
+    
+    try:
+        response = requests.get(url, timeout=30, stream=True)
+        response.raise_for_status()
+        
+        # Validate content type
+        content_type = response.headers.get("content-type", "")
+        if "pdf" not in content_type.lower() and "octet-stream" not in content_type.lower():
+            raise PDFDownloadError(
+                f"URL did not return a PDF. Content-Type: {content_type}\nURL: {url}"
+            )
+        
+        # Stream to file
+        with open(cache_path, "wb") as f:
+            for chunk in response.iter_content(chunk_size=8192):
+                f.write(chunk)
+        
+        if progress_callback:
+            progress_callback("Download complete")
+        
+        return cache_path
+        
+    except requests.exceptions.HTTPError as e:
+        raise PDFDownloadError(
+            f"HTTP error {e.response.status_code}: {e.response.reason}\nURL: {url}"
+        )
+    except requests.exceptions.ConnectionError as e:
+        raise PDFDownloadError(f"Connection error: {e}\nURL: {url}")
+    except requests.exceptions.Timeout:
+        raise PDFDownloadError(f"Request timed out after 30 seconds\nURL: {url}")
+    except requests.exceptions.RequestException as e:
+        raise PDFDownloadError(f"Request failed: {e}\nURL: {url}")
+@
+
+\subsection{High-level PDF access}
+
+For convenience, we provide a function that accepts either a Paper object
+or a URL string, making it easy to use from both programmatic code and
+the TUI.
+
+<<pdf download functions>>=
+def get_pdf(
+    source: Any,
+    progress_callback: Callable[[str], None] | None = None,
+) -> Path:
+    """
+    Get a PDF, downloading if necessary.
+    
+    This is the main entry point for PDF access. It accepts either a Paper
+    object (using its pdf_url attribute) or a direct URL string.
+    
+    Args:
+        source: A Paper object with pdf_url, or a URL string.
+        progress_callback: Optional callback for status messages.
+    
+    Returns:
+        Path to the cached PDF file.
+    
+    Raises:
+        PDFDownloadError: If download fails or no URL available.
+    """
+    # Extract URL from source
+    if isinstance(source, str):
+        url = source
+    else:
+        # Assume it's a Paper object
+        url = getattr(source, "pdf_url", None)
+        if not url:
+            raise PDFDownloadError(
+                f"Paper has no PDF URL: {getattr(source, 'title', 'Unknown')}"
+            )
+    
+    return download_pdf(url, progress_callback)
+@
+
+\subsection{Testing download functions}
+
+<<test functions>>=
+class TestPDFDownload:
+    """Tests for PDF download functions."""
+
+    def test_download_pdf_caches_result(self, tmp_path, monkeypatch):
+        """Downloaded PDF is cached."""
+        monkeypatch.setenv("SCHOLAR_CACHE_DIR", str(tmp_path))
+        
+        # Mock requests.get
+        mock_response = MagicMock()
+        mock_response.headers = {"content-type": "application/pdf"}
+        mock_response.iter_content.return_value = [b"PDF content"]
+        
+        with patch("scholar.pdf.requests.get", return_value=mock_response):
+            path = download_pdf("https://example.com/paper.pdf")
+        
+        assert path.exists()
+        assert path.read_bytes() == b"PDF content"
+
+    def test_download_pdf_uses_cache(self, tmp_path, monkeypatch):
+        """Second download uses cached file."""
+        monkeypatch.setenv("SCHOLAR_CACHE_DIR", str(tmp_path))
+        
+        # Pre-create cached file
+        url = "https://example.com/cached.pdf"
+        cache_path = get_cached_pdf_path(url)
+        cache_path.write_bytes(b"Cached PDF")
+        
+        # Should not make HTTP request
+        with patch("scholar.pdf.requests.get") as mock_get:
+            path = download_pdf(url)
+            mock_get.assert_not_called()
+        
+        assert path == cache_path
+
+    def test_download_pdf_validates_content_type(self, tmp_path, monkeypatch):
+        """Rejects non-PDF content types."""
+        monkeypatch.setenv("SCHOLAR_CACHE_DIR", str(tmp_path))
+        
+        mock_response = MagicMock()
+        mock_response.headers = {"content-type": "text/html"}
+        
+        with patch("scholar.pdf.requests.get", return_value=mock_response):
+            with pytest.raises(PDFDownloadError) as exc_info:
+                download_pdf("https://example.com/not-a-pdf")
+        
+        assert "did not return a PDF" in str(exc_info.value)
+
+    def test_get_pdf_from_paper(self, tmp_path, monkeypatch):
+        """get_pdf works with Paper objects."""
+        monkeypatch.setenv("SCHOLAR_CACHE_DIR", str(tmp_path))
+        
+        paper = Mock()
+        paper.pdf_url = "https://example.com/paper.pdf"
+        paper.title = "Test Paper"
+        
+        mock_response = MagicMock()
+        mock_response.headers = {"content-type": "application/pdf"}
+        mock_response.iter_content.return_value = [b"PDF"]
+        
+        with patch("scholar.pdf.requests.get", return_value=mock_response):
+            path = get_pdf(paper)
+        
+        assert path.exists()
+
+    def test_get_pdf_from_url_string(self, tmp_path, monkeypatch):
+        """get_pdf works with URL strings."""
+        monkeypatch.setenv("SCHOLAR_CACHE_DIR", str(tmp_path))
+        
+        mock_response = MagicMock()
+        mock_response.headers = {"content-type": "application/pdf"}
+        mock_response.iter_content.return_value = [b"PDF"]
+        
+        with patch("scholar.pdf.requests.get", return_value=mock_response):
+            path = get_pdf("https://example.com/paper.pdf")
+        
+        assert path.exists()
+
+    def test_get_pdf_no_url_raises_error(self):
+        """get_pdf raises error when paper has no PDF URL."""
+        paper = Mock()
+        paper.pdf_url = None
+        paper.title = "No PDF Paper"
+        
+        with pytest.raises(PDFDownloadError) as exc_info:
+            get_pdf(paper)
+        
+        assert "no PDF URL" in str(exc_info.value)
+@
+
+
+\section{Opening PDFs}
+
+We provide a cross-platform function to open PDFs with the system default
+viewer. This delegates to platform-specific commands.
+
+<<pdf open functions>>=
+def open_pdf(path: Path) -> bool:
+    """
+    Open a PDF with the system default viewer.
+    
+    Uses platform-appropriate commands:
+    - macOS: open
+    - Windows: start
+    - Linux/other: xdg-open
+    
+    Args:
+        path: Path to the PDF file.
+    
+    Returns:
+        True if the viewer was launched successfully, False otherwise.
+    """
+    try:
+        if sys.platform == "darwin":
+            subprocess.run(["open", str(path)], check=True)
+        elif sys.platform == "win32":
+            os.startfile(str(path))  # type: ignore
+        else:
+            subprocess.run(["xdg-open", str(path)], check=True)
+        return True
+    except Exception:
+        return False
+@
+
+\subsection{Testing open function}
+
+<<test functions>>=
+class TestOpenPDF:
+    """Tests for PDF open function."""
+
+    def test_open_pdf_macos(self, tmp_path, monkeypatch):
+        """Uses 'open' command on macOS."""
+        monkeypatch.setattr(sys, "platform", "darwin")
+        pdf_path = tmp_path / "test.pdf"
+        pdf_path.write_bytes(b"PDF")
+        
+        with patch("scholar.pdf.subprocess.run") as mock_run:
+            mock_run.return_value = None
+            result = open_pdf(pdf_path)
+        
+        assert result is True
+        mock_run.assert_called_once()
+        assert "open" in mock_run.call_args[0][0]
+
+    def test_open_pdf_linux(self, tmp_path, monkeypatch):
+        """Uses 'xdg-open' command on Linux."""
+        monkeypatch.setattr(sys, "platform", "linux")
+        pdf_path = tmp_path / "test.pdf"
+        pdf_path.write_bytes(b"PDF")
+        
+        with patch("scholar.pdf.subprocess.run") as mock_run:
+            mock_run.return_value = None
+            result = open_pdf(pdf_path)
+        
+        assert result is True
+        mock_run.assert_called_once()
+        assert "xdg-open" in mock_run.call_args[0][0]
+
+    def test_open_pdf_failure_returns_false(self, tmp_path, monkeypatch):
+        """Returns False when open command fails."""
+        monkeypatch.setattr(sys, "platform", "linux")
+        pdf_path = tmp_path / "test.pdf"
+        pdf_path.write_bytes(b"PDF")
+        
+        with patch("scholar.pdf.subprocess.run", side_effect=Exception("Failed")):
+            result = open_pdf(pdf_path)
+        
+        assert result is False
+@
