@@ -6,6 +6,11 @@ tests/*.py
 doc/*.pdf
 doc/ltxobj/
 
+# Generated review reports (from scholar sessions export or TUI)
+review_*.tex
+review_*.bib
+review_*.csv
+
 # Byte-compiled / optimized / DLL files
 __pycache__/
 *.py[cod]
