@@ -503,17 +503,44 @@ The modal supports three key interactions:
 \begin{description}
 \item[Toggle existing tags] Press Space or click to check/uncheck tags
   in the list. Multiple tags can be selected simultaneously.
-\item[Add new tags] Type in the input field and press Enter. The new
-  tag appears in the list and is automatically selected. The input
-  clears so users can add more tags without extra keystrokes.
-\item[Confirm selection] Press Enter on an empty input field to confirm
-  and close the modal. This \enquote{Enter twice to confirm} pattern
-  is intentional: it prevents accidental submission while adding tags.
+\item[Add new tags] Press Tab to move to the input field, type a tag name,
+  and press Enter. The new tag appears in the list and is automatically 
+  selected. The input clears so users can add more tags without extra 
+  keystrokes.
+\item[Confirm selection] Press Enter to confirm and close the modal.
+  This works from both the selection list and the input field.
 \end{description}
 
 For discarding papers, the modal enforces that at least one motivation
 must be selected---we pass [[require_at_least_one=True]]. For keeping
 papers with themes, selection is optional.
+
+\subsubsection{Focus Management}
+
+Initial focus depends on whether there are existing tags to choose from.
+If the list has tags, we focus the [[SelectionList]] so users can immediately
+toggle selections with Space. If the list is empty (first time discarding
+or adding themes), we focus the [[Input]] field since there's nothing to
+select yet.
+
+An earlier design always focused the [[SelectionList]] and relied on
+[[on_input_submitted]] to handle Enter. This failed because:
+\begin{enumerate}
+\item The [[SelectionList]] widget captures keyboard input but doesn't
+  pass text to the [[Input]] field---typing while the list has focus
+  does nothing useful.
+\item The [[on_input_submitted]] event only fires when the [[Input]] widget
+  has focus and receives Enter. With focus on the [[SelectionList]], 
+  pressing Enter did nothing.
+\item Users had to know to press Tab to reach the input field, but this
+  wasn't documented and wasn't discoverable.
+\end{enumerate}
+
+The fix adds an [[enter]] binding at the modal level via [[action_confirm]].
+This binding fires regardless of which widget has focus. The action checks
+whether the [[Input]] has focus: if so and it contains text, the text is
+added as a new tag; otherwise, the selection is confirmed. This means
+Enter always does something sensible.
 
 \subsection{Code Reuse Through Parameterization}
 
@@ -552,6 +579,7 @@ class TagSelectionModal(ModalScreen[list[str] | None]):
     
     BINDINGS = [
         Binding("escape", "cancel", "Cancel"),
+        Binding("enter", "confirm", "Confirm"),
     ]
     
     DEFAULT_CSS = """
@@ -628,17 +656,17 @@ count into the display label. Tags that were previously selected
             )
             
             # Show contextual help, noting if selection is required
-            help_text = "[dim]Space: toggle, Enter: add/confirm, Escape: cancel[/dim]"
+            help_text = "[dim]Space: toggle, Enter: confirm, Tab: add new, Escape: cancel[/dim]"
             if self.require_at_least_one:
                 help_text = "[dim]At least one required. " + help_text[5:]
             yield Static(help_text, id="tag-help")
     
     def on_mount(self) -> None:
-        """Focus the selection list on mount."""
-        try:
+        """Focus appropriate widget based on available tags."""
+        if self.available_tags:
             self.query_one("#tag-list", SelectionList).focus()
-        except Exception:
-            pass
+        else:
+            self.query_one("#tag-input", Input).focus()
 @
 
 \subsection{Handling Input}
@@ -704,6 +732,21 @@ zero tags} (the latter only valid when [[require_at_least_one=False]]).
     def action_cancel(self) -> None:
         """Cancel without making changes."""
         self.dismiss(None)
+    
+    def action_confirm(self) -> None:
+        """Confirm selection when Enter pressed."""
+        input_widget = self.query_one("#tag-input", Input)
+        if input_widget.has_focus:
+            # Input has focus - if there's text, add it; otherwise confirm
+            tag = input_widget.value.strip()
+            if tag:
+                self._add_and_select_tag(tag)
+                input_widget.value = ""
+            else:
+                self._confirm_selection()
+        else:
+            # SelectionList has focus - just confirm
+            self._confirm_selection()
 @
 
 \section{Sort Modal}
