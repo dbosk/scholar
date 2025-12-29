@@ -933,8 +933,8 @@ def sessions_resume(
 
     Opens the interactive review interface with the saved session loaded.
     """
-    from scholar.review import load_session
-    from scholar.tui import ReviewApp, prompt_for_report
+    from scholar.review import load_session, save_session
+    from scholar.tui import PaperReviewApp, prompt_for_report
 
     console = Console()
     session = load_session(name)
@@ -945,8 +945,11 @@ def sessions_resume(
 
     console.print(f"[dim]Resuming session: {session.query}[/dim]")
 
-    app = ReviewApp(session)
+    app = PaperReviewApp(session)
     app.run()
+
+    # Save updated session
+    save_session(session)
 
     prompt_for_report(session)
 @
