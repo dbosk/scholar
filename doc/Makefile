@@ -10,7 +10,7 @@ SRC_TEX+=	../src/scholar/tui.tex
 
 all: ${DOC}
 
-scholar.pdf: scholar.tex
+scholar.pdf: scholar.tex preamble.tex
 scholar.pdf: ${SRC_TEX}
 
 # Build .tex files in src/scholar if they don't exist or are outdated
