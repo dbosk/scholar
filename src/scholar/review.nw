@@ -723,7 +723,14 @@ def list_sessions() -> list[dict[str, Any]]:
     List all saved review sessions.
     
     Returns:
-        List of session metadata dictionaries.
+        List of session metadata dictionaries with keys:
+        - name: Session name or query
+        - query: Original search query
+        - timestamp: datetime object
+        - kept: Number of kept papers
+        - discarded: Number of discarded papers
+        - pending: Number of pending papers
+        - path: Path to session file
     """
     sessions_dir = _get_sessions_dir()
     sessions = []
@@ -732,17 +739,33 @@ def list_sessions() -> list[dict[str, Any]]:
         try:
             with open(session_file, "r", encoding="utf-8") as f:
                 data = json.load(f)
+            
+            # Parse timestamp string to datetime
+            timestamp_str = data.get("timestamp", "")
+            try:
+                timestamp = datetime.fromisoformat(timestamp_str)
+            except (ValueError, TypeError):
+                timestamp = datetime.now()
+            
+            # Count decisions by status
+            decisions = data.get("decisions", [])
+            kept = sum(1 for d in decisions if d.get("status") == "kept")
+            discarded = sum(1 for d in decisions if d.get("status") == "discarded")
+            pending = sum(1 for d in decisions if d.get("status") == "pending")
+            
             sessions.append({
                 "name": data.get("name") or data.get("query"),
                 "query": data.get("query"),
-                "timestamp": data.get("timestamp"),
-                "decision_count": len(data.get("decisions", [])),
+                "timestamp": timestamp,
+                "kept": kept,
+                "discarded": discarded,
+                "pending": pending,
                 "path": session_file,
             })
         except (json.JSONDecodeError, OSError):
             pass
     
-    return sorted(sessions, key=lambda s: s.get("timestamp", ""), reverse=True)
+    return sorted(sessions, key=lambda s: s.get("timestamp", datetime.min), reverse=True)
 
 
 def save_search_decisions(query: str, decisions: list[ReviewDecision]) -> None:
