@@ -762,7 +762,7 @@ def save_search_decisions(query: str, decisions: list[ReviewDecision]) -> None:
         paper_id = get_paper_id(d.paper)
         decision_records[paper_id] = ReviewDecisionRecord(
             status=d.status.value,
-            motivation=d.motivation,  # Uses first tag for backward compat
+            tags=d.tags,  # Tags = motivations for discarded, themes for kept
             title=d.paper.title,
             authors=list(d.paper.authors),
             year=d.paper.year,
