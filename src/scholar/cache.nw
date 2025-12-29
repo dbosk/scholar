@@ -336,7 +336,7 @@ import atexit
 
 <<constants>>=
 # Registry of caches to save on exit: provider_name -> cache dict
-_CACHE_REGISTRY: dict[str, dict[Any, Any]] = {}
+CACHE_REGISTRY: dict[str, dict[Any, Any]] = {}
 @
 
 <<cache management functions>>=
@@ -344,21 +344,21 @@ def register_cache(provider_name: str, cache: dict[Any, Any]) -> None:
     """
     Register a cache for automatic persistence on exit.
     """
-    _CACHE_REGISTRY[provider_name] = cache
+    CACHE_REGISTRY[provider_name] = cache
 
 
-def _save_all_caches() -> None:
+def save_all_caches() -> None:
     """
     Save all registered caches to disk.
 
     Called automatically on program exit.
     """
-    for provider_name, cache in _CACHE_REGISTRY.items():
+    for provider_name, cache in CACHE_REGISTRY.items():
         save_cache(provider_name, cache)
 @
 
 <<atexit registration>>=
-atexit.register(_save_all_caches)
+atexit.register(save_all_caches)
 @
 
 \subsection{Testing automatic persistence}
@@ -368,20 +368,20 @@ class TestAutoPersistence:
     """Tests for automatic cache persistence."""
 
     def test_register_and_save_all(self, tmp_path, monkeypatch):
-        """Registered caches are saved on _save_all_caches."""
+        """Registered caches are saved on save_all_caches."""
         monkeypatch.setenv("SCHOLAR_CACHE_DIR", str(tmp_path))
         # Clear any existing registrations
-        _CACHE_REGISTRY.clear()
+        CACHE_REGISTRY.clear()
         # Register a cache
         cache = {("query", 100): [Paper(title="Test", authors=["A"])]}
         register_cache("test_provider", cache)
         # Save all caches
-        _save_all_caches()
+        save_all_caches()
         # Verify it was saved
         loaded = load_cache("test_provider")
         assert loaded == cache
         # Clean up
-        _CACHE_REGISTRY.clear()
+        CACHE_REGISTRY.clear()
 @
 
 
