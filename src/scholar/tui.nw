@@ -1106,14 +1106,17 @@ class PaperReviewApp(App):
             list_view.append(PaperListItem(decision, i, self.review_mode))
         
         # Restore selection and focus after UI updates complete.
-        # We must reset index to None first, then set desired value.
-        # Otherwise, if the index value is unchanged (e.g., still 0),
-        # the reactive watcher doesn't fire and highlight isn't updated.
-        if filtered:
-            target_index = min(self.current_index, len(filtered) - 1)
-            list_view.index = None
-            list_view.index = target_index
-        self.call_later(list_view.focus)
+        # We must defer the index setting to after the DOM is updated,
+        # otherwise the highlight doesn't appear when returning from screens.
+        def restore_selection():
+            if filtered:
+                target_index = min(self.current_index, len(filtered) - 1)
+                # Reset to None first to ensure watcher fires even if same value
+                list_view.index = None
+                list_view.index = target_index
+            list_view.focus()
+        
+        self.call_after_refresh(restore_selection)
     
     def _update_status(self) -> None:
         """Update the status bar with current counts."""
