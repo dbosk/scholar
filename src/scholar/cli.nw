@@ -759,8 +759,7 @@ def sessions_list(
         print(json.dumps(sessions, indent=2, default=str))
     else:
         table = Table(title="Saved Review Sessions", box=box.HORIZONTALS)
-        table.add_column("Name", style="cyan", no_wrap=True)
-        table.add_column("Query", style="white", max_width=30)
+        table.add_column("Name", style="cyan", no_wrap=False)
         table.add_column("Date", style="dim")
         table.add_column("Kept", style="green", justify="right")
         table.add_column("Discarded", style="red", justify="right")
@@ -769,7 +768,6 @@ def sessions_list(
         for s in sessions:
             table.add_row(
                 s["name"],
-                s["query"][:30] + ("..." if len(s["query"]) > 30 else ""),
                 s["timestamp"].strftime("%Y-%m-%d %H:%M"),
                 str(s["kept"]),
                 str(s["discarded"]),
