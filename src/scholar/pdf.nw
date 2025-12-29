@@ -45,6 +45,7 @@ The cache is content-addressed using SHA-256 hashes of URLs.
 <<pdf imports>>
 <<pdf constants>>
 <<pdf cache functions>>
+<<doi resolution functions>>
 <<pdf download functions>>
 <<pdf open functions>>
 @
@@ -228,6 +229,319 @@ class TestPDFCache:
 @
 
 
+\section{DOI Resolution}
+\label{sec:doi-resolution}
+
+When users have a DOI but not a direct PDF URL, we need to resolve the DOI
+to find an open access PDF. We try multiple sources in order of reliability:
+
+\begin{description}
+\item[Unpaywall] The primary source for legal open access PDFs. Unpaywall
+  maintains a database of open access versions of papers.
+\item[Semantic Scholar] Provides PDF links for many papers in their database.
+\item[DOI redirect] As a fallback, following the DOI redirect sometimes leads
+  to a page with a PDF link.
+\end{description}
+
+\subsection{DOI Detection}
+
+First, we need to detect whether an input string is a DOI. DOIs have a
+standard format starting with \texttt{10.} followed by a registrant code
+and a suffix.
+
+<<doi resolution functions>>=
+import re
+
+DOI_PATTERN = re.compile(r'^10\.\d{4,}/[^\s]+$')
+DOI_URL_PATTERN = re.compile(r'(?:https?://)?(?:dx\.)?doi\.org/(10\.\d{4,}/[^\s]+)')
+
+
+def is_doi(identifier: str) -> bool:
+    """
+    Check if a string is a DOI.
+    
+    Accepts both raw DOIs (10.1234/example) and DOI URLs
+    (https://doi.org/10.1234/example).
+    
+    Args:
+        identifier: String to check.
+    
+    Returns:
+        True if the string is a DOI or DOI URL.
+    """
+    identifier = identifier.strip()
+    if DOI_PATTERN.match(identifier):
+        return True
+    if DOI_URL_PATTERN.match(identifier):
+        return True
+    return False
+
+
+def extract_doi(identifier: str) -> str | None:
+    """
+    Extract the DOI from a string.
+    
+    Handles both raw DOIs and DOI URLs.
+    
+    Args:
+        identifier: String potentially containing a DOI.
+    
+    Returns:
+        The extracted DOI, or None if not a DOI.
+    """
+    identifier = identifier.strip()
+    if DOI_PATTERN.match(identifier):
+        return identifier
+    match = DOI_URL_PATTERN.match(identifier)
+    if match:
+        return match.group(1)
+    return None
+@
+
+\subsection{Unpaywall Resolution}
+
+Unpaywall provides a free API to find open access versions of papers.
+We query their API with the DOI and extract the PDF URL from the response.
+
+<<doi resolution functions>>=
+UNPAYWALL_API = "https://api.unpaywall.org/v2/{doi}"
+UNPAYWALL_EMAIL = "scholar-cli@example.com"  # Required by Unpaywall API
+
+
+def resolve_doi_unpaywall(
+    doi: str,
+    progress_callback: Callable[[str], None] | None = None,
+) -> str | None:
+    """
+    Resolve a DOI to a PDF URL using Unpaywall.
+    
+    Args:
+        doi: The DOI to resolve.
+        progress_callback: Optional callback for status messages.
+    
+    Returns:
+        PDF URL if found, None otherwise.
+    """
+    if progress_callback:
+        progress_callback(f"Checking Unpaywall for {doi}...")
+    
+    try:
+        url = UNPAYWALL_API.format(doi=doi)
+        response = requests.get(
+            url,
+            params={"email": UNPAYWALL_EMAIL},
+            timeout=10,
+        )
+        
+        if response.status_code != 200:
+            return None
+        
+        data = response.json()
+        
+        # Try best_oa_location first
+        best_oa = data.get("best_oa_location")
+        if best_oa and best_oa.get("url_for_pdf"):
+            return best_oa["url_for_pdf"]
+        
+        # Fall back to any OA location with a PDF
+        for location in data.get("oa_locations", []):
+            if location.get("url_for_pdf"):
+                return location["url_for_pdf"]
+        
+        return None
+        
+    except Exception:
+        return None
+@
+
+\subsection{Semantic Scholar Resolution}
+
+Semantic Scholar also provides PDF links for many papers. We query their
+API using the DOI.
+
+<<doi resolution functions>>=
+S2_PAPER_API = "https://api.semanticscholar.org/graph/v1/paper/DOI:{doi}"
+
+
+def resolve_doi_semantic_scholar(
+    doi: str,
+    progress_callback: Callable[[str], None] | None = None,
+) -> str | None:
+    """
+    Resolve a DOI to a PDF URL using Semantic Scholar.
+    
+    Args:
+        doi: The DOI to resolve.
+        progress_callback: Optional callback for status messages.
+    
+    Returns:
+        PDF URL if found, None otherwise.
+    """
+    if progress_callback:
+        progress_callback(f"Checking Semantic Scholar for {doi}...")
+    
+    try:
+        url = S2_PAPER_API.format(doi=doi)
+        response = requests.get(
+            url,
+            params={"fields": "openAccessPdf"},
+            timeout=10,
+        )
+        
+        if response.status_code != 200:
+            return None
+        
+        data = response.json()
+        oa_pdf = data.get("openAccessPdf")
+        if oa_pdf and oa_pdf.get("url"):
+            return oa_pdf["url"]
+        
+        return None
+        
+    except Exception:
+        return None
+@
+
+\subsection{Combined DOI Resolution}
+
+The main resolution function tries each source in order until it finds a PDF.
+
+<<doi resolution functions>>=
+def resolve_doi_to_pdf(
+    doi: str,
+    progress_callback: Callable[[str], None] | None = None,
+) -> str:
+    """
+    Resolve a DOI to a PDF URL.
+    
+    Tries multiple sources in order: Unpaywall, Semantic Scholar.
+    
+    Args:
+        doi: The DOI to resolve.
+        progress_callback: Optional callback for status messages.
+    
+    Returns:
+        PDF URL.
+    
+    Raises:
+        PDFDownloadError: If no PDF URL could be found.
+    """
+    # Try Unpaywall first (best source for legal OA)
+    url = resolve_doi_unpaywall(doi, progress_callback)
+    if url:
+        if progress_callback:
+            progress_callback(f"Found PDF via Unpaywall")
+        return url
+    
+    # Try Semantic Scholar
+    url = resolve_doi_semantic_scholar(doi, progress_callback)
+    if url:
+        if progress_callback:
+            progress_callback(f"Found PDF via Semantic Scholar")
+        return url
+    
+    # No PDF found
+    raise PDFDownloadError(
+        f"Could not find open access PDF for DOI: {doi}\n"
+        f"The paper may not be available as open access."
+    )
+@
+
+\subsection{Testing DOI resolution}
+
+<<test functions>>=
+class TestDOIResolution:
+    """Tests for DOI resolution functions."""
+
+    def test_is_doi_raw(self):
+        """Recognizes raw DOI format."""
+        assert is_doi("10.1234/test.paper")
+        assert is_doi("10.48550/arXiv.2301.00001")
+
+    def test_is_doi_url(self):
+        """Recognizes DOI URLs."""
+        assert is_doi("https://doi.org/10.1234/test")
+        assert is_doi("http://dx.doi.org/10.1234/test")
+        assert is_doi("doi.org/10.1234/test")
+
+    def test_is_doi_false(self):
+        """Rejects non-DOIs."""
+        assert not is_doi("https://example.com/paper.pdf")
+        assert not is_doi("not a doi")
+        assert not is_doi("10.123/short")  # Too short registrant
+
+    def test_extract_doi_raw(self):
+        """Extracts raw DOI."""
+        assert extract_doi("10.1234/test.paper") == "10.1234/test.paper"
+
+    def test_extract_doi_from_url(self):
+        """Extracts DOI from URL."""
+        assert extract_doi("https://doi.org/10.1234/test") == "10.1234/test"
+        assert extract_doi("http://dx.doi.org/10.5678/paper") == "10.5678/paper"
+
+    def test_extract_doi_none(self):
+        """Returns None for non-DOIs."""
+        assert extract_doi("not a doi") is None
+        assert extract_doi("https://example.com") is None
+
+    def test_resolve_doi_unpaywall(self, monkeypatch):
+        """Unpaywall resolution finds PDF URL."""
+        mock_response = Mock()
+        mock_response.status_code = 200
+        mock_response.json.return_value = {
+            "best_oa_location": {"url_for_pdf": "https://example.com/paper.pdf"}
+        }
+        
+        with patch("scholar.pdf.requests.get", return_value=mock_response):
+            url = resolve_doi_unpaywall("10.1234/test")
+        
+        assert url == "https://example.com/paper.pdf"
+
+    def test_resolve_doi_semantic_scholar(self, monkeypatch):
+        """Semantic Scholar resolution finds PDF URL."""
+        mock_response = Mock()
+        mock_response.status_code = 200
+        mock_response.json.return_value = {
+            "openAccessPdf": {"url": "https://arxiv.org/pdf/2301.00001.pdf"}
+        }
+        
+        with patch("scholar.pdf.requests.get", return_value=mock_response):
+            url = resolve_doi_semantic_scholar("10.1234/test")
+        
+        assert url == "https://arxiv.org/pdf/2301.00001.pdf"
+
+    def test_resolve_doi_to_pdf_tries_sources(self, monkeypatch):
+        """Combined resolution tries multiple sources."""
+        # First call (Unpaywall) fails, second (S2) succeeds
+        mock_response_fail = Mock()
+        mock_response_fail.status_code = 404
+        
+        mock_response_success = Mock()
+        mock_response_success.status_code = 200
+        mock_response_success.json.return_value = {
+            "openAccessPdf": {"url": "https://example.com/paper.pdf"}
+        }
+        
+        with patch("scholar.pdf.requests.get", side_effect=[
+            mock_response_fail, mock_response_success
+        ]):
+            url = resolve_doi_to_pdf("10.1234/test")
+        
+        assert url == "https://example.com/paper.pdf"
+
+    def test_resolve_doi_to_pdf_no_pdf_raises(self):
+        """Raises error when no PDF found."""
+        mock_response = Mock()
+        mock_response.status_code = 404
+        
+        with patch("scholar.pdf.requests.get", return_value=mock_response):
+            with pytest.raises(PDFDownloadError) as exc_info:
+                resolve_doi_to_pdf("10.1234/no-pdf")
+        
+        assert "Could not find open access PDF" in str(exc_info.value)
+@
+
+
 \section{PDF Download}
 
 The download function handles HTTP requests with proper error handling and
@@ -306,9 +620,9 @@ def download_pdf(
 
 \subsection{High-level PDF access}
 
-For convenience, we provide a function that accepts either a Paper object
+For convenience, we provide a function that accepts a Paper object, a DOI,
 or a URL string, making it easy to use from both programmatic code and
-the TUI.
+the CLI/TUI.
 
 <<pdf download functions>>=
 def get_pdf(
@@ -318,28 +632,46 @@ def get_pdf(
     """
     Get a PDF, downloading if necessary.
     
-    This is the main entry point for PDF access. It accepts either a Paper
-    object (using its pdf_url attribute) or a direct URL string.
+    This is the main entry point for PDF access. It accepts:
+    - A Paper object (using its pdf_url or doi attributes)
+    - A DOI string (resolved via Unpaywall/Semantic Scholar)
+    - A direct URL string
     
     Args:
-        source: A Paper object with pdf_url, or a URL string.
+        source: A Paper object, DOI string, or URL string.
         progress_callback: Optional callback for status messages.
     
     Returns:
         Path to the cached PDF file.
     
     Raises:
-        PDFDownloadError: If download fails or no URL available.
+        PDFDownloadError: If download fails or no PDF available.
     """
-    # Extract URL from source
+    url: str | None = None
+    
     if isinstance(source, str):
-        url = source
+        # Check if it's a DOI
+        doi = extract_doi(source)
+        if doi:
+            if progress_callback:
+                progress_callback(f"Resolving DOI: {doi}")
+            url = resolve_doi_to_pdf(doi, progress_callback)
+        else:
+            # Assume it's a URL
+            url = source
     else:
         # Assume it's a Paper object
+        # Try pdf_url first, then doi
         url = getattr(source, "pdf_url", None)
         if not url:
+            doi = getattr(source, "doi", None)
+            if doi:
+                if progress_callback:
+                    progress_callback(f"Resolving DOI: {doi}")
+                url = resolve_doi_to_pdf(doi, progress_callback)
+        if not url:
             raise PDFDownloadError(
-                f"Paper has no PDF URL: {getattr(source, 'title', 'Unknown')}"
+                f"Paper has no PDF URL or DOI: {getattr(source, 'title', 'Unknown')}"
             )
     
     return download_pdf(url, progress_callback)
@@ -426,15 +758,16 @@ class TestPDFDownload:
         assert path.exists()
 
     def test_get_pdf_no_url_raises_error(self):
-        """get_pdf raises error when paper has no PDF URL."""
+        """get_pdf raises error when paper has no PDF URL or DOI."""
         paper = Mock()
         paper.pdf_url = None
+        paper.doi = None
         paper.title = "No PDF Paper"
         
         with pytest.raises(PDFDownloadError) as exc_info:
             get_pdf(paper)
         
-        assert "no PDF URL" in str(exc_info.value)
+        assert "no PDF URL or DOI" in str(exc_info.value)
 @
 
 

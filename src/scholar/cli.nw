@@ -49,6 +49,7 @@ across bibliographic databases.
 <<search command>>
 <<providers command>>
 <<cache command>>
+<<pdf command>>
 <<notes command>>
 <<submodule registration>>
 <<main entry point>>
@@ -371,6 +372,108 @@ def cache(
     else:
         console.print(f"[red]Unknown action: {action}[/red]")
         console.print("Valid actions: clear, info, path")
+        raise typer.Exit(1)
+@
+
+
+\section{PDF Management}
+\label{ch:pdf-cli}
+
+Researchers often need to download and view PDFs when reviewing papers.
+The [[pdf]] command provides access to PDF download, caching, and viewing
+functionality.
+
+\subsection{Command Design}
+
+Like the [[cache]] command, [[pdf]] uses an action argument with an optional
+URL parameter:
+\begin{description}
+\item[pdf open <url>] Download (if needed) and open a PDF from its URL
+\item[pdf info] Show PDF cache statistics
+\item[pdf clear] Delete all cached PDFs
+\item[pdf path] Print the PDF cache directory path
+\end{description}
+
+The [[open]] action is the primary use case---it handles the full workflow
+of checking the cache, downloading if necessary, and opening in the system
+viewer.
+
+<<pdf command>>=
+@app.command()
+def pdf(
+    action: Annotated[
+        str,
+        typer.Argument(help="Action: open, info, clear, or path"),
+    ],
+    url: Annotated[
+        Optional[str],
+        typer.Argument(help="PDF URL (required for 'open' action)"),
+    ] = None,
+) -> None:
+    """
+    Manage PDF downloads and cache.
+
+    Actions:
+        open <url>  - Download (if needed) and open a PDF
+        info        - Show PDF cache statistics
+        clear       - Delete all cached PDFs
+        path        - Print the PDF cache directory path
+    
+    Examples:
+        scholar pdf open "https://arxiv.org/pdf/2301.00001.pdf"
+        scholar pdf info
+        scholar pdf clear
+    """
+    from scholar.pdf import (
+        get_pdf_cache_dir, get_pdf, open_pdf, 
+        clear_pdf_cache, get_pdf_cache_info, PDFDownloadError
+    )
+
+    console = Console()
+
+    if action == "open":
+        if not url:
+            console.print("[red]Error: URL required for 'open' action[/red]")
+            console.print("Usage: scholar pdf open <url>")
+            raise typer.Exit(1)
+        
+        try:
+            console.print(f"[dim]Fetching PDF...[/dim]")
+            pdf_path = get_pdf(url)
+            console.print(f"[green]PDF cached at: {pdf_path}[/green]")
+            
+            if open_pdf(pdf_path):
+                console.print("[dim]Opened in system viewer[/dim]")
+            else:
+                console.print("[yellow]Could not open PDF viewer[/yellow]")
+                console.print(f"[dim]PDF available at: {pdf_path}[/dim]")
+        except PDFDownloadError as e:
+            console.print(f"[red]Download failed: {e}[/red]")
+            raise typer.Exit(1)
+
+    elif action == "info":
+        info = get_pdf_cache_info()
+        table = Table(title="PDF Cache Statistics", box=box.HORIZONTALS)
+        table.add_column("Metric", style="cyan")
+        table.add_column("Value", style="green")
+
+        table.add_row("Location", str(get_pdf_cache_dir()))
+        table.add_row("Cached PDFs", str(info["count"]))
+        size_mb = info["size_bytes"] / (1024 * 1024)
+        table.add_row("Total size", f"{size_mb:.1f} MB")
+
+        console.print(table)
+
+    elif action == "clear":
+        count = clear_pdf_cache()
+        console.print(f"[green]Cleared {count} cached PDF(s).[/green]")
+
+    elif action == "path":
+        print(get_pdf_cache_dir())
+
+    else:
+        console.print(f"[red]Unknown action: {action}[/red]")
+        console.print("Valid actions: open, info, clear, path")
         raise typer.Exit(1)
 @
 
