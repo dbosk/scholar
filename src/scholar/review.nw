@@ -1,0 +1,1141 @@
+\chapter{Review Session Management}
+\label{review-module}
+
+\section{Introduction}
+
+This module provides the core data structures and functions for managing
+systematic literature review sessions. It separates the domain logic from
+the TUI, enabling programmatic review workflows.
+
+\subsection{Design Goals}
+
+The review module is designed with these goals:
+\begin{description}
+\item[TUI Independence] All review functionality should be usable from Python
+  code without any TUI dependencies.
+\item[Tag-Based Decisions] Decisions support multiple tags (themes for kept
+  papers, motivations for discarded papers) rather than single strings.
+\item[Session Persistence] Review sessions can be saved and loaded, supporting
+  interrupted workflows.
+\item[Programmatic Access] Enable automation of review decisions based on
+  paper content, keywords, or other criteria.
+\end{description}
+
+\subsection{Tags: Themes and Motivations}
+
+The module uses a unified \enquote{tags} concept for both:
+\begin{description}
+\item[Themes] Optional tags for kept papers, categorizing them by topic or
+  relevance (e.g., \enquote{privacy-focused}, \enquote{federated-learning}).
+\item[Motivations] Required tags for discarded papers, explaining why they
+  were excluded (e.g., \enquote{wrong-domain}, \enquote{not-peer-reviewed}).
+\end{description}
+
+Both are stored in the same [[tags]] field, with the semantic difference
+determined by the decision status. Discarded papers require at least one
+tag (motivation), while kept papers may have zero or more tags (themes).
+
+\section{Module Structure}
+
+<<[[review.py]]>>=
+"""
+Core review session management for systematic literature reviews.
+
+Provides data structures and functions for managing paper review decisions,
+session persistence, and report generation.
+"""
+<<review imports>>
+<<review constants>>
+<<review data structures>>
+<<review session functions>>
+<<review report generation>>
+@
+
+
+\section{Testing}
+\label{sec:review-tests}
+
+Tests are distributed throughout this document, appearing after each
+implementation section they verify.
+
+<<test [[review.py]]>>=
+"""Tests for the review module."""
+import pytest
+from datetime import datetime
+from pathlib import Path
+from unittest.mock import Mock
+
+from scholar.review import *
+from scholar.scholar import Paper
+
+
+<<test functions>>
+@
+
+
+\section{Imports and Constants}
+
+<<review imports>>=
+from dataclasses import dataclass, field
+from datetime import datetime
+from enum import Enum
+from pathlib import Path
+from typing import Any
+import json
+
+from scholar.scholar import Paper
+from scholar.notes import (
+    get_paper_id, get_query_hash, get_data_dir,
+    load_search_decisions, save_search_decisions as notes_save_decisions,
+    ReviewDecisionRecord,
+)
+@
+
+<<review constants>>=
+SESSIONS_DIR = "review_sessions"
+@
+
+
+\section{Data Structures}
+
+\subsection{Decision Status}
+
+The decision status uses an enum to ensure type safety and clear semantics.
+
+<<review data structures>>=
+class DecisionStatus(Enum):
+    """Status of a paper review decision."""
+    PENDING = "pending"
+    KEPT = "kept"
+    DISCARDED = "discarded"
+@
+
+\subsection{Review Decision}
+
+A [[ReviewDecision]] captures the review state of a single paper, including
+its status and associated tags.
+
+<<review data structures>>=
+@dataclass
+class ReviewDecision:
+    """
+    A review decision for a single paper.
+    
+    Tracks whether the paper was kept or discarded during review,
+    along with tags (themes for kept, motivations for discarded).
+    
+    Attributes:
+        paper: The Paper being reviewed.
+        provider: Which search provider returned this paper.
+        status: Current decision status (pending/kept/discarded).
+        tags: List of tags (themes for kept, motivations for discarded).
+    """
+    paper: Paper
+    provider: str
+    status: DecisionStatus = DecisionStatus.PENDING
+    tags: list[str] = field(default_factory=list)
+    
+    @property
+    def is_decided(self) -> bool:
+        """Check if a decision has been made."""
+        return self.status != DecisionStatus.PENDING
+    
+    @property
+    def is_valid(self) -> bool:
+        """
+        Check if the decision is valid.
+        
+        Discarded papers require at least one tag (motivation).
+        Kept and pending papers are always valid.
+        """
+        if self.status == DecisionStatus.DISCARDED:
+            return len(self.tags) > 0
+        return True
+    
+    def add_tag(self, tag: str) -> None:
+        """Add a tag if not already present."""
+        if tag and tag not in self.tags:
+            self.tags.append(tag)
+    
+    def remove_tag(self, tag: str) -> None:
+        """Remove a tag if present."""
+        if tag in self.tags:
+            self.tags.remove(tag)
+    
+    def has_tag(self, tag: str) -> bool:
+        """Check if this decision has a specific tag."""
+        return tag in self.tags
+    
+    def clear_tags(self) -> None:
+        """Remove all tags."""
+        self.tags.clear()
+    
+    # Backward compatibility for code using 'motivation' as single string
+    @property
+    def motivation(self) -> str:
+        """Get first tag as motivation (backward compatibility)."""
+        return self.tags[0] if self.tags else ""
+    
+    @motivation.setter
+    def motivation(self, value: str) -> None:
+        """Set motivation as single tag (backward compatibility)."""
+        self.tags = [value] if value else []
+@
+
+\subsection{Testing ReviewDecision}
+
+<<test functions>>=
+class TestReviewDecision:
+    """Tests for ReviewDecision dataclass."""
+
+    def test_default_status_is_pending(self):
+        """New decisions should be pending."""
+        paper = Paper(title="Test", authors=["Author"], year=2024)
+        decision = ReviewDecision(paper=paper, provider="test")
+        assert decision.status == DecisionStatus.PENDING
+        assert not decision.is_decided
+
+    def test_kept_is_decided(self):
+        """Kept papers are decided."""
+        paper = Paper(title="Test", authors=["Author"], year=2024)
+        decision = ReviewDecision(
+            paper=paper,
+            provider="test",
+            status=DecisionStatus.KEPT
+        )
+        assert decision.is_decided
+
+    def test_discarded_requires_tag(self):
+        """Discarded papers without tags are invalid."""
+        paper = Paper(title="Test", authors=["Author"], year=2024)
+        decision = ReviewDecision(
+            paper=paper,
+            provider="test",
+            status=DecisionStatus.DISCARDED,
+            tags=[]
+        )
+        assert not decision.is_valid
+        
+        decision.add_tag("Not relevant")
+        assert decision.is_valid
+
+    def test_add_remove_tags(self):
+        """Can add and remove tags."""
+        paper = Paper(title="Test", authors=["Author"], year=2024)
+        decision = ReviewDecision(paper=paper, provider="test")
+        
+        decision.add_tag("theme1")
+        decision.add_tag("theme2")
+        assert decision.has_tag("theme1")
+        assert len(decision.tags) == 2
+        
+        # Adding duplicate doesn't add again
+        decision.add_tag("theme1")
+        assert len(decision.tags) == 2
+        
+        decision.remove_tag("theme1")
+        assert not decision.has_tag("theme1")
+        assert len(decision.tags) == 1
+
+    def test_backward_compat_motivation(self):
+        """motivation property works for backward compatibility."""
+        paper = Paper(title="Test", authors=["Author"], year=2024)
+        decision = ReviewDecision(paper=paper, provider="test")
+        
+        decision.motivation = "Not relevant"
+        assert decision.tags == ["Not relevant"]
+        assert decision.motivation == "Not relevant"
+        
+        decision.motivation = ""
+        assert decision.tags == []
+        assert decision.motivation == ""
+@
+
+
+\subsection{Review Session}
+
+A [[ReviewSession]] contains all decisions for a review, along with metadata
+about the search and analysis methods.
+
+<<review data structures>>=
+@dataclass 
+class ReviewSession:
+    """
+    A complete review session with all papers and decisions.
+    
+    Maintains the search parameters and all review decisions,
+    supporting sorting, filtering, and analysis operations.
+    """
+    query: str
+    providers: list[str]
+    timestamp: datetime
+    decisions: list[ReviewDecision] = field(default_factory=list)
+    name: str | None = None  # Optional session name for persistence
+    
+    @property
+    def kept_papers(self) -> list[ReviewDecision]:
+        """Get all papers marked as kept."""
+        return [d for d in self.decisions if d.status == DecisionStatus.KEPT]
+    
+    @property
+    def discarded_papers(self) -> list[ReviewDecision]:
+        """Get all papers marked as discarded."""
+        return [d for d in self.decisions if d.status == DecisionStatus.DISCARDED]
+    
+    @property
+    def pending_papers(self) -> list[ReviewDecision]:
+        """Get all papers still pending review."""
+        return [d for d in self.decisions if d.status == DecisionStatus.PENDING]
+    
+    def all_themes(self) -> set[str]:
+        """Get all unique themes from kept papers."""
+        themes: set[str] = set()
+        for d in self.kept_papers:
+            themes.update(d.tags)
+        return themes
+    
+    def all_motivations(self) -> set[str]:
+        """Get all unique motivations from discarded papers."""
+        motivations: set[str] = set()
+        for d in self.discarded_papers:
+            motivations.update(d.tags)
+        return motivations
+    
+    def theme_counts(self) -> dict[str, int]:
+        """Count papers per theme."""
+        counts: dict[str, int] = {}
+        for d in self.kept_papers:
+            for tag in d.tags:
+                counts[tag] = counts.get(tag, 0) + 1
+        return counts
+    
+    def motivation_counts(self) -> dict[str, int]:
+        """Count papers per motivation."""
+        counts: dict[str, int] = {}
+        for d in self.discarded_papers:
+            for tag in d.tags:
+                counts[tag] = counts.get(tag, 0) + 1
+        return counts
+    
+    def papers_with_tag(self, tag: str) -> list[ReviewDecision]:
+        """Get all decisions with a specific tag."""
+        return [d for d in self.decisions if d.has_tag(tag)]
+    
+    def sort_by(self, key: str, reverse: bool = False) -> None:
+        """
+        Sort decisions by a paper attribute.
+        
+        Supported keys: title, year, author, provider
+        """
+        if key == "title":
+            self.decisions.sort(key=lambda d: d.paper.title.lower(), reverse=reverse)
+        elif key == "year":
+            self.decisions.sort(key=lambda d: d.paper.year or 0, reverse=reverse)
+        elif key == "author":
+            self.decisions.sort(
+                key=lambda d: d.paper.authors[0].lower() if d.paper.authors else "",
+                reverse=reverse
+            )
+        elif key == "provider":
+            self.decisions.sort(key=lambda d: d.provider.lower(), reverse=reverse)
+@
+
+\subsection{Testing ReviewSession}
+
+<<test functions>>=
+class TestReviewSession:
+    """Tests for ReviewSession dataclass."""
+
+    @pytest.fixture
+    def sample_session(self):
+        """Create a sample session with mixed decisions."""
+        papers = [
+            Paper(title="Paper A", authors=["Author A"], year=2020),
+            Paper(title="Paper B", authors=["Author B"], year=2022),
+            Paper(title="Paper C", authors=["Author C"], year=2021),
+        ]
+        session = ReviewSession(
+            query="test query",
+            providers=["provider1"],
+            timestamp=datetime.now(),
+        )
+        session.decisions = [
+            ReviewDecision(
+                paper=papers[0], provider="p1", 
+                status=DecisionStatus.KEPT, tags=["privacy", "ml"]
+            ),
+            ReviewDecision(
+                paper=papers[1], provider="p1", 
+                status=DecisionStatus.DISCARDED, tags=["off-topic"]
+            ),
+            ReviewDecision(paper=papers[2], provider="p1", status=DecisionStatus.PENDING),
+        ]
+        return session
+
+    def test_kept_papers(self, sample_session):
+        """Test filtering kept papers."""
+        kept = sample_session.kept_papers
+        assert len(kept) == 1
+        assert kept[0].paper.title == "Paper A"
+
+    def test_discarded_papers(self, sample_session):
+        """Test filtering discarded papers."""
+        discarded = sample_session.discarded_papers
+        assert len(discarded) == 1
+        assert discarded[0].paper.title == "Paper B"
+        assert "off-topic" in discarded[0].tags
+
+    def test_all_themes(self, sample_session):
+        """Test getting all themes."""
+        themes = sample_session.all_themes()
+        assert themes == {"privacy", "ml"}
+
+    def test_all_motivations(self, sample_session):
+        """Test getting all motivations."""
+        motivations = sample_session.all_motivations()
+        assert motivations == {"off-topic"}
+
+    def test_theme_counts(self, sample_session):
+        """Test counting papers per theme."""
+        counts = sample_session.theme_counts()
+        assert counts["privacy"] == 1
+        assert counts["ml"] == 1
+
+    def test_papers_with_tag(self, sample_session):
+        """Test finding papers with specific tag."""
+        papers = sample_session.papers_with_tag("privacy")
+        assert len(papers) == 1
+        assert papers[0].paper.title == "Paper A"
+
+    def test_sort_by_year(self, sample_session):
+        """Test sorting by year."""
+        sample_session.sort_by("year")
+        years = [d.paper.year for d in sample_session.decisions]
+        assert years == [2020, 2021, 2022]
+
+    def test_sort_by_year_reverse(self, sample_session):
+        """Test sorting by year descending."""
+        sample_session.sort_by("year", reverse=True)
+        years = [d.paper.year for d in sample_session.decisions]
+        assert years == [2022, 2021, 2020]
+@
+
+
+\section{Session Functions}
+
+\subsection{Creating Sessions}
+
+We provide factory functions for creating review sessions from search results.
+
+<<review session functions>>=
+def create_review_session(
+    results: list[Any],  # list[SearchResult]
+    query: str,
+    session_name: str | None = None,
+) -> ReviewSession:
+    """
+    Create a review session from search results.
+    
+    Loads any previous decisions for the same query/session and merges
+    them with the new search results.
+    
+    Args:
+        results: List of SearchResult objects from a search.
+        query: The search query string.
+        session_name: Optional name for the session (uses query if not provided).
+    
+    Returns:
+        A ReviewSession ready for review.
+    """
+    # Use session_name for persistence, fall back to query
+    persistence_key = session_name if session_name else query
+    
+    # Load previous decisions for this session
+    previous_decisions = load_search_decisions(persistence_key)
+    
+    # Create review session
+    providers = list(set(r.provider for r in results))
+    session = ReviewSession(
+        query=query,
+        providers=providers,
+        timestamp=datetime.now(),
+        name=session_name,
+    )
+    
+    # Track existing paper IDs to handle merging
+    existing_paper_ids: set[str] = set()
+    if previous_decisions:
+        existing_paper_ids = set(previous_decisions.decisions.keys())
+        
+        # First, restore decisions for papers from previous session
+        # that are NOT in the current search results
+        current_paper_ids = set()
+        for result in results:
+            for paper in result.papers:
+                current_paper_ids.add(get_paper_id(paper))
+        
+        # Add papers from previous session that aren't in current results
+        for paper_id, prev in previous_decisions.decisions.items():
+            if paper_id not in current_paper_ids:
+                # Reconstruct paper from stored data
+                paper = Paper(
+                    title=prev.title,
+                    authors=prev.authors if prev.authors else [],
+                    year=prev.year,
+                    doi=prev.doi,
+                    abstract=prev.abstract,
+                    venue=prev.venue,
+                    url=prev.url,
+                    pdf_url=prev.pdf_url,
+                    source=getattr(prev, 'source', "previous"),
+                )
+                status = DecisionStatus.PENDING
+                if prev.status == "kept":
+                    status = DecisionStatus.KEPT
+                elif prev.status == "discarded":
+                    status = DecisionStatus.DISCARDED
+                
+                # Handle both old (motivation) and new (tags) formats
+                tags = _extract_tags_from_record(prev)
+                
+                session.decisions.append(
+                    ReviewDecision(
+                        paper=paper,
+                        provider=getattr(prev, 'provider', "previous"),
+                        status=status,
+                        tags=tags,
+                    )
+                )
+    
+    # Convert search results to review decisions
+    for result in results:
+        for paper in result.papers:
+            paper_id = get_paper_id(paper)
+            
+            # Check for previous decision
+            prev = None
+            if previous_decisions:
+                prev = previous_decisions.decisions.get(paper_id)
+            
+            status = DecisionStatus.PENDING
+            tags: list[str] = []
+            if prev:
+                if prev.status == "kept":
+                    status = DecisionStatus.KEPT
+                elif prev.status == "discarded":
+                    status = DecisionStatus.DISCARDED
+                tags = _extract_tags_from_record(prev)
+            
+            session.decisions.append(
+                ReviewDecision(
+                    paper=paper,
+                    provider=result.provider,
+                    status=status,
+                    tags=tags,
+                )
+            )
+    
+    return session
+
+
+def _extract_tags_from_record(record: ReviewDecisionRecord) -> list[str]:
+    """
+    Extract tags from a ReviewDecisionRecord.
+    
+    Handles both old format (motivation as string) and new format (tags as list).
+    """
+    # Check for new tags field first
+    if hasattr(record, 'tags') and record.tags:
+        return list(record.tags)
+    # Fall back to old motivation field
+    if hasattr(record, 'motivation') and record.motivation:
+        return [record.motivation]
+    return []
+
+
+def create_notes_session() -> ReviewSession:
+    """
+    Create a session for browsing papers with notes.
+    
+    This is a notes-only session (no keep/discard) for reviewing
+    previously annotated papers.
+    
+    Returns:
+        A ReviewSession containing all papers with notes.
+    """
+    from scholar.notes import list_papers_with_notes
+    
+    papers_with_notes = list_papers_with_notes()
+    
+    session = ReviewSession(
+        query="",
+        providers=[],
+        timestamp=datetime.now(),
+    )
+    
+    for paper_note in papers_with_notes:
+        paper = Paper(
+            title=paper_note.title,
+            authors=getattr(paper_note, 'authors', []),
+            year=getattr(paper_note, 'year', None),
+            doi=getattr(paper_note, 'doi', None),
+            abstract=None,
+            venue=getattr(paper_note, 'venue', None),
+            url=getattr(paper_note, 'url', None),
+            pdf_url=getattr(paper_note, 'pdf_url', None),
+            source="notes",
+        )
+        session.decisions.append(
+            ReviewDecision(paper=paper, provider="notes")
+        )
+    
+    return session
+@
+
+\subsection{Session Persistence}
+
+Sessions can be saved and loaded for interrupted workflows.
+
+<<review session functions>>=
+def _get_sessions_dir() -> Path:
+    """Get the directory for storing review sessions."""
+    path = get_data_dir() / SESSIONS_DIR
+    path.mkdir(parents=True, exist_ok=True)
+    return path
+
+
+def save_session(session: ReviewSession) -> Path:
+    """
+    Save a review session to disk.
+    
+    Args:
+        session: The ReviewSession to save.
+    
+    Returns:
+        Path to the saved session file.
+    """
+    # Use session name or query hash as filename
+    if session.name:
+        filename = f"{session.name}.json"
+    else:
+        filename = f"{get_query_hash(session.query)}.json"
+    
+    session_path = _get_sessions_dir() / filename
+    
+    # Convert to serializable format
+    data = {
+        "query": session.query,
+        "name": session.name,
+        "providers": session.providers,
+        "timestamp": session.timestamp.isoformat(),
+        "decisions": [
+            {
+                "paper_id": get_paper_id(d.paper),
+                "provider": d.provider,
+                "status": d.status.value,
+                "tags": d.tags,
+                "paper": {
+                    "title": d.paper.title,
+                    "authors": list(d.paper.authors),
+                    "year": d.paper.year,
+                    "doi": d.paper.doi,
+                    "abstract": d.paper.abstract,
+                    "venue": d.paper.venue,
+                    "url": d.paper.url,
+                    "pdf_url": d.paper.pdf_url,
+                    "source": d.paper.source,
+                },
+            }
+            for d in session.decisions
+        ],
+    }
+    
+    with open(session_path, "w", encoding="utf-8") as f:
+        json.dump(data, f, indent=2, ensure_ascii=False)
+    
+    return session_path
+
+
+def load_session(name_or_query: str) -> ReviewSession | None:
+    """
+    Load a review session from disk.
+    
+    Args:
+        name_or_query: Session name or query string.
+    
+    Returns:
+        The loaded ReviewSession, or None if not found.
+    """
+    sessions_dir = _get_sessions_dir()
+    
+    # Try exact name first
+    session_path = sessions_dir / f"{name_or_query}.json"
+    if not session_path.exists():
+        # Try query hash
+        session_path = sessions_dir / f"{get_query_hash(name_or_query)}.json"
+    
+    if not session_path.exists():
+        return None
+    
+    try:
+        with open(session_path, "r", encoding="utf-8") as f:
+            data = json.load(f)
+        
+        session = ReviewSession(
+            query=data["query"],
+            providers=data["providers"],
+            timestamp=datetime.fromisoformat(data["timestamp"]),
+            name=data.get("name"),
+        )
+        
+        for dec_data in data["decisions"]:
+            paper_data = dec_data["paper"]
+            paper = Paper(
+                title=paper_data["title"],
+                authors=paper_data.get("authors", []),
+                year=paper_data.get("year"),
+                doi=paper_data.get("doi"),
+                abstract=paper_data.get("abstract"),
+                venue=paper_data.get("venue"),
+                url=paper_data.get("url"),
+                pdf_url=paper_data.get("pdf_url"),
+                source=paper_data.get("source", "session"),
+            )
+            status = DecisionStatus(dec_data["status"])
+            tags = dec_data.get("tags", [])
+            
+            session.decisions.append(
+                ReviewDecision(
+                    paper=paper,
+                    provider=dec_data["provider"],
+                    status=status,
+                    tags=tags,
+                )
+            )
+        
+        return session
+    except (json.JSONDecodeError, KeyError, OSError):
+        return None
+
+
+def list_sessions() -> list[dict[str, Any]]:
+    """
+    List all saved review sessions.
+    
+    Returns:
+        List of session metadata dictionaries.
+    """
+    sessions_dir = _get_sessions_dir()
+    sessions = []
+    
+    for session_file in sessions_dir.glob("*.json"):
+        try:
+            with open(session_file, "r", encoding="utf-8") as f:
+                data = json.load(f)
+            sessions.append({
+                "name": data.get("name") or data.get("query"),
+                "query": data.get("query"),
+                "timestamp": data.get("timestamp"),
+                "decision_count": len(data.get("decisions", [])),
+                "path": session_file,
+            })
+        except (json.JSONDecodeError, OSError):
+            pass
+    
+    return sorted(sessions, key=lambda s: s.get("timestamp", ""), reverse=True)
+
+
+def save_search_decisions(query: str, decisions: list[ReviewDecision]) -> None:
+    """
+    Save decisions for a search query (compatible with notes module).
+    
+    This function bridges the review module with the notes persistence layer,
+    converting ReviewDecision objects to the format expected by notes.py.
+    
+    Args:
+        query: The search query string.
+        decisions: List of ReviewDecision objects.
+    """
+    # Convert to notes module format
+    decision_records = {}
+    for d in decisions:
+        paper_id = get_paper_id(d.paper)
+        decision_records[paper_id] = ReviewDecisionRecord(
+            status=d.status.value,
+            motivation=d.motivation,  # Uses first tag for backward compat
+            title=d.paper.title,
+            authors=list(d.paper.authors),
+            year=d.paper.year,
+            doi=d.paper.doi,
+            abstract=d.paper.abstract,
+            venue=d.paper.venue,
+            url=d.paper.url,
+            pdf_url=d.paper.pdf_url,
+            provider=d.provider,
+        )
+    
+    notes_save_decisions(query, decision_records)
+@
+
+\subsection{Testing Session Functions}
+
+<<test functions>>=
+class TestSessionFunctions:
+    """Tests for session creation and persistence."""
+
+    def test_create_review_session(self):
+        """Can create a review session from search results."""
+        # Create mock search result
+        result = Mock()
+        result.provider = "test"
+        result.papers = [
+            Paper(title="Paper 1", authors=["Author"], year=2024),
+        ]
+        
+        session = create_review_session([result], "test query")
+        
+        assert session.query == "test query"
+        assert len(session.decisions) == 1
+        assert session.decisions[0].status == DecisionStatus.PENDING
+
+    def test_save_and_load_session(self, tmp_path, monkeypatch):
+        """Can save and load a session."""
+        monkeypatch.setenv("SCHOLAR_DATA_DIR", str(tmp_path))
+        
+        paper = Paper(title="Test Paper", authors=["Author"], year=2024)
+        session = ReviewSession(
+            query="test query",
+            providers=["test"],
+            timestamp=datetime.now(),
+            name="my-session",
+        )
+        session.decisions.append(
+            ReviewDecision(
+                paper=paper,
+                provider="test",
+                status=DecisionStatus.KEPT,
+                tags=["relevant", "ml"],
+            )
+        )
+        
+        save_session(session)
+        loaded = load_session("my-session")
+        
+        assert loaded is not None
+        assert loaded.query == "test query"
+        assert len(loaded.decisions) == 1
+        assert loaded.decisions[0].status == DecisionStatus.KEPT
+        assert loaded.decisions[0].tags == ["relevant", "ml"]
+
+    def test_list_sessions(self, tmp_path, monkeypatch):
+        """Can list all sessions."""
+        monkeypatch.setenv("SCHOLAR_DATA_DIR", str(tmp_path))
+        
+        session1 = ReviewSession(
+            query="query1", providers=["test"], 
+            timestamp=datetime.now(), name="session1"
+        )
+        session2 = ReviewSession(
+            query="query2", providers=["test"], 
+            timestamp=datetime.now(), name="session2"
+        )
+        
+        save_session(session1)
+        save_session(session2)
+        
+        sessions = list_sessions()
+        assert len(sessions) == 2
+@
+
+
+\section{Report Generation}
+
+The module provides \LaTeX\ report generation with theme and motivation
+groupings, enabling systematic documentation of review decisions.
+
+<<review report generation>>=
+def escape_bibtex(text: str) -> str:
+    """Escape special BibTeX characters."""
+    text = text.replace('&', r'\&')
+    text = text.replace('%', r'\%')
+    text = text.replace('$', r'\$')
+    text = text.replace('#', r'\#')
+    text = text.replace('_', r'\_')
+    return text
+
+
+def escape_latex(text: str) -> str:
+    """
+    Escape special LaTeX characters.
+    
+    Order matters: backslash must be escaped first to avoid double-escaping.
+    """
+    text = text.replace('\\', r'\textbackslash{}')
+    replacements = {
+        '&': r'\&',
+        '%': r'\%',
+        '$': r'\$',
+        '#': r'\#',
+        '_': r'\_',
+        '{': r'\{',
+        '}': r'\}',
+        '~': r'\textasciitilde{}',
+        '^': r'\textasciicircum{}',
+    }
+    for char, replacement in replacements.items():
+        text = text.replace(char, replacement)
+    return text
+
+
+def markdown_to_latex(markdown_text: str) -> str:
+    """
+    Convert Markdown text to LaTeX using pypandoc.
+    
+    Falls back to escaped plain text if pypandoc is not available.
+    """
+    try:
+        import pypandoc
+        return pypandoc.convert_text(markdown_text, 'latex', format='markdown')
+    except Exception:
+        return escape_latex(markdown_text)
+
+
+def generate_latex_report(session: ReviewSession, output_path: Path) -> None:
+    """
+    Generate a LaTeX report of the review session.
+    
+    The report includes:
+    - Search parameters (query, providers, date)
+    - Summary statistics
+    - Kept papers grouped by theme
+    - Discarded papers grouped by motivation
+    
+    Also generates a .bib file with the same base name.
+    
+    Args:
+        session: The ReviewSession to report on.
+        output_path: Path for the .tex file (will also create .bib).
+    """
+    def make_cite_key(paper: Paper, index: int) -> str:
+        """Generate a unique citation key for a paper."""
+        if paper.authors:
+            first_author = paper.authors[0].split()[-1].lower()
+            first_author = ''.join(c for c in first_author if c.isalnum())
+        else:
+            first_author = "unknown"
+        year = paper.year or "nd"
+        return f"{first_author}{year}_{index}"
+    
+    def format_bibtex_entry(paper: Paper, cite_key: str) -> str:
+        """Format a paper as a BibTeX entry."""
+        lines = [f"@article{{{cite_key},"]
+        lines.append(f"  title = {{{escape_bibtex(paper.title)}}},")
+        if paper.authors:
+            authors = " and ".join(paper.authors)
+            lines.append(f"  author = {{{escape_bibtex(authors)}}},")
+        if paper.year:
+            lines.append(f"  year = {{{paper.year}}},")
+        if paper.venue:
+            lines.append(f"  journal = {{{escape_bibtex(paper.venue)}}},")
+        if paper.doi:
+            lines.append(f"  doi = {{{paper.doi}}},")
+        if paper.url:
+            lines.append(f"  url = {{{paper.url}}},")
+        lines.append("}")
+        return "\n".join(lines)
+    
+    # Generate citation keys for all papers
+    all_decisions = session.kept_papers + session.discarded_papers
+    cite_keys: dict[int, str] = {}
+    for i, decision in enumerate(all_decisions):
+        cite_keys[id(decision)] = make_cite_key(decision.paper, i)
+    
+    # Generate .bib file
+    bib_entries = []
+    for decision in all_decisions:
+        cite_key = cite_keys[id(decision)]
+        bib_entries.append(format_bibtex_entry(decision.paper, cite_key))
+    
+    bib_path = output_path.with_suffix('.bib')
+    bib_path.write_text("\n\n".join(bib_entries))
+    
+    # Generate .tex file
+    lines = [
+        r"\documentclass{article}",
+        r"\usepackage[utf8]{inputenc}",
+        r"\usepackage{hyperref}",
+        r"\usepackage{enumitem}",
+        r"\usepackage{geometry}",
+        r"\usepackage[backend=biber,style=authoryear]{biblatex}",
+        f"\\addbibresource{{{bib_path.name}}}",
+        r"\geometry{margin=1in}",
+        r"",
+        r"\title{Literature Review Report}",
+        f"\\date{{{session.timestamp.strftime('%Y-%m-%d')}}}",
+        r"",
+        r"\begin{document}",
+        r"\maketitle",
+        r"",
+        r"\section{Search Parameters}",
+        r"\begin{description}",
+        f"\\item[Query] {escape_latex(session.query)}",
+        f"\\item[Providers] {', '.join(session.providers)}",
+        f"\\item[Date] {session.timestamp.strftime('%Y-%m-%d %H:%M')}",
+        f"\\item[Total Papers] {len(session.decisions)}",
+        r"\end{description}",
+        r"",
+        r"\section{Summary}",
+        r"\begin{description}",
+        f"\\item[Kept] {len(session.kept_papers)}",
+        f"\\item[Discarded] {len(session.discarded_papers)}",
+        f"\\item[Pending] {len(session.pending_papers)}",
+        r"\end{description}",
+        r"",
+    ]
+    
+    # Kept papers section - grouped by theme
+    if session.kept_papers:
+        lines.extend([
+            r"\section{Kept Papers}",
+        ])
+        
+        themes = session.all_themes()
+        if themes:
+            # Group by theme
+            for theme in sorted(themes):
+                papers_with_theme = [
+                    d for d in session.kept_papers if d.has_tag(theme)
+                ]
+                lines.append(f"\\subsection{{{escape_latex(theme)}}}")
+                lines.append(r"\begin{enumerate}")
+                for decision in papers_with_theme:
+                    cite_key = cite_keys[id(decision)]
+                    lines.append(f"\\item \\fullcite{{{cite_key}}}")
+                lines.append(r"\end{enumerate}")
+                lines.append("")
+        else:
+            # No themes, just list papers
+            lines.append(r"\begin{enumerate}")
+            for decision in session.kept_papers:
+                cite_key = cite_keys[id(decision)]
+                lines.append(f"\\item \\fullcite{{{cite_key}}}")
+            lines.append(r"\end{enumerate}")
+            lines.append("")
+    
+    # Discarded papers section - grouped by motivation
+    if session.discarded_papers:
+        lines.extend([
+            r"\section{Discarded Papers}",
+        ])
+        
+        motivations = session.all_motivations()
+        if motivations:
+            # Group by motivation
+            for motivation in sorted(motivations):
+                papers_with_motivation = [
+                    d for d in session.discarded_papers if d.has_tag(motivation)
+                ]
+                lines.append(f"\\subsection{{{escape_latex(motivation)}}}")
+                lines.append(r"\begin{enumerate}")
+                for decision in papers_with_motivation:
+                    cite_key = cite_keys[id(decision)]
+                    lines.append(f"\\item \\fullcite{{{cite_key}}}")
+                lines.append(r"\end{enumerate}")
+                lines.append("")
+        else:
+            # No motivations, just list papers
+            lines.append(r"\begin{enumerate}")
+            for decision in session.discarded_papers:
+                cite_key = cite_keys[id(decision)]
+                lines.append(f"\\item \\fullcite{{{cite_key}}}")
+            lines.append(r"\end{enumerate}")
+            lines.append("")
+    
+    lines.extend([
+        r"\end{document}",
+    ])
+    
+    output_path.write_text("\n".join(lines))
+@
+
+\subsection{Testing Report Generation}
+
+<<test functions>>=
+class TestReportGeneration:
+    """Tests for LaTeX report generation."""
+
+    def test_generate_report_with_themes(self, tmp_path):
+        """Report groups kept papers by theme."""
+        paper1 = Paper(title="Paper 1", authors=["Author A"], year=2024)
+        paper2 = Paper(title="Paper 2", authors=["Author B"], year=2024)
+        
+        session = ReviewSession(
+            query="test",
+            providers=["test"],
+            timestamp=datetime.now(),
+        )
+        session.decisions = [
+            ReviewDecision(
+                paper=paper1, provider="test",
+                status=DecisionStatus.KEPT, tags=["ml", "privacy"]
+            ),
+            ReviewDecision(
+                paper=paper2, provider="test",
+                status=DecisionStatus.KEPT, tags=["ml"]
+            ),
+        ]
+        
+        output_path = tmp_path / "report.tex"
+        generate_latex_report(session, output_path)
+        
+        content = output_path.read_text()
+        assert r"\subsection{ml}" in content
+        assert r"\subsection{privacy}" in content
+
+    def test_generate_report_with_motivations(self, tmp_path):
+        """Report groups discarded papers by motivation."""
+        paper = Paper(title="Discarded Paper", authors=["Author"], year=2024)
+        
+        session = ReviewSession(
+            query="test",
+            providers=["test"],
+            timestamp=datetime.now(),
+        )
+        session.decisions = [
+            ReviewDecision(
+                paper=paper, provider="test",
+                status=DecisionStatus.DISCARDED, tags=["off-topic"]
+            ),
+        ]
+        
+        output_path = tmp_path / "report.tex"
+        generate_latex_report(session, output_path)
+        
+        content = output_path.read_text()
+        assert r"\section{Discarded Papers}" in content
+        assert r"\subsection{off-topic}" in content
+
+    def test_escapes_special_characters(self, tmp_path):
+        """Special characters are escaped in report."""
+        paper = Paper(
+            title="Test & Paper with 100% special_chars",
+            authors=["O'Brien"],
+            year=2024,
+        )
+        
+        session = ReviewSession(
+            query="test",
+            providers=["test"],
+            timestamp=datetime.now(),
+        )
+        session.decisions = [
+            ReviewDecision(paper=paper, provider="test", status=DecisionStatus.KEPT),
+        ]
+        
+        output_path = tmp_path / "report.tex"
+        generate_latex_report(session, output_path)
+        
+        bib_content = output_path.with_suffix(".bib").read_text()
+        assert r"\&" in bib_content
+        assert r"\%" in bib_content
+@

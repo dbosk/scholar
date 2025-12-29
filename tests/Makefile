@@ -3,6 +3,7 @@ TESTS+=		test_providers.py
 TESTS+=		test_cache.py
 TESTS+=		test_cli.py
 TESTS+=		test_tui.py
+TESTS+=		test_review.py
 
 CONFIG+=	conftest.py
 
@@ -24,6 +25,9 @@ test_cli.py: ../src/scholar/cli.nw
 
 test_tui.py: ../src/scholar/tui.nw
 	notangle -R"test [[tui.py]]" $< | cpif $@
+
+test_review.py: ../src/scholar/review.nw
+	notangle -R"test [[review.py]]" $< | cpif $@
 
 conftest.py: ../src/scholar/cache.nw
 	notangle -R"[[conftest.py]]" $< | cpif $@
