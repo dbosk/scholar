@@ -150,6 +150,7 @@ from scholar.review import (
     DecisionStatus, ReviewDecision, ReviewSession,
     create_review_session, save_search_decisions,
     escape_latex,
+    generate_csv_report, generate_latex_report,
 )
 from scholar.pdf import (
     get_pdf_cache_dir, get_cached_pdf_path, download_pdf, open_pdf, PDFDownloadError,
@@ -1346,161 +1347,20 @@ double-escaping the backslashes introduced by other replacements.
 Notes are stored as Markdown and converted to \LaTeX\ using pypandoc for proper
 rendering in the report.
 
+The report generation functions ([[generate_latex_report]] and 
+[[generate_csv_report]]) are provided by the [[review]] module
+(\autoref{review-module}). The TUI only provides the interactive prompt
+that asks users if they want to save reports after a review session.
+
 <<tui report generation>>=
-def markdown_to_latex(markdown_text: str) -> str:
-    """
-    Convert Markdown text to LaTeX using pypandoc.
-    
-    Falls back to escaped plain text if pypandoc is not available
-    or if conversion fails.
-    """
-    try:
-        import pypandoc
-        return pypandoc.convert_text(markdown_text, 'latex', format='markdown')
-    except Exception:
-        # Fallback: escape special characters and return as-is
-        return escape_latex(markdown_text)
-
-
-def generate_latex_report(session: ReviewSession, output_path: Path) -> None:
-    """
-    Generate a LaTeX report of the review session.
-    
-    The report includes:
-    - Search parameters (query, providers, date)
-    - Summary statistics
-    - List of kept papers with citations
-    - List of discarded papers with motivations
-    
-    Also generates a .bib file with the same base name.
-    """
-    def escape_bibtex(text: str) -> str:
-        """Escape special BibTeX characters."""
-        # BibTeX needs braces around special chars
-        text = text.replace('&', r'\&')
-        text = text.replace('%', r'\%')
-        text = text.replace('$', r'\$')
-        text = text.replace('#', r'\#')
-        text = text.replace('_', r'\_')
-        return text
-    
-    # escape_latex is imported from scholar.review
-    
-    def make_cite_key(paper: Paper, index: int) -> str:
-        """Generate a unique citation key for a paper."""
-        # Use first author's last name + year + index for uniqueness
-        if paper.authors:
-            first_author = paper.authors[0].split()[-1].lower()
-            # Remove non-alphanumeric characters
-            first_author = ''.join(c for c in first_author if c.isalnum())
-        else:
-            first_author = "unknown"
-        year = paper.year or "nd"
-        return f"{first_author}{year}_{index}"
-    
-    def format_bibtex_entry(paper: Paper, cite_key: str) -> str:
-        """Format a paper as a BibTeX entry."""
-        lines = [f"@article{{{cite_key},"]
-        lines.append(f"  title = {{{escape_bibtex(paper.title)}}},")
-        if paper.authors:
-            authors = " and ".join(paper.authors)
-            lines.append(f"  author = {{{escape_bibtex(authors)}}},")
-        if paper.year:
-            lines.append(f"  year = {{{paper.year}}},")
-        if paper.venue:
-            lines.append(f"  journal = {{{escape_bibtex(paper.venue)}}},")
-        if paper.doi:
-            lines.append(f"  doi = {{{paper.doi}}},")
-        if paper.url:
-            lines.append(f"  url = {{{paper.url}}},")
-        lines.append("}")
-        return "\n".join(lines)
-    
-    # Generate citation keys for all papers
-    all_decisions = session.kept_papers + session.discarded_papers
-    cite_keys: dict[int, str] = {}
-    for i, decision in enumerate(all_decisions):
-        cite_keys[id(decision)] = make_cite_key(decision.paper, i)
-    
-    # Generate .bib file
-    bib_entries = []
-    for decision in all_decisions:
-        cite_key = cite_keys[id(decision)]
-        bib_entries.append(format_bibtex_entry(decision.paper, cite_key))
-    
-    bib_path = output_path.with_suffix('.bib')
-    bib_path.write_text("\n\n".join(bib_entries))
-    
-    # Generate .tex file with biblatex
-    lines = [
-        r"\documentclass{article}",
-        r"\usepackage[utf8]{inputenc}",
-        r"\usepackage{hyperref}",
-        r"\usepackage{enumitem}",
-        r"\usepackage{geometry}",
-        r"\usepackage[backend=biber,style=authoryear]{biblatex}",
-        f"\\addbibresource{{{bib_path.name}}}",
-        r"\geometry{margin=1in}",
-        r"",
-        r"\title{Literature Review Report}",
-        f"\\date{{{session.timestamp.strftime('%Y-%m-%d')}}}",
-        r"",
-        r"\begin{document}",
-        r"\maketitle",
-        r"",
-        r"\section{Search Parameters}",
-        r"\begin{description}",
-        f"\\item[Query] {escape_latex(session.query)}",
-        f"\\item[Providers] {', '.join(session.providers)}",
-        f"\\item[Date] {session.timestamp.strftime('%Y-%m-%d %H:%M')}",
-        f"\\item[Total Papers] {len(session.decisions)}",
-        r"\end{description}",
-        r"",
-        r"\section{Summary}",
-        r"\begin{description}",
-        f"\\item[Kept] {len(session.kept_papers)}",
-        f"\\item[Discarded] {len(session.discarded_papers)}",
-        f"\\item[Pending] {len(session.pending_papers)}",
-        r"\end{description}",
-        r"",
-    ]
-    
-    # Kept papers section
-    if session.kept_papers:
-        lines.extend([
-            r"\section{Kept Papers}",
-            r"\begin{enumerate}",
-        ])
-        for decision in session.kept_papers:
-            cite_key = cite_keys[id(decision)]
-            lines.append(f"\\item \\fullcite{{{cite_key}}}")
-        lines.append(r"\end{enumerate}")
-        lines.append("")
-    
-    # Discarded papers section
-    if session.discarded_papers:
-        lines.extend([
-            r"\section{Discarded Papers}",
-            r"\begin{enumerate}",
-        ])
-        for decision in session.discarded_papers:
-            cite_key = cite_keys[id(decision)]
-            motivation = escape_latex(decision.motivation)
-            lines.append(f"\\item \\fullcite{{{cite_key}}}")
-            lines.append(f"  \\\\\\textbf{{Motivation:}} {motivation}")
-        lines.append(r"\end{enumerate}")
-        lines.append("")
-    
-    lines.extend([
-        r"\end{document}",
-    ])
-    
-    output_path.write_text("\n".join(lines))
-
-
 def prompt_for_report(session: ReviewSession) -> None:
     """
-    Prompt the user to save a LaTeX report after the review session.
+    Prompt the user to save reports after the review session.
+    
+    Generates three files with the same base name:
+    - .tex: LaTeX report with citations
+    - .bib: BibTeX bibliography
+    - .csv: Spreadsheet-friendly export
     
     Called after the TUI exits if any decisions were made.
     """
@@ -1520,87 +1380,29 @@ def prompt_for_report(session: ReviewSession) -> None:
     console.print(f"  [red]Discarded:[/red] {discarded}")
     console.print(f"  Pending: {len(session.pending_papers)}")
     
-    if Confirm.ask("\nWould you like to save a LaTeX report?", default=True):
-        default_name = f"review_{session.timestamp.strftime('%Y%m%d_%H%M%S')}.tex"
-        filename = Prompt.ask("Filename", default=default_name)
-        output_path = Path(filename)
-        generate_latex_report(session, output_path)
-        console.print(f"[green]Report saved to {output_path}[/green]")
+    if Confirm.ask("\nWould you like to save reports?", default=True):
+        default_name = f"review_{session.timestamp.strftime('%Y%m%d_%H%M%S')}"
+        basename = Prompt.ask("Base filename (without extension)", default=default_name)
+        
+        # Generate all three report files
+        tex_path = Path(f"{basename}.tex")
+        csv_path = Path(f"{basename}.csv")
+        
+        generate_latex_report(session, tex_path)
+        generate_csv_report(session, csv_path)
+        
+        console.print(f"[green]Reports saved:[/green]")
+        console.print(f"  - {tex_path}")
+        console.print(f"  - {tex_path.with_suffix('.bib')}")
+        console.print(f"  - {csv_path}")
 @
 
-\subsection{Testing report generation}
+\subsection{Note on report generation testing}
 
-Let's verify that the LaTeX report generation works correctly and properly
-escapes special characters.
-
-<<test functions>>=
-class TestLatexReport:
-    """Tests for LaTeX report generation."""
-
-    def test_generate_report(self, tmp_path):
-        """Test basic report generation.
-
-        The generator creates both a .tex file (with fullcite references)
-        and a .bib file (with paper details). We check both files.
-        """
-        paper = Paper(
-            title="Test Paper",
-            authors=["John Doe", "Jane Smith"],
-            year=2024,
-            doi="10.1234/test",
-            venue="Test Conference",
-        )
-        session = ReviewSession(
-            query="machine learning",
-            providers=["semantic_scholar"],
-            timestamp=datetime(2024, 1, 15, 10, 30),
-        )
-        session.decisions = [
-            ReviewDecision(paper=paper, provider="semantic_scholar", status=DecisionStatus.KEPT),
-        ]
-
-        output_path = tmp_path / "report.tex"
-        generate_latex_report(session, output_path)
-
-        # Check .tex file for report structure
-        tex_content = output_path.read_text()
-        assert r"\title{Literature Review Report}" in tex_content
-        assert "machine learning" in tex_content
-        assert r"\fullcite{" in tex_content
-
-        # Check .bib file for paper details
-        bib_path = output_path.with_suffix(".bib")
-        bib_content = bib_path.read_text()
-        assert "Test Paper" in bib_content
-        assert "John Doe" in bib_content
-        assert "2024" in bib_content
-
-    def test_escapes_special_characters(self, tmp_path):
-        """Test that special BibTeX characters are escaped in .bib file."""
-        paper = Paper(
-            title="Test & Paper with 100% special_chars",
-            authors=["O'Brien"],
-            year=2024,
-        )
-        session = ReviewSession(
-            query="test",
-            providers=["test"],
-            timestamp=datetime.now(),
-        )
-        session.decisions = [
-            ReviewDecision(paper=paper, provider="test", status=DecisionStatus.KEPT),
-        ]
-
-        output_path = tmp_path / "report.tex"
-        generate_latex_report(session, output_path)
-
-        # Special characters should be escaped in the .bib file
-        bib_path = output_path.with_suffix(".bib")
-        bib_content = bib_path.read_text()
-        assert r"\&" in bib_content
-        assert r"\%" in bib_content
-        assert r"\_" in bib_content
-@
+The [[generate_latex_report]] and [[generate_csv_report]] functions are now
+provided by the [[review]] module and are tested there (see
+\autoref{review-module}). The TUI only provides [[prompt_for_report]], which
+is an interactive function that doesn't require automated testing.
 
 
 \section{Entry Point}

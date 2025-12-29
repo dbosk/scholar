@@ -51,6 +51,7 @@ across bibliographic databases.
 <<cache command>>
 <<pdf command>>
 <<notes command>>
+<<sessions command>>
 <<submodule registration>>
 <<main entry point>>
 @
@@ -702,6 +703,254 @@ def notes_clear(
         notes_file.unlink()
 
     console.print(f"[green]Deleted {len(notes)} note(s).[/green]")
+@
+
+
+\section{Session Management}
+\label{ch:session-management}
+
+The [[sessions]] command provides access to saved review sessions without
+launching the full TUI. Users can:
+\begin{description}
+\item[sessions list] View all saved review sessions with their statistics
+\item[sessions show] Display details of a specific session
+\item[sessions export] Generate reports (CSV, \LaTeX{}) from a saved session
+\item[sessions resume] Continue reviewing a saved session in the TUI
+\end{description}
+
+This enables scripted workflows and integration with other tools.
+
+\subsection{The sessions command group}
+
+<<sessions command>>=
+sessions_app = typer.Typer(
+    name="sessions",
+    help="Manage saved review sessions.",
+    no_args_is_help=True,
+)
+app.add_typer(sessions_app, name="sessions")
+
+
+@sessions_app.command("list")
+def sessions_list(
+    output_format: Annotated[
+        str,
+        typer.Option(
+            "--format", "-f",
+            help="Output format: table or json.",
+        ),
+    ] = "table",
+) -> None:
+    """
+    List all saved review sessions.
+
+    Shows query, providers, timestamps, and paper counts.
+    """
+    from scholar.review import list_sessions
+
+    console = Console()
+    sessions = list_sessions()
+
+    if not sessions:
+        console.print("[dim]No saved sessions found.[/dim]")
+        return
+
+    if output_format == "json":
+        print(json.dumps(sessions, indent=2, default=str))
+    else:
+        table = Table(title="Saved Review Sessions", box=box.HORIZONTALS)
+        table.add_column("Name", style="cyan", no_wrap=True)
+        table.add_column("Query", style="white", max_width=30)
+        table.add_column("Date", style="dim")
+        table.add_column("Kept", style="green", justify="right")
+        table.add_column("Discarded", style="red", justify="right")
+        table.add_column("Pending", style="yellow", justify="right")
+
+        for s in sessions:
+            table.add_row(
+                s["name"],
+                s["query"][:30] + ("..." if len(s["query"]) > 30 else ""),
+                s["timestamp"].strftime("%Y-%m-%d %H:%M"),
+                str(s["kept"]),
+                str(s["discarded"]),
+                str(s["pending"]),
+            )
+
+        console.print(table)
+        console.print(f"\n[dim]Total: {len(sessions)} session(s)[/dim]")
+
+
+@sessions_app.command("show")
+def sessions_show(
+    name: Annotated[
+        str,
+        typer.Argument(help="Session name or query to show."),
+    ],
+    output_format: Annotated[
+        str,
+        typer.Option(
+            "--format", "-f",
+            help="Output format: table or json.",
+        ),
+    ] = "table",
+) -> None:
+    """
+    Show details of a saved review session.
+
+    Displays all papers with their decisions, themes, and motivations.
+    """
+    from scholar.review import load_session
+
+    console = Console()
+    session = load_session(name)
+
+    if session is None:
+        console.print(f"[red]Session not found: {name}[/red]")
+        raise typer.Exit(1)
+
+    if output_format == "json":
+        output = {
+            "query": session.query,
+            "providers": session.providers,
+            "timestamp": session.timestamp.isoformat(),
+            "decisions": [
+                {
+                    "title": d.paper.title,
+                    "authors": d.paper.authors,
+                    "year": d.paper.year,
+                    "status": d.status.value,
+                    "tags": d.tags,
+                    "provider": d.provider,
+                }
+                for d in session.decisions
+            ],
+        }
+        print(json.dumps(output, indent=2))
+    else:
+        console.print(f"[bold]Session: {session.query}[/bold]")
+        console.print(f"[dim]Date: {session.timestamp.strftime('%Y-%m-%d %H:%M')}[/dim]")
+        console.print(f"[dim]Providers: {', '.join(session.providers)}[/dim]")
+        console.print()
+
+        # Show kept papers
+        kept = session.kept_papers
+        if kept:
+            console.print(f"[green bold]Kept ({len(kept)}):[/green bold]")
+            for d in kept:
+                tags = f" [{', '.join(d.tags)}]" if d.tags else ""
+                console.print(f"  - {d.paper.title}{tags}")
+            console.print()
+
+        # Show discarded papers
+        discarded = session.discarded_papers
+        if discarded:
+            console.print(f"[red bold]Discarded ({len(discarded)}):[/red bold]")
+            for d in discarded:
+                tags = f" [{', '.join(d.tags)}]" if d.tags else ""
+                console.print(f"  - {d.paper.title}{tags}")
+            console.print()
+
+        # Show pending papers
+        pending = session.pending_papers
+        if pending:
+            console.print(f"[yellow bold]Pending ({len(pending)}):[/yellow bold]")
+            for d in pending:
+                console.print(f"  - {d.paper.title}")
+
+
+@sessions_app.command("export")
+def sessions_export(
+    name: Annotated[
+        str,
+        typer.Argument(help="Session name or query to export."),
+    ],
+    output: Annotated[
+        Optional[str],
+        typer.Option(
+            "--output", "-o",
+            help="Output base filename (without extension). Defaults to session name.",
+        ),
+    ] = None,
+    format_type: Annotated[
+        str,
+        typer.Option(
+            "--format", "-f",
+            help="Export format: csv, latex, or all.",
+        ),
+    ] = "all",
+) -> None:
+    """
+    Export a saved session to file(s).
+
+    Generates CSV and/or LaTeX reports from a saved review session.
+    Use --format to select specific formats.
+    """
+    from scholar.review import (
+        load_session, generate_latex_report, generate_csv_report,
+    )
+
+    console = Console()
+    session = load_session(name)
+
+    if session is None:
+        console.print(f"[red]Session not found: {name}[/red]")
+        raise typer.Exit(1)
+
+    # Use session query as default output name (sanitized)
+    if output is None:
+        # Sanitize query for filename
+        safe_name = "".join(
+            c if c.isalnum() or c in "-_" else "_"
+            for c in session.query[:30]
+        )
+        output = f"review_{safe_name}"
+
+    files_created = []
+
+    if format_type in ("csv", "all"):
+        csv_path = Path(f"{output}.csv")
+        generate_csv_report(session, csv_path)
+        files_created.append(csv_path)
+
+    if format_type in ("latex", "all"):
+        tex_path = Path(f"{output}.tex")
+        generate_latex_report(session, tex_path)
+        files_created.append(tex_path)
+        files_created.append(tex_path.with_suffix(".bib"))
+
+    console.print("[green]Exported:[/green]")
+    for f in files_created:
+        console.print(f"  - {f}")
+
+
+@sessions_app.command("resume")
+def sessions_resume(
+    name: Annotated[
+        str,
+        typer.Argument(help="Session name or query to resume."),
+    ],
+) -> None:
+    """
+    Resume reviewing a saved session in the TUI.
+
+    Opens the interactive review interface with the saved session loaded.
+    """
+    from scholar.review import load_session
+    from scholar.tui import ReviewApp, prompt_for_report
+
+    console = Console()
+    session = load_session(name)
+
+    if session is None:
+        console.print(f"[red]Session not found: {name}[/red]")
+        raise typer.Exit(1)
+
+    console.print(f"[dim]Resuming session: {session.query}[/dim]")
+
+    app = ReviewApp(session)
+    app.run()
+
+    prompt_for_report(session)
 @
 
 

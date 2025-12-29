@@ -1056,6 +1056,49 @@ def generate_latex_report(session: ReviewSession, output_path: Path) -> None:
     ])
     
     output_path.write_text("\n".join(lines))
+
+
+def generate_csv_report(session: ReviewSession, output_path: Path) -> None:
+    """
+    Generate a CSV report of the review session.
+    
+    The CSV includes all papers (kept and discarded) with columns:
+    - status: kept/discarded/pending
+    - title, authors, year, venue, doi, url
+    - tags: semicolon-separated list of themes/motivations
+    - abstract: full abstract text
+    - provider: source of the paper
+    
+    Args:
+        session: The ReviewSession to report on.
+        output_path: Path for the .csv file.
+    """
+    import csv
+    
+    with open(output_path, 'w', newline='', encoding='utf-8') as f:
+        writer = csv.writer(f)
+        
+        # Header row
+        writer.writerow([
+            'status', 'title', 'authors', 'year', 'venue', 
+            'doi', 'url', 'tags', 'abstract', 'provider'
+        ])
+        
+        # Write all decisions
+        for decision in session.decisions:
+            paper = decision.paper
+            writer.writerow([
+                decision.status.value,
+                paper.title,
+                '; '.join(paper.authors) if paper.authors else '',
+                paper.year or '',
+                paper.venue or '',
+                paper.doi or '',
+                paper.url or '',
+                '; '.join(decision.tags) if decision.tags else '',
+                paper.abstract or '',
+                decision.provider,
+            ])
 @
 
 \subsection{Testing Report Generation}
