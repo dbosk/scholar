@@ -15,6 +15,8 @@ dependencies = [
     "cachetools>=6.2.4",
     "platformdirs>=4.5.1",
     "textual>=6.11.0",
+    "pypandoc>=1.14",
+    "click>=8.0.0",
 ]
 
 [project.scripts]

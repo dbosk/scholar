@@ -9,9 +9,18 @@ academic papers returned from search results. The TUI allows researchers to:
 \item Browse papers with vim-style navigation
 \item View paper abstracts
 \item Keep or discard papers with mandatory motivations for discards
+\item Add and edit notes for papers (persisted globally)
 \item Sort papers by various criteria
 \item Generate LaTeX reports of the review session
 \end{itemize}
+
+The TUI supports two modes:
+\begin{description}
+\item[Review mode] Used when reviewing search results, with keep/discard 
+  functionality enabled and decisions saved per-query.
+\item[Notes mode] Used when browsing papers with notes, with keep/discard 
+  disabled but note editing still available.
+\end{description}
 
 The interface is built using Textual, a modern Python TUI framework that 
 provides rich terminal interfaces with mouse support and responsive layouts.
@@ -62,13 +71,18 @@ from textual.containers import Container, Horizontal, Vertical, VerticalScroll
 from textual.screen import Screen, ModalScreen
 from textual.widgets import (
     Button, DataTable, Footer, Header, Input, Label,
-    ListItem, ListView, OptionList, Static, TextArea,
+    ListItem, ListView, Markdown, OptionList, Static, TextArea,
 )
 from textual.message import Message
 from textual import work
 from rich.text import Text
 
 from scholar.scholar import Paper, SearchResult
+from scholar.notes import (
+    get_note, save_note, has_note, edit_note_in_editor,
+    load_search_decisions, save_search_decisions, get_previous_decision,
+    get_paper_id,
+)
 @
 
 The decision status uses an enum to ensure type safety and clear semantics.
@@ -342,22 +356,29 @@ title, authors, year, and current review status using color coding.
 class PaperListItem(ListItem):
     """A list item displaying a paper with its review status."""
     
-    def __init__(self, decision: ReviewDecision, index: int) -> None:
+    def __init__(self, decision: ReviewDecision, index: int, review_mode: bool = True) -> None:
         super().__init__()
         self.decision = decision
         self.index = index
+        self.review_mode = review_mode
     
     def compose(self) -> ComposeResult:
         paper = self.decision.paper
         status = self.decision.status
         
-        # Color code by status
-        if status == DecisionStatus.KEPT:
-            status_indicator = "[green]✓[/green]"
-        elif status == DecisionStatus.DISCARDED:
-            status_indicator = "[red]✗[/red]"
+        # Note indicator
+        note_indicator = "[yellow]📝[/yellow] " if has_note(paper) else "   "
+        
+        # Color code by status (only in review mode)
+        if self.review_mode:
+            if status == DecisionStatus.KEPT:
+                status_indicator = "[green]✓[/green]"
+            elif status == DecisionStatus.DISCARDED:
+                status_indicator = "[red]✗[/red]"
+            else:
+                status_indicator = "[dim]○[/dim]"
         else:
-            status_indicator = "[dim]○[/dim]"
+            status_indicator = " "
         
         # Format authors (truncate if too many)
         authors = ", ".join(paper.authors[:3])
@@ -368,7 +389,7 @@ class PaperListItem(ListItem):
         provider = f"[dim]{self.decision.provider}[/dim]"
         
         yield Static(
-            f"{status_indicator} {paper.title[:60]}{'...' if len(paper.title) > 60 else ''}\n"
+            f"{status_indicator} {note_indicator}{paper.title[:55]}{'...' if len(paper.title) > 55 else ''}\n"
             f"   [dim]{authors} ({year})[/dim] {provider}"
         )
 @
@@ -389,12 +410,14 @@ class AbstractScreen(Screen[None]):
         Binding("K", "keep", "Keep"),
         Binding("d", "discard", "Discard"),
         Binding("p", "open_pdf", "Open PDF"),
+        Binding("n", "edit_notes", "Notes"),
     ]
     
-    def __init__(self, decision: ReviewDecision, previous_motivations: list[str]) -> None:
+    def __init__(self, decision: ReviewDecision, previous_motivations: list[str], review_mode: bool = True) -> None:
         super().__init__()
         self.decision = decision
         self.previous_motivations = previous_motivations
+        self.review_mode = review_mode
         self.pdf_status: str = ""
     
     def compose(self) -> ComposeResult:
@@ -428,8 +451,26 @@ class AbstractScreen(Screen[None]):
                 else:
                     yield Static("[dim]No abstract available and no PDF link found.[/dim]")
             
+            # Show notes section if paper has notes
+            note = get_note(paper)
+            if note:
+                yield Static("")
+                yield Static("[bold cyan]─── Notes ───[/bold cyan]")
+                yield Markdown(note.note, id="notes-content")
+            else:
+                yield Static("")
+                yield Static("[dim]No notes. Press [bold yellow]n[/bold yellow] to add notes.[/dim]")
+            
             yield Static("", id="pdf-status")
         yield Footer()
+    
+    def action_edit_notes(self) -> None:
+        """Open editor to edit notes for this paper."""
+        paper = self.decision.paper
+        with self.app.suspend():
+            edit_note_in_editor(paper)
+        # Refresh the screen to show updated notes
+        self.refresh(recompose=True)
     
     def action_open_pdf(self) -> None:
         """Download and open the PDF."""
@@ -463,12 +504,18 @@ class AbstractScreen(Screen[None]):
     
     def action_keep(self) -> None:
         """Mark paper as kept and return."""
+        if not self.review_mode:
+            self.notify("Keep/discard disabled in notes mode", severity="warning")
+            return
         self.decision.status = DecisionStatus.KEPT
         self.decision.motivation = ""
         self.dismiss(None)
     
     def action_discard(self) -> None:
         """Open discard modal to get motivation."""
+        if not self.review_mode:
+            self.notify("Keep/discard disabled in notes mode", severity="warning")
+            return
         def handle_discard(result: bool | None) -> None:
             if result:
                 self.dismiss(None)
@@ -710,11 +757,13 @@ class PaperReviewApp(App):
         Binding("K", "keep", "Keep"),
         Binding("d", "discard", "Discard"),
         Binding("s", "sort", "Sort"),
+        Binding("n", "edit_notes", "Notes"),
     ]
     
-    def __init__(self, session: ReviewSession) -> None:
+    def __init__(self, session: ReviewSession, review_mode: bool = True) -> None:
         super().__init__()
         self.session = session
+        self.review_mode = review_mode
         self.current_index = 0
     
     def compose(self) -> ComposeResult:
@@ -734,7 +783,7 @@ class PaperReviewApp(App):
         list_view.clear()
         
         for i, decision in enumerate(self.session.decisions):
-            list_view.append(PaperListItem(decision, i))
+            list_view.append(PaperListItem(decision, i, self.review_mode))
         
         # Restore selection and focus after UI updates complete
         if self.session.decisions:
@@ -749,13 +798,21 @@ class PaperReviewApp(App):
         total = len(self.session.decisions)
         
         status = self.query_one("#status-bar", Static)
-        status.update(
-            f"Query: {self.session.query} | "
-            f"[green]Kept: {kept}[/green] | "
-            f"[red]Discarded: {discarded}[/red] | "
-            f"Pending: {pending} | "
-            f"Total: {total}"
-        )
+        if self.review_mode:
+            status.update(
+                f"Query: {self.session.query} | "
+                f"[green]Kept: {kept}[/green] | "
+                f"[red]Discarded: {discarded}[/red] | "
+                f"Pending: {pending} | "
+                f"Total: {total}"
+            )
+        else:
+            # Notes mode - simpler status
+            status.update(
+                f"Papers with notes: {total} | "
+                f"Press [bold yellow]n[/bold yellow] to edit notes, "
+                f"[bold yellow]p[/bold yellow] to open PDF"
+            )
     
     def _get_current_decision(self) -> ReviewDecision | None:
         """Get the currently selected decision."""
@@ -783,7 +840,10 @@ class PaperReviewApp(App):
         if decision:
             previous = [d.motivation for d in self.session.decisions 
                        if d.status == DecisionStatus.DISCARDED and d.motivation]
-            self.push_screen(AbstractScreen(decision, previous), self._on_abstract_closed)
+            self.push_screen(
+                AbstractScreen(decision, previous, self.review_mode), 
+                self._on_abstract_closed
+            )
     
     def _on_abstract_closed(self, result: None) -> None:
         """Called when abstract screen is closed."""
@@ -791,8 +851,19 @@ class PaperReviewApp(App):
         self._update_status()
         self.query_one("#paper-list", ListView).focus()
     
+    def action_edit_notes(self) -> None:
+        """Open editor to edit notes for current paper."""
+        decision = self._get_current_decision()
+        if decision:
+            with self.suspend():
+                edit_note_in_editor(decision.paper)
+            self._refresh_list()
+    
     def action_keep(self) -> None:
         """Mark current paper as kept."""
+        if not self.review_mode:
+            self.notify("Keep/discard disabled in notes mode", severity="warning")
+            return
         decision = self._get_current_decision()
         if decision:
             decision.status = DecisionStatus.KEPT
@@ -802,6 +873,9 @@ class PaperReviewApp(App):
     
     def action_discard(self) -> None:
         """Open discard modal for current paper."""
+        if not self.review_mode:
+            self.notify("Keep/discard disabled in notes mode", severity="warning")
+            return
         decision = self._get_current_decision()
         if decision:
             # Collect previous motivations from discarded papers
@@ -833,10 +907,28 @@ class PaperReviewApp(App):
 \chapter{Report Generation}
 
 After the review session, we generate a LaTeX report documenting the search 
-parameters, review decisions, and motivations. This provides an audit trail 
-for systematic literature reviews.
+parameters, review decisions, motivations, and any notes. This provides an 
+audit trail for systematic literature reviews.
+
+Notes are stored as Markdown and converted to LaTeX using pypandoc for proper
+rendering in the report.
 
 <<tui report generation>>=
+def markdown_to_latex(markdown_text: str) -> str:
+    """
+    Convert Markdown text to LaTeX using pypandoc.
+    
+    Falls back to escaped plain text if pypandoc is not available
+    or if conversion fails.
+    """
+    try:
+        import pypandoc
+        return pypandoc.convert_text(markdown_text, 'latex', format='markdown')
+    except Exception:
+        # Fallback: escape special characters and return as-is
+        return escape_latex(markdown_text)
+
+
 def generate_latex_report(session: ReviewSession, output_path: Path) -> None:
     """
     Generate a LaTeX report of the review session.
@@ -1113,6 +1205,9 @@ def run_review(results: list[SearchResult], query: str) -> ReviewSession:
     Converts SearchResult objects into a ReviewSession, launches the TUI,
     and returns the session with all decisions after the user exits.
     """
+    # Load previous decisions for this query
+    previous_decisions = load_search_decisions(query)
+    
     # Create review session
     providers = list(set(r.provider for r in results))
     session = ReviewSession(
@@ -1124,18 +1219,86 @@ def run_review(results: list[SearchResult], query: str) -> ReviewSession:
     # Convert search results to review decisions
     for result in results:
         for paper in result.papers:
+            # Check for previous decision
+            prev = None
+            if previous_decisions:
+                prev = get_previous_decision(query, paper)
+            
+            status = DecisionStatus.PENDING
+            motivation = ""
+            if prev:
+                if prev.status == "keep":
+                    status = DecisionStatus.KEPT
+                elif prev.status == "discard":
+                    status = DecisionStatus.DISCARDED
+                motivation = prev.motivation
+            
             session.decisions.append(
-                ReviewDecision(paper=paper, provider=result.provider)
+                ReviewDecision(
+                    paper=paper,
+                    provider=result.provider,
+                    status=status,
+                    motivation=motivation,
+                )
             )
     
-    # Run the TUI
-    app = PaperReviewApp(session)
+    # Run the TUI in review mode
+    app = PaperReviewApp(session, review_mode=True)
     app.run()
+    
+    # Save decisions for this query
+    save_search_decisions(query, session.decisions)
     
     # Prompt for report
     prompt_for_report(session)
     
     return session
+
+
+def run_notes_browser() -> None:
+    """
+    Run the notes browser TUI for viewing and editing paper notes.
+    
+    This launches the TUI in notes-only mode (no keep/discard functionality),
+    showing all papers that have notes attached.
+    """
+    # Get all papers with notes
+    papers_with_notes = list_papers_with_notes()
+    
+    if not papers_with_notes:
+        console = Console()
+        console.print("[yellow]No papers with notes found.[/yellow]")
+        console.print("Use 'scholar search --review' to review papers and add notes.")
+        return
+    
+    # Create a session with these papers (no query, notes-only mode)
+    session = ReviewSession(
+        query="",
+        providers=[],
+        timestamp=datetime.now(),
+    )
+    
+    # Convert paper notes to review decisions for display
+    for paper_note in papers_with_notes:
+        # Create a minimal Paper object from the note
+        paper = Paper(
+            title=paper_note.title,
+            authors=paper_note.authors if hasattr(paper_note, 'authors') else [],
+            year=paper_note.year if hasattr(paper_note, 'year') else None,
+            doi=paper_note.doi if hasattr(paper_note, 'doi') else None,
+            abstract=None,
+            venue=paper_note.venue if hasattr(paper_note, 'venue') else None,
+            url=paper_note.url if hasattr(paper_note, 'url') else None,
+            pdf_url=paper_note.pdf_url if hasattr(paper_note, 'pdf_url') else None,
+            source="notes",
+        )
+        session.decisions.append(
+            ReviewDecision(paper=paper, provider="notes")
+        )
+    
+    # Run the TUI in notes-only mode (no keep/discard)
+    app = PaperReviewApp(session, review_mode=False)
+    app.run()
 @
 
 \chapter{Tests}

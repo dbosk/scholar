@@ -49,6 +49,7 @@ across bibliographic databases.
 <<search command>>
 <<providers command>>
 <<cache command>>
+<<notes command>>
 <<submodule registration>>
 <<main entry point>>
 @
@@ -325,6 +326,212 @@ def cache(
         console.print(f"[red]Unknown action: {action}[/red]")
         console.print("Valid actions: clear, info, path")
         raise typer.Exit(1)
+@
+
+
+\chapter{Notes Management}
+
+Paper notes are stored persistently and can be browsed, exported, and imported.
+The [[notes]] command provides access to these features.
+
+When invoked without a subcommand, [[scholar notes]] launches a TUI for browsing
+all papers that have notes attached.
+
+<<notes command>>=
+notes_app = typer.Typer(
+    name="notes",
+    help="Manage paper notes and annotations.",
+    no_args_is_help=False,
+)
+app.add_typer(notes_app, name="notes")
+
+
+@notes_app.callback(invoke_without_command=True)
+def notes_callback(ctx: typer.Context) -> None:
+    """
+    Browse and manage paper notes.
+
+    When invoked without a subcommand, launches an interactive TUI
+    for browsing all papers with notes.
+    """
+    if ctx.invoked_subcommand is None:
+        from scholar.tui import run_notes_browser
+        run_notes_browser()
+
+
+@notes_app.command("list")
+def notes_list(
+    output_format: Annotated[
+        str,
+        typer.Option(
+            "--format", "-f",
+            help="Output format: table or json.",
+        ),
+    ] = "table",
+) -> None:
+    """
+    List all papers with notes.
+
+    Shows paper titles, note excerpts, and timestamps.
+    """
+    from scholar.notes import list_papers_with_notes
+
+    console = Console()
+    notes = list_papers_with_notes()
+
+    if not notes:
+        console.print("[dim]No papers have notes yet.[/dim]")
+        return
+
+    if output_format == "json":
+        import json
+        output = [
+            {
+                "paper_id": n.paper_id,
+                "title": n.title,
+                "note": n.note,
+                "created_at": n.created_at.isoformat(),
+                "updated_at": n.updated_at.isoformat(),
+            }
+            for n in notes
+        ]
+        print(json.dumps(output, indent=2))
+    else:
+        table = Table(title="Papers with Notes", box=box.HORIZONTALS)
+        table.add_column("Title", style="cyan", no_wrap=False, max_width=50)
+        table.add_column("Note Preview", style="dim", max_width=30)
+        table.add_column("Updated", style="green")
+
+        for note in notes:
+            preview = note.note[:50] + "..." if len(note.note) > 50 else note.note
+            preview = preview.replace("\n", " ")
+            table.add_row(
+                note.title[:50] + ("..." if len(note.title) > 50 else ""),
+                preview,
+                note.updated_at.strftime("%Y-%m-%d"),
+            )
+
+        console.print(table)
+        console.print(f"\n[dim]Total: {len(notes)} paper(s) with notes[/dim]")
+
+
+@notes_app.command("show")
+def notes_show(
+    paper_id: Annotated[
+        str,
+        typer.Argument(help="Paper ID (DOI or hash) to show notes for."),
+    ],
+) -> None:
+    """
+    Show notes for a specific paper.
+
+    Use 'scholar notes list' to find paper IDs.
+    """
+    from scholar.notes import list_papers_with_notes
+
+    console = Console()
+    notes = list_papers_with_notes()
+
+    for note in notes:
+        if note.paper_id == paper_id or paper_id in note.paper_id:
+            console.print(f"[bold]{note.title}[/bold]")
+            console.print(f"[dim]ID: {note.paper_id}[/dim]")
+            console.print(f"[dim]Updated: {note.updated_at.strftime('%Y-%m-%d %H:%M')}[/dim]")
+            console.print()
+            console.print(note.note)
+            return
+
+    console.print(f"[red]No notes found for paper ID: {paper_id}[/red]")
+    raise typer.Exit(1)
+
+
+@notes_app.command("export")
+def notes_export(
+    output: Annotated[
+        Path,
+        typer.Argument(help="Output file path (JSON format)."),
+    ] = Path("scholar_notes.json"),
+) -> None:
+    """
+    Export all notes to a JSON file.
+
+    Creates a backup of all paper notes that can be imported later.
+    """
+    from scholar.notes import export_notes
+
+    console = Console()
+    count = export_notes(output)
+    console.print(f"[green]Exported {count} note(s) to {output}[/green]")
+
+
+@notes_app.command("import")
+def notes_import(
+    input_file: Annotated[
+        Path,
+        typer.Argument(help="Input file path (JSON format)."),
+    ],
+    merge: Annotated[
+        bool,
+        typer.Option(
+            "--merge", "-m",
+            help="Merge with existing notes (default: replace).",
+        ),
+    ] = False,
+) -> None:
+    """
+    Import notes from a JSON file.
+
+    By default, replaces existing notes. Use --merge to combine.
+    """
+    from scholar.notes import import_notes
+
+    console = Console()
+
+    if not input_file.exists():
+        console.print(f"[red]File not found: {input_file}[/red]")
+        raise typer.Exit(1)
+
+    count = import_notes(input_file, merge=merge)
+    action = "Merged" if merge else "Imported"
+    console.print(f"[green]{action} {count} note(s) from {input_file}[/green]")
+
+
+@notes_app.command("clear")
+def notes_clear(
+    force: Annotated[
+        bool,
+        typer.Option(
+            "--force", "-f",
+            help="Skip confirmation prompt.",
+        ),
+    ] = False,
+) -> None:
+    """
+    Delete all notes.
+
+    Requires --force flag to confirm deletion.
+    """
+    from scholar.notes import list_papers_with_notes, get_data_dir
+    import shutil
+
+    console = Console()
+    notes = list_papers_with_notes()
+
+    if not notes:
+        console.print("[dim]No notes to clear.[/dim]")
+        return
+
+    if not force:
+        console.print(f"[yellow]This will delete {len(notes)} note(s).[/yellow]")
+        console.print("[yellow]Use --force to confirm.[/yellow]")
+        raise typer.Exit(1)
+
+    # Delete the notes file
+    notes_file = get_data_dir() / "paper_notes.json"
+    if notes_file.exists():
+        notes_file.unlink()
+
+    console.print(f"[green]Deleted {len(notes)} note(s).[/green]")
 @
 
 
@@ -727,6 +934,7 @@ We collect the imports used throughout the module:
 <<cli imports>>=
 from typing import Optional
 from typing_extensions import Annotated
+from pathlib import Path
 import json
 
 import typer
