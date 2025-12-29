@@ -1,7 +1,7 @@
 \chapter{Paper Notes and Decision Persistence}
 \label{notes-module}
 
-\section{Introduction}
+\subsection{Introduction}
 
 When conducting systematic literature reviews, researchers need to:
 \begin{itemize}
@@ -15,7 +15,7 @@ search decisions (per-query). Unlike the search cache which stores API results,
 this module stores user-generated content that should never be automatically
 cleared.
 
-\section{Design overview}
+\subsection{Design overview}
 
 We store data in the user's data directory (not cache directory):
 \begin{description}
@@ -30,7 +30,7 @@ Paper identity uses DOI when available, otherwise a hash of the lowercase title
 combined with the first author's last name. This provides better disambiguation
 than title alone.
 
-\section{Module structure}
+\subsection{Module structure}
 
 <<[[notes.py]]>>=
 """
@@ -51,13 +51,34 @@ Search decisions are per-query and help restore previous review state.
 @
 
 
-\chapter{Data Structures}
-\label{ch:notes-data-structures}
+\section{Testing}
+\label{ch:notes-testing}
+
+Tests are distributed throughout this document, appearing after each
+implementation section they verify. The test file collects all distributed
+test chunks:
+
+<<test [[notes.py]]>>=
+"""Tests for the notes persistence module."""
+import json
+import pytest
+from pathlib import Path
+from unittest.mock import Mock
+
+from scholar.notes import *
+
+
+<<test functions>>
+@
+
+
+\section{Data Structures}
+\label{sec:notes-data-structures}
 
 We define dataclasses to represent notes and decisions. These are serialized
 to JSON for storage.
 
-\section{Two Types of Persistent Data}
+\subsection{Two Types of Persistent Data}
 
 The module manages two related but distinct types of data:
 \begin{description}
@@ -194,7 +215,7 @@ class SearchDecisions:
 @
 
 
-\chapter{Paper Identity}
+\section{Paper Identity}
 \label{ch:paper-identity}
 
 To associate notes with papers across different searches and sessions, we need
@@ -202,7 +223,7 @@ a stable identifier. DOI is ideal when available, but many papers lack DOIs.
 For papers without DOIs, we create a hash from the title and first author's
 last name.
 
-\section{Why Include First Author?}
+\subsection{Why Include First Author?}
 
 Using title alone would cause collisions for papers with the same title
 (surprisingly common in academia). Adding the first author's last name
@@ -213,7 +234,7 @@ provides additional disambiguation. We don't use all authors because:
 \item First author is usually consistent and sufficient
 \end{itemize}
 
-\section{Hash Length Trade-off}
+\subsection{Hash Length Trade-off}
 
 We use 16 hex characters (64 bits) from SHA-256. This provides:
 \begin{itemize}
@@ -272,9 +293,9 @@ def get_query_hash(query: str) -> str:
     return hashlib.sha256(normalized.encode()).hexdigest()[:16]
 @
 
-\section{Testing paper identity}
+\subsection{Testing paper identity}
 
-<<test paper identity>>=
+<<test functions>>=
 class TestPaperIdentity:
     """Tests for paper identity functions."""
 
@@ -348,7 +369,7 @@ class TestPaperIdentity:
 @
 
 
-\chapter{Data Directory Management}
+\section{Data Directory Management}
 
 We use [[platformdirs]] to find the appropriate data directory for each
 operating system. This directory stores user-generated content that should
@@ -382,9 +403,9 @@ def get_decisions_dir() -> Path:
     return path
 @
 
-\section{Testing data directory}
+\subsection{Testing data directory}
 
-<<test data directory>>=
+<<test functions>>=
 class TestDataDirectory:
     """Tests for data directory functions."""
 
@@ -412,7 +433,7 @@ class TestDataDirectory:
 @
 
 
-\chapter{Paper Notes Functions}
+\section{Paper Notes Functions}
 
 Notes are stored in a single JSON file mapping paper IDs to note objects.
 This keeps all notes together for easy backup and export.
@@ -556,9 +577,9 @@ def has_note(paper: Any) -> bool:
     return paper_id in notes
 @
 
-\section{Testing paper notes}
+\subsection{Testing paper notes}
 
-<<test paper notes>>=
+<<test functions>>=
 class TestPaperNotes:
     """Tests for paper notes functions."""
 
@@ -660,7 +681,7 @@ class TestPaperNotes:
 @
 
 
-\chapter{Search Decisions Functions}
+\section{Search Decisions Functions}
 
 Search decisions are stored per-query, allowing us to restore the previous
 review state when repeating a search. Each query gets its own JSON file.
@@ -752,9 +773,9 @@ def clear_all_decisions() -> int:
     return count
 @
 
-\section{Testing search decisions}
+\subsection{Testing search decisions}
 
-<<test search decisions>>=
+<<test functions>>=
 class TestSearchDecisions:
     """Tests for search decisions functions."""
 
@@ -837,7 +858,7 @@ class TestSearchDecisions:
 @
 
 
-\chapter{Editor Integration}
+\section{Editor Integration}
 
 To edit notes, we open the user's preferred editor (from [[VISUAL]] or
 [[EDITOR]] environment variables). We use [[click.edit()]] which handles
@@ -898,13 +919,13 @@ def edit_note_in_editor(paper: Any) -> str | None:
 @
 
 
-\chapter{Export and Import}
+\section{Export and Import}
 \label{ch:export-import}
 
 Users may want to backup their notes or transfer them between machines.
 We provide export and import functions for this purpose.
 
-\section{Use Cases for Export/Import}
+\subsection{Use Cases for Export/Import}
 
 These functions support several systematic review workflows:
 \begin{description}
@@ -918,7 +939,7 @@ These functions support several systematic review workflows:
   reproducibility.
 \end{description}
 
-\section{Merge Semantics}
+\subsection{Merge Semantics}
 
 When importing with [[merge=True]] (the default), existing notes take
 precedence. This prevents accidentally overwriting recent changes with
@@ -982,9 +1003,9 @@ def import_notes(input_path: Path, merge: bool = True) -> int:
         return len(imported_notes)
 @
 
-\section{Testing export and import}
+\subsection{Testing export and import}
 
-<<test export import>>=
+<<test functions>>=
 class TestExportImport:
     """Tests for export and import functions."""
 
@@ -1054,47 +1075,4 @@ class TestExportImport:
         # New note imported
         notes = list_papers_with_notes()
         assert len(notes) == 2
-@
-
-
-\chapter{Tests}
-\label{ch:notes-testing}
-
-Tests are distributed throughout this document, appearing after each
-implementation section they verify. The test file collects all distributed
-test chunks:
-
-<<test [[notes.py]]>>=
-"""Tests for the notes persistence module."""
-import json
-import pytest
-from pathlib import Path
-from unittest.mock import Mock
-
-from scholar.notes import (
-    get_paper_id,
-    get_query_hash,
-    get_data_dir,
-    get_decisions_dir,
-    get_note,
-    save_note,
-    delete_note,
-    has_note,
-    list_papers_with_notes,
-    export_notes,
-    import_notes,
-    load_search_decisions,
-    save_search_decisions,
-    get_previous_decision,
-    clear_all_decisions,
-    ReviewDecisionRecord,
-    DECISIONS_DIR,
-)
-
-
-<<test paper identity>>
-<<test data directory>>
-<<test paper notes>>
-<<test search decisions>>
-<<test export import>>
 @

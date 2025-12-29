@@ -49,7 +49,29 @@ Cache is stored as pickled dictionaries, one per provider.
 @
 
 
-\chapter{Cache directory management}
+\section{Testing}
+\label{sec:testing}
+
+Tests are distributed throughout this document, appearing after each
+implementation section they verify.
+The test file collects all distributed test chunks:
+
+<<test [[cache.py]]>>=
+"""Tests for the cache module."""
+import os
+import pytest
+from pathlib import Path
+from unittest.mock import patch
+
+from scholar.cache import *
+from scholar import *
+
+
+<<test functions>>
+@
+
+
+\section{Cache directory management}
 
 We use [[platformdirs]] to determine the appropriate cache directory for each
 operating system.
@@ -79,12 +101,12 @@ def get_cache_dir() -> Path:
     return path
 @
 
-\section{Testing cache directory}
+\subsection{Testing cache directory}
 
 The cache directory should be created if it doesn't exist, and should respect
 the environment variable override.
 
-<<test cache directory>>=
+<<test functions>>=
 class TestGetCacheDir:
     """Tests for get_cache_dir function."""
 
@@ -105,14 +127,14 @@ class TestGetCacheDir:
 @
 
 
-\chapter{Loading and saving caches}
-\label{ch:cache-load-save}
+\section{Loading and saving caches}
+\label{sec:cache-load-save}
 
 Each provider has its own cache file, named after the provider.
 We use Python's native binary serialization because it handles the [[Paper]]
 dataclass objects without any additional configuration.
 
-\section{Why Not JSON?}
+\subsection{Why Not JSON?}
 
 We considered JSON for human-readable cache files, but chose binary
 serialization because:
@@ -128,7 +150,7 @@ The tradeoff is that cache files aren't human-readable, but since they're
 only for performance optimization (not user data), this is acceptable.
 User-generated content (notes) uses JSON for the opposite reasons.
 
-\section{Atomic Writes (Not Implemented)}
+\subsection{Atomic Writes (Not Implemented)}
 
 Ideally, we'd use atomic writes (write to temp file, then rename) to
 prevent corruption during crashes. For simplicity, we write directly.
@@ -142,7 +164,7 @@ import pickle
 from typing import Any
 @
 
-\section{Graceful Degradation}
+\subsection{Graceful Degradation}
 
 When loading a cache, we return an empty dictionary if the file doesn't
 exist or is corrupted.
@@ -181,11 +203,11 @@ def save_cache(provider_name: str, cache: dict[Any, Any]) -> None:
         pass  # Silently fail if we can't write
 @
 
-\section{Testing load and save}
+\subsection{Testing load and save}
 
 Caches should round-trip through save and load correctly.
 
-<<test load save>>=
+<<test functions>>=
 class TestLoadSaveCache:
     """Tests for load_cache and save_cache functions."""
 
@@ -216,7 +238,7 @@ class TestLoadSaveCache:
 @
 
 
-\chapter{Cache management}
+\section{Cache management}
 
 Users need ways to inspect and clear the cache.
 We provide functions to get statistics and clear all cached data.
@@ -271,9 +293,9 @@ def get_cache_stats() -> dict[str, Any]:
     }
 @
 
-\section{Testing cache management}
+\subsection{Testing cache management}
 
-<<test cache management>>=
+<<test functions>>=
 class TestCacheManagement:
     """Tests for cache management functions."""
 
@@ -303,7 +325,7 @@ class TestCacheManagement:
 @
 
 
-\chapter{Automatic cache persistence}
+\section{Automatic cache persistence}
 
 We want caches to be saved automatically when the program exits.
 We maintain a registry of active caches and use [[atexit]] to save them.
@@ -339,9 +361,9 @@ def _save_all_caches() -> None:
 atexit.register(_save_all_caches)
 @
 
-\section{Testing automatic persistence}
+\subsection{Testing automatic persistence}
 
-<<test auto persistence>>=
+<<test functions>>=
 class TestAutoPersistence:
     """Tests for automatic cache persistence."""
 
@@ -363,41 +385,7 @@ class TestAutoPersistence:
 @
 
 
-\chapter{Tests}
-\label{ch:testing}
-
-Tests are distributed throughout this document, appearing after each
-implementation section they verify.
-The test file collects all distributed test chunks:
-
-<<test [[cache.py]]>>=
-"""Tests for the cache module."""
-import os
-import pytest
-from pathlib import Path
-from unittest.mock import patch
-
-from scholar.cache import (
-    get_cache_dir,
-    load_cache,
-    save_cache,
-    clear_cache,
-    get_cache_stats,
-    register_cache,
-    _save_all_caches,
-    _CACHE_REGISTRY,
-)
-from scholar import Paper
-
-
-<<test cache directory>>
-<<test load save>>
-<<test cache management>>
-<<test auto persistence>>
-@
-
-
-\chapter{Test Configuration}
+\section{Test Configuration}
 
 The provider tests use caching, which can cause test pollution---cached results
 from one test may be returned in another test, causing mock assertions to fail.

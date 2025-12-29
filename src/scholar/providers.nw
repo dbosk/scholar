@@ -50,15 +50,35 @@ itself with the provider registry on import.
 @
 
 
-\chapter{Provider Protocol}
-\label{ch:provider-protocol}
+\section{Testing}
+\label{sec:providers-testing}
+
+Tests are distributed throughout this document, appearing immediately after
+each provider's implementation.
+The test file collects all distributed test chunks:
+
+<<test [[providers.py]]>>=
+"""Tests for the providers module."""
+import pytest
+from unittest.mock import Mock, patch
+
+from scholar import *
+from scholar.providers import *
+
+
+<<test functions>>
+@
+
+
+\section{Provider Protocol}
+\label{sec:provider-protocol}
 
 We define a protocol (structural typing) rather than an abstract base class.
 This design choice reflects Python's \enquote{duck typing} philosophy: if an
 object has a [[name]] attribute and a [[search]] method with the right
 signature, it \emph{is} a provider---no inheritance required.
 
-\section{Why Protocol Over ABC?}
+\subsection{Why Protocol Over ABC?}
 
 Using [[Protocol]] from [[typing]] has several advantages over
 [[abc.ABC]]:
@@ -72,7 +92,7 @@ Using [[Protocol]] from [[typing]] has several advantages over
   without knowing about Scholar, enabling future extensibility.
 \end{description}
 
-\section{Required Interface}
+\subsection{Required Interface}
 
 A provider must have:
 \begin{description}
@@ -101,14 +121,14 @@ class SearchProvider(Protocol):
 @
 
 
-\chapter{Provider Registry}
-\label{ch:provider-registry}
+\section{Provider Registry}
+\label{sec:provider-registry}
 
 Providers register themselves when imported. This \emph{self-registration}
 pattern allows the [[Search]] class to discover available providers without
 hardcoding them.
 
-\section{Why Self-Registration?}
+\subsection{Why Self-Registration?}
 
 The registry pattern provides plugin-like architecture:
 \begin{description}
@@ -122,7 +142,7 @@ The registry pattern provides plugin-like architecture:
   which providers are available and configured.
 \end{description}
 
-\section{Implementation}
+\subsection{Implementation}
 
 <<provider registry>>=
 PROVIDERS: dict[str, SearchProvider] = {}
@@ -143,15 +163,69 @@ def get_all_providers() -> list[SearchProvider]:
     return list(PROVIDERS.values())
 @
 
+\subsection{Testing the registry}
 
-\chapter{Semantic Scholar Provider}
-\label{ch:semantic-scholar}
+The registry should store and retrieve providers:
+
+<<test functions>>=
+class TestProviderRegistry:
+    """Tests for the provider registry."""
+
+    def test_semantic_scholar_registered(self):
+        """Semantic Scholar provider is auto-registered."""
+        provider = get_provider("semantic_scholar")
+        assert provider is not None
+        assert provider.name == "semantic_scholar"
+
+    def test_openalex_registered(self):
+        """OpenAlex provider is auto-registered."""
+        provider = get_provider("openalex")
+        assert provider is not None
+        assert provider.name == "openalex"
+
+    def test_dblp_registered(self):
+        """DBLP provider is auto-registered."""
+        provider = get_provider("dblp")
+        assert provider is not None
+        assert provider.name == "dblp"
+
+    def test_wos_registered(self):
+        """Web of Science provider is auto-registered."""
+        provider = get_provider("wos")
+        assert provider is not None
+        assert provider.name == "wos"
+
+    def test_ieee_registered(self):
+        """IEEE Xplore provider is auto-registered."""
+        provider = get_provider("ieee")
+        assert provider is not None
+        assert provider.name == "ieee"
+
+    def test_get_all_providers(self):
+        """get_all_providers returns registered providers."""
+        providers = get_all_providers()
+        assert len(providers) >= 5
+        names = [p.name for p in providers]
+        assert "semantic_scholar" in names
+        assert "openalex" in names
+        assert "dblp" in names
+        assert "wos" in names
+        assert "ieee" in names
+
+    def test_get_unknown_provider(self):
+        """get_provider returns None for unknown providers."""
+        assert get_provider("unknown_provider") is None
+@
+
+
+\section{Semantic Scholar Provider}
+\label{sec:semantic-scholar}
 
 Semantic Scholar is an AI-powered research tool that provides free access to
 over 200 million academic papers.
 Their API allows searching papers by keyword, author, venue, and more.
 
-\section{Package Choice}
+\subsection{Package Choice}
 
 We use the [[semanticscholar]] Python package rather than calling the REST API
 directly. This package provides:
@@ -165,7 +239,7 @@ directly. This package provides:
 An optional API key ([[S2_API_KEY]]) increases rate limits from 100 to 10,000
 requests per minute.
 
-\section{Error Handling Philosophy}
+\subsection{Error Handling Philosophy}
 
 All providers silently return an empty list on errors rather than raising
 exceptions. This design choice ensures:
@@ -180,7 +254,7 @@ The tradeoff is that failures are invisible. Users may not notice a provider
 is misconfigured until they wonder why results are sparse. The CLI's
 [[providers]] command helps diagnose such issues.
 
-\section{Provider implementation}
+\subsection{Provider implementation}
 
 <<semantic scholar provider>>=
 class SemanticScholarProvider:
@@ -225,7 +299,7 @@ class SemanticScholarProvider:
     <<convert semantic scholar paper>>
 @
 
-\subsection{Converting paper format}
+\subsubsection{Converting paper format}
 
 Semantic Scholar returns papers in their own format.
 We convert them to our common [[Paper]] type:
@@ -255,7 +329,7 @@ def _convert_paper(self, ss_paper) -> Paper:
     )
 @
 
-\section{Auto-registration}
+\subsection{Auto-registration}
 
 We register the provider when this module is imported:
 
@@ -264,17 +338,17 @@ We register the provider when this module is imported:
 register_provider(SemanticScholarProvider())
 @
 
-\section{Dependencies}
+\subsection{Dependencies}
 
 <<semantic scholar imports>>=
 from semanticscholar import SemanticScholar
 @
 
-\section{Testing Semantic Scholar provider}
+\subsection{Testing Semantic Scholar provider}
 
 We mock the API client to avoid real network calls in tests:
 
-<<test semantic scholar>>=
+<<test functions>>=
 class TestSemanticScholarProvider:
     """Tests for the SemanticScholar provider."""
 
@@ -362,20 +436,20 @@ class TestSemanticScholarIntegration:
 @
 
 
-\chapter{OpenAlex Provider}
-\label{ch:openalex}
+\section{OpenAlex Provider}
+\label{sec:openalex}
 
 OpenAlex is a free and open catalog of the world's scholarly works, authors,
 venues, institutions, and concepts.
 It covers over 250 million works and is fully open access.
 
-\section{Package Choice}
+\subsection{Package Choice}
 
 We use the [[pyalex]] Python package which provides a clean interface to the
 OpenAlex API. Unlike Semantic Scholar's package, [[pyalex]] returns raw
 dictionaries rather than typed objects, requiring manual field extraction.
 
-\section{Authentication}
+\subsection{Authentication}
 
 No API key is required, but providing an email address (via [[OPENALEX_EMAIL]]
 environment variable) gives access to the \enquote{polite pool}---a separate
@@ -384,7 +458,7 @@ pool of API resources with faster response times for identified users.
 This is OpenAlex's approach to encouraging good API citizenship without
 creating barriers to access.
 
-\section{Provider implementation}
+\subsection{Provider implementation}
 
 <<openalex provider>>=
 class OpenAlexProvider:
@@ -418,7 +492,7 @@ class OpenAlexProvider:
     <<convert openalex work>>
 @
 
-\subsection{Converting work format}
+\subsubsection{Converting work format}
 
 OpenAlex returns works as dictionaries.
 We extract the relevant fields and convert to our [[Paper]] type:
@@ -468,24 +542,24 @@ def _convert_work(self, work: dict) -> Paper:
     )
 @
 
-\section{Auto-registration}
+\subsection{Auto-registration}
 
 <<openalex provider>>=
 # Register the provider on module import
 register_provider(OpenAlexProvider())
 @
 
-\section{Dependencies}
+\subsection{Dependencies}
 
 <<openalex imports>>=
 import pyalex
 @
 
-\section{Testing OpenAlex provider}
+\subsection{Testing OpenAlex provider}
 
 We test the OpenAlex provider with mocked API responses:
 
-<<test openalex>>=
+<<test functions>>=
 class TestOpenAlexProvider:
     """Tests for the OpenAlex provider."""
 
@@ -594,14 +668,14 @@ class TestOpenAlexIntegration:
 @
 
 
-\chapter{DBLP Provider}
+\section{DBLP Provider}
 
 DBLP is a computer science bibliography database hosted at the University of
 Trier and Schloss Dagstuhl.
 It provides comprehensive coverage of major computer science journals and
 conference proceedings.
 
-\section{Package evaluation}
+\subsection{Package evaluation}
 
 We evaluated several Python packages for DBLP access:
 
@@ -621,7 +695,7 @@ we already depend on.
 No API key is required.
 The API returns JSON with publication data that we parse directly.
 
-\section{Provider implementation}
+\subsection{Provider implementation}
 
 <<dblp provider>>=
 class DBLPProvider:
@@ -656,7 +730,7 @@ class DBLPProvider:
     <<convert dblp hit>>
 @
 
-\subsection{Converting publication format}
+\subsubsection{Converting publication format}
 
 The DBLP API returns each publication as a JSON object with an [[info]] field
 containing:
@@ -709,14 +783,14 @@ def _convert_hit(self, hit: dict) -> Paper:
     )
 @
 
-\section{Auto-registration}
+\subsection{Auto-registration}
 
 <<dblp provider>>=
 # Register the provider on module import
 register_provider(DBLPProvider())
 @
 
-\section{Dependencies}
+\subsection{Dependencies}
 
 <<dblp imports>>=
 import requests
@@ -726,11 +800,11 @@ import requests
 DBLP_API_URL = "https://dblp.org/search/publ/api"
 @
 
-\section{Testing DBLP provider}
+\subsection{Testing DBLP provider}
 
 We test the DBLP provider with mocked API responses:
 
-<<test dblp>>=
+<<test functions>>=
 class TestDBLPProvider:
     """Tests for the DBLP provider."""
 
@@ -917,13 +991,13 @@ class TestDBLPIntegration:
 @
 
 
-\chapter{Web of Science Provider}
+\section{Web of Science Provider}
 
 Web of Science (WoS) is a comprehensive citation index covering scholarly
 literature across sciences, social sciences, arts, and humanities.
 It is maintained by Clarivate and requires institutional access or an API key.
 
-\section{API options}
+\subsection{API options}
 
 Clarivate provides several API options:
 
@@ -940,7 +1014,7 @@ from GitHub, not PyPI.
 For consistency with our DBLP implementation, we use the Starter API's REST
 endpoint directly via [[requests]].
 
-\section{Provider implementation}
+\subsection{Provider implementation}
 
 <<wos provider>>=
 class WebOfScienceProvider:
@@ -991,7 +1065,7 @@ class WebOfScienceProvider:
     <<convert wos hit>>
 @
 
-\subsection{Converting document format}
+\subsubsection{Converting document format}
 
 The WoS Starter API returns documents with fields including:
 \begin{description}
@@ -1049,14 +1123,14 @@ def _convert_hit(self, hit: dict) -> Paper:
     )
 @
 
-\section{Auto-registration}
+\subsection{Auto-registration}
 
 <<wos provider>>=
 # Register the provider on module import
 register_provider(WebOfScienceProvider())
 @
 
-\section{Dependencies}
+\subsection{Dependencies}
 
 Since the provider uses the same [[requests]] library as DBLP, we only need
 to define the API URL constant:
@@ -1065,12 +1139,12 @@ to define the API URL constant:
 WOS_API_URL = "https://api.clarivate.com/apis/wos-starter/v1/documents"
 @
 
-\section{Testing Web of Science provider}
+\subsection{Testing Web of Science provider}
 
 We test the WoS provider with mocked API responses.
 Note that without an API key, the provider returns empty results:
 
-<<test wos>>=
+<<test functions>>=
 class TestWebOfScienceProvider:
     """Tests for the Web of Science provider."""
 
@@ -1228,7 +1302,7 @@ class TestWebOfScienceIntegration:
 @
 
 
-\chapter{IEEE Xplore Provider}
+\section{IEEE Xplore Provider}
 
 IEEE Xplore is a research database providing access to scientific and technical
 content published by IEEE (Institute of Electrical and Electronics Engineers)
@@ -1236,7 +1310,7 @@ and its publishing partners.
 It contains over 6 million documents including journals, conference proceedings,
 technical standards, and books.
 
-\section{API access}
+\subsection{API access}
 
 IEEE provides a Metadata API for searching and retrieving bibliographic data.
 The API requires registration and an API key, which can be obtained from the
@@ -1247,7 +1321,7 @@ on PyPI---it must be downloaded from the Developer Portal.
 For consistency with our other providers, we use the REST API directly via
 [[requests]].
 
-\section{Provider implementation}
+\subsection{Provider implementation}
 
 <<ieee provider>>=
 class IEEEXploreProvider:
@@ -1296,7 +1370,7 @@ class IEEEXploreProvider:
     <<convert ieee article>>
 @
 
-\subsection{Converting article format}
+\subsubsection{Converting article format}
 
 The IEEE Xplore API returns articles with fields including:
 \begin{description}
@@ -1346,14 +1420,14 @@ def _convert_article(self, article: dict) -> Paper:
     )
 @
 
-\section{Auto-registration}
+\subsection{Auto-registration}
 
 <<ieee provider>>=
 # Register the provider on module import
 register_provider(IEEEXploreProvider())
 @
 
-\section{Dependencies}
+\subsection{Dependencies}
 
 Since the provider uses the same [[requests]] library as DBLP and WoS, we only
 need to define the API URL constant:
@@ -1362,12 +1436,12 @@ need to define the API URL constant:
 IEEE_API_URL = "https://ieeexploreapi.ieee.org/api/v1/search/articles"
 @
 
-\section{Testing IEEE Xplore provider}
+\subsection{Testing IEEE Xplore provider}
 
 We test the IEEE Xplore provider with mocked API responses.
 Like WoS, without an API key the provider returns empty results:
 
-<<test ieee>>=
+<<test functions>>=
 class TestIEEEXploreProvider:
     """Tests for the IEEE Xplore provider."""
 
@@ -1545,7 +1619,7 @@ class TestIEEEXploreIntegration:
 @
 
 
-\chapter{Dependencies}
+\section{Dependencies}
 
 We organize imports so each provider's dependencies are co-located with
 its implementation.
@@ -1570,102 +1644,4 @@ DEFAULT_LIMIT = 100
 <<dblp constants>>
 <<wos constants>>
 <<ieee constants>>
-@
-
-
-\chapter{Testing}
-\label{ch:providers-testing}
-
-Tests are distributed throughout this document, appearing immediately after
-each provider's implementation.
-This chapter assembles all test chunks into the test file and includes the
-registry tests.
-
-<<test [[providers.py]]>>=
-"""Tests for the providers module."""
-import pytest
-from unittest.mock import Mock, patch
-
-from scholar import Paper
-from scholar.providers import (
-    SemanticScholarProvider,
-    OpenAlexProvider,
-    DBLPProvider,
-    WebOfScienceProvider,
-    IEEEXploreProvider,
-    register_provider,
-    get_provider,
-    get_all_providers,
-    PROVIDERS,
-)
-@
-
-
-\section{Testing the registry}
-
-The registry should store and retrieve providers:
-
-<<test [[providers.py]]>>=
-class TestProviderRegistry:
-    """Tests for the provider registry."""
-
-    def test_semantic_scholar_registered(self):
-        """Semantic Scholar provider is auto-registered."""
-        provider = get_provider("semantic_scholar")
-        assert provider is not None
-        assert provider.name == "semantic_scholar"
-
-    def test_openalex_registered(self):
-        """OpenAlex provider is auto-registered."""
-        provider = get_provider("openalex")
-        assert provider is not None
-        assert provider.name == "openalex"
-
-    def test_dblp_registered(self):
-        """DBLP provider is auto-registered."""
-        provider = get_provider("dblp")
-        assert provider is not None
-        assert provider.name == "dblp"
-
-    def test_wos_registered(self):
-        """Web of Science provider is auto-registered."""
-        provider = get_provider("wos")
-        assert provider is not None
-        assert provider.name == "wos"
-
-    def test_ieee_registered(self):
-        """IEEE Xplore provider is auto-registered."""
-        provider = get_provider("ieee")
-        assert provider is not None
-        assert provider.name == "ieee"
-
-    def test_get_all_providers(self):
-        """get_all_providers returns registered providers."""
-        providers = get_all_providers()
-        assert len(providers) >= 5
-        names = [p.name for p in providers]
-        assert "semantic_scholar" in names
-        assert "openalex" in names
-        assert "dblp" in names
-        assert "wos" in names
-        assert "ieee" in names
-
-    def test_get_unknown_provider(self):
-        """get_provider returns None for unknown providers."""
-        assert get_provider("unknown_provider") is None
-@
-
-
-\section{Provider tests}
-
-Tests for each provider are distributed throughout this document, appearing
-immediately after each provider's implementation.
-We reference them here to assemble the complete test file:
-
-<<test [[providers.py]]>>=
-<<test semantic scholar>>
-<<test openalex>>
-<<test dblp>>
-<<test wos>>
-<<test ieee>>
 @

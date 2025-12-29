@@ -66,7 +66,28 @@ if __name__ == "__main__":
 @
 
 
-\chapter{The Typer Application}
+\section{Testing}
+\label{ch:cli-testing}
+
+Tests are distributed throughout this document, appearing after each
+implementation section they verify.
+The test file collects all distributed test chunks:
+
+<<test [[cli.py]]>>=
+"""Tests for the CLI module."""
+import pytest
+from unittest.mock import Mock
+from typer.testing import CliRunner
+
+from scholar.cli import *
+from scholar import *
+
+
+<<test functions>>
+@
+
+
+\section{The Typer Application}
 
 We create a Typer application that serves as the root for all subcommands.
 The [[no_args_is_help=True]] setting ensures users see help when they run
@@ -96,7 +117,7 @@ def callback() -> None:
 @
 
 
-\chapter{The Search Command}
+\section{The Search Command}
 
 The primary command is [[search]], which queries bibliographic databases and
 displays results.
@@ -120,7 +141,7 @@ def search(
     <<execute search and display results>>
 @
 
-\section{Command options}
+\subsection{Command options}
 
 The search command accepts options for controlling which providers to query
 and how to format output:
@@ -158,7 +179,7 @@ name: Annotated[
 ] = None
 @
 
-\section{Executing the search}
+\subsection{Executing the search}
 
 We import the [[Search]] class from the core module and execute the query.
 The results are then passed to the appropriate formatter:
@@ -186,7 +207,7 @@ display_results(results, actual_format)
 @
 
 
-\chapter{Listing Available Providers}
+\section{Listing Available Providers}
 
 Users need to know which search providers are available and how to configure
 them.
@@ -274,13 +295,13 @@ for provider in get_all_providers():
 @
 
 
-\chapter{Cache Management}
+\section{Cache Management}
 \label{ch:cache-cli}
 
 Search results are cached to avoid redundant API calls.
 Users can inspect and manage the cache using the [[cache]] command.
 
-\section{Action-Based Design}
+\subsection{Action-Based Design}
 
 We use an action argument ([[clear]], [[info]], [[path]]) rather than
 subcommands for cache management. This keeps the interface simpler for
@@ -354,13 +375,13 @@ def cache(
 @
 
 
-\chapter{Notes Management}
+\section{Notes Management}
 \label{ch:notes-cli}
 
 Paper notes are stored persistently and can be browsed, exported, and imported.
 The [[notes]] command provides access to these features.
 
-\section{Subcommand Hierarchy}
+\subsection{Subcommand Hierarchy}
 
 Unlike the [[cache]] command which uses a single action argument, [[notes]]
 uses Typer subcommands because it has more operations with different
@@ -377,7 +398,7 @@ argument patterns:
 The subcommand structure scales better and allows each operation to have
 its own arguments and help text.
 
-\section{Default Behavior}
+\subsection{Default Behavior}
 
 When invoked without a subcommand, [[scholar notes]] launches a TUI for
 browsing all papers that have notes attached. This uses Typer's
@@ -581,7 +602,7 @@ def notes_clear(
 @
 
 
-\chapter{Output Formatting}
+\section{Output Formatting}
 \label{ch:output-formatting}
 
 Different use cases require different output formats:
@@ -592,7 +613,7 @@ Different use cases require different output formats:
 \item[bibtex] Citation format for integration with \LaTeX{} documents.
 \end{description}
 
-\section{Automatic Format Detection}
+\subsection{Automatic Format Detection}
 
 The [[auto]] format (the default) detects whether output goes to a terminal
 or a pipe, selecting the appropriate format:
@@ -604,11 +625,11 @@ or a pipe, selecting the appropriate format:
 This UX pattern means [[scholar search "query"]] shows pretty tables for
 humans, while [[scholar search "query" | wc -l]] counts lines correctly.
 
-\section{Formatter Architecture}
+\subsection{Formatter Architecture}
 
 We implement a formatter for each and dispatch based on the user's choice.
 
-\section{The display function}
+\subsection{The display function}
 
 This function selects the appropriate formatter and invokes it:
 
@@ -637,7 +658,7 @@ def display_results(results: list, output_format: str = "table") -> None:
 @
 
 
-\section{Table formatter}
+\subsection{Table formatter}
 
 The table formatter uses Rich to create visually appealing output.
 We show the query and provider as context, then list papers with key metadata:
@@ -682,7 +703,7 @@ class TableFormatter:
 @
 
 
-\section{CSV formatter}
+\subsection{CSV formatter}
 
 For scripting and shell pipelines, we provide a tab-separated CSV format.
 This is especially useful when output is piped to other commands.
@@ -716,7 +737,7 @@ class CSVFormatter:
 @
 
 
-\section{JSON formatter}
+\subsection{JSON formatter}
 
 For scripting, we provide JSON output that includes all paper metadata:
 
@@ -749,7 +770,7 @@ class JSONFormatter:
 @
 
 
-\section{BibTeX formatter}
+\subsection{BibTeX formatter}
 
 For \LaTeX{} users, we generate BibTeX entries that can be added to a
 [[.bib]] file:
@@ -785,11 +806,11 @@ class BibTeXFormatter:
         print()
 @
 
-\section{Testing formatters}
+\subsection{Testing formatters}
 
 We test each formatter with sample data:
 
-<<test formatters>>=
+<<test functions>>=
 class TestFormatters:
     """Tests for output formatters."""
 
@@ -840,7 +861,7 @@ class TestFormatters:
 @
 
 
-\chapter{Submodule Registration}
+\section{Submodule Registration}
 
 To support future extensions like snowball and tuxedo, we provide a mechanism
 for submodules to register their commands with the main application.
@@ -871,7 +892,7 @@ def register_submodules() -> None:
 @
 
 
-\chapter{Entry Point}
+\section{Entry Point}
 
 The main entry point registers any available submodules and then runs the
 Typer application:
@@ -883,12 +904,12 @@ def main() -> None:
     app()
 @
 
-\section{Testing the CLI application}
+\subsection{Testing the CLI application}
 
 We use Typer's [[CliRunner]] to test the CLI without actually invoking
 a subprocess:
 
-<<test cli>>=
+<<test functions>>=
 runner = CliRunner()
 
 
@@ -989,7 +1010,7 @@ class TestCLI:
 @
 
 
-\chapter{Dependencies}
+\section{Dependencies}
 
 We collect the imports used throughout the module:
 
@@ -1007,26 +1028,4 @@ from rich.table import Table
 
 <<constants>>=
 # CLI constants (reserved for future use)
-@
-
-
-\chapter{Tests}
-\label{ch:cli-testing}
-
-Tests are distributed throughout this document, appearing after each
-implementation section they verify.
-The test file collects all distributed test chunks:
-
-<<test [[cli.py]]>>=
-"""Tests for the CLI module."""
-import pytest
-from unittest.mock import Mock
-from typer.testing import CliRunner
-
-from scholar.cli import app, TableFormatter, JSONFormatter, BibTeXFormatter
-from scholar import SearchResult, Paper
-
-
-<<test cli>>
-<<test formatters>>
 @
