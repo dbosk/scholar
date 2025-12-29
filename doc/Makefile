@@ -21,6 +21,7 @@ INCLUDE_MAKEFILES=../makefiles
 include ${INCLUDE_MAKEFILES}/tex.mk
 
 clean:
-	latexmk -C ${DOC}
+	${RM} ${DOC}
+	${MAKE} -C ../src/scholar clean
 
 distclean:
