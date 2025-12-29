@@ -136,11 +136,16 @@ class ReviewDecisionRecord:
     """
     A single review decision for a paper within a search.
     
-    Stores the status (keep/discard/pending), motivation, and paper details
-    needed for reconstruction when merging sessions.
+    Stores the status (keep/discard/pending), tags (themes for kept papers,
+    motivations for discarded), and paper details needed for reconstruction
+    when merging sessions.
+    
+    The [[tags]] field replaces the older [[motivation]] field. For backward
+    compatibility, [[motivation]] is kept as a property that accesses the
+    first tag.
     """
     status: str  # "kept", "discarded", "pending"
-    motivation: str = ""
+    tags: list[str] = field(default_factory=list)
     # Paper details for reconstruction
     title: str = ""
     authors: list[str] = field(default_factory=list)
@@ -152,17 +157,49 @@ class ReviewDecisionRecord:
     pdf_url: str | None = None
     provider: str = ""
     
+    @property
+    def motivation(self) -> str:
+        """Get first tag as motivation (backward compatibility)."""
+        return self.tags[0] if self.tags else ""
+    
+    @motivation.setter
+    def motivation(self, value: str) -> None:
+        """Set motivation as single tag (backward compatibility)."""
+        if value:
+            if not self.tags:
+                self.tags = [value]
+            else:
+                self.tags[0] = value
+        elif self.tags:
+            self.tags = self.tags[1:]  # Remove first tag
+    
     def to_dict(self) -> dict[str, Any]:
         """Convert to dictionary for JSON serialization."""
-        return asdict(self)
+        return {
+            "status": self.status,
+            "tags": self.tags,
+            "title": self.title,
+            "authors": self.authors,
+            "year": self.year,
+            "doi": self.doi,
+            "abstract": self.abstract,
+            "venue": self.venue,
+            "url": self.url,
+            "pdf_url": self.pdf_url,
+            "provider": self.provider,
+        }
     
     @classmethod
     def from_dict(cls, data: dict[str, Any]) -> "ReviewDecisionRecord":
-        """Create from dictionary."""
-        # Handle older records that don't have paper details
+        """Create from dictionary, handling both old and new formats."""
+        # Handle old format with 'motivation' field
+        tags = data.get("tags", [])
+        if not tags and data.get("motivation"):
+            tags = [data["motivation"]]
+        
         return cls(
             status=data.get("status", "pending"),
-            motivation=data.get("motivation", ""),
+            tags=tags,
             title=data.get("title", ""),
             authors=data.get("authors", []),
             year=data.get("year"),
@@ -785,10 +822,13 @@ class TestSearchDecisions:
         
         query = "machine learning"
         decisions = {
-            "doi:10.1234/test1": ReviewDecisionRecord(status="kept"),
+            "doi:10.1234/test1": ReviewDecisionRecord(
+                status="kept",
+                tags=["relevant", "ml"]
+            ),
             "doi:10.1234/test2": ReviewDecisionRecord(
                 status="discarded",
-                motivation="Not relevant"
+                tags=["Not relevant", "wrong-domain"]
             ),
         }
         
@@ -799,7 +839,41 @@ class TestSearchDecisions:
         assert loaded.query == query
         assert len(loaded.decisions) == 2
         assert loaded.decisions["doi:10.1234/test1"].status == "kept"
+        assert loaded.decisions["doi:10.1234/test1"].tags == ["relevant", "ml"]
+        assert loaded.decisions["doi:10.1234/test2"].tags == ["Not relevant", "wrong-domain"]
+        # Backward compat: motivation property still works
         assert loaded.decisions["doi:10.1234/test2"].motivation == "Not relevant"
+
+    def test_load_old_format_decisions(self, tmp_path, monkeypatch):
+        """Can load decisions saved in old format (motivation instead of tags)."""
+        monkeypatch.setenv("SCHOLAR_DATA_DIR", str(tmp_path))
+        
+        # Simulate old format file
+        old_format = {
+            "query": "old query",
+            "query_hash": get_query_hash("old query"),
+            "decisions": {
+                "doi:10.1234/old": {
+                    "status": "discarded",
+                    "motivation": "Old format motivation",
+                    "title": "Old Paper",
+                    "authors": [],
+                }
+            },
+            "timestamp": "2024-01-01",
+        }
+        
+        decisions_file = get_decisions_dir() / f"{get_query_hash('old query')}.json"
+        with open(decisions_file, "w") as f:
+            json.dump(old_format, f)
+        
+        loaded = load_search_decisions("old query")
+        assert loaded is not None
+        record = loaded.decisions["doi:10.1234/old"]
+        # Old motivation should be converted to tags
+        assert record.tags == ["Old format motivation"]
+        # Backward compat property still works
+        assert record.motivation == "Old format motivation"
 
     def test_load_nonexistent_returns_none(self, tmp_path, monkeypatch):
         """Loading nonexistent decisions returns None."""
