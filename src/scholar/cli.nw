@@ -135,8 +135,9 @@ def search(
     """
     Search bibliographic databases with structured queries.
 
-    Queries default providers (openalex, dblp) when no -p option is given.
-    Use -p to select specific providers, including those requiring API keys.
+    Queries all available providers when no -p option is given. A provider is
+    available if it doesn't require an API key, or has its API key configured.
+    Use 'scholar providers' to see which providers are currently available.
 
     Examples:
         scholar search "machine learning privacy"
@@ -250,7 +251,7 @@ provider: Annotated[
     Optional[list[str]],
     typer.Option(
         "--provider", "-p",
-        help="Provider to query. Repeatable. Default: openalex, dblp.",
+        help="Provider to query. Repeatable. Default: all available providers.",
         autocompletion=complete_provider,
     ),
 ] = None,
@@ -277,7 +278,16 @@ name: Annotated[
         help="Session name for review. Use same name to append results from "
              "multiple searches. Defaults to query string.",
     ),
-] = None
+] = None,
+limit: Annotated[
+    int,
+    typer.Option(
+        "--limit", "-l",
+        help="Maximum results per provider (default: 100). "
+             "Provider limits: DBLP=1000, WoS=50, IEEE=200. "
+             "Semantic Scholar and OpenAlex have no documented limit.",
+    ),
+] = 100
 @
 
 \subsection{Executing the search}
@@ -287,10 +297,26 @@ The results are then passed to the appropriate formatter:
 
 <<execute search and display results>>=
 from scholar import Search
+from scholar.providers import get_provider_limits, get_default_providers
 import sys
 
+# Determine which providers will be used
+if provider is None:
+    provider_names = [p.name for p in get_default_providers()]
+else:
+    provider_names = provider
+
+# Warn about provider limits
+limits = get_provider_limits()
+for pname in provider_names:
+    max_limit = limits.get(pname)
+    if max_limit is not None and limit > max_limit:
+        logger.warning(
+            f"{pname} caps results at {max_limit} (requested {limit})"
+        )
+
 s = Search(query)
-results = s.execute(providers=provider)
+results = s.execute(providers=provider, limit=limit)
 
 # If review mode, launch TUI instead of displaying results
 if review:
@@ -331,7 +357,7 @@ whether it is a default, whether an API key is required, and the environment
 variable to set:
 
 <<display provider information>>=
-from scholar.providers import get_all_providers, DEFAULT_PROVIDERS
+from scholar.providers import get_all_providers
 
 console = Console()
 
@@ -346,8 +372,8 @@ table.add_column("How to Get Key", style="dim")
 
 console.print(table)
 console.print()
-console.print("[dim]Default providers are used when no -p option is given.[/dim]")
-console.print("[dim]Use -p <name> to add non-default providers to a search.[/dim]")
+console.print("[dim]Default providers are those currently available (no key required or key configured).[/dim]")
+console.print("[dim]Use -p <name> to select specific providers for a search.[/dim]")
 @
 
 We define the configuration details for each provider.
@@ -385,8 +411,8 @@ provider_info = {
 
 for provider in get_all_providers():
     info = provider_info.get(provider.name, {})
-    is_default = provider.name in DEFAULT_PROVIDERS
-    default_status = "[green]Yes[/green]" if is_default else "[dim]No[/dim]"
+    is_available = provider.is_available()
+    default_status = "[green]Yes[/green]" if is_available else "[dim]No[/dim]"
     required = info.get("required", False)
     key_status = "[red]Required[/red]" if required else "[green]Optional[/green]"
     table.add_row(
@@ -1439,6 +1465,7 @@ class TestCLI:
 
         mock_provider = Mock()
         mock_provider.name = "mock"
+        mock_provider.MAX_LIMIT = None
         mock_provider.search.return_value = []
         monkeypatch.setattr(providers, "PROVIDERS", {"mock": mock_provider})
 
@@ -1516,6 +1543,7 @@ from typing import Optional
 from typing_extensions import Annotated
 from pathlib import Path
 import json
+import logging
 
 import typer
 from rich import box
@@ -1524,5 +1552,5 @@ from rich.table import Table
 @
 
 <<constants>>=
-# CLI constants (reserved for future use)
+logger = logging.getLogger(__name__)
 @

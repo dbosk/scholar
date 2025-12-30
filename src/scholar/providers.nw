@@ -96,8 +96,10 @@ Using [[Protocol]] from [[typing]] has several advantages over
 
 A provider must have:
 \begin{description}
-\item[name] A unique identifier string.
-\item[search] A method that takes a query and returns papers.
+\item[[[name]]] A unique identifier string.
+\item[[[search]]] A method that takes a query and returns papers.
+\item[[[is_available]]] A method that returns [[True]] if the provider can be
+  used (either requires no API key, or has its API key configured).
 \end{description}
 
 <<provider protocol>>=
@@ -116,6 +118,18 @@ class SearchProvider(Protocol):
 
         Returns:
             List of Paper objects matching the query.
+        """
+        ...
+
+    def is_available(self) -> bool:
+        """
+        Check if this provider is available for use.
+
+        A provider is available if it either doesn't require an API key,
+        or has its required API key configured in the environment.
+
+        Returns:
+            True if the provider can be used, False otherwise.
         """
         ...
 @
@@ -215,90 +229,154 @@ class TestProviderRegistry:
     def test_get_unknown_provider(self):
         """get_provider returns None for unknown providers."""
         assert get_provider("unknown_provider") is None
+
+    def test_providers_have_max_limit(self):
+        """All providers have MAX_LIMIT attribute."""
+        for name, provider in PROVIDERS.items():
+            assert hasattr(provider, "MAX_LIMIT"), f"{name} missing MAX_LIMIT"
+
+    def test_get_provider_limits(self):
+        """get_provider_limits returns correct limits."""
+        limits = get_provider_limits()
+        assert limits["semantic_scholar"] is None
+        assert limits["openalex"] is None
+        assert limits["dblp"] == 1000
+        assert limits["wos"] == 50
+        assert limits["ieee"] == 200
 @
 
 
 \subsection{Default providers}
 \label{sec:default-providers}
 
-Not all registered providers are suitable as defaults.
-Some require API keys that users may not have; others may have reliability
-issues.
-We define a separate list of \emph{default} providers---those used when no
-explicit [[--provider]] argument is given.
+Default providers are determined \emph{dynamically} based on availability.
+A provider is available (and thus included as a default) if it either:
+\begin{itemize}
+\item Does not require an API key ([[semantic_scholar]], [[openalex]],
+  [[dblp]]), or
+\item Requires an API key and has one configured in the environment
+  ([[wos]] with [[WOS_API_KEY]], [[ieee]] with [[IEEE_API_KEY]]).
+\end{itemize}
 
-The rationale for the current defaults:
-\begin{description}
-\item[openalex] Free, no API key required, fast and reliable responses.
-  Covers 250+ million works with open access.
-\item[dblp] Free, no API key required, reliable.
-  Comprehensive coverage of computer science literature.
-\end{description}
-
-Providers \emph{not} included as defaults:
-\begin{description}
-\item[semantic\_scholar] Currently experiencing reliability issues
-  (timeouts, no results).
-  Can be explicitly requested with [[-p semantic\_scholar]].
-\item[wos, ieee] Require API keys.
-  Users who have keys can explicitly request them.
-\end{description}
+This approach ensures that users automatically get access to all providers they
+can use, without manual configuration.
+When a user obtains an API key for a previously unavailable provider (like
+Web of Science), that provider automatically becomes a default.
 
 <<provider registry>>=
-# Default providers used when no --provider argument is given.
-# These are providers that work without API keys and have reliable performance.
-DEFAULT_PROVIDERS: list[str] = ["openalex", "dblp"]
-
-
 def get_default_providers() -> list[SearchProvider]:
-    """Get the default providers used when no providers are specified."""
-    return [PROVIDERS[name] for name in DEFAULT_PROVIDERS if name in PROVIDERS]
+    """
+    Get providers that are currently available for use.
+
+    Returns all providers where [[is_available()]] returns [[True]].
+    This includes providers that don't require API keys (semantic_scholar,
+    openalex, dblp) and providers with required API keys that are configured
+    in the environment (wos, ieee).
+    """
+    return [p for p in PROVIDERS.values() if p.is_available()]
+
+
+def get_provider_limits() -> dict[str, int | None]:
+    """
+    Get the maximum result limits for all registered providers.
+
+    Returns a dict mapping provider names to their MAX_LIMIT values.
+    A value of None indicates no documented maximum limit.
+    """
+    return {name: getattr(p, "MAX_LIMIT", None) for name, p in PROVIDERS.items()}
 @
 
-\subsubsection{Testing default providers}
+\subsubsection{Testing provider availability}
 
-The default providers should be a subset of registered providers:
+We test that the [[is_available()]] method correctly reflects whether each
+provider can be used:
 
 <<test functions>>=
+class TestProviderAvailability:
+    """Tests for provider availability (is_available method)."""
+
+    def test_semantic_scholar_always_available(self):
+        """Semantic Scholar is available without API key."""
+        provider = SemanticScholarProvider(api_key=None)
+        provider.api_key = None  # Ensure no key
+        assert provider.is_available() is True
+
+    def test_openalex_always_available(self):
+        """OpenAlex is available without email."""
+        provider = OpenAlexProvider(email=None)
+        assert provider.is_available() is True
+
+    def test_dblp_always_available(self):
+        """DBLP is available (no credentials needed)."""
+        provider = DBLPProvider()
+        assert provider.is_available() is True
+
+    def test_wos_unavailable_without_key(self):
+        """Web of Science is unavailable without API key."""
+        provider = WebOfScienceProvider(api_key=None)
+        provider.api_key = None  # Ensure no key
+        assert provider.is_available() is False
+
+    def test_wos_available_with_key(self):
+        """Web of Science is available with API key."""
+        provider = WebOfScienceProvider(api_key="test_key")
+        assert provider.is_available() is True
+
+    def test_ieee_unavailable_without_key(self):
+        """IEEE Xplore is unavailable without API key."""
+        provider = IEEEXploreProvider(api_key=None)
+        provider.api_key = None  # Ensure no key
+        assert provider.is_available() is False
+
+    def test_ieee_available_with_key(self):
+        """IEEE Xplore is available with API key."""
+        provider = IEEEXploreProvider(api_key="test_key")
+        assert provider.is_available() is True
+
+
 class TestDefaultProviders:
-    """Tests for default provider functionality."""
+    """Tests for get_default_providers functionality."""
 
-    def test_default_providers_list_exists(self):
-        """DEFAULT_PROVIDERS list is defined."""
-        assert isinstance(DEFAULT_PROVIDERS, list)
-        assert len(DEFAULT_PROVIDERS) >= 1
-
-    def test_default_providers_are_registered(self):
-        """All default providers are registered."""
-        for name in DEFAULT_PROVIDERS:
-            assert get_provider(name) is not None
-
-    def test_get_default_providers(self):
-        """get_default_providers returns correct providers."""
+    def test_get_default_providers_returns_list(self):
+        """get_default_providers returns a list of providers."""
         defaults = get_default_providers()
-        assert len(defaults) == len(DEFAULT_PROVIDERS)
-        for provider in defaults:
-            assert provider.name in DEFAULT_PROVIDERS
+        assert isinstance(defaults, list)
 
-    def test_openalex_is_default(self):
-        """OpenAlex is a default provider."""
-        assert "openalex" in DEFAULT_PROVIDERS
+    def test_default_providers_are_available(self):
+        """All default providers report is_available() as True."""
+        for provider in get_default_providers():
+            assert provider.is_available() is True
 
-    def test_dblp_is_default(self):
-        """DBLP is a default provider."""
-        assert "dblp" in DEFAULT_PROVIDERS
+    def test_always_available_providers_in_defaults(self):
+        """Providers that don't require API keys are always in defaults."""
+        defaults = get_default_providers()
+        default_names = [p.name for p in defaults]
+        # These providers don't require API keys
+        assert "semantic_scholar" in default_names
+        assert "openalex" in default_names
+        assert "dblp" in default_names
 
-    def test_semantic_scholar_not_default(self):
-        """Semantic Scholar is not a default (due to reliability issues)."""
-        assert "semantic_scholar" not in DEFAULT_PROVIDERS
+    def test_wos_in_defaults_only_with_key(self, monkeypatch):
+        """WoS is in defaults only when WOS_API_KEY is set."""
+        # Without key
+        monkeypatch.delenv("WOS_API_KEY", raising=False)
+        # Re-register provider without key
+        wos_provider = WebOfScienceProvider(api_key=None)
+        wos_provider.api_key = None
+        register_provider(wos_provider)
+        defaults = get_default_providers()
+        assert "wos" not in [p.name for p in defaults]
 
-    def test_wos_not_default(self):
-        """Web of Science is not a default (requires API key)."""
-        assert "wos" not in DEFAULT_PROVIDERS
-
-    def test_ieee_not_default(self):
-        """IEEE Xplore is not a default (requires API key)."""
-        assert "ieee" not in DEFAULT_PROVIDERS
+    def test_ieee_in_defaults_only_with_key(self, monkeypatch):
+        """IEEE is in defaults only when IEEE_API_KEY is set."""
+        # Without key
+        monkeypatch.delenv("IEEE_API_KEY", raising=False)
+        # Re-register provider without key
+        ieee_provider = IEEEXploreProvider(api_key=None)
+        ieee_provider.api_key = None
+        register_provider(ieee_provider)
+        defaults = get_default_providers()
+        assert "ieee" not in [p.name for p in defaults]
 @
 
 
@@ -354,6 +432,7 @@ class SemanticScholarProvider:
     """Search provider for Semantic Scholar."""
 
     name = "semantic_scholar"
+    MAX_LIMIT: int | None = None   # No documented maximum
     API_URL = "https://api.semanticscholar.org/graph/v1/paper/search"
     RATE_LIMIT_WITH_KEY = 1.0      # 1 second between requests
     RATE_LIMIT_WITHOUT_KEY = 3.0   # 3 seconds (100 req/5min = 0.33/sec)
@@ -371,6 +450,10 @@ class SemanticScholarProvider:
         register_cache(self.name, self._cache)
         self._last_request_time: float = 0.0
         self._session = self._create_session()
+
+    def is_available(self) -> bool:
+        """Semantic Scholar is always available (API key is optional)."""
+        return True
 
     <<semantic scholar rate limiting>>
     <<semantic scholar search method>>
@@ -677,6 +760,7 @@ class OpenAlexProvider:
     """Search provider for OpenAlex."""
 
     name = "openalex"
+    MAX_LIMIT: int | None = None   # No documented maximum
 
     def __init__(self, email: str | None = None):
         """
@@ -691,6 +775,10 @@ class OpenAlexProvider:
             pyalex.config.email = configured_email
         self._cache: dict = load_cache(self.name)
         register_cache(self.name, self._cache)
+
+    def is_available(self) -> bool:
+        """OpenAlex is always available (email is optional)."""
+        return True
 
     @cachedmethod(lambda self: self._cache)
     def search(self, query: str, limit: int = 100) -> list[Paper]:
@@ -915,11 +1003,16 @@ class DBLPProvider:
     """Search provider for DBLP."""
 
     name = "dblp"
+    MAX_LIMIT = 1000  # DBLP API caps at 1000 results per request
 
     def __init__(self):
         """Initialize the DBLP provider."""
         self._cache: dict = load_cache(self.name)
         register_cache(self.name, self._cache)
+
+    def is_available(self) -> bool:
+        """DBLP is always available (no API key needed)."""
+        return True
 
     @cachedmethod(lambda self: self._cache)
     def search(self, query: str, limit: int = 100) -> list[Paper]:
@@ -1235,6 +1328,7 @@ class WebOfScienceProvider:
     """Search provider for Web of Science."""
 
     name = "wos"
+    MAX_LIMIT = 50  # WoS Starter API caps at 50 results per page
 
     def __init__(self, api_key: str | None = None):
         """
@@ -1247,6 +1341,10 @@ class WebOfScienceProvider:
         self.api_key = api_key or os.environ.get("WOS_API_KEY")
         self._cache: dict = load_cache(self.name)
         register_cache(self.name, self._cache)
+
+    def is_available(self) -> bool:
+        """Web of Science requires an API key to be configured."""
+        return bool(self.api_key)
 
     @cachedmethod(lambda self: self._cache)
     def search(self, query: str, limit: int = 100) -> list[Paper]:
@@ -1543,6 +1641,7 @@ class IEEEXploreProvider:
     """Search provider for IEEE Xplore."""
 
     name = "ieee"
+    MAX_LIMIT = 200  # IEEE API returns max 200 results per request
 
     def __init__(self, api_key: str | None = None):
         """
@@ -1555,6 +1654,10 @@ class IEEEXploreProvider:
         self.api_key = api_key or os.environ.get("IEEE_API_KEY")
         self._cache: dict = load_cache(self.name)
         register_cache(self.name, self._cache)
+
+    def is_available(self) -> bool:
+        """IEEE Xplore requires an API key to be configured."""
+        return bool(self.api_key)
 
     @cachedmethod(lambda self: self._cache)
     def search(self, query: str, limit: int = 100) -> list[Paper]:
