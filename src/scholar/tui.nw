@@ -155,6 +155,7 @@ from scholar.review import (
 from scholar.pdf import (
     get_pdf_cache_dir, get_cached_pdf_path, download_pdf, open_pdf, PDFDownloadError,
 )
+from scholar.enrich import enrich_paper, needs_enrichment
 @
 
 The data structures for review decisions ([[DecisionStatus]], [[ReviewDecision]], 
@@ -286,6 +287,7 @@ The abstract screen provides several actions:
 \item[Discard (\texttt{d})] Open motivation selection modal, then return
 \item[Notes (\texttt{n})] Open external editor for paper notes
 \item[PDF (\texttt{p})] Download and open the paper's PDF
+\item[Enrich (\texttt{e})] Fetch missing abstract from Semantic Scholar or OpenAlex
 \item[Back (Escape/q)] Return to list without changing status
 \end{description}
 
@@ -313,6 +315,7 @@ class AbstractScreen(Screen[None]):
         Binding("d", "discard", "Discard"),
         Binding("p", "open_pdf", "Open PDF"),
         Binding("n", "edit_notes", "Notes"),
+        Binding("e", "enrich", "Enrich"),
     ]
     
     def __init__(self, decision: ReviewDecision, session: ReviewSession, review_mode: bool = True) -> None:
@@ -385,6 +388,31 @@ class AbstractScreen(Screen[None]):
             edit_note_in_editor(paper)
         # Refresh the screen to show updated notes
         self.refresh(recompose=True)
+    
+    def action_enrich(self) -> None:
+        """Fetch missing abstract from Semantic Scholar or OpenAlex."""
+        paper = self.decision.paper
+        
+        if not paper.doi:
+            self.notify("No DOI available for enrichment", severity="warning")
+            return
+        
+        if not needs_enrichment(paper, ["abstract"]):
+            self.notify("Paper already has an abstract", severity="information")
+            return
+        
+        self.notify("Fetching abstract...", severity="information")
+        
+        enriched = enrich_paper(paper)
+        
+        if enriched.abstract and enriched.abstract != paper.abstract:
+            # Update the paper in the decision
+            self.decision.paper = enriched
+            self.notify("Abstract fetched successfully", severity="information")
+            # Refresh to show the new abstract
+            self.refresh(recompose=True)
+        else:
+            self.notify("Could not find abstract in any provider", severity="warning")
     
     def action_open_pdf(self) -> None:
         """Download and open the PDF."""
