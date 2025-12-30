@@ -1,0 +1,211 @@
+\chapter{Introduction}
+\label{ch:introduction}
+
+Scholar is a command-line tool for conducting structured literature searches 
+across multiple academic databases.
+It is designed to support systematic literature reviews by providing a unified 
+interface for searching, reviewing, and documenting the search process.
+
+\section{Motivation}
+
+Systematic literature reviews require searching multiple databases to ensure 
+comprehensive coverage of relevant research.
+Each database has its own interface, query syntax, and export format.
+Researchers must manually:
+\begin{enumerate}
+\item Run the same query in multiple databases
+\item Export results in various formats
+\item Merge and deduplicate results
+\item Document which databases were searched, when, and with what queries
+\item Review each paper and record decisions with justifications
+\end{enumerate}
+
+This manual process is tedious, error-prone, and difficult to reproduce.
+Scholar automates these tasks while maintaining the transparency required for 
+rigorous systematic reviews.
+
+
+\section{Features Overview}
+
+Scholar provides the following capabilities:
+
+\subsection{Multi-Database Search}
+
+Search across five academic databases with a single command:
+\begin{description}
+\item[Semantic Scholar] AI-powered research database covering 200+ million 
+  papers across all fields.
+  Provides abstracts and open-access PDF links where available.
+  Optional API key for higher rate limits.
+\item[OpenAlex] Open catalog of 250+ million scholarly works, fully open 
+  access.
+  Provides comprehensive metadata including abstracts and citation counts.
+  Optional email for faster responses.
+\item[DBLP] Computer science bibliography with comprehensive coverage of 
+  journals and conference proceedings.
+  No abstracts, but reliable bibliographic data.
+  No authentication required.
+\item[Web of Science] Comprehensive citation index covering sciences, social 
+  sciences, arts, and humanities.
+  Requires API key from Clarivate.
+\item[IEEE Xplore] Technical literature from IEEE and partner publishers.
+  Strong coverage of electrical engineering, computer science, and related 
+  fields.
+  Requires API key from IEEE.
+\end{description}
+
+\subsection{Result Management}
+
+\begin{description}
+\item[Deduplication] Papers appearing in multiple databases are automatically 
+  merged, combining metadata from all sources.
+  For example, a paper found in both DBLP (without abstract) and Semantic 
+  Scholar (with abstract) appears once with the abstract included.
+\item[Caching] Search results are cached locally to avoid redundant API calls 
+  and respect rate limits.
+  Caches persist across sessions.
+\item[Multiple output formats] Results can be displayed as tables (for 
+  interactive use), CSV (for spreadsheets), JSON (for scripting), or BibTeX 
+  (for \LaTeX{} documents).
+\end{description}
+
+\subsection{Interactive Review}
+
+The terminal-based user interface (TUI) supports systematic review workflows:
+\begin{description}
+\item[Navigation] Browse papers with vim-style keybindings (\texttt{j}/\texttt{k} 
+  for up/down).
+\item[Viewing] Read full abstracts and metadata for each paper.
+\item[Decisions] Mark papers as kept or discarded.
+  Discards require motivations (creating an audit trail), while keeps can 
+  optionally be tagged with themes for organization.
+\item[Notes] Add notes to any paper using your preferred text editor.
+  Notes persist across sessions and are included in generated reports.
+\item[PDF viewing] Download and view PDFs directly from the TUI.
+  PDFs are cached locally for offline access.
+\item[Enrichment] Fetch missing abstracts from Semantic Scholar or OpenAlex 
+  for papers that lack them.
+\item[Sorting and filtering] Order papers by title, year, author, or provider.
+  Filter to show only kept, discarded, or pending papers.
+\end{description}
+
+\subsection{Session Management}
+
+Review sessions can be saved and resumed:
+\begin{description}
+\item[Persistence] Decisions are saved automatically when exiting the TUI.
+  Resume a session to continue where you left off.
+\item[Named sessions] Use the same session name across multiple searches to 
+  accumulate papers for a single review.
+\item[Reports] Generate \LaTeX{} reports with BibTeX bibliographies documenting 
+  the review process, or export to CSV for spreadsheet analysis.
+\end{description}
+
+
+\section{Typical Workflow}
+
+A typical systematic review workflow with Scholar proceeds as follows:
+
+\paragraph{1. Initial search}
+Run a search query and enter the interactive review mode:
+\begin{verbatim}
+scholar search "privacy-preserving machine learning" \
+    --review --name "privacy-ml-review"
+\end{verbatim}
+The \texttt{--name} flag creates a named session for later resumption.
+
+\paragraph{2. Review papers}
+In the TUI, browse through papers:
+\begin{itemize}
+\item Press \texttt{Enter} to view a paper's abstract
+\item Press \texttt{K} to keep a paper, or \texttt{T} to keep with themes
+\item Press \texttt{d} to discard (you must provide a motivation)
+\item Press \texttt{n} to add notes
+\item Press \texttt{p} to view the PDF
+\item Press \texttt{q} to quit and save progress
+\end{itemize}
+
+\paragraph{3. Add more searches}
+Run additional queries and append to the same session:
+\begin{verbatim}
+scholar search "federated learning privacy" \
+    --review --name "privacy-ml-review"
+\end{verbatim}
+Papers already in the session retain their decisions; new papers are added.
+
+\paragraph{4. Resume later}
+Return to an incomplete review:
+\begin{verbatim}
+scholar sessions resume "privacy-ml-review"
+\end{verbatim}
+
+\paragraph{5. Generate reports}
+Export the review for inclusion in a paper or thesis:
+\begin{verbatim}
+scholar sessions export "privacy-ml-review" -f all
+\end{verbatim}
+This generates \texttt{.tex}, \texttt{.bib}, and \texttt{.csv} files 
+documenting all decisions with motivations and notes.
+
+
+\section{Command Reference}
+
+Scholar provides the following commands:
+
+\begin{description}
+\item[\texttt{scholar search}] Search bibliographic databases.
+  Options control which providers to query, output format, and whether to 
+  launch the interactive review.
+\item[\texttt{scholar providers}] List available search providers and their 
+  configuration status (API keys, etc.).
+\item[\texttt{scholar sessions}] Manage saved review sessions: list, show, 
+  export, or resume.
+\item[\texttt{scholar notes}] Browse and manage paper notes: list, show, 
+  export, import, or clear.
+\item[\texttt{scholar enrich}] Fetch missing abstracts for papers in a saved 
+  session.
+\item[\texttt{scholar cache}] Manage the search result cache: view statistics, 
+  clear, or show the cache directory path.
+\item[\texttt{scholar pdf}] Manage PDF downloads: open a PDF by URL, view 
+  cache statistics, clear the cache, or show the cache directory.
+\end{description}
+
+Each command supports \texttt{--help} for detailed usage information.
+
+
+\section{Configuration}
+
+Scholar uses environment variables for configuration:
+
+\begin{description}
+\item[\texttt{S2\_API\_KEY}] Semantic Scholar API key (optional, increases 
+  rate limits).
+\item[\texttt{OPENALEX\_EMAIL}] Email for OpenAlex polite pool (optional, 
+  faster responses).
+\item[\texttt{WOS\_API\_KEY}] Web of Science API key (required for WoS 
+  searches).
+\item[\texttt{IEEE\_API\_KEY}] IEEE Xplore API key (required for IEEE 
+  searches).
+\item[\texttt{SCHOLAR\_CACHE\_DIR}] Override the default cache directory 
+  location.
+\item[\texttt{VISUAL} or \texttt{EDITOR}] Text editor for note editing 
+  (standard Unix convention).
+\end{description}
+
+
+\section{Document Organization}
+
+This document is a literate program combining documentation and implementation.
+It is organized as follows:
+
+\begin{description}
+\item[Part I: Core Functionality] The data models, search abstraction, caching 
+  system, and provider implementations.
+\item[Part II: User Interface] The command-line interface and interactive 
+  terminal UI for paper review.
+\end{description}
+
+Each chapter presents both the design rationale and the implementation, with 
+tests appearing alongside the code they verify.
+The source files are generated (\enquote{tangled}) from this document using 
+noweb.
