@@ -163,6 +163,52 @@ def __hash__(self) -> int:
 
 This allows us to use papers in sets for automatic deduplication.
 
+\subsubsection{Consolidating data from multiple sources}
+
+When the same paper appears from multiple providers, each may have different
+metadata: one might have an abstract while another has a PDF~URL.
+Rather than arbitrarily keeping one version, we consolidate the data to get
+the most complete record.
+
+The [[merge_with]] method combines two equal papers (same DOI or title),
+keeping non-[[None]] values from either source.
+We prefer [[self]]'s values when both have data, since the caller controls
+the order of merging.
+
+<<paper methods>>=
+def merge_with(self, other: "Paper") -> "Paper":
+    """
+    Create a consolidated paper from two equal papers.
+
+    Keeps non-None values, preferring self when both have values.
+    Combines sources if different.
+
+    Raises:
+        ValueError: If papers are not equal (different DOI/title).
+    """
+    if self != other:
+        raise ValueError("Can only merge equal papers")
+
+    # Combine sources for provenance tracking
+    sources = []
+    if self.source:
+        sources.append(self.source)
+    if other.source and other.source not in sources:
+        sources.append(other.source)
+
+    return Paper(
+        title=self.title or other.title,
+        authors=self.authors if self.authors else other.authors,
+        year=self.year if self.year is not None else other.year,
+        doi=self.doi or other.doi,
+        abstract=self.abstract or other.abstract,
+        venue=self.venue or other.venue,
+        url=self.url or other.url,
+        pdf_url=self.pdf_url or other.pdf_url,
+        source=", ".join(sources) if sources else None,
+    )
+@
+
 \subsubsection{Testing paper equality}
 
 Let's verify that paper equality and hashing work correctly for deduplication:
@@ -194,6 +240,66 @@ class TestPaper:
         p1 = Paper(title="Test", authors=["A"], doi="10.1234/test")
         p2 = Paper(title="Different", authors=["B"], doi="10.1234/test")
         assert hash(p1) == hash(p2)
+
+
+class TestPaperMergeWith:
+    """Tests for Paper.merge_with() consolidation."""
+
+    def test_merge_keeps_abstract_from_other(self):
+        """Merging keeps abstract from paper that has it."""
+        p1 = Paper(title="Test", authors=["A"], doi="10.1/test", source="dblp")
+        p2 = Paper(
+            title="Test", authors=["A"], doi="10.1/test",
+            abstract="This is the abstract", source="semantic_scholar"
+        )
+        merged = p1.merge_with(p2)
+        assert merged.abstract == "This is the abstract"
+
+    def test_merge_prefers_self_values(self):
+        """When both have a value, prefer self."""
+        p1 = Paper(
+            title="Test", authors=["A"], doi="10.1/test",
+            venue="Conference A", source="provider1"
+        )
+        p2 = Paper(
+            title="Test", authors=["A"], doi="10.1/test",
+            venue="Conference B", source="provider2"
+        )
+        merged = p1.merge_with(p2)
+        assert merged.venue == "Conference A"
+
+    def test_merge_combines_sources(self):
+        """Merging combines sources from both papers."""
+        p1 = Paper(title="Test", authors=["A"], source="dblp")
+        p2 = Paper(title="test", authors=["B"], source="semantic_scholar")
+        merged = p1.merge_with(p2)
+        assert "dblp" in merged.source
+        assert "semantic_scholar" in merged.source
+
+    def test_merge_raises_for_unequal_papers(self):
+        """Cannot merge papers that aren't equal."""
+        p1 = Paper(title="Paper A", authors=["A"], doi="10.1/a")
+        p2 = Paper(title="Paper B", authors=["B"], doi="10.1/b")
+        with pytest.raises(ValueError, match="Can only merge equal papers"):
+            p1.merge_with(p2)
+
+    def test_merge_consolidates_all_fields(self):
+        """Merging fills in all missing fields from other."""
+        p1 = Paper(
+            title="Test", authors=["A"], doi="10.1/test",
+            year=2024, source="provider1"
+        )
+        p2 = Paper(
+            title="Test", authors=["A"], doi="10.1/test",
+            abstract="Abstract", venue="Venue", url="http://example.com",
+            pdf_url="http://example.com/pdf", source="provider2"
+        )
+        merged = p1.merge_with(p2)
+        assert merged.year == 2024  # From p1
+        assert merged.abstract == "Abstract"  # From p2
+        assert merged.venue == "Venue"  # From p2
+        assert merged.url == "http://example.com"  # From p2
+        assert merged.pdf_url == "http://example.com/pdf"  # From p2
 @
 
 
@@ -221,30 +327,40 @@ ranges, document types, etc.) that were applied.
 
 \subsubsection{Combining results}
 
-We can merge results from multiple searches, deduplicating papers:
+We can merge results from multiple searches, deduplicating and consolidating
+papers.
+When the same paper appears from multiple providers, we consolidate the data
+to get the most complete record (keeping abstracts, DOIs, etc.\ from whichever
+source has them).
 
 <<search result methods>>=
 def merge(self, other: "SearchResult") -> "SearchResult":
-    """Merge two search results, deduplicating papers."""
-    seen = set(self.papers)
-    merged_papers = list(self.papers)
+    """Merge two search results, deduplicating and consolidating papers."""
+    # Use dict keyed by paper identity to enable consolidation
+    paper_map: dict[Paper, Paper] = {}
+
+    for paper in self.papers:
+        paper_map[paper] = paper
+
     for paper in other.papers:
-        if paper not in seen:
-            merged_papers.append(paper)
-            seen.add(paper)
+        if paper in paper_map:
+            # Consolidate with existing paper
+            paper_map[paper] = paper_map[paper].merge_with(paper)
+        else:
+            paper_map[paper] = paper
 
     return SearchResult(
         query=f"{self.query} | {other.query}",
         provider=f"{self.provider}, {other.provider}",
         timestamp=self.timestamp,
-        papers=merged_papers,
+        papers=list(paper_map.values()),
         filters=None,
     )
 @
 
 \subsubsection{Testing search results}
 
-The merge operation should deduplicate papers:
+The merge operation should deduplicate and consolidate papers:
 
 <<test functions>>=
 class TestSearchResult:
@@ -271,6 +387,36 @@ class TestSearchResult:
 
         merged = r1.merge(r2)
         assert len(merged.papers) == 2
+
+    def test_merge_consolidates_data(self):
+        """Merging consolidates data from duplicate papers."""
+        # DBLP paper without abstract
+        p1 = Paper(
+            title="Paper A", authors=["Author"], doi="10.1/a",
+            source="dblp"
+        )
+        # Semantic Scholar paper with abstract
+        p2 = Paper(
+            title="Paper A", authors=["Author"], doi="10.1/a",
+            abstract="This is the abstract", source="semantic_scholar"
+        )
+
+        r1 = SearchResult(
+            query="test", provider="dblp",
+            timestamp="2024-01-01", papers=[p1]
+        )
+        r2 = SearchResult(
+            query="test", provider="semantic_scholar",
+            timestamp="2024-01-01", papers=[p2]
+        )
+
+        merged = r1.merge(r2)
+        assert len(merged.papers) == 1
+        # Consolidated paper should have the abstract
+        assert merged.papers[0].abstract == "This is the abstract"
+        # And combined sources
+        assert "dblp" in merged.papers[0].source
+        assert "semantic_scholar" in merged.papers[0].source
 @
 
 
@@ -343,13 +489,18 @@ The lazy import pattern has a small runtime cost (import check on each call)
 but is negligible compared to API call latency.
 
 <<search methods>>=
-def execute(self, providers: list[str] | None = None) -> list[SearchResult]:
+def execute(
+    self,
+    providers: list[str] | None = None,
+    limit: int = 100,
+) -> list[SearchResult]:
     """
     Execute the search across specified providers.
 
     Args:
         providers: List of provider names to search. If None, uses the
             default providers (openalex, dblp).
+        limit: Maximum number of results per provider.
 
     Returns:
         List of SearchResult objects, one per provider.
@@ -370,7 +521,7 @@ def execute(self, providers: list[str] | None = None) -> list[SearchResult]:
 
     # Query each provider
     for provider in provider_list:
-        papers = provider.search(self.query)
+        papers = provider.search(self.query, limit=limit)
         result = SearchResult(
             query=self.query,
             provider=provider.name,
