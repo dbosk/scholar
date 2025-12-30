@@ -1,6 +1,7 @@
 TESTS+=		test_scholar.py
 TESTS+=		test_providers.py
 TESTS+=		test_cache.py
+TESTS+=		test_enrich.py
 TESTS+=		test_cli.py
 TESTS+=		test_tui.py
 TESTS+=		test_review.py
@@ -20,6 +21,9 @@ test_providers.py: ../src/scholar/providers.nw
 
 test_cache.py: ../src/scholar/cache.nw
 	notangle -R"test [[cache.py]]" $< | cpif $@
+
+test_enrich.py: ../src/scholar/enrich.nw
+	notangle -R"test [[enrich.py]]" $< | cpif $@
 
 test_cli.py: ../src/scholar/cli.nw
 	notangle -R"test [[cli.py]]" $< | cpif $@
