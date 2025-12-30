@@ -871,6 +871,14 @@ pool of API resources with faster response times for identified users.
 This is OpenAlex's approach to encouraging good API citizenship without
 creating barriers to access.
 
+\subsection{Rate Limiting}
+
+OpenAlex allows up to 10 requests per second.
+We implement proactive rate limiting by tracking the time of the last request
+and waiting if necessary before making a new one.
+This ensures we stay well within limits even during batch operations like
+paper enrichment.
+
 \subsection{Provider implementation}
 
 <<openalex provider>>=
@@ -879,6 +887,7 @@ class OpenAlexProvider:
 
     name = "openalex"
     MAX_LIMIT: int | None = None   # No documented maximum
+    RATE_LIMIT = 0.1               # 10 requests/second = 0.1 seconds between requests
 
     def __init__(self, email: str | None = None):
         """
@@ -893,15 +902,24 @@ class OpenAlexProvider:
             pyalex.config.email = configured_email
         self._cache: dict = load_cache(self.name)
         register_cache(self.name, self._cache)
+        self._last_request_time: float = 0.0
 
     def is_available(self) -> bool:
         """OpenAlex is always available (email is optional)."""
         return True
 
+    def _wait_for_rate_limit(self) -> None:
+        """Ensure minimum interval between requests."""
+        elapsed = time.time() - self._last_request_time
+        if elapsed < self.RATE_LIMIT:
+            time.sleep(self.RATE_LIMIT - elapsed)
+        self._last_request_time = time.time()
+
     @cachedmethod(lambda self: self._cache)
     def search(self, query: str, limit: int = 100) -> list[Paper]:
         """Search OpenAlex for papers matching the query."""
         try:
+            self._wait_for_rate_limit()
             works = pyalex.Works().search(query).get(per_page=limit)
             return [self._convert_work(w) for w in works]
         except Exception as e:
@@ -987,6 +1005,8 @@ def get_paper_by_doi(self, doi: str) -> Paper | None:
         return self._cache[cache_key]
 
     try:
+        self._wait_for_rate_limit()
+
         # OpenAlex uses full DOI URL as identifier
         doi_url = f"https://doi.org/{doi}"
         work = pyalex.Works()[doi_url]
@@ -1014,6 +1034,8 @@ register_provider(OpenAlexProvider())
 \subsection{Dependencies}
 
 <<openalex imports>>=
+import time
+
 import pyalex
 @
 
