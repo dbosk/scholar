@@ -10,7 +10,6 @@ dependencies = [
     "requests>=2.32.5",
     "typer>=0.21.0",
     "rich>=14.2.0",
-    "semanticscholar>=0.11.0",
     "pyalex>=0.19",
     "cachetools>=6.2.4",
     "platformdirs>=4.5.1",
