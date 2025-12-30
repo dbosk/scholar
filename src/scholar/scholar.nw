@@ -348,19 +348,19 @@ def execute(self, providers: list[str] | None = None) -> list[SearchResult]:
     Execute the search across specified providers.
 
     Args:
-        providers: List of provider names to search. If None, uses all
-            available providers.
+        providers: List of provider names to search. If None, uses the
+            default providers (openalex, dblp).
 
     Returns:
         List of SearchResult objects, one per provider.
     """
-    from scholar.providers import get_provider, get_all_providers
+    from scholar.providers import get_provider, get_default_providers
 
     timestamp = datetime.now().isoformat()
 
     # Determine which providers to use
     if providers is None:
-        provider_list = get_all_providers()
+        provider_list = get_default_providers()
     else:
         provider_list = [
             get_provider(name)
@@ -406,7 +406,7 @@ class TestSearch:
         assert result.query == "test query"
 
     def test_search_class_execute(self, monkeypatch):
-        """Search.execute() returns results."""
+        """Search.execute() returns results when providers are specified."""
         from scholar import providers
 
         mock_provider = Mock()
@@ -415,7 +415,8 @@ class TestSearch:
         monkeypatch.setattr(providers, "PROVIDERS", {"mock": mock_provider})
 
         s = Search("test")
-        results = s.execute()
+        # Explicitly specify the mock provider since "mock" is not a default
+        results = s.execute(providers=["mock"])
         assert len(results) > 0
 @
 

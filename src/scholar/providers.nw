@@ -218,6 +218,90 @@ class TestProviderRegistry:
 @
 
 
+\subsection{Default providers}
+\label{sec:default-providers}
+
+Not all registered providers are suitable as defaults.
+Some require API keys that users may not have; others may have reliability
+issues.
+We define a separate list of \emph{default} providers---those used when no
+explicit [[--provider]] argument is given.
+
+The rationale for the current defaults:
+\begin{description}
+\item[openalex] Free, no API key required, fast and reliable responses.
+  Covers 250+ million works with open access.
+\item[dblp] Free, no API key required, reliable.
+  Comprehensive coverage of computer science literature.
+\end{description}
+
+Providers \emph{not} included as defaults:
+\begin{description}
+\item[semantic\_scholar] Currently experiencing reliability issues
+  (timeouts, no results).
+  Can be explicitly requested with [[-p semantic\_scholar]].
+\item[wos, ieee] Require API keys.
+  Users who have keys can explicitly request them.
+\end{description}
+
+<<provider registry>>=
+# Default providers used when no --provider argument is given.
+# These are providers that work without API keys and have reliable performance.
+DEFAULT_PROVIDERS: list[str] = ["openalex", "dblp"]
+
+
+def get_default_providers() -> list[SearchProvider]:
+    """Get the default providers used when no providers are specified."""
+    return [PROVIDERS[name] for name in DEFAULT_PROVIDERS if name in PROVIDERS]
+@
+
+\subsubsection{Testing default providers}
+
+The default providers should be a subset of registered providers:
+
+<<test functions>>=
+class TestDefaultProviders:
+    """Tests for default provider functionality."""
+
+    def test_default_providers_list_exists(self):
+        """DEFAULT_PROVIDERS list is defined."""
+        assert isinstance(DEFAULT_PROVIDERS, list)
+        assert len(DEFAULT_PROVIDERS) >= 1
+
+    def test_default_providers_are_registered(self):
+        """All default providers are registered."""
+        for name in DEFAULT_PROVIDERS:
+            assert get_provider(name) is not None
+
+    def test_get_default_providers(self):
+        """get_default_providers returns correct providers."""
+        defaults = get_default_providers()
+        assert len(defaults) == len(DEFAULT_PROVIDERS)
+        for provider in defaults:
+            assert provider.name in DEFAULT_PROVIDERS
+
+    def test_openalex_is_default(self):
+        """OpenAlex is a default provider."""
+        assert "openalex" in DEFAULT_PROVIDERS
+
+    def test_dblp_is_default(self):
+        """DBLP is a default provider."""
+        assert "dblp" in DEFAULT_PROVIDERS
+
+    def test_semantic_scholar_not_default(self):
+        """Semantic Scholar is not a default (due to reliability issues)."""
+        assert "semantic_scholar" not in DEFAULT_PROVIDERS
+
+    def test_wos_not_default(self):
+        """Web of Science is not a default (requires API key)."""
+        assert "wos" not in DEFAULT_PROVIDERS
+
+    def test_ieee_not_default(self):
+        """IEEE Xplore is not a default (requires API key)."""
+        assert "ieee" not in DEFAULT_PROVIDERS
+@
+
+
 \section{Semantic Scholar Provider}
 \label{sec:semantic-scholar}
 
@@ -241,18 +325,21 @@ requests per minute.
 
 \subsection{Error Handling Philosophy}
 
-All providers silently return an empty list on errors rather than raising
-exceptions. This design choice ensures:
+All providers return an empty list on errors rather than raising exceptions,
+but they log warnings to help diagnose issues.
+This design choice ensures:
 \begin{description}
 \item[Partial results] If one provider fails (network issue, rate limit),
   other providers can still contribute results.
 \item[Robustness] Transient errors don't crash the entire search.
+\item[Visibility] Errors are logged via [[logging.warning()]], so users can
+  see what went wrong (e.g., rate limits, timeouts, API errors).
 \item[Simplicity] Callers don't need complex exception handling.
 \end{description}
 
-The tradeoff is that failures are invisible. Users may not notice a provider
-is misconfigured until they wonder why results are sparse. The CLI's
-[[providers]] command helps diagnose such issues.
+To see error messages, ensure logging is configured at WARNING level or above.
+The CLI's [[providers]] command helps diagnose configuration issues like
+missing API keys.
 
 \subsection{Provider implementation}
 
@@ -292,8 +379,16 @@ class SemanticScholarProvider:
                 ],
             )
             return [self._convert_paper(p) for p in results]
-        except Exception:
-            # Return empty list on API errors
+        except ConnectionRefusedError:
+            # The semanticscholar library raises ConnectionRefusedError for HTTP 429
+            logger.warning(
+                "semantic_scholar: Rate limited. "
+                "Get a free API key at https://www.semanticscholar.org/product/api#api-key-form "
+                "and set S2_API_KEY environment variable."
+            )
+            return []
+        except Exception as e:
+            logger.warning("semantic_scholar: %s", e)
             return []
 
     <<convert semantic scholar paper>>
@@ -486,7 +581,8 @@ class OpenAlexProvider:
         try:
             works = pyalex.Works().search(query).get(per_page=limit)
             return [self._convert_work(w) for w in works]
-        except Exception:
+        except Exception as e:
+            logger.warning("openalex: %s", e)
             return []
 
     <<convert openalex work>>
@@ -724,7 +820,8 @@ class DBLPProvider:
 
             hits = data.get("result", {}).get("hits", {}).get("hit", [])
             return [self._convert_hit(hit) for hit in hits]
-        except Exception:
+        except Exception as e:
+            logger.warning("dblp: %s", e)
             return []
 
     <<convert dblp hit>>
@@ -1059,7 +1156,8 @@ class WebOfScienceProvider:
 
             hits = data.get("hits", [])
             return [self._convert_hit(hit) for hit in hits]
-        except Exception:
+        except Exception as e:
+            logger.warning("wos: %s", e)
             return []
 
     <<convert wos hit>>
@@ -1364,7 +1462,8 @@ class IEEEXploreProvider:
 
             articles = data.get("articles", [])
             return [self._convert_article(article) for article in articles]
-        except Exception:
+        except Exception as e:
+            logger.warning("ieee: %s", e)
             return []
 
     <<convert ieee article>>
@@ -1626,6 +1725,7 @@ its implementation.
 If a provider is removed, its dependencies go with it.
 
 <<imports>>=
+import logging
 import os
 from typing import Protocol
 
@@ -1636,6 +1736,8 @@ from scholar.cache import load_cache, register_cache
 <<semantic scholar imports>>
 <<openalex imports>>
 <<dblp imports>>
+
+logger = logging.getLogger(__name__)
 @
 
 <<constants>>=

@@ -135,11 +135,13 @@ def search(
     """
     Search bibliographic databases with structured queries.
 
-    Queries all available providers by default. Use -p to select specific ones.
+    Queries default providers (openalex, dblp) when no -p option is given.
+    Use -p to select specific providers, including those requiring API keys.
 
     Examples:
         scholar search "machine learning privacy"
         scholar search "federated learning" -p semantic_scholar -f json
+        scholar search "neural networks" -p openalex -p dblp -p semantic_scholar
     """
     <<execute search and display results>>
 @
@@ -248,7 +250,7 @@ provider: Annotated[
     Optional[list[str]],
     typer.Option(
         "--provider", "-p",
-        help="Provider to query. Repeatable. Default: all providers.",
+        help="Provider to query. Repeatable. Default: openalex, dblp.",
         autocompletion=complete_provider,
     ),
 ] = None,
@@ -325,15 +327,17 @@ def providers() -> None:
 @
 
 We organize provider information in a table showing the provider name,
-whether an API key is required, and the environment variable to set:
+whether it is a default, whether an API key is required, and the environment
+variable to set:
 
 <<display provider information>>=
-from scholar.providers import get_all_providers
+from scholar.providers import get_all_providers, DEFAULT_PROVIDERS
 
 console = Console()
 
 table = Table(title="Available Search Providers", box=box.HORIZONTALS)
 table.add_column("Provider", style="cyan")
+table.add_column("Default", style="magenta")
 table.add_column("API Key", style="yellow")
 table.add_column("Environment Variable", style="green")
 table.add_column("How to Get Key", style="dim")
@@ -342,10 +346,8 @@ table.add_column("How to Get Key", style="dim")
 
 console.print(table)
 console.print()
-console.print("[dim]Providers without API keys work immediately.[/dim]")
-console.print(
-    "[dim]Set environment variables to enable key-required providers.[/dim]"
-)
+console.print("[dim]Default providers are used when no -p option is given.[/dim]")
+console.print("[dim]Use -p <name> to add non-default providers to a search.[/dim]")
 @
 
 We define the configuration details for each provider.
@@ -383,10 +385,13 @@ provider_info = {
 
 for provider in get_all_providers():
     info = provider_info.get(provider.name, {})
+    is_default = provider.name in DEFAULT_PROVIDERS
+    default_status = "[green]Yes[/green]" if is_default else "[dim]No[/dim]"
     required = info.get("required", False)
     key_status = "[red]Required[/red]" if required else "[green]Optional[/green]"
     table.add_row(
         provider.name,
+        default_status,
         key_status,
         info.get("env_var", "-"),
         info.get("how_to_get", ""),
