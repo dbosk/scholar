@@ -966,7 +966,82 @@ def generate_latex_report(session: ReviewSession, output_path: Path) -> None:
             lines.append(f"  url = {{{paper.url}}},")
         lines.append("}")
         return "\n".join(lines)
-    
+
+    def format_list_table(
+        decisions: list[ReviewDecision],
+        cite_keys: dict[int, str],
+        tag_label: str,
+    ) -> list[str]:
+        """
+        Generate LaTeX for a list table with Title, Year, Tags columns.
+
+        Uses \\citetitle for paper titles to leverage biblatex formatting.
+        """
+        lines = [
+            r"\begin{longtable}{>{\raggedright\arraybackslash}p{0.55\textwidth}"
+            r"c>{\raggedright\arraybackslash}p{0.25\textwidth}}",
+            r"\toprule",
+            f"\\textbf{{Title}} & \\textbf{{Year}} & \\textbf{{{tag_label}}} \\\\",
+            r"\midrule",
+            r"\endhead",
+            r"\bottomrule",
+            r"\endlastfoot",
+        ]
+        for decision in decisions:
+            cite_key = cite_keys[id(decision)]
+            year = decision.paper.year or "---"
+            tags = ", ".join(escape_latex(t) for t in sorted(decision.tags))
+            lines.append(
+                f"\\citetitle{{{cite_key}}} & {year} & {tags} \\\\"
+            )
+        lines.append(r"\end{longtable}")
+        return lines
+
+    def format_matrix_table(
+        decisions: list[ReviewDecision],
+        cite_keys: dict[int, str],
+        tags: set[str],
+    ) -> list[str]:
+        """
+        Generate LaTeX for a cross-tabulation matrix (papers x tags).
+
+        Uses \\citetitle for paper titles and \\checkmark for presence.
+        """
+        sorted_tags = sorted(tags)
+        num_tags = len(sorted_tags)
+
+        # Build column spec: title column + one centered column per tag
+        col_spec = r">{\raggedright\arraybackslash}p{0.4\textwidth}" + "c" * num_tags
+
+        lines = [
+            f"\\begin{{longtable}}{{{col_spec}}}",
+            r"\toprule",
+        ]
+
+        # Header row with rotated tag names
+        header_cells = [r"\textbf{Title}"]
+        for tag in sorted_tags:
+            header_cells.append(f"\\rotatebox{{90}}{{{escape_latex(tag)}}}")
+        lines.append(" & ".join(header_cells) + r" \\")
+        lines.append(r"\midrule")
+        lines.append(r"\endhead")
+        lines.append(r"\bottomrule")
+        lines.append(r"\endlastfoot")
+
+        # Data rows
+        for decision in decisions:
+            cite_key = cite_keys[id(decision)]
+            row_cells = [f"\\citetitle{{{cite_key}}}"]
+            for tag in sorted_tags:
+                if decision.has_tag(tag):
+                    row_cells.append(r"$\checkmark$")
+                else:
+                    row_cells.append("")
+            lines.append(" & ".join(row_cells) + r" \\")
+
+        lines.append(r"\end{longtable}")
+        return lines
+
     # Generate citation keys for all papers
     all_decisions = session.kept_papers + session.discarded_papers
     cite_keys: dict[int, str] = {}
@@ -988,6 +1063,11 @@ def generate_latex_report(session: ReviewSession, output_path: Path) -> None:
         r"\usepackage[utf8]{inputenc}",
         r"\usepackage{hyperref}",
         r"\usepackage{enumitem}",
+        r"\usepackage{longtable}",
+        r"\usepackage{booktabs}",
+        r"\usepackage{array}",
+        r"\usepackage{amssymb}",
+        r"\usepackage{graphicx}",
         r"\usepackage{geometry}",
         r"\usepackage[backend=biber,style=authoryear]{biblatex}",
         f"\\addbibresource{{{bib_path.name}}}",
@@ -1015,7 +1095,46 @@ def generate_latex_report(session: ReviewSession, output_path: Path) -> None:
         r"\end{description}",
         r"",
     ]
-    
+
+    # Summary Tables section
+    if session.kept_papers or session.discarded_papers:
+        lines.extend([
+            r"\section{Summary Tables}",
+            r"",
+        ])
+
+        if session.kept_papers:
+            lines.extend([
+                r"\subsection{Kept Papers Overview}",
+                r"",
+            ])
+            lines.extend(format_list_table(
+                session.kept_papers, cite_keys, "Themes"
+            ))
+            lines.append(r"")
+            themes = session.all_themes()
+            if themes:
+                lines.extend(format_matrix_table(
+                    session.kept_papers, cite_keys, themes
+                ))
+                lines.append(r"")
+
+        if session.discarded_papers:
+            lines.extend([
+                r"\subsection{Discarded Papers Overview}",
+                r"",
+            ])
+            lines.extend(format_list_table(
+                session.discarded_papers, cite_keys, "Motivations"
+            ))
+            lines.append(r"")
+            motivations = session.all_motivations()
+            if motivations:
+                lines.extend(format_matrix_table(
+                    session.discarded_papers, cite_keys, motivations
+                ))
+                lines.append(r"")
+
     # Kept papers section - grouped by theme
     if session.kept_papers:
         lines.extend([
@@ -1204,4 +1323,132 @@ class TestReportGeneration:
         bib_content = output_path.with_suffix(".bib").read_text()
         assert r"\&" in bib_content
         assert r"\%" in bib_content
+
+    def test_generate_report_with_list_table(self, tmp_path):
+        """Report includes list table for kept papers with longtable."""
+        paper1 = Paper(title="Paper 1", authors=["Author A"], year=2024)
+        paper2 = Paper(title="Paper 2", authors=["Author B"], year=2023)
+
+        session = ReviewSession(
+            query="test",
+            providers=["test"],
+            timestamp=datetime.now(),
+        )
+        session.decisions = [
+            ReviewDecision(
+                paper=paper1, provider="test",
+                status=DecisionStatus.KEPT, tags=["ml", "privacy"]
+            ),
+            ReviewDecision(
+                paper=paper2, provider="test",
+                status=DecisionStatus.KEPT, tags=["ml"]
+            ),
+        ]
+
+        output_path = tmp_path / "report.tex"
+        generate_latex_report(session, output_path)
+
+        content = output_path.read_text()
+        assert r"\begin{longtable}" in content
+        assert r"\toprule" in content
+        assert "Kept Papers Overview" in content
+
+    def test_generate_report_with_matrix_table(self, tmp_path):
+        """Report includes cross-tabulation matrix with checkmarks."""
+        paper1 = Paper(title="Paper 1", authors=["Author A"], year=2024)
+        paper2 = Paper(title="Paper 2", authors=["Author B"], year=2023)
+
+        session = ReviewSession(
+            query="test",
+            providers=["test"],
+            timestamp=datetime.now(),
+        )
+        session.decisions = [
+            ReviewDecision(
+                paper=paper1, provider="test",
+                status=DecisionStatus.KEPT, tags=["ml", "privacy"]
+            ),
+            ReviewDecision(
+                paper=paper2, provider="test",
+                status=DecisionStatus.KEPT, tags=["ml"]
+            ),
+        ]
+
+        output_path = tmp_path / "report.tex"
+        generate_latex_report(session, output_path)
+
+        content = output_path.read_text()
+        assert r"$\checkmark$" in content
+        assert r"\rotatebox{90}" in content
+
+    def test_generate_report_uses_citetitle(self, tmp_path):
+        """Report uses citetitle for paper titles in tables."""
+        paper = Paper(title="Test Paper", authors=["Author"], year=2024)
+
+        session = ReviewSession(
+            query="test",
+            providers=["test"],
+            timestamp=datetime.now(),
+        )
+        session.decisions = [
+            ReviewDecision(
+                paper=paper, provider="test",
+                status=DecisionStatus.KEPT, tags=["ml"]
+            ),
+        ]
+
+        output_path = tmp_path / "report.tex"
+        generate_latex_report(session, output_path)
+
+        content = output_path.read_text()
+        assert r"\citetitle{" in content
+
+    def test_table_handles_no_tags(self, tmp_path):
+        """Report shows list table but skips matrix when no tags present."""
+        paper = Paper(title="Paper Without Tags", authors=["Author"], year=2024)
+
+        session = ReviewSession(
+            query="test",
+            providers=["test"],
+            timestamp=datetime.now(),
+        )
+        session.decisions = [
+            ReviewDecision(
+                paper=paper, provider="test",
+                status=DecisionStatus.KEPT, tags=[]
+            ),
+        ]
+
+        output_path = tmp_path / "report.tex"
+        generate_latex_report(session, output_path)
+
+        content = output_path.read_text()
+        # Should have list table
+        assert r"\begin{longtable}" in content
+        # Should not have checkmarks (no matrix table)
+        assert r"$\checkmark$" not in content
+
+    def test_discarded_papers_tables(self, tmp_path):
+        """Report includes tables for discarded papers."""
+        paper = Paper(title="Discarded Paper", authors=["Author"], year=2024)
+
+        session = ReviewSession(
+            query="test",
+            providers=["test"],
+            timestamp=datetime.now(),
+        )
+        session.decisions = [
+            ReviewDecision(
+                paper=paper, provider="test",
+                status=DecisionStatus.DISCARDED, tags=["off-topic", "not-peer-reviewed"]
+            ),
+        ]
+
+        output_path = tmp_path / "report.tex"
+        generate_latex_report(session, output_path)
+
+        content = output_path.read_text()
+        assert "Discarded Papers Overview" in content
+        assert "off-topic" in content
+        assert "not-peer-reviewed" in content
 @
