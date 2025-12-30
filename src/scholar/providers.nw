@@ -286,54 +286,13 @@ def get_provider_limits() -> dict[str, int | None]:
     return {name: getattr(p, "MAX_LIMIT", None) for name, p in PROVIDERS.items()}
 @
 
-\subsubsection{Testing provider availability}
+\subsubsection{Testing get\_default\_providers}
 
-We test that the [[is_available()]] method correctly reflects whether each
-provider can be used:
+The [[get_default_providers]] function returns only providers that are
+currently available.
+We test this behavior:
 
 <<test functions>>=
-class TestProviderAvailability:
-    """Tests for provider availability (is_available method)."""
-
-    def test_semantic_scholar_always_available(self):
-        """Semantic Scholar is available without API key."""
-        provider = SemanticScholarProvider(api_key=None)
-        provider.api_key = None  # Ensure no key
-        assert provider.is_available() is True
-
-    def test_openalex_always_available(self):
-        """OpenAlex is available without email."""
-        provider = OpenAlexProvider(email=None)
-        assert provider.is_available() is True
-
-    def test_dblp_always_available(self):
-        """DBLP is available (no credentials needed)."""
-        provider = DBLPProvider()
-        assert provider.is_available() is True
-
-    def test_wos_unavailable_without_key(self):
-        """Web of Science is unavailable without API key."""
-        provider = WebOfScienceProvider(api_key=None)
-        provider.api_key = None  # Ensure no key
-        assert provider.is_available() is False
-
-    def test_wos_available_with_key(self):
-        """Web of Science is available with API key."""
-        provider = WebOfScienceProvider(api_key="test_key")
-        assert provider.is_available() is True
-
-    def test_ieee_unavailable_without_key(self):
-        """IEEE Xplore is unavailable without API key."""
-        provider = IEEEXploreProvider(api_key=None)
-        provider.api_key = None  # Ensure no key
-        assert provider.is_available() is False
-
-    def test_ieee_available_with_key(self):
-        """IEEE Xplore is available with API key."""
-        provider = IEEEXploreProvider(api_key="test_key")
-        assert provider.is_available() is True
-
-
 class TestDefaultProviders:
     """Tests for get_default_providers functionality."""
 
@@ -457,6 +416,7 @@ class SemanticScholarProvider:
 
     <<semantic scholar rate limiting>>
     <<semantic scholar search method>>
+    <<semantic scholar get paper by doi>>
     <<convert semantic scholar paper>>
 @
 
@@ -555,6 +515,76 @@ def search(self, query: str, limit: int = 100) -> list[Paper]:
         return []
 @
 
+\subsubsection{DOI lookup}
+
+In addition to keyword search, we can fetch a single paper by its DOI.
+This is useful for enriching papers that lack abstracts---if we have the DOI,
+we can look up the paper directly in Semantic Scholar to get its abstract.
+
+The API endpoint is [[https://api.semanticscholar.org/graph/v1/paper/DOI:{doi}]].
+We request the same fields as the search API for consistency.
+
+<<semantic scholar get paper by doi>>=
+def get_paper_by_doi(self, doi: str) -> Paper | None:
+    """
+    Fetch a single paper by its DOI.
+
+    Args:
+        doi: The DOI to look up (e.g., "10.1145/1234567.1234568").
+
+    Returns:
+        Paper if found, None otherwise.
+    """
+    if not doi:
+        return None
+
+    # Check cache first
+    cache_key = ("doi", doi)
+    if cache_key in self._cache:
+        return self._cache[cache_key]
+
+    try:
+        self._wait_for_rate_limit()
+
+        headers = {}
+        if self.api_key:
+            headers["x-api-key"] = self.api_key
+
+        # Use the paper endpoint with DOI: prefix
+        url = f"https://api.semanticscholar.org/graph/v1/paper/DOI:{doi}"
+        response = self._session.get(
+            url,
+            params={
+                "fields": "title,authors,year,abstract,venue,externalIds,url,openAccessPdf",
+            },
+            headers=headers,
+            timeout=30,
+        )
+
+        if response.status_code == 404:
+            # Paper not found - cache the miss to avoid repeated lookups
+            self._cache[cache_key] = None
+            return None
+
+        if response.status_code == 429:
+            logger.warning("semantic_scholar: Rate limited during DOI lookup")
+            return None
+
+        response.raise_for_status()
+        paper_data = response.json()
+
+        paper = self._convert_paper(paper_data)
+        self._cache[cache_key] = paper
+        return paper
+
+    except requests.exceptions.HTTPError as e:
+        logger.warning("semantic_scholar: DOI lookup error: %s", e)
+        return None
+    except Exception as e:
+        logger.warning("semantic_scholar: DOI lookup failed: %s", e)
+        return None
+@
+
 \subsubsection{Converting paper format}
 
 Semantic Scholar returns papers as JSON dictionaries.
@@ -615,11 +645,19 @@ from urllib3.util.retry import Retry
 
 \subsection{Testing Semantic Scholar provider}
 
-We mock the HTTP requests to avoid real network calls in tests:
+We mock the HTTP requests to avoid real network calls in tests.
+First, we verify that the provider is always available since Semantic Scholar
+does not require an API key:
 
 <<test functions>>=
 class TestSemanticScholarProvider:
     """Tests for the SemanticScholar provider."""
+
+    def test_is_available_always_true(self):
+        """Semantic Scholar is available without API key."""
+        provider = SemanticScholarProvider(api_key=None)
+        provider.api_key = None  # Ensure no key
+        assert provider.is_available() is True
 
     def test_search_converts_papers(self):
         """search() converts API results to Paper objects."""
@@ -710,6 +748,86 @@ class TestSemanticScholarProvider:
             assert provider._min_request_interval == 3.0
 
 
+class TestSemanticScholarGetPaperByDoi:
+    """Tests for SemanticScholar DOI lookup."""
+
+    def test_get_paper_by_doi_returns_paper(self):
+        """get_paper_by_doi() returns a Paper when found."""
+        provider = SemanticScholarProvider()
+
+        mock_response = Mock()
+        mock_response.status_code = 200
+        mock_response.json.return_value = {
+            "paperId": "abc123",
+            "title": "Test Paper",
+            "authors": [{"name": "Alice"}],
+            "year": 2024,
+            "externalIds": {"DOI": "10.1234/test"},
+            "abstract": "This is the abstract",
+            "venue": "Test Conference",
+            "url": "https://example.com/paper",
+        }
+
+        with patch.object(provider._session, "get", return_value=mock_response):
+            paper = provider.get_paper_by_doi("10.1234/test")
+
+            assert paper is not None
+            assert paper.title == "Test Paper"
+            assert paper.abstract == "This is the abstract"
+            assert paper.doi == "10.1234/test"
+            assert paper.source == "semantic_scholar"
+
+    def test_get_paper_by_doi_returns_none_on_404(self):
+        """get_paper_by_doi() returns None when paper not found."""
+        provider = SemanticScholarProvider()
+
+        mock_response = Mock()
+        mock_response.status_code = 404
+
+        with patch.object(provider._session, "get", return_value=mock_response):
+            paper = provider.get_paper_by_doi("10.1234/nonexistent")
+            assert paper is None
+
+    def test_get_paper_by_doi_returns_none_on_empty_doi(self):
+        """get_paper_by_doi() returns None for empty DOI."""
+        provider = SemanticScholarProvider()
+        assert provider.get_paper_by_doi("") is None
+        assert provider.get_paper_by_doi(None) is None
+
+    def test_get_paper_by_doi_handles_rate_limit(self):
+        """get_paper_by_doi() returns None on rate limit."""
+        provider = SemanticScholarProvider()
+
+        mock_response = Mock()
+        mock_response.status_code = 429
+
+        with patch.object(provider._session, "get", return_value=mock_response):
+            paper = provider.get_paper_by_doi("10.1234/test")
+            assert paper is None
+
+    def test_get_paper_by_doi_caches_results(self):
+        """get_paper_by_doi() caches successful lookups."""
+        provider = SemanticScholarProvider()
+
+        mock_response = Mock()
+        mock_response.status_code = 200
+        mock_response.json.return_value = {
+            "paperId": "abc123",
+            "title": "Test Paper",
+            "authors": [],
+            "externalIds": {"DOI": "10.1234/test"},
+        }
+
+        with patch.object(provider._session, "get", return_value=mock_response) as mock_get:
+            # First call
+            paper1 = provider.get_paper_by_doi("10.1234/test")
+            # Second call should use cache
+            paper2 = provider.get_paper_by_doi("10.1234/test")
+
+            assert mock_get.call_count == 1  # Only one API call
+            assert paper1.title == paper2.title
+
+
 class TestSemanticScholarIntegration:
     """Integration test for the SemanticScholar provider."""
 
@@ -753,6 +871,14 @@ pool of API resources with faster response times for identified users.
 This is OpenAlex's approach to encouraging good API citizenship without
 creating barriers to access.
 
+\subsection{Rate Limiting}
+
+OpenAlex allows up to 10 requests per second.
+We implement proactive rate limiting by tracking the time of the last request
+and waiting if necessary before making a new one.
+This ensures we stay well within limits even during batch operations like
+paper enrichment.
+
 \subsection{Provider implementation}
 
 <<openalex provider>>=
@@ -761,6 +887,7 @@ class OpenAlexProvider:
 
     name = "openalex"
     MAX_LIMIT: int | None = None   # No documented maximum
+    RATE_LIMIT = 0.1               # 10 requests/second = 0.1 seconds between requests
 
     def __init__(self, email: str | None = None):
         """
@@ -775,21 +902,31 @@ class OpenAlexProvider:
             pyalex.config.email = configured_email
         self._cache: dict = load_cache(self.name)
         register_cache(self.name, self._cache)
+        self._last_request_time: float = 0.0
 
     def is_available(self) -> bool:
         """OpenAlex is always available (email is optional)."""
         return True
 
+    def _wait_for_rate_limit(self) -> None:
+        """Ensure minimum interval between requests."""
+        elapsed = time.time() - self._last_request_time
+        if elapsed < self.RATE_LIMIT:
+            time.sleep(self.RATE_LIMIT - elapsed)
+        self._last_request_time = time.time()
+
     @cachedmethod(lambda self: self._cache)
     def search(self, query: str, limit: int = 100) -> list[Paper]:
         """Search OpenAlex for papers matching the query."""
         try:
+            self._wait_for_rate_limit()
             works = pyalex.Works().search(query).get(per_page=limit)
             return [self._convert_work(w) for w in works]
         except Exception as e:
             logger.warning("openalex: %s", e)
             return []
 
+    <<openalex get paper by doi>>
     <<convert openalex work>>
 @
 
@@ -843,6 +980,50 @@ def _convert_work(self, work: dict) -> Paper:
     )
 @
 
+\subsubsection{DOI lookup}
+
+Like Semantic Scholar, we can fetch a single paper by its DOI.
+OpenAlex uses DOI URLs as identifiers, so we query by the full DOI URL.
+
+<<openalex get paper by doi>>=
+def get_paper_by_doi(self, doi: str) -> Paper | None:
+    """
+    Fetch a single paper by its DOI.
+
+    Args:
+        doi: The DOI to look up (e.g., "10.1145/1234567.1234568").
+
+    Returns:
+        Paper if found, None otherwise.
+    """
+    if not doi:
+        return None
+
+    # Check cache first
+    cache_key = ("doi", doi)
+    if cache_key in self._cache:
+        return self._cache[cache_key]
+
+    try:
+        self._wait_for_rate_limit()
+
+        # OpenAlex uses full DOI URL as identifier
+        doi_url = f"https://doi.org/{doi}"
+        work = pyalex.Works()[doi_url]
+
+        if not work:
+            self._cache[cache_key] = None
+            return None
+
+        paper = self._convert_work(work)
+        self._cache[cache_key] = paper
+        return paper
+
+    except Exception as e:
+        logger.warning("openalex: DOI lookup failed: %s", e)
+        return None
+@
+
 \subsection{Auto-registration}
 
 <<openalex provider>>=
@@ -853,16 +1034,25 @@ register_provider(OpenAlexProvider())
 \subsection{Dependencies}
 
 <<openalex imports>>=
+import time
+
 import pyalex
 @
 
 \subsection{Testing OpenAlex provider}
 
-We test the OpenAlex provider with mocked API responses:
+We test the OpenAlex provider with mocked API responses.
+First, we verify that the provider is always available since OpenAlex
+does not require an API key (email is optional for polite pool access):
 
 <<test functions>>=
 class TestOpenAlexProvider:
     """Tests for the OpenAlex provider."""
+
+    def test_is_available_always_true(self):
+        """OpenAlex is available without email."""
+        provider = OpenAlexProvider(email=None)
+        assert provider.is_available() is True
 
     def test_search_converts_works(self):
         """search() converts API results to Paper objects."""
@@ -944,6 +1134,81 @@ class TestOpenAlexProvider:
             assert paper.authors == []
             assert paper.year is None
             assert paper.doi is None
+
+
+class TestOpenAlexGetPaperByDoi:
+    """Tests for OpenAlex DOI lookup."""
+
+    def test_get_paper_by_doi_returns_paper(self):
+        """get_paper_by_doi() returns a Paper when found."""
+        provider = OpenAlexProvider()
+
+        mock_work = {
+            "title": "Test Paper",
+            "authorships": [{"author": {"display_name": "Alice"}}],
+            "publication_year": 2024,
+            "doi": "https://doi.org/10.1234/test",
+            "abstract": "This is the abstract",
+            "id": "https://openalex.org/W123456",
+        }
+
+        with patch("pyalex.Works") as mock_works:
+            mock_works.return_value.__getitem__.return_value = mock_work
+
+            paper = provider.get_paper_by_doi("10.1234/test")
+
+            assert paper is not None
+            assert paper.title == "Test Paper"
+            assert paper.abstract == "This is the abstract"
+            assert paper.doi == "10.1234/test"
+            assert paper.source == "openalex"
+
+    def test_get_paper_by_doi_returns_none_when_not_found(self):
+        """get_paper_by_doi() returns None when paper not found."""
+        provider = OpenAlexProvider()
+
+        with patch("pyalex.Works") as mock_works:
+            mock_works.return_value.__getitem__.return_value = None
+
+            paper = provider.get_paper_by_doi("10.1234/nonexistent")
+            assert paper is None
+
+    def test_get_paper_by_doi_returns_none_on_empty_doi(self):
+        """get_paper_by_doi() returns None for empty DOI."""
+        provider = OpenAlexProvider()
+        assert provider.get_paper_by_doi("") is None
+        assert provider.get_paper_by_doi(None) is None
+
+    def test_get_paper_by_doi_handles_exception(self):
+        """get_paper_by_doi() returns None on API error."""
+        provider = OpenAlexProvider()
+
+        with patch("pyalex.Works") as mock_works:
+            mock_works.return_value.__getitem__.side_effect = Exception("API error")
+
+            paper = provider.get_paper_by_doi("10.1234/test")
+            assert paper is None
+
+    def test_get_paper_by_doi_caches_results(self):
+        """get_paper_by_doi() caches successful lookups."""
+        provider = OpenAlexProvider()
+
+        mock_work = {
+            "title": "Test Paper",
+            "authorships": [],
+            "doi": "https://doi.org/10.1234/test",
+        }
+
+        with patch("pyalex.Works") as mock_works:
+            mock_works.return_value.__getitem__.return_value = mock_work
+
+            # First call
+            paper1 = provider.get_paper_by_doi("10.1234/test")
+            # Second call should use cache
+            paper2 = provider.get_paper_by_doi("10.1234/test")
+
+            assert mock_works.return_value.__getitem__.call_count == 1  # Only one API call
+            assert paper1.title == paper2.title
 
 
 class TestOpenAlexIntegration:
@@ -1109,11 +1374,18 @@ DBLP_API_URL = "https://dblp.org/search/publ/api"
 
 \subsection{Testing DBLP provider}
 
-We test the DBLP provider with mocked API responses:
+We test the DBLP provider with mocked API responses.
+First, we verify that the provider is always available since DBLP
+does not require any credentials:
 
 <<test functions>>=
 class TestDBLPProvider:
     """Tests for the DBLP provider."""
+
+    def test_is_available_always_true(self):
+        """DBLP is available (no credentials needed)."""
+        provider = DBLPProvider()
+        assert provider.is_available() is True
 
     def test_search_converts_publications(self):
         """search() converts API results to Paper objects."""
@@ -1455,11 +1727,22 @@ WOS_API_URL = "https://api.clarivate.com/apis/wos-starter/v1/documents"
 \subsection{Testing Web of Science provider}
 
 We test the WoS provider with mocked API responses.
-Note that without an API key, the provider returns empty results:
+First, we verify the availability depends on having an API key configured:
 
 <<test functions>>=
 class TestWebOfScienceProvider:
     """Tests for the Web of Science provider."""
+
+    def test_is_available_false_without_key(self):
+        """Web of Science is unavailable without API key."""
+        provider = WebOfScienceProvider(api_key=None)
+        provider.api_key = None  # Ensure no key
+        assert provider.is_available() is False
+
+    def test_is_available_true_with_key(self):
+        """Web of Science is available with API key."""
+        provider = WebOfScienceProvider(api_key="test_key")
+        assert provider.is_available() is True
 
     def test_search_returns_empty_without_api_key(self):
         """search() returns empty list when no API key is configured."""
@@ -1758,11 +2041,22 @@ IEEE_API_URL = "https://ieeexploreapi.ieee.org/api/v1/search/articles"
 \subsection{Testing IEEE Xplore provider}
 
 We test the IEEE Xplore provider with mocked API responses.
-Like WoS, without an API key the provider returns empty results:
+First, we verify the availability depends on having an API key configured:
 
 <<test functions>>=
 class TestIEEEXploreProvider:
     """Tests for the IEEE Xplore provider."""
+
+    def test_is_available_false_without_key(self):
+        """IEEE Xplore is unavailable without API key."""
+        provider = IEEEXploreProvider(api_key=None)
+        provider.api_key = None  # Ensure no key
+        assert provider.is_available() is False
+
+    def test_is_available_true_with_key(self):
+        """IEEE Xplore is available with API key."""
+        provider = IEEEXploreProvider(api_key="test_key")
+        assert provider.is_available() is True
 
     def test_search_returns_empty_without_api_key(self):
         """search() returns empty list when no API key is configured."""

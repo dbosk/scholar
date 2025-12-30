@@ -1,0 +1,387 @@
+\chapter{Paper Enrichment}
+\label{enrich-module}
+
+\section{Introduction}
+
+When searching for papers across multiple providers, we often encounter
+incomplete metadata.
+For example, DBLP provides excellent bibliographic coverage but doesn't include
+abstracts.
+Web of Science's Starter API similarly omits abstracts.
+
+Paper enrichment fills in these gaps by looking up papers in providers with
+better coverage.
+If we have a paper's DOI, we can query Semantic Scholar or OpenAlex to fetch
+the missing abstract.
+
+This module provides two levels of enrichment:
+\begin{description}
+\item[Single paper enrichment] Fetch missing fields for one paper, useful in
+  the TUI when viewing a paper's details.
+\item[Batch enrichment] Enrich multiple papers, useful after a search to fill
+  in abstracts for all results.
+\end{description}
+
+\section{Module structure}
+
+The enrichment module exports the main enrichment functions:
+
+<<[[enrich.py]]>>=
+"""
+Paper enrichment using DOI lookups.
+
+Fetches missing paper metadata (especially abstracts) from providers
+with better coverage like Semantic Scholar and OpenAlex.
+"""
+
+<<imports>>
+<<constants>>
+<<enrichment functions>>
+@
+
+
+\section{Testing}
+\label{sec:enrich-testing}
+
+Tests are distributed throughout this document after each function.
+The test file collects all test chunks:
+
+<<test [[enrich.py]]>>=
+"""Tests for the enrich module."""
+import pytest
+from unittest.mock import Mock, patch, MagicMock
+
+from scholar import Paper
+from scholar.enrich import *
+
+
+<<test functions>>
+@
+
+
+\section{Enrichment Providers}
+\label{sec:enrichment-providers}
+
+Not all providers support DOI lookups or provide abstracts.
+We define which providers to use for enrichment and in what order:
+
+\begin{description}
+\item[Semantic Scholar] Excellent abstract coverage, free API with optional
+  key for higher rate limits.
+  Primary enrichment source.
+\item[OpenAlex] Very broad coverage (250M+ works), always free.
+  Fallback if Semantic Scholar doesn't have the paper.
+\end{description}
+
+<<constants>>=
+# Providers that support DOI lookup and provide abstracts
+ENRICHMENT_PROVIDERS = ["semantic_scholar", "openalex"]
+@
+
+
+\section{Single Paper Enrichment}
+
+The core enrichment function takes a paper and returns an enriched version.
+If the paper already has all fields or lacks a DOI (making lookup impossible),
+we return the original paper unchanged.
+
+<<enrichment functions>>=
+def enrich_paper(
+    paper: Paper,
+    fields: list[str] | None = None,
+) -> Paper:
+    """
+    Enrich a paper by fetching missing fields from other providers.
+
+    Args:
+        paper: The paper to enrich.
+        fields: Fields to enrich. If None, enriches 'abstract' only.
+
+    Returns:
+        A new Paper with enriched fields, or the original if enrichment
+        fails or isn't needed.
+    """
+    if fields is None:
+        fields = ["abstract"]
+
+    # Check if enrichment is needed
+    if not needs_enrichment(paper, fields):
+        return paper
+
+    # Need DOI for lookup
+    if not paper.doi:
+        return paper
+
+    # Try each enrichment provider in order
+    for provider_name in ENRICHMENT_PROVIDERS:
+        provider = get_provider(provider_name)
+        if provider is None:
+            continue
+
+        if not hasattr(provider, "get_paper_by_doi"):
+            continue
+
+        enriched = provider.get_paper_by_doi(paper.doi)
+        if enriched is None:
+            continue
+
+        # Merge the enriched data into our paper
+        # We want to keep our paper's existing data and fill in gaps
+        return paper.merge_with(enriched)
+
+    # No provider could enrich the paper
+    return paper
+@
+
+\subsection{Checking if enrichment is needed}
+
+We only enrich papers that have missing fields.
+This avoids unnecessary API calls for papers that already have all data.
+
+<<enrichment functions>>=
+def needs_enrichment(paper: Paper, fields: list[str]) -> bool:
+    """Check if a paper needs enrichment for the specified fields."""
+    for field in fields:
+        value = getattr(paper, field, None)
+        if value is None or value == "":
+            return True
+    return False
+@
+
+\subsection{Testing single paper enrichment}
+
+<<test functions>>=
+class TestEnrichPaper:
+    """Tests for enrich_paper function."""
+
+    def test_enriches_missing_abstract(self):
+        """enrich_paper fills in missing abstract."""
+        paper = Paper(
+            title="Test Paper",
+            authors=["Author"],
+            doi="10.1234/test",
+            source="dblp"
+        )
+
+        enriched_paper = Paper(
+            title="Test Paper",
+            authors=["Author"],
+            doi="10.1234/test",
+            abstract="This is the abstract",
+            source="semantic_scholar"
+        )
+
+        mock_provider = MagicMock()
+        mock_provider.get_paper_by_doi.return_value = enriched_paper
+
+        with patch("scholar.enrich.get_provider", return_value=mock_provider):
+            result = enrich_paper(paper)
+
+        assert result.abstract == "This is the abstract"
+        assert "dblp" in result.source
+        assert "semantic_scholar" in result.source
+
+    def test_returns_original_if_no_doi(self):
+        """enrich_paper returns original paper if no DOI."""
+        paper = Paper(title="Test Paper", authors=["Author"])
+        result = enrich_paper(paper)
+        assert result is paper
+
+    def test_returns_original_if_already_complete(self):
+        """enrich_paper returns original if fields are already filled."""
+        paper = Paper(
+            title="Test Paper",
+            authors=["Author"],
+            doi="10.1234/test",
+            abstract="Already has abstract"
+        )
+
+        mock_provider = MagicMock()
+        with patch("scholar.enrich.get_provider", return_value=mock_provider):
+            result = enrich_paper(paper)
+
+        # Should not have called the provider
+        mock_provider.get_paper_by_doi.assert_not_called()
+        assert result is paper
+
+    def test_tries_fallback_provider(self):
+        """enrich_paper tries fallback if first provider fails."""
+        paper = Paper(
+            title="Test Paper",
+            authors=["Author"],
+            doi="10.1234/test"
+        )
+
+        first_provider = MagicMock()
+        first_provider.get_paper_by_doi.return_value = None  # Not found
+
+        second_provider = MagicMock()
+        second_provider.get_paper_by_doi.return_value = Paper(
+            title="Test Paper",
+            authors=["Author"],
+            doi="10.1234/test",
+            abstract="Found in second provider",
+            source="openalex"
+        )
+
+        def mock_get_provider(name):
+            if name == "semantic_scholar":
+                return first_provider
+            elif name == "openalex":
+                return second_provider
+            return None
+
+        with patch("scholar.enrich.get_provider", side_effect=mock_get_provider):
+            result = enrich_paper(paper)
+
+        assert result.abstract == "Found in second provider"
+
+    def test_returns_original_if_no_provider_finds(self):
+        """enrich_paper returns original if no provider can enrich."""
+        paper = Paper(
+            title="Test Paper",
+            authors=["Author"],
+            doi="10.1234/test"
+        )
+
+        mock_provider = MagicMock()
+        mock_provider.get_paper_by_doi.return_value = None
+
+        with patch("scholar.enrich.get_provider", return_value=mock_provider):
+            result = enrich_paper(paper)
+
+        assert result is paper
+
+
+class TestNeedsEnrichment:
+    """Tests for needs_enrichment helper."""
+
+    def test_needs_enrichment_missing_abstract(self):
+        """Paper with missing abstract needs enrichment."""
+        paper = Paper(title="Test", authors=[], abstract=None)
+        assert needs_enrichment(paper, ["abstract"]) is True
+
+    def test_needs_enrichment_empty_abstract(self):
+        """Paper with empty abstract needs enrichment."""
+        paper = Paper(title="Test", authors=[], abstract="")
+        assert needs_enrichment(paper, ["abstract"]) is True
+
+    def test_no_enrichment_if_complete(self):
+        """Paper with filled fields doesn't need enrichment."""
+        paper = Paper(title="Test", authors=[], abstract="Has abstract")
+        assert needs_enrichment(paper, ["abstract"]) is False
+@
+
+
+\section{Batch Enrichment}
+
+For enriching multiple papers (e.g., after a search), we provide a batch
+function with optional progress reporting.
+
+<<enrichment functions>>=
+def enrich_papers(
+    papers: list[Paper],
+    fields: list[str] | None = None,
+    progress_callback: Callable[[int, int], None] | None = None,
+) -> list[Paper]:
+    """
+    Enrich multiple papers.
+
+    Args:
+        papers: List of papers to enrich.
+        fields: Fields to enrich. If None, enriches 'abstract' only.
+        progress_callback: Called with (current, total) after each paper.
+
+    Returns:
+        List of enriched papers in the same order.
+    """
+    if fields is None:
+        fields = ["abstract"]
+
+    enriched = []
+    total = len(papers)
+
+    for i, paper in enumerate(papers):
+        enriched.append(enrich_paper(paper, fields))
+        if progress_callback:
+            progress_callback(i + 1, total)
+
+    return enriched
+@
+
+\subsection{Testing batch enrichment}
+
+<<test functions>>=
+class TestEnrichPapers:
+    """Tests for enrich_papers function."""
+
+    def test_enriches_all_papers(self):
+        """enrich_papers processes all papers in list."""
+        papers = [
+            Paper(title="Paper 1", authors=[], doi="10.1/a"),
+            Paper(title="Paper 2", authors=[], doi="10.1/b"),
+        ]
+
+        def make_enriched(doi):
+            return Paper(
+                title="Enriched",
+                authors=[],
+                doi=doi,
+                abstract=f"Abstract for {doi}",
+                source="semantic_scholar"
+            )
+
+        mock_provider = MagicMock()
+        mock_provider.get_paper_by_doi.side_effect = lambda doi: make_enriched(doi)
+
+        with patch("scholar.enrich.get_provider", return_value=mock_provider):
+            result = enrich_papers(papers)
+
+        assert len(result) == 2
+        assert result[0].abstract == "Abstract for 10.1/a"
+        assert result[1].abstract == "Abstract for 10.1/b"
+
+    def test_calls_progress_callback(self):
+        """enrich_papers calls progress callback."""
+        papers = [
+            Paper(title="Paper 1", authors=[]),
+            Paper(title="Paper 2", authors=[]),
+        ]
+
+        progress_calls = []
+
+        def track_progress(current, total):
+            progress_calls.append((current, total))
+
+        # Papers without DOI won't be enriched
+        result = enrich_papers(papers, progress_callback=track_progress)
+
+        assert progress_calls == [(1, 2), (2, 2)]
+
+    def test_preserves_order(self):
+        """enrich_papers preserves paper order."""
+        papers = [
+            Paper(title="First", authors=[]),
+            Paper(title="Second", authors=[]),
+            Paper(title="Third", authors=[]),
+        ]
+
+        result = enrich_papers(papers)
+
+        assert result[0].title == "First"
+        assert result[1].title == "Second"
+        assert result[2].title == "Third"
+@
+
+
+\section{Dependencies}
+
+<<imports>>=
+import logging
+from typing import Callable
+
+from scholar import Paper
+from scholar.providers import get_provider
+
+logger = logging.getLogger(__name__)
+@

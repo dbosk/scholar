@@ -48,6 +48,7 @@ across bibliographic databases.
 <<typer application>>
 <<completion functions>>
 <<search command>>
+<<enrich command>>
 <<providers command>>
 <<cache command>>
 <<pdf command>>
@@ -287,7 +288,15 @@ limit: Annotated[
              "Provider limits: DBLP=1000, WoS=50, IEEE=200. "
              "Semantic Scholar and OpenAlex have no documented limit.",
     ),
-] = 100
+] = 100,
+enrich: Annotated[
+    bool,
+    typer.Option(
+        "--enrich", "-e",
+        help="Fetch missing abstracts from Semantic Scholar/OpenAlex. "
+             "Only works for papers with DOIs.",
+    ),
+] = False
 @
 
 \subsection{Executing the search}
@@ -318,11 +327,17 @@ for pname in provider_names:
 s = Search(query)
 results = s.execute(providers=provider, limit=limit)
 
+# Merge results from all providers (deduplicates and consolidates data)
+<<merge search results>>
+
+# Optionally enrich papers with missing abstracts
+<<enrich papers if requested>>
+
 # If review mode, launch TUI instead of displaying results
 if review:
     from scholar.tui import run_review
     session_name = name if name else query
-    run_review(results, query, session_name)
+    run_review(merged_results, query, session_name)
     return
 
 # Auto-detect format based on TTY
@@ -330,7 +345,149 @@ actual_format = output_format
 if output_format == "auto":
     actual_format = "table" if sys.stdout.isatty() else "csv"
 
-display_results(results, actual_format)
+display_results(merged_results, actual_format)
+@
+
+\subsection{Merging results from multiple providers}
+
+When searching multiple providers, the same paper may appear from different
+sources.
+Rather than showing duplicates, we merge all results into a single
+[[SearchResult]], consolidating data from each provider.
+
+For example, a paper found in both DBLP (no abstract) and Semantic Scholar
+(with abstract) will appear once with the abstract from Semantic Scholar.
+The [[source]] field tracks which providers found the paper.
+
+<<merge search results>>=
+from functools import reduce
+
+if len(results) > 1:
+    merged = reduce(lambda a, b: a.merge(b), results)
+    merged_results = [merged]
+elif len(results) == 1:
+    merged_results = results
+else:
+    merged_results = []
+@
+
+\subsection{Enriching papers}
+
+When the [[--enrich]] flag is provided, we fetch missing abstracts for papers
+that have DOIs.
+This is particularly useful when searching DBLP (which doesn't include
+abstracts) alongside other providers.
+
+We show a progress indicator since enrichment requires API calls for each
+paper missing an abstract.
+
+<<enrich papers if requested>>=
+if enrich and merged_results:
+    from scholar.enrich import enrich_papers, needs_enrichment
+    from rich.progress import Progress
+
+    # Count papers that need enrichment
+    papers = merged_results[0].papers
+    papers_to_enrich = [p for p in papers if needs_enrichment(p, ["abstract"]) and p.doi]
+
+    if papers_to_enrich:
+        with Progress() as progress:
+            task = progress.add_task(
+                "[cyan]Enriching papers...",
+                total=len(papers_to_enrich)
+            )
+
+            def update_progress(current: int, total: int) -> None:
+                progress.update(task, completed=current)
+
+            enriched = enrich_papers(papers, progress_callback=update_progress)
+            merged_results[0] = SearchResult(
+                query=merged_results[0].query,
+                provider=merged_results[0].provider,
+                timestamp=merged_results[0].timestamp,
+                papers=enriched,
+                filters=merged_results[0].filters,
+            )
+@
+
+
+\section{Enriching Papers}
+
+The [[enrich]] command fetches missing abstracts for papers in a review session.
+This is useful when you've already done a search and want to fill in abstracts
+without re-running the search.
+
+<<enrich command>>=
+@app.command()
+def enrich(
+    session: Annotated[
+        str,
+        typer.Argument(
+            help="Name of the review session to enrich.",
+            autocompletion=complete_session_name,
+        ),
+    ],
+) -> None:
+    """
+    Fetch missing abstracts for papers in a review session.
+
+    Looks up papers by DOI in Semantic Scholar and OpenAlex to fill in
+    missing abstracts. Only papers with DOIs can be enriched.
+
+    Example:
+        scholar enrich "machine learning"
+    """
+    <<enrich session papers>>
+@
+
+\subsection{Enriching session papers}
+
+We load the session, enrich the papers, and save the updated session:
+
+<<enrich session papers>>=
+from scholar.review import load_session, save_session
+from scholar.enrich import enrich_papers, needs_enrichment
+from rich.progress import Progress
+
+console = Console()
+
+# Load the session
+try:
+    session_data = load_session(session)
+except FileNotFoundError:
+    console.print(f"[red]Session '{session}' not found.[/red]")
+    raise typer.Exit(1)
+
+# Get papers that need enrichment
+papers = session_data.papers
+papers_with_doi = [p for p in papers if p.doi]
+papers_to_enrich = [p for p in papers_with_doi if needs_enrichment(p, ["abstract"])]
+
+if not papers_to_enrich:
+    console.print("[yellow]No papers need enrichment (all have abstracts or lack DOIs).[/yellow]")
+    return
+
+console.print(f"[cyan]Found {len(papers_to_enrich)} papers to enrich (of {len(papers)} total).[/cyan]")
+
+# Enrich with progress bar
+with Progress() as progress:
+    task = progress.add_task("[cyan]Enriching...", total=len(papers))
+
+    def update_progress(current: int, total: int) -> None:
+        progress.update(task, completed=current)
+
+    enriched_papers = enrich_papers(papers, progress_callback=update_progress)
+
+# Update session with enriched papers
+session_data.papers = enriched_papers
+save_session(session_data)
+
+# Count how many were actually enriched
+enriched_count = sum(
+    1 for orig, new in zip(papers, enriched_papers)
+    if orig.abstract != new.abstract and new.abstract
+)
+console.print(f"[green]Enriched {enriched_count} papers.[/green]")
 @
 
 
