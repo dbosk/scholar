@@ -286,54 +286,13 @@ def get_provider_limits() -> dict[str, int | None]:
     return {name: getattr(p, "MAX_LIMIT", None) for name, p in PROVIDERS.items()}
 @
 
-\subsubsection{Testing provider availability}
+\subsubsection{Testing get\_default\_providers}
 
-We test that the [[is_available()]] method correctly reflects whether each
-provider can be used:
+The [[get_default_providers]] function returns only providers that are
+currently available.
+We test this behavior:
 
 <<test functions>>=
-class TestProviderAvailability:
-    """Tests for provider availability (is_available method)."""
-
-    def test_semantic_scholar_always_available(self):
-        """Semantic Scholar is available without API key."""
-        provider = SemanticScholarProvider(api_key=None)
-        provider.api_key = None  # Ensure no key
-        assert provider.is_available() is True
-
-    def test_openalex_always_available(self):
-        """OpenAlex is available without email."""
-        provider = OpenAlexProvider(email=None)
-        assert provider.is_available() is True
-
-    def test_dblp_always_available(self):
-        """DBLP is available (no credentials needed)."""
-        provider = DBLPProvider()
-        assert provider.is_available() is True
-
-    def test_wos_unavailable_without_key(self):
-        """Web of Science is unavailable without API key."""
-        provider = WebOfScienceProvider(api_key=None)
-        provider.api_key = None  # Ensure no key
-        assert provider.is_available() is False
-
-    def test_wos_available_with_key(self):
-        """Web of Science is available with API key."""
-        provider = WebOfScienceProvider(api_key="test_key")
-        assert provider.is_available() is True
-
-    def test_ieee_unavailable_without_key(self):
-        """IEEE Xplore is unavailable without API key."""
-        provider = IEEEXploreProvider(api_key=None)
-        provider.api_key = None  # Ensure no key
-        assert provider.is_available() is False
-
-    def test_ieee_available_with_key(self):
-        """IEEE Xplore is available with API key."""
-        provider = IEEEXploreProvider(api_key="test_key")
-        assert provider.is_available() is True
-
-
 class TestDefaultProviders:
     """Tests for get_default_providers functionality."""
 
@@ -686,11 +645,19 @@ from urllib3.util.retry import Retry
 
 \subsection{Testing Semantic Scholar provider}
 
-We mock the HTTP requests to avoid real network calls in tests:
+We mock the HTTP requests to avoid real network calls in tests.
+First, we verify that the provider is always available since Semantic Scholar
+does not require an API key:
 
 <<test functions>>=
 class TestSemanticScholarProvider:
     """Tests for the SemanticScholar provider."""
+
+    def test_is_available_always_true(self):
+        """Semantic Scholar is available without API key."""
+        provider = SemanticScholarProvider(api_key=None)
+        provider.api_key = None  # Ensure no key
+        assert provider.is_available() is True
 
     def test_search_converts_papers(self):
         """search() converts API results to Paper objects."""
@@ -1052,11 +1019,18 @@ import pyalex
 
 \subsection{Testing OpenAlex provider}
 
-We test the OpenAlex provider with mocked API responses:
+We test the OpenAlex provider with mocked API responses.
+First, we verify that the provider is always available since OpenAlex
+does not require an API key (email is optional for polite pool access):
 
 <<test functions>>=
 class TestOpenAlexProvider:
     """Tests for the OpenAlex provider."""
+
+    def test_is_available_always_true(self):
+        """OpenAlex is available without email."""
+        provider = OpenAlexProvider(email=None)
+        assert provider.is_available() is True
 
     def test_search_converts_works(self):
         """search() converts API results to Paper objects."""
@@ -1378,11 +1352,18 @@ DBLP_API_URL = "https://dblp.org/search/publ/api"
 
 \subsection{Testing DBLP provider}
 
-We test the DBLP provider with mocked API responses:
+We test the DBLP provider with mocked API responses.
+First, we verify that the provider is always available since DBLP
+does not require any credentials:
 
 <<test functions>>=
 class TestDBLPProvider:
     """Tests for the DBLP provider."""
+
+    def test_is_available_always_true(self):
+        """DBLP is available (no credentials needed)."""
+        provider = DBLPProvider()
+        assert provider.is_available() is True
 
     def test_search_converts_publications(self):
         """search() converts API results to Paper objects."""
@@ -1724,11 +1705,22 @@ WOS_API_URL = "https://api.clarivate.com/apis/wos-starter/v1/documents"
 \subsection{Testing Web of Science provider}
 
 We test the WoS provider with mocked API responses.
-Note that without an API key, the provider returns empty results:
+First, we verify the availability depends on having an API key configured:
 
 <<test functions>>=
 class TestWebOfScienceProvider:
     """Tests for the Web of Science provider."""
+
+    def test_is_available_false_without_key(self):
+        """Web of Science is unavailable without API key."""
+        provider = WebOfScienceProvider(api_key=None)
+        provider.api_key = None  # Ensure no key
+        assert provider.is_available() is False
+
+    def test_is_available_true_with_key(self):
+        """Web of Science is available with API key."""
+        provider = WebOfScienceProvider(api_key="test_key")
+        assert provider.is_available() is True
 
     def test_search_returns_empty_without_api_key(self):
         """search() returns empty list when no API key is configured."""
@@ -2027,11 +2019,22 @@ IEEE_API_URL = "https://ieeexploreapi.ieee.org/api/v1/search/articles"
 \subsection{Testing IEEE Xplore provider}
 
 We test the IEEE Xplore provider with mocked API responses.
-Like WoS, without an API key the provider returns empty results:
+First, we verify the availability depends on having an API key configured:
 
 <<test functions>>=
 class TestIEEEXploreProvider:
     """Tests for the IEEE Xplore provider."""
+
+    def test_is_available_false_without_key(self):
+        """IEEE Xplore is unavailable without API key."""
+        provider = IEEEXploreProvider(api_key=None)
+        provider.api_key = None  # Ensure no key
+        assert provider.is_available() is False
+
+    def test_is_available_true_with_key(self):
+        """IEEE Xplore is available with API key."""
+        provider = IEEEXploreProvider(api_key="test_key")
+        assert provider.is_available() is True
 
     def test_search_returns_empty_without_api_key(self):
         """search() returns empty list when no API key is configured."""
