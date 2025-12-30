@@ -46,6 +46,7 @@ across bibliographic databases.
 <<constants>>
 <<output formatters>>
 <<typer application>>
+<<completion functions>>
 <<search command>>
 <<providers command>>
 <<cache command>>
@@ -143,6 +144,100 @@ def search(
     <<execute search and display results>>
 @
 
+\subsection{Shell completion}
+
+To improve the user experience, we provide shell completion for various
+options and arguments.
+Typer supports this via the [[autocompletion]] parameter, which accepts a
+callback function that receives the incomplete text and returns valid
+completions.
+
+\paragraph{Provider completion}
+For the [[-p]]/[[--provider]] option, we complete from the registered
+providers:
+
+<<completion functions>>=
+def complete_provider(incomplete: str) -> list[str]:
+    """Provide shell completion for provider names."""
+    from scholar.providers import PROVIDERS
+    return [name for name in PROVIDERS.keys() if name.startswith(incomplete)]
+@
+
+\paragraph{Output format completion}
+Several commands accept a [[--format]] option.
+We define completers for each set of valid formats:
+
+<<completion functions>>=
+SEARCH_FORMATS = ["auto", "table", "csv", "json", "bibtex"]
+DISPLAY_FORMATS = ["table", "json"]
+EXPORT_FORMATS = ["csv", "latex", "all"]
+
+
+def complete_search_format(incomplete: str) -> list[str]:
+    """Provide shell completion for search output formats."""
+    return [f for f in SEARCH_FORMATS if f.startswith(incomplete)]
+
+
+def complete_display_format(incomplete: str) -> list[str]:
+    """Provide shell completion for display formats (table/json)."""
+    return [f for f in DISPLAY_FORMATS if f.startswith(incomplete)]
+
+
+def complete_export_format(incomplete: str) -> list[str]:
+    """Provide shell completion for export formats."""
+    return [f for f in EXPORT_FORMATS if f.startswith(incomplete)]
+@
+
+\paragraph{Action completion}
+The [[cache]] and [[pdf]] commands take an action argument.
+We complete from the valid action names:
+
+<<completion functions>>=
+CACHE_ACTIONS = ["clear", "info", "path"]
+PDF_ACTIONS = ["open", "info", "clear", "path"]
+
+
+def complete_cache_action(incomplete: str) -> list[str]:
+    """Provide shell completion for cache actions."""
+    return [a for a in CACHE_ACTIONS if a.startswith(incomplete)]
+
+
+def complete_pdf_action(incomplete: str) -> list[str]:
+    """Provide shell completion for PDF actions."""
+    return [a for a in PDF_ACTIONS if a.startswith(incomplete)]
+@
+
+\paragraph{Session name completion}
+For commands that operate on saved sessions, we complete from the stored
+session names.
+This requires dynamically loading the session list:
+
+<<completion functions>>=
+def complete_session_name(incomplete: str) -> list[str]:
+    """Provide shell completion for session names."""
+    from scholar.review import list_sessions
+    try:
+        sessions = list_sessions()
+        return [s["name"] for s in sessions if s["name"].startswith(incomplete)]
+    except Exception:
+        return []
+@
+
+\paragraph{Paper ID completion}
+For commands that reference papers with notes, we complete from stored
+paper IDs:
+
+<<completion functions>>=
+def complete_paper_id(incomplete: str) -> list[str]:
+    """Provide shell completion for paper IDs with notes."""
+    from scholar.notes import list_papers_with_notes
+    try:
+        notes = list_papers_with_notes()
+        return [n.paper_id for n in notes if n.paper_id.startswith(incomplete)]
+    except Exception:
+        return []
+@
+
 \subsection{Command options}
 
 The search command accepts options for controlling which providers to query
@@ -154,6 +249,7 @@ provider: Annotated[
     typer.Option(
         "--provider", "-p",
         help="Provider to query. Repeatable. Default: all providers.",
+        autocompletion=complete_provider,
     ),
 ] = None,
 output_format: Annotated[
@@ -162,6 +258,7 @@ output_format: Annotated[
         "--format", "-f",
         help="Output format: auto, table, csv, json, or bibtex. "
              "Auto selects table for TTY, csv otherwise.",
+        autocompletion=complete_search_format,
     ),
 ] = "auto",
 review: Annotated[
@@ -323,7 +420,10 @@ command uses.
 def cache(
     action: Annotated[
         str,
-        typer.Argument(help="Action: clear, info, or path"),
+        typer.Argument(
+            help="Action: clear, info, or path",
+            autocompletion=complete_cache_action,
+        ),
     ],
 ) -> None:
     """
@@ -404,7 +504,10 @@ viewer.
 def pdf(
     action: Annotated[
         str,
-        typer.Argument(help="Action: open, info, clear, or path"),
+        typer.Argument(
+            help="Action: open, info, clear, or path",
+            autocompletion=complete_pdf_action,
+        ),
     ],
     url: Annotated[
         Optional[str],
@@ -537,6 +640,7 @@ def notes_list(
         typer.Option(
             "--format", "-f",
             help="Output format: table or json.",
+            autocompletion=complete_display_format,
         ),
     ] = "table",
 ) -> None:
@@ -590,7 +694,10 @@ def notes_list(
 def notes_show(
     paper_id: Annotated[
         str,
-        typer.Argument(help="Paper ID (DOI or hash) to show notes for."),
+        typer.Argument(
+            help="Paper ID (DOI or hash) to show notes for.",
+            autocompletion=complete_paper_id,
+        ),
     ],
 ) -> None:
     """
@@ -738,6 +845,7 @@ def sessions_list(
         typer.Option(
             "--format", "-f",
             help="Output format: table or json.",
+            autocompletion=complete_display_format,
         ),
     ] = "table",
 ) -> None:
@@ -782,13 +890,17 @@ def sessions_list(
 def sessions_show(
     name: Annotated[
         str,
-        typer.Argument(help="Session name or query to show."),
+        typer.Argument(
+            help="Session name or query to show.",
+            autocompletion=complete_session_name,
+        ),
     ],
     output_format: Annotated[
         str,
         typer.Option(
             "--format", "-f",
             help="Output format: table or json.",
+            autocompletion=complete_display_format,
         ),
     ] = "table",
 ) -> None:
@@ -880,7 +992,10 @@ def sessions_show(
 def sessions_export(
     name: Annotated[
         str,
-        typer.Argument(help="Session name or query to export."),
+        typer.Argument(
+            help="Session name or query to export.",
+            autocompletion=complete_session_name,
+        ),
     ],
     output: Annotated[
         Optional[str],
@@ -894,6 +1009,7 @@ def sessions_export(
         typer.Option(
             "--format", "-f",
             help="Export format: csv, latex, or all.",
+            autocompletion=complete_export_format,
         ),
     ] = "all",
 ) -> None:
@@ -945,7 +1061,10 @@ def sessions_export(
 def sessions_resume(
     name: Annotated[
         str,
-        typer.Argument(help="Session name or query to resume."),
+        typer.Argument(
+            help="Session name or query to resume.",
+            autocompletion=complete_session_name,
+        ),
     ],
 ) -> None:
     """
