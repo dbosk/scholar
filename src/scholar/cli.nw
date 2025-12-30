@@ -318,11 +318,14 @@ for pname in provider_names:
 s = Search(query)
 results = s.execute(providers=provider, limit=limit)
 
+# Merge results from all providers (deduplicates and consolidates data)
+<<merge search results>>
+
 # If review mode, launch TUI instead of displaying results
 if review:
     from scholar.tui import run_review
     session_name = name if name else query
-    run_review(results, query, session_name)
+    run_review(merged_results, query, session_name)
     return
 
 # Auto-detect format based on TTY
@@ -330,7 +333,30 @@ actual_format = output_format
 if output_format == "auto":
     actual_format = "table" if sys.stdout.isatty() else "csv"
 
-display_results(results, actual_format)
+display_results(merged_results, actual_format)
+@
+
+\subsection{Merging results from multiple providers}
+
+When searching multiple providers, the same paper may appear from different
+sources.
+Rather than showing duplicates, we merge all results into a single
+[[SearchResult]], consolidating data from each provider.
+
+For example, a paper found in both DBLP (no abstract) and Semantic Scholar
+(with abstract) will appear once with the abstract from Semantic Scholar.
+The [[source]] field tracks which providers found the paper.
+
+<<merge search results>>=
+from functools import reduce
+
+if len(results) > 1:
+    merged = reduce(lambda a, b: a.merge(b), results)
+    merged_results = [merged]
+elif len(results) == 1:
+    merged_results = results
+else:
+    merged_results = []
 @
 
 
