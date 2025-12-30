@@ -296,6 +296,13 @@ enrich: Annotated[
         help="Fetch missing abstracts from Semantic Scholar/OpenAlex. "
              "Only works for papers with DOIs.",
     ),
+] = False,
+report: Annotated[
+    bool,
+    typer.Option(
+        "--report", "-R",
+        help="Prompt to save reports (LaTeX, BibTeX, CSV) after review.",
+    ),
 ] = False
 @
 
@@ -337,7 +344,7 @@ results = s.execute(providers=provider, limit=limit)
 if review:
     from scholar.tui import run_review
     session_name = name if name else query
-    run_review(merged_results, query, session_name)
+    run_review(merged_results, query, session_name, prompt_report=report)
     return
 
 # Auto-detect format based on TTY

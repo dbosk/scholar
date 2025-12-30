@@ -1469,7 +1469,8 @@ The entry point supports two distinct modes:
 
 <<tui entry point>>=
 def run_review(results: list[SearchResult], query: str, 
-               session_name: str | None = None) -> ReviewSession:
+               session_name: str | None = None,
+               prompt_report: bool = False) -> ReviewSession:
     """
     Run the interactive review TUI for search results.
     
@@ -1483,6 +1484,8 @@ def run_review(results: list[SearchResult], query: str,
                       stored under this name instead of the query. This allows
                       the same query with different names (different purposes)
                       or multiple queries with the same name (appending results).
+        prompt_report: If True, prompt the user to save reports after the review
+                       session. If False (the default), no prompt is shown.
     """
     # Use session_name for persistence, fall back to query
     persistence_key = session_name if session_name else query
@@ -1500,8 +1503,9 @@ def run_review(results: list[SearchResult], query: str,
     # Save the complete session for `scholar sessions` commands
     save_session(session)
     
-    # Prompt for report
-    prompt_for_report(session)
+    # Prompt for report only if requested
+    if prompt_report:
+        prompt_for_report(session)
     
     return session
 
