@@ -122,13 +122,14 @@ def callback(
         ),
     ] = 0,
     quiet: Annotated[
-        bool,
+        int,
         typer.Option(
             "--quiet",
             "-q",
-            help="Suppress all non-error output.",
+            count=True,
+            help="Decrease verbosity (can be repeated: -q, -qq, -qqq).",
         ),
-    ] = False,
+    ] = 0,
 ) -> None:
     """
     Scholar: A tool for structured literature searches.
@@ -140,26 +141,43 @@ def callback(
 
 \subsection{Logging Configuration}
 
-The verbosity options control the logging level:
+The verbosity options control the logging level by computing a level offset:
 \begin{itemize}
-\item No options: WARNING level (default)
-\item [[--quiet]] or [[-q]]: ERROR level only
-\item [[-v]]: INFO level
-\item [[-vv]]: DEBUG level
-\item [[-vvv]] or more: DEBUG level with maximum verbosity
+\item Start with WARNING level (baseline)
+\item Add verbose count, subtract quiet count
+\item Level = WARNING - (verbose - quiet)
+\item Results:
+  \begin{itemize}
+  \item No options (0): WARNING level
+  \item [[-v]] (+1): INFO level
+  \item [[-vv]] (+2): DEBUG level
+  \item [[-q]] (-1): ERROR level
+  \item [[-qq]] (-2): CRITICAL level
+  \item [[-qqq]] or more (-3+): Silence all output (level 100)
+  \end{itemize}
 \end{itemize}
 
-The [[--quiet]] flag takes precedence over [[--verbose]].
+The net verbosity is [[verbose - quiet]], allowing flexible control.
 
 <<configure logging>>=
-if quiet:
-    log_level = logging.ERROR
-elif verbose == 0:
-    log_level = logging.WARNING
-elif verbose == 1:
-    log_level = logging.INFO
-else:
-    log_level = logging.DEBUG
+# Calculate net verbosity: positive = more verbose, negative = quieter
+net_verbosity = verbose - quiet
+
+# Map to logging levels
+# WARNING (30) is baseline
+# Each step of verbosity changes by 10
+if net_verbosity >= 2:
+    log_level = logging.DEBUG  # 10
+elif net_verbosity == 1:
+    log_level = logging.INFO  # 20
+elif net_verbosity == 0:
+    log_level = logging.WARNING  # 30
+elif net_verbosity == -1:
+    log_level = logging.ERROR  # 40
+elif net_verbosity == -2:
+    log_level = logging.CRITICAL  # 50
+else:  # net_verbosity <= -3
+    log_level = 100  # Silence everything
 
 logging.basicConfig(
     level=log_level,
@@ -1781,11 +1799,20 @@ class TestCLI:
         mock_provider.search.return_value = []
         monkeypatch.setattr(providers, "PROVIDERS", {"mock": mock_provider})
 
+        # Test -q option
         result = runner.invoke(app, ["-q", "search", "test"])
         assert result.exit_code == 0
 
+        # Test -qq option
+        result = runner.invoke(app, ["-qq", "search", "test"])
+        assert result.exit_code == 0
+
+        # Test -qqq option (silence all)
+        result = runner.invoke(app, ["-qqq", "search", "test"])
+        assert result.exit_code == 0
+
     def test_verbose_and_quiet_together(self, monkeypatch):
-        """Quiet takes precedence over verbose."""
+        """Verbose and quiet offset each other."""
         from scholar import providers
 
         mock_provider = Mock()
@@ -1794,8 +1821,16 @@ class TestCLI:
         mock_provider.search.return_value = []
         monkeypatch.setattr(providers, "PROVIDERS", {"mock": mock_provider})
 
-        # Quiet should take precedence
-        result = runner.invoke(app, ["-q", "-v", "search", "test"])
+        # -v and -q cancel out (net 0 = WARNING)
+        result = runner.invoke(app, ["-v", "-q", "search", "test"])
+        assert result.exit_code == 0
+
+        # -vv and -q = net +1 = INFO
+        result = runner.invoke(app, ["-vv", "-q", "search", "test"])
+        assert result.exit_code == 0
+
+        # -v and -qq = net -1 = ERROR
+        result = runner.invoke(app, ["-v", "-qq", "search", "test"])
         assert result.exit_code == 0
 @
 
