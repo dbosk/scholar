@@ -336,18 +336,25 @@ source has them).
 <<search result methods>>=
 def merge(self, other: "SearchResult") -> "SearchResult":
     """Merge two search results, deduplicating and consolidating papers."""
+    logger.debug(f"Merging search results: {len(self.papers)} + {len(other.papers)} papers")
+    
     # Use dict keyed by paper identity to enable consolidation
     paper_map: dict[Paper, Paper] = {}
 
     for paper in self.papers:
         paper_map[paper] = paper
 
+    duplicates = 0
     for paper in other.papers:
         if paper in paper_map:
             # Consolidate with existing paper
             paper_map[paper] = paper_map[paper].merge_with(paper)
+            duplicates += 1
         else:
             paper_map[paper] = paper
+
+    merged_count = len(paper_map)
+    logger.info(f"Merged results: {merged_count} unique papers ({duplicates} duplicates removed)")
 
     return SearchResult(
         query=f"{self.query} | {other.query}",
@@ -519,9 +526,14 @@ def execute(
             if get_provider(name) is not None
         ]
 
+    logger.info(f"Executing search for query: '{self.query}'")
+    logger.debug(f"Using {len(provider_list)} provider(s): {[p.name for p in provider_list]}")
+
     # Query each provider
     for provider in provider_list:
+        logger.debug(f"Querying {provider.name} with limit={limit}")
         papers = provider.search(self.query, limit=limit)
+        logger.info(f"{provider.name}: Retrieved {len(papers)} papers")
         result = SearchResult(
             query=self.query,
             provider=provider.name,
@@ -530,6 +542,7 @@ def execute(
         )
         self.results.append(result)
 
+    logger.info(f"Search complete: {len(self.results)} result set(s)")
     return self.results
 @
 
@@ -579,6 +592,9 @@ We collect the imports used throughout the module:
 <<imports>>=
 from dataclasses import dataclass
 from datetime import datetime
+import logging
+
+logger = logging.getLogger(__name__)
 @
 
 <<constants>>=

@@ -469,11 +469,13 @@ The search method calls the API with rate limiting and handles errors:
 def search(self, query: str, limit: int = 100) -> list[Paper]:
     """Search Semantic Scholar for papers matching the query."""
     try:
+        logger.debug(f"semantic_scholar: Searching for '{query}' with limit={limit}")
         self._wait_for_rate_limit()
 
         headers = {}
         if self.api_key:
             headers["x-api-key"] = self.api_key
+            logger.debug("semantic_scholar: Using API key")
 
         response = self._session.get(
             self.API_URL,
@@ -497,8 +499,10 @@ def search(self, query: str, limit: int = 100) -> list[Paper]:
 
         response.raise_for_status()
         data = response.json()
-
-        return [self._convert_paper(p) for p in data.get("data", [])]
+        
+        results = [self._convert_paper(p) for p in data.get("data", [])]
+        logger.debug(f"semantic_scholar: Retrieved {len(results)} papers")
+        return results
     except requests.exceptions.RetryError:
         logger.warning(
             "semantic_scholar: Rate limited after retries. "
@@ -919,9 +923,12 @@ class OpenAlexProvider:
     def search(self, query: str, limit: int = 100) -> list[Paper]:
         """Search OpenAlex for papers matching the query."""
         try:
+            logger.debug(f"openalex: Searching for '{query}' with limit={limit}")
             self._wait_for_rate_limit()
             works = pyalex.Works().search(query).get(per_page=limit)
-            return [self._convert_work(w) for w in works]
+            results = [self._convert_work(w) for w in works]
+            logger.debug(f"openalex: Retrieved {len(results)} papers")
+            return results
         except Exception as e:
             logger.warning("openalex: %s", e)
             return []
@@ -1283,8 +1290,12 @@ class DBLPProvider:
     def search(self, query: str, limit: int = 100) -> list[Paper]:
         """Search DBLP for papers matching the query."""
         try:
+            logger.debug(f"dblp: Searching for '{query}' with limit={limit}")
             # DBLP API caps at 1000 results per request
             effective_limit = min(limit, 1000)
+            if effective_limit < limit:
+                logger.debug(f"dblp: Limiting to {effective_limit} (API maximum)")
+            
             response = requests.get(
                 DBLP_API_URL,
                 params={"q": query, "format": "json", "h": effective_limit},
@@ -1294,7 +1305,9 @@ class DBLPProvider:
             data = response.json()
 
             hits = data.get("result", {}).get("hits", {}).get("hit", [])
-            return [self._convert_hit(hit) for hit in hits]
+            results = [self._convert_hit(hit) for hit in hits]
+            logger.debug(f"dblp: Retrieved {len(results)} papers")
+            return results
         except Exception as e:
             logger.warning("dblp: %s", e)
             return []

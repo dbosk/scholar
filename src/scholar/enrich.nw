@@ -106,11 +106,15 @@ def enrich_paper(
 
     # Check if enrichment is needed
     if not needs_enrichment(paper, fields):
+        logger.debug(f"Paper '{paper.title[:50]}...' doesn't need enrichment")
         return paper
 
     # Need DOI for lookup
     if not paper.doi:
+        logger.debug(f"Paper '{paper.title[:50]}...' has no DOI, cannot enrich")
         return paper
+
+    logger.debug(f"Enriching paper '{paper.title[:50]}...' (DOI: {paper.doi})")
 
     # Try each enrichment provider in order
     for provider_name in ENRICHMENT_PROVIDERS:
@@ -121,15 +125,19 @@ def enrich_paper(
         if not hasattr(provider, "get_paper_by_doi"):
             continue
 
+        logger.debug(f"Trying to enrich from {provider_name}")
         enriched = provider.get_paper_by_doi(paper.doi)
         if enriched is None:
+            logger.debug(f"{provider_name} returned no data for DOI {paper.doi}")
             continue
 
         # Merge the enriched data into our paper
         # We want to keep our paper's existing data and fill in gaps
+        logger.info(f"Successfully enriched paper from {provider_name}")
         return paper.merge_with(enriched)
 
     # No provider could enrich the paper
+    logger.debug(f"No provider could enrich paper with DOI {paper.doi}")
     return paper
 @
 
@@ -298,14 +306,21 @@ def enrich_papers(
     if fields is None:
         fields = ["abstract"]
 
+    logger.info(f"Starting batch enrichment of {len(papers)} papers")
+    
     enriched = []
     total = len(papers)
+    enriched_count = 0
 
     for i, paper in enumerate(papers):
-        enriched.append(enrich_paper(paper, fields))
+        result = enrich_paper(paper, fields)
+        if result != paper:  # Paper was enriched
+            enriched_count += 1
+        enriched.append(result)
         if progress_callback:
             progress_callback(i + 1, total)
 
+    logger.info(f"Batch enrichment complete: {enriched_count}/{total} papers enriched")
     return enriched
 @
 

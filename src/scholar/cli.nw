@@ -441,11 +441,13 @@ The [[source]] field tracks which providers found the paper.
 from functools import reduce
 
 if len(results) > 1:
+    logger.info(f"Merging {len(results)} result sets")
     merged = reduce(lambda a, b: a.merge(b), results)
     merged_results = [merged]
 elif len(results) == 1:
     merged_results = results
 else:
+    logger.warning("No search results returned")
     merged_results = []
 @
 
