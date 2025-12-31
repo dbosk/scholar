@@ -1319,6 +1319,38 @@ humans, while [[scholar search "query" | wc -l]] counts lines correctly.
 
 We implement a formatter for each and dispatch based on the user's choice.
 
+\subsection{Testing Formatters}
+
+Before implementing formatters, let's establish the testing framework.
+All formatter tests share a common fixture providing sample search results:
+
+<<test functions>>=
+class TestFormatters:
+    """Tests for output formatters."""
+
+    @pytest.fixture
+    def sample_results(self):
+        """Create sample search results for testing."""
+        papers = [
+            Paper(
+                title="Test Paper",
+                authors=["Alice", "Bob"],
+                year=2024,
+                doi="10.1234/test",
+            ),
+        ]
+        return [
+            SearchResult(
+                query="test",
+                provider="test_provider",
+                timestamp="2024-01-01T00:00:00",
+                papers=papers,
+            )
+        ]
+@
+
+Individual formatter tests appear after each formatter's implementation below.
+
 \subsection{The display function}
 
 This function selects the appropriate formatter and invokes it:
@@ -1392,6 +1424,17 @@ class TableFormatter:
                 self.console.print("[dim]No results found.[/dim]")
 @
 
+Let's verify the table formatter produces correct output:
+
+<<test functions>>=
+    def test_table_formatter(self, sample_results, capsys):
+        """TableFormatter produces output."""
+        formatter = TableFormatter()
+        formatter.format(sample_results)
+        captured = capsys.readouterr()
+        assert "Test Paper" in captured.out
+@
+
 
 \subsection{CSV formatter}
 
@@ -1426,6 +1469,24 @@ class CSVFormatter:
             print()
 @
 
+Let's verify the CSV formatter produces correct tab-separated output with the
+expected header and metadata comments:
+
+<<test functions>>=
+    def test_csv_formatter(self, sample_results, capsys):
+        """CSVFormatter produces tab-separated output with header."""
+        formatter = CSVFormatter()
+        formatter.format(sample_results)
+        captured = capsys.readouterr()
+        # Check metadata comments
+        assert "# Query: test" in captured.out
+        assert "# Provider: test_provider" in captured.out
+        # Check header row
+        assert "title\tauthors\tyear\tdoi\tvenue\turl" in captured.out
+        # Check data row
+        assert "Test Paper\tAlice; Bob\t2024\t10.1234/test" in captured.out
+@
+
 
 \subsection{JSON formatter}
 
@@ -1457,6 +1518,21 @@ class JSONFormatter:
                 ],
             })
         print(json.dumps(output, indent=2))
+@
+
+Let's verify the JSON formatter produces valid, parseable JSON with the correct
+structure:
+
+<<test functions>>=
+    def test_json_formatter(self, sample_results, capsys):
+        """JSONFormatter produces valid JSON."""
+        formatter = JSONFormatter()
+        formatter.format(sample_results)
+        captured = capsys.readouterr()
+        import json
+        data = json.loads(captured.out)
+        assert data[0]["query"] == "test"
+        assert data[0]["papers"][0]["title"] == "Test Paper"
 @
 
 
@@ -1496,51 +1572,10 @@ class BibTeXFormatter:
         print()
 @
 
-\subsection{Testing formatters}
-
-We test each formatter with sample data:
+Let's verify the BibTeX formatter produces valid entries with the correct
+structure:
 
 <<test functions>>=
-class TestFormatters:
-    """Tests for output formatters."""
-
-    @pytest.fixture
-    def sample_results(self):
-        """Create sample search results for testing."""
-        papers = [
-            Paper(
-                title="Test Paper",
-                authors=["Alice", "Bob"],
-                year=2024,
-                doi="10.1234/test",
-            ),
-        ]
-        return [
-            SearchResult(
-                query="test",
-                provider="test_provider",
-                timestamp="2024-01-01T00:00:00",
-                papers=papers,
-            )
-        ]
-
-    def test_table_formatter(self, sample_results, capsys):
-        """TableFormatter produces output."""
-        formatter = TableFormatter()
-        formatter.format(sample_results)
-        captured = capsys.readouterr()
-        assert "Test Paper" in captured.out
-
-    def test_json_formatter(self, sample_results, capsys):
-        """JSONFormatter produces valid JSON."""
-        formatter = JSONFormatter()
-        formatter.format(sample_results)
-        captured = capsys.readouterr()
-        import json
-        data = json.loads(captured.out)
-        assert data[0]["query"] == "test"
-        assert data[0]["papers"][0]["title"] == "Test Paper"
-
     def test_bibtex_formatter(self, sample_results, capsys):
         """BibTeXFormatter produces BibTeX entries."""
         formatter = BibTeXFormatter()
