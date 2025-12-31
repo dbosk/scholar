@@ -141,31 +141,31 @@ def callback(
 
 \subsection{Logging Configuration}
 
-The verbosity options control the logging level by computing a level offset:
+The verbosity options control the logging level by computing net verbosity:
 \begin{itemize}
-\item Start with WARNING level (baseline)
-\item Add verbose count, subtract quiet count
-\item Level = WARNING - (verbose - quiet)
-\item Results:
+\item Calculate net verbosity as [[verbose - quiet]]
+\item Map net verbosity to Python logging levels:
   \begin{itemize}
-  \item No options (0): WARNING level
-  \item [[-v]] (+1): INFO level
-  \item [[-vv]] (+2): DEBUG level
-  \item [[-q]] (-1): ERROR level
-  \item [[-qq]] (-2): CRITICAL level
-  \item [[-qqq]] or more (-3+): Silence all output (level 100)
+  \item [[net >= +2]]: DEBUG (10) - maximum verbosity
+  \item [[net = +1]]: INFO (20) - informational messages
+  \item [[net = 0]]: WARNING (30) - warnings only (default)
+  \item [[net = -1]]: ERROR (40) - errors only
+  \item [[net = -2]]: CRITICAL (50) - critical errors only
+  \item [[net <= -3]]: Silence all logging output
   \end{itemize}
 \end{itemize}
 
-The net verbosity is [[verbose - quiet]], allowing flexible control.
+This allows flexible control: [[scholar -vv -q]] gives INFO level (net=+1),
+while [[scholar -qqq]] silences all output for scripting (errors via exit codes).
 
 <<configure logging>>=
 # Calculate net verbosity: positive = more verbose, negative = quieter
 net_verbosity = verbose - quiet
 
-# Map to logging levels
-# WARNING (30) is baseline
-# Each step of verbosity changes by 10
+# Silence level for net_verbosity <= -3
+SILENCE_LEVEL = logging.CRITICAL + 50
+
+# Map net verbosity to logging levels
 if net_verbosity >= 2:
     log_level = logging.DEBUG  # 10
 elif net_verbosity == 1:
@@ -177,7 +177,7 @@ elif net_verbosity == -1:
 elif net_verbosity == -2:
     log_level = logging.CRITICAL  # 50
 else:  # net_verbosity <= -3
-    log_level = 100  # Silence everything
+    log_level = SILENCE_LEVEL  # Silence everything
 
 logging.basicConfig(
     level=log_level,
