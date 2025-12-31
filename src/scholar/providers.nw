@@ -465,9 +465,20 @@ def _wait_for_rate_limit(self) -> None:
 The search method calls the API with rate limiting and handles errors:
 
 <<semantic scholar search method>>=
-@cachedmethod(lambda self: self._cache)
 def search(self, query: str, limit: int = 100) -> list[Paper]:
     """Search Semantic Scholar for papers matching the query."""
+    # Check cache and log hit/miss
+    cache_key = (query, limit)
+    if cache_key in self._cache:
+        logger.info(f"semantic_scholar: Cache hit for query '{query}'")
+    else:
+        logger.info(f"semantic_scholar: Cache miss for query '{query}', fetching from API")
+    
+    return self._search_impl(query, limit)
+
+@cachedmethod(lambda self: self._cache)
+def _search_impl(self, query: str, limit: int = 100) -> list[Paper]:
+    """Internal search implementation (cached)."""
     try:
         logger.debug(f"semantic_scholar: Searching for '{query}' with limit={limit}")
         self._wait_for_rate_limit()
@@ -545,7 +556,10 @@ def get_paper_by_doi(self, doi: str) -> Paper | None:
     # Check cache first
     cache_key = ("doi", doi)
     if cache_key in self._cache:
+        logger.info(f"semantic_scholar: Cache hit for DOI {doi}")
         return self._cache[cache_key]
+    
+    logger.info(f"semantic_scholar: Cache miss for DOI {doi}, fetching from API")
 
     try:
         self._wait_for_rate_limit()
@@ -919,9 +933,20 @@ class OpenAlexProvider:
             time.sleep(self.RATE_LIMIT - elapsed)
         self._last_request_time = time.time()
 
-    @cachedmethod(lambda self: self._cache)
     def search(self, query: str, limit: int = 100) -> list[Paper]:
         """Search OpenAlex for papers matching the query."""
+        # Check cache and log hit/miss
+        cache_key = (query, limit)
+        if cache_key in self._cache:
+            logger.info(f"openalex: Cache hit for query '{query}'")
+        else:
+            logger.info(f"openalex: Cache miss for query '{query}', fetching from API")
+        
+        return self._search_impl(query, limit)
+
+    @cachedmethod(lambda self: self._cache)
+    def _search_impl(self, query: str, limit: int = 100) -> list[Paper]:
+        """Internal search implementation (cached)."""
         try:
             logger.debug(f"openalex: Searching for '{query}' with limit={limit}")
             self._wait_for_rate_limit()
@@ -1009,7 +1034,10 @@ def get_paper_by_doi(self, doi: str) -> Paper | None:
     # Check cache first
     cache_key = ("doi", doi)
     if cache_key in self._cache:
+        logger.info(f"openalex: Cache hit for DOI {doi}")
         return self._cache[cache_key]
+    
+    logger.info(f"openalex: Cache miss for DOI {doi}, fetching from API")
 
     try:
         self._wait_for_rate_limit()
@@ -1286,9 +1314,20 @@ class DBLPProvider:
         """DBLP is always available (no API key needed)."""
         return True
 
-    @cachedmethod(lambda self: self._cache)
     def search(self, query: str, limit: int = 100) -> list[Paper]:
         """Search DBLP for papers matching the query."""
+        # Check cache and log hit/miss
+        cache_key = (query, limit)
+        if cache_key in self._cache:
+            logger.info(f"dblp: Cache hit for query '{query}'")
+        else:
+            logger.info(f"dblp: Cache miss for query '{query}', fetching from API")
+        
+        return self._search_impl(query, limit)
+
+    @cachedmethod(lambda self: self._cache)
+    def _search_impl(self, query: str, limit: int = 100) -> list[Paper]:
+        """Internal search implementation (cached)."""
         try:
             logger.debug(f"dblp: Searching for '{query}' with limit={limit}")
             # DBLP API caps at 1000 results per request
@@ -1631,9 +1670,23 @@ class WebOfScienceProvider:
         """Web of Science requires an API key to be configured."""
         return bool(self.api_key)
 
-    @cachedmethod(lambda self: self._cache)
     def search(self, query: str, limit: int = 100) -> list[Paper]:
         """Search Web of Science for papers matching the query."""
+        if not self.api_key:
+            return []  # No API key configured
+        
+        # Check cache and log hit/miss
+        cache_key = (query, limit)
+        if cache_key in self._cache:
+            logger.info(f"wos: Cache hit for query '{query}'")
+        else:
+            logger.info(f"wos: Cache miss for query '{query}', fetching from API")
+        
+        return self._search_impl(query, limit)
+
+    @cachedmethod(lambda self: self._cache)
+    def _search_impl(self, query: str, limit: int = 100) -> list[Paper]:
+        """Internal search implementation (cached)."""
         if not self.api_key:
             return []  # No API key configured
 
@@ -1955,9 +2008,23 @@ class IEEEXploreProvider:
         """IEEE Xplore requires an API key to be configured."""
         return bool(self.api_key)
 
-    @cachedmethod(lambda self: self._cache)
     def search(self, query: str, limit: int = 100) -> list[Paper]:
         """Search IEEE Xplore for papers matching the query."""
+        if not self.api_key:
+            return []  # No API key configured
+        
+        # Check cache and log hit/miss
+        cache_key = (query, limit)
+        if cache_key in self._cache:
+            logger.info(f"ieee: Cache hit for query '{query}'")
+        else:
+            logger.info(f"ieee: Cache miss for query '{query}', fetching from API")
+        
+        return self._search_impl(query, limit)
+
+    @cachedmethod(lambda self: self._cache)
+    def _search_impl(self, query: str, limit: int = 100) -> list[Paper]:
+        """Internal search implementation (cached)."""
         if not self.api_key:
             return []  # No API key configured
 
