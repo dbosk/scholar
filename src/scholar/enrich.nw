@@ -106,15 +106,18 @@ def enrich_paper(
 
     # Check if enrichment is needed
     if not needs_enrichment(paper, fields):
-        logger.debug(f"Paper '{paper.title[:50]}...' doesn't need enrichment")
+        title_preview = paper.title[:50] + ('...' if len(paper.title) > 50 else '')
+        logger.debug(f"Paper '{title_preview}' doesn't need enrichment")
         return paper
 
     # Need DOI for lookup
     if not paper.doi:
-        logger.debug(f"Paper '{paper.title[:50]}...' has no DOI, cannot enrich")
+        title_preview = paper.title[:50] + ('...' if len(paper.title) > 50 else '')
+        logger.debug(f"Paper '{title_preview}' has no DOI, cannot enrich")
         return paper
 
-    logger.debug(f"Enriching paper '{paper.title[:50]}...' (DOI: {paper.doi})")
+    title_preview = paper.title[:50] + ('...' if len(paper.title) > 50 else '')
+    logger.debug(f"Enriching paper '{title_preview}' (DOI: {paper.doi})")
 
     # Try each enrichment provider in order
     for provider_name in ENRICHMENT_PROVIDERS:
