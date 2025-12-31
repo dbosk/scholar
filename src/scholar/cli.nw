@@ -111,13 +111,60 @@ app = typer.Typer(
 
 
 @app.callback()
-def callback() -> None:
+def callback(
+    verbose: Annotated[
+        int,
+        typer.Option(
+            "--verbose",
+            "-v",
+            count=True,
+            help="Increase verbosity (can be repeated: -v, -vv, -vvv).",
+        ),
+    ] = 0,
+    quiet: Annotated[
+        bool,
+        typer.Option(
+            "--quiet",
+            "-q",
+            help="Suppress all non-error output.",
+        ),
+    ] = False,
+) -> None:
     """
     Scholar: A tool for structured literature searches.
 
     Use 'scholar search' to query bibliographic databases.
     """
-    pass
+    <<configure logging>>
+@
+
+\subsection{Logging Configuration}
+
+The verbosity options control the logging level:
+\begin{itemize}
+\item No options: WARNING level (default)
+\item [[--quiet]] or [[-q]]: ERROR level only
+\item [[-v]]: INFO level
+\item [[-vv]]: DEBUG level
+\item [[-vvv]] or more: DEBUG level with maximum verbosity
+\end{itemize}
+
+The [[--quiet]] flag takes precedence over [[--verbose]].
+
+<<configure logging>>=
+if quiet:
+    log_level = logging.ERROR
+elif verbose == 0:
+    log_level = logging.WARNING
+elif verbose == 1:
+    log_level = logging.INFO
+else:
+    log_level = logging.DEBUG
+
+logging.basicConfig(
+    level=log_level,
+    format="%(levelname)s: %(message)s",
+)
 @
 
 
@@ -322,6 +369,10 @@ if provider is None:
 else:
     provider_names = provider
 
+logger.info(f"Searching with providers: {', '.join(provider_names)}")
+logger.debug(f"Search query: '{query}'")
+logger.debug(f"Limit per provider: {limit}")
+
 # Warn about provider limits
 limits = get_provider_limits()
 for pname in provider_names:
@@ -333,6 +384,8 @@ for pname in provider_names:
 
 s = Search(query)
 results = s.execute(providers=provider, limit=limit)
+
+logger.debug(f"Retrieved {len(results)} result sets")
 
 # Merge results from all providers (deduplicates and consolidates data)
 <<merge search results>>
@@ -1698,6 +1751,52 @@ class TestCLI:
         result = runner.invoke(app, ["cache", "invalid"])
         assert result.exit_code == 1
         assert "Unknown action" in result.stdout
+
+    def test_verbose_option(self, monkeypatch):
+        """Verbose option increases logging level."""
+        from scholar import providers
+        import logging
+
+        mock_provider = Mock()
+        mock_provider.name = "mock"
+        mock_provider.MAX_LIMIT = None
+        mock_provider.search.return_value = []
+        monkeypatch.setattr(providers, "PROVIDERS", {"mock": mock_provider})
+
+        # Test -v option
+        result = runner.invoke(app, ["-v", "search", "test"])
+        assert result.exit_code == 0
+
+        # Test -vv option
+        result = runner.invoke(app, ["-vv", "search", "test"])
+        assert result.exit_code == 0
+
+    def test_quiet_option(self, monkeypatch):
+        """Quiet option suppresses non-error output."""
+        from scholar import providers
+
+        mock_provider = Mock()
+        mock_provider.name = "mock"
+        mock_provider.MAX_LIMIT = None
+        mock_provider.search.return_value = []
+        monkeypatch.setattr(providers, "PROVIDERS", {"mock": mock_provider})
+
+        result = runner.invoke(app, ["-q", "search", "test"])
+        assert result.exit_code == 0
+
+    def test_verbose_and_quiet_together(self, monkeypatch):
+        """Quiet takes precedence over verbose."""
+        from scholar import providers
+
+        mock_provider = Mock()
+        mock_provider.name = "mock"
+        mock_provider.MAX_LIMIT = None
+        mock_provider.search.return_value = []
+        monkeypatch.setattr(providers, "PROVIDERS", {"mock": mock_provider})
+
+        # Quiet should take precedence
+        result = runner.invoke(app, ["-q", "-v", "search", "test"])
+        assert result.exit_code == 0
 @
 
 
