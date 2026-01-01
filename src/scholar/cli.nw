@@ -635,8 +635,8 @@ provider_info = {
     },
     "wos": {
         "required": True,
-        "env_var": "WOS_API_KEY",
-        "how_to_get": "developer.clarivate.com",
+        "env_var": "WOS_EXPANDED_API_KEY or WOS_STARTER_API_KEY",
+        "how_to_get": "developer.clarivate.com (Expanded API preferred)",
     },
     "ieee": {
         "required": True,
