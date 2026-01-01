@@ -363,7 +363,7 @@ API using the DOI.
 S2_PAPER_API = "https://api.semanticscholar.org/graph/v1/paper/DOI:{doi}"
 
 
-def resolve_doi_semantic_scholar(
+def resolve_doi_s2(
     doi: str,
     progress_callback: Callable[[str], None] | None = None,
 ) -> str | None:
@@ -434,7 +434,7 @@ def resolve_doi_to_pdf(
         return url
     
     # Try Semantic Scholar
-    url = resolve_doi_semantic_scholar(doi, progress_callback)
+    url = resolve_doi_s2(doi, progress_callback)
     if url:
         if progress_callback:
             progress_callback(f"Found PDF via Semantic Scholar")
@@ -497,7 +497,7 @@ class TestDOIResolution:
         
         assert url == "https://example.com/paper.pdf"
 
-    def test_resolve_doi_semantic_scholar(self, monkeypatch):
+    def test_resolve_doi_s2(self, monkeypatch):
         """Semantic Scholar resolution finds PDF URL."""
         mock_response = Mock()
         mock_response.status_code = 200
@@ -506,7 +506,7 @@ class TestDOIResolution:
         }
         
         with patch("scholar.pdf.requests.get", return_value=mock_response):
-            url = resolve_doi_semantic_scholar("10.1234/test")
+            url = resolve_doi_s2("10.1234/test")
         
         assert url == "https://arxiv.org/pdf/2301.00001.pdf"
 

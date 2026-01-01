@@ -48,6 +48,7 @@ session persistence, and report generation.
 <<review constants>>
 <<review data structures>>
 <<review session functions>>
+<<review filtering functions>>
 <<review report generation>>
 @
 
@@ -66,7 +67,7 @@ from pathlib import Path
 from unittest.mock import Mock
 
 from scholar.review import *
-from scholar.scholar import Paper
+from scholar.scholar import Paper, SearchFilters
 
 
 <<test functions>>
@@ -83,7 +84,7 @@ from pathlib import Path
 from typing import Any
 import json
 
-from scholar.scholar import Paper
+from scholar.scholar import Paper, SearchFilters
 from scholar.notes import (
     get_paper_id, get_query_hash, get_data_dir,
     load_search_decisions, save_search_decisions as notes_save_decisions,
@@ -868,6 +869,118 @@ class TestSessionFunctions:
         
         sessions = list_sessions()
         assert len(sessions) == 2
+@
+
+
+\section{Filtering Decisions}
+
+For convenience, we provide a function to filter a list of review decisions
+using a [[SearchFilters]] object. This mirrors the [[filter_papers]] function
+in the scholar module, but works directly with [[ReviewDecision]] objects.
+
+This is useful when the TUI or other code needs to filter decisions locally
+without re-querying the providers. The filtering is applied to each decision's
+paper, not the decision metadata itself.
+
+<<review filtering functions>>=
+def filter_decisions(
+    decisions: list[ReviewDecision],
+    filters: SearchFilters
+) -> list[ReviewDecision]:
+    """
+    Filter a list of review decisions using the given filters.
+    
+    This function applies filters locally to an existing collection of
+    decisions, without making any API calls. The filtering is based on
+    each decision's paper attributes (year, venue, etc.).
+    
+    Args:
+        decisions: List of ReviewDecision objects to filter.
+        filters: SearchFilters specifying the filtering criteria.
+        
+    Returns:
+        List of decisions whose papers match all active filters.
+        
+    Example:
+        >>> from scholar.review import ReviewDecision, filter_decisions
+        >>> from scholar import Paper, SearchFilters
+        >>> decisions = [
+        ...     ReviewDecision(paper=Paper(title="New", year=2020), provider="test"),
+        ...     ReviewDecision(paper=Paper(title="Old", year=2015), provider="test"),
+        ... ]
+        >>> filters = SearchFilters(year="2018-")
+        >>> filter_decisions(decisions, filters)
+        [ReviewDecision(paper=Paper(title="New", year=2020), ...)]
+    """
+    if filters.is_empty():
+        return decisions
+    return [d for d in decisions if filters.matches(d.paper)]
+@
+
+\subsection{Testing filter\_decisions}
+
+Let's verify the filtering function works correctly with decisions:
+
+<<test functions>>=
+class TestFilterDecisions:
+    """Tests for the filter_decisions function."""
+
+    @pytest.fixture
+    def sample_decisions(self):
+        """Create sample decisions for testing."""
+        return [
+            ReviewDecision(
+                paper=Paper(
+                    title="Recent ML", authors=["Author A"], year=2023, venue="NeurIPS"
+                ),
+                provider="test",
+            ),
+            ReviewDecision(
+                paper=Paper(
+                    title="Older Work", authors=["Author B"], year=2018, venue="ICML"
+                ),
+                provider="test",
+            ),
+            ReviewDecision(
+                paper=Paper(
+                    title="Very Old", authors=["Author C"], year=2010, venue="Nature"
+                ),
+                provider="test",
+            ),
+        ]
+
+    def test_filter_by_year(self, sample_decisions):
+        """Can filter decisions by year range."""
+        filters = SearchFilters(year="2015-")
+        result = filter_decisions(sample_decisions, filters)
+        assert len(result) == 2
+        assert all(d.paper.year >= 2015 for d in result)
+
+    def test_filter_by_venue(self, sample_decisions):
+        """Can filter decisions by venue."""
+        filters = SearchFilters(venue="NeurIPS")
+        result = filter_decisions(sample_decisions, filters)
+        assert len(result) == 1
+        assert result[0].paper.title == "Recent ML"
+
+    def test_empty_filter_returns_all(self, sample_decisions):
+        """Empty filters return all decisions."""
+        filters = SearchFilters()
+        result = filter_decisions(sample_decisions, filters)
+        assert len(result) == 3
+
+    def test_combined_filters(self, sample_decisions):
+        """Can combine multiple filters."""
+        filters = SearchFilters(year="2015-", venue="ICML")
+        result = filter_decisions(sample_decisions, filters)
+        assert len(result) == 1
+        assert result[0].paper.title == "Older Work"
+
+    def test_no_matches_returns_empty(self, sample_decisions):
+        """Returns empty list when no decisions match."""
+        filters = SearchFilters(year="2025-")
+        result = filter_decisions(sample_decisions, filters)
+        assert result == []
 @
 
 

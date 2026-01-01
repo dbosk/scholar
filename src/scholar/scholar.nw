@@ -58,14 +58,16 @@ The package initialization exports the public interface:
 Scholar package for structured literature searches.
 """
 
-from .scholar import Search, SearchResult, Paper
-from .scholar import search
+from .scholar import Search, SearchResult, Paper, SearchFilters
+from .scholar import search, filter_papers
 
 __all__ = [
     "Search",
     "SearchResult",
     "Paper",
+    "SearchFilters",
     "search",
+    "filter_papers",
 ]
 @
 
@@ -250,7 +252,7 @@ class TestPaperMergeWith:
         p1 = Paper(title="Test", authors=["A"], doi="10.1/test", source="dblp")
         p2 = Paper(
             title="Test", authors=["A"], doi="10.1/test",
-            abstract="This is the abstract", source="semantic_scholar"
+            abstract="This is the abstract", source="s2"
         )
         merged = p1.merge_with(p2)
         assert merged.abstract == "This is the abstract"
@@ -271,10 +273,10 @@ class TestPaperMergeWith:
     def test_merge_combines_sources(self):
         """Merging combines sources from both papers."""
         p1 = Paper(title="Test", authors=["A"], source="dblp")
-        p2 = Paper(title="test", authors=["B"], source="semantic_scholar")
+        p2 = Paper(title="test", authors=["B"], source="s2")
         merged = p1.merge_with(p2)
         assert "dblp" in merged.source
-        assert "semantic_scholar" in merged.source
+        assert "s2" in merged.source
 
     def test_merge_raises_for_unequal_papers(self):
         """Cannot merge papers that aren't equal."""
@@ -300,6 +302,404 @@ class TestPaperMergeWith:
         assert merged.venue == "Venue"  # From p2
         assert merged.url == "http://example.com"  # From p2
         assert merged.pdf_url == "http://example.com/pdf"  # From p2
+@
+
+
+\subsection{Search filters}
+\label{sec:search-filters}
+
+Structured literature reviews often require filtering by publication year,
+open access availability, venue, citation count, or publication type.
+Different providers support different filters natively, so we define a common
+filter specification that each provider interprets according to its capabilities.
+
+The [[SearchFilters]] dataclass captures these common filtering criteria.
+Providers that don't support a particular filter either ignore it (with a
+warning) or embed it in the query string where possible.
+
+<<classes>>=
+@dataclass
+class SearchFilters:
+    """
+    Common filtering criteria for academic paper searches.
+
+    Fields:
+        year: Publication year or range (e.g., "2020", "2020-2024", "2020-", "-2024")
+        open_access: If True, only return open access papers
+        venue: Filter by venue/journal name (substring match)
+        min_citations: Minimum citation count
+        pub_types: List of publication types to include
+            (article, conference, review, book, preprint, dataset)
+    """
+
+    year: str | None = None
+    open_access: bool = False
+    venue: str | None = None
+    min_citations: int | None = None
+    pub_types: list[str] | None = None
+
+    <<search filters methods>>
+@
+
+\subsubsection{Parsing year ranges}
+
+The [[year]] field accepts several formats for flexibility:
+\begin{description}
+\item[Single year] [[2020]] matches papers from 2020 only.
+\item[Range] [[2020-2024]] matches papers from 2020 through 2024.
+\item[Open start] [[-2024]] matches papers up to and including 2024.
+\item[Open end] [[2020-]] matches papers from 2020 onwards.
+\end{description}
+
+The [[year_range]] method parses these formats and returns a tuple of
+[[(start_year, end_year)]], where [[None]] indicates an open boundary:
+
+<<search filters methods>>=
+def year_range(self) -> tuple[int | None, int | None]:
+    """
+    Parse the year field into a (start, end) tuple.
+
+    Returns:
+        Tuple of (start_year, end_year) where None indicates open boundary.
+        Returns (None, None) if no year filter is set.
+
+    Raises:
+        ValueError: If year format is invalid.
+    """
+    if not self.year:
+        return (None, None)
+
+    year_str = self.year.strip()
+
+    # Single year: "2020"
+    if year_str.isdigit():
+        year = int(year_str)
+        return (year, year)
+
+    # Range with dash
+    if "-" in year_str:
+        parts = year_str.split("-", 1)
+
+        # Open start: "-2024"
+        if parts[0] == "":
+            return (None, int(parts[1]))
+
+        # Open end: "2020-"
+        if parts[1] == "":
+            return (int(parts[0]), None)
+
+        # Full range: "2020-2024"
+        return (int(parts[0]), int(parts[1]))
+
+    raise ValueError(f"Invalid year format: {year_str}")
+@
+
+\subsubsection{Serialization for display and caching}
+
+For display in search results and for cache key generation, we need to
+serialize the filters to a dictionary and generate a stable cache key:
+
+<<search filters methods>>=
+def as_dict(self) -> dict:
+    """
+    Convert filters to a dictionary for display or storage.
+
+    Only includes non-default (active) filters.
+    """
+    result = {}
+    if self.year:
+        result["year"] = self.year
+    if self.open_access:
+        result["open_access"] = True
+    if self.venue:
+        result["venue"] = self.venue
+    if self.min_citations is not None:
+        result["min_citations"] = self.min_citations
+    if self.pub_types:
+        result["pub_types"] = self.pub_types
+    return result
+
+def cache_key(self) -> str:
+    """
+    Generate a stable string key for caching filtered searches.
+
+    Returns an empty string if no filters are active, so unfiltered
+    searches maintain backward compatibility with existing cache entries.
+    """
+    parts = []
+    if self.year:
+        parts.append(f"y:{self.year}")
+    if self.open_access:
+        parts.append("oa:1")
+    if self.venue:
+        parts.append(f"v:{self.venue}")
+    if self.min_citations is not None:
+        parts.append(f"c:{self.min_citations}")
+    if self.pub_types:
+        parts.append(f"t:{','.join(sorted(self.pub_types))}")
+    return "|".join(parts)
+
+def is_empty(self) -> bool:
+    """Return True if no filters are active."""
+    return not any([
+        self.year,
+        self.open_access,
+        self.venue,
+        self.min_citations is not None,
+        self.pub_types,
+    ])
+
+def matches(self, paper: Paper) -> bool:
+    """
+    Check if a paper matches all active filters.
+    
+    Args:
+        paper: The Paper object to check.
+        
+    Returns:
+        True if the paper matches all active filters, False otherwise.
+        Returns True if no filters are active.
+    """
+    if self.is_empty():
+        return True
+    
+    # Year filter
+    if self.year:
+        try:
+            start, end = self.year_range()
+            if paper.year is None:
+                return False
+            if start is not None and paper.year < start:
+                return False
+            if end is not None and paper.year > end:
+                return False
+        except ValueError:
+            pass  # Invalid year format, skip filter
+    
+    # Venue filter (case-insensitive substring match)
+    if self.venue:
+        if not paper.venue:
+            return False
+        if self.venue.lower() not in paper.venue.lower():
+            return False
+    
+    # Citation count filter
+    if self.min_citations is not None:
+        paper_citations = getattr(paper, 'citation_count', None)
+        if paper_citations is None or paper_citations < self.min_citations:
+            return False
+    
+    # Open access filter
+    if self.open_access:
+        paper_oa = getattr(paper, 'open_access', False)
+        if not paper_oa:
+            return False
+    
+    # Publication type filter
+    if self.pub_types:
+        paper_type = getattr(paper, 'publication_type', None)
+        if paper_type is None or paper_type not in self.pub_types:
+            return False
+    
+    return True
+@
+
+\subsubsection{Filtering paper collections}
+
+For convenience, we provide a module-level function to filter a list of papers
+using a [[SearchFilters]] object. This is useful for post-hoc filtering of
+search results without re-querying the providers.
+
+<<functions>>=
+def filter_papers(papers: list[Paper], filters: SearchFilters) -> list[Paper]:
+    """
+    Filter a list of papers using the given filters.
+    
+    This function applies filters locally to an existing collection of papers,
+    without making any API calls. Useful for narrowing down results from
+    multiple merged searches.
+    
+    Args:
+        papers: List of Paper objects to filter.
+        filters: SearchFilters specifying the filtering criteria.
+        
+    Returns:
+        List of papers matching all active filters.
+        
+    Example:
+        >>> from scholar import Paper, SearchFilters, filter_papers
+        >>> papers = [Paper(title="ML Paper", year=2020), 
+        ...           Paper(title="Old Paper", year=2015)]
+        >>> filters = SearchFilters(year="2018-")
+        >>> filter_papers(papers, filters)
+        [Paper(title="ML Paper", year=2020)]
+    """
+    if filters.is_empty():
+        return papers
+    return [p for p in papers if filters.matches(p)]
+@
+
+\subsubsection{Testing SearchFilters}
+
+Let's verify that year parsing and serialization work correctly:
+
+<<test functions>>=
+class TestSearchFilters:
+    """Tests for the SearchFilters class."""
+
+    def test_year_range_single_year(self):
+        """Single year returns same start and end."""
+        f = SearchFilters(year="2020")
+        assert f.year_range() == (2020, 2020)
+
+    def test_year_range_full_range(self):
+        """Full range returns both bounds."""
+        f = SearchFilters(year="2020-2024")
+        assert f.year_range() == (2020, 2024)
+
+    def test_year_range_open_start(self):
+        """Open start range returns None for start."""
+        f = SearchFilters(year="-2024")
+        assert f.year_range() == (None, 2024)
+
+    def test_year_range_open_end(self):
+        """Open end range returns None for end."""
+        f = SearchFilters(year="2020-")
+        assert f.year_range() == (2020, None)
+
+    def test_year_range_no_year(self):
+        """No year filter returns (None, None)."""
+        f = SearchFilters()
+        assert f.year_range() == (None, None)
+
+    def test_year_range_invalid_format(self):
+        """Invalid year format raises ValueError."""
+        f = SearchFilters(year="invalid")
+        with pytest.raises(ValueError, match="Invalid year format"):
+            f.year_range()
+
+    def test_as_dict_empty(self):
+        """Empty filters produce empty dict."""
+        f = SearchFilters()
+        assert f.as_dict() == {}
+
+    def test_as_dict_with_values(self):
+        """Active filters appear in dict."""
+        f = SearchFilters(
+            year="2020-2024",
+            open_access=True,
+            venue="Nature",
+            min_citations=10,
+            pub_types=["article", "conference"],
+        )
+        d = f.as_dict()
+        assert d["year"] == "2020-2024"
+        assert d["open_access"] is True
+        assert d["venue"] == "Nature"
+        assert d["min_citations"] == 10
+        assert d["pub_types"] == ["article", "conference"]
+
+    def test_cache_key_empty(self):
+        """Empty filters produce empty cache key."""
+        f = SearchFilters()
+        assert f.cache_key() == ""
+
+    def test_cache_key_with_values(self):
+        """Active filters produce stable cache key."""
+        f = SearchFilters(year="2020", open_access=True, min_citations=5)
+        key = f.cache_key()
+        assert "y:2020" in key
+        assert "oa:1" in key
+        assert "c:5" in key
+
+    def test_cache_key_stable_ordering(self):
+        """Cache key is stable regardless of pub_types order."""
+        f1 = SearchFilters(pub_types=["article", "conference"])
+        f2 = SearchFilters(pub_types=["conference", "article"])
+        assert f1.cache_key() == f2.cache_key()
+
+    def test_is_empty_true(self):
+        """is_empty returns True for default filters."""
+        f = SearchFilters()
+        assert f.is_empty() is True
+
+    def test_is_empty_false(self):
+        """is_empty returns False when any filter is set."""
+        assert SearchFilters(year="2020").is_empty() is False
+        assert SearchFilters(open_access=True).is_empty() is False
+        assert SearchFilters(venue="Nature").is_empty() is False
+        assert SearchFilters(min_citations=0).is_empty() is False
+        assert SearchFilters(pub_types=["article"]).is_empty() is False
+
+    def test_matches_empty_filters(self):
+        """Empty filters match any paper."""
+        f = SearchFilters()
+        paper = Paper(title="Test", authors=[], year=2020)
+        assert f.matches(paper) is True
+
+    def test_matches_year_in_range(self):
+        """Paper within year range matches."""
+        f = SearchFilters(year="2018-2022")
+        assert f.matches(Paper(title="Test", authors=[], year=2020)) is True
+        assert f.matches(Paper(title="Test", authors=[], year=2018)) is True
+        assert f.matches(Paper(title="Test", authors=[], year=2022)) is True
+
+    def test_matches_year_out_of_range(self):
+        """Paper outside year range doesn't match."""
+        f = SearchFilters(year="2018-2022")
+        assert f.matches(Paper(title="Test", authors=[], year=2017)) is False
+        assert f.matches(Paper(title="Test", authors=[], year=2023)) is False
+
+    def test_matches_year_none(self):
+        """Paper without year doesn't match year filter."""
+        f = SearchFilters(year="2020")
+        assert f.matches(Paper(title="Test", authors=[], year=None)) is False
+
+    def test_matches_venue(self):
+        """Venue filter uses case-insensitive substring match."""
+        f = SearchFilters(venue="Nature")
+        assert f.matches(Paper(title="Test", authors=[], venue="Nature Communications")) is True
+        assert f.matches(Paper(title="Test", authors=[], venue="nature")) is True
+        assert f.matches(Paper(title="Test", authors=[], venue="Science")) is False
+        assert f.matches(Paper(title="Test", authors=[], venue=None)) is False
+
+    def test_matches_multiple_filters(self):
+        """All active filters must match."""
+        f = SearchFilters(year="2020-", venue="Nature")
+        assert f.matches(Paper(title="Test", authors=[], year=2021, venue="Nature")) is True
+        assert f.matches(Paper(title="Test", authors=[], year=2019, venue="Nature")) is False
+        assert f.matches(Paper(title="Test", authors=[], year=2021, venue="Science")) is False
+
+
+class TestFilterPapers:
+    """Tests for the filter_papers function."""
+
+    def test_filter_papers_empty_filters(self):
+        """Empty filters return all papers."""
+        papers = [Paper(title="A", authors=[], year=2020), Paper(title="B", authors=[], year=2015)]
+        result = filter_papers(papers, SearchFilters())
+        assert result == papers
+
+    def test_filter_papers_by_year(self):
+        """Filters papers by year range."""
+        papers = [
+            Paper(title="A", authors=[], year=2020),
+            Paper(title="B", authors=[], year=2015),
+            Paper(title="C", authors=[], year=2022),
+        ]
+        result = filter_papers(papers, SearchFilters(year="2018-"))
+        assert len(result) == 2
+        assert all(p.year >= 2018 for p in result)
+
+    def test_filter_papers_preserves_order(self):
+        """Filtered list preserves original order."""
+        papers = [
+            Paper(title="A", authors=[], year=2020),
+            Paper(title="B", authors=[], year=2021),
+            Paper(title="C", authors=[], year=2022),
+        ]
+        result = filter_papers(papers, SearchFilters(year="2020-"))
+        assert [p.title for p in result] == ["A", "B", "C"]
 @
 
 
@@ -405,7 +805,7 @@ class TestSearchResult:
         # Semantic Scholar paper with abstract
         p2 = Paper(
             title="Paper A", authors=["Author"], doi="10.1/a",
-            abstract="This is the abstract", source="semantic_scholar"
+            abstract="This is the abstract", source="s2"
         )
 
         r1 = SearchResult(
@@ -413,7 +813,7 @@ class TestSearchResult:
             timestamp="2024-01-01", papers=[p1]
         )
         r2 = SearchResult(
-            query="test", provider="semantic_scholar",
+            query="test", provider="s2",
             timestamp="2024-01-01", papers=[p2]
         )
 
@@ -423,7 +823,7 @@ class TestSearchResult:
         assert merged.papers[0].abstract == "This is the abstract"
         # And combined sources
         assert "dblp" in merged.papers[0].source
-        assert "semantic_scholar" in merged.papers[0].source
+        assert "s2" in merged.papers[0].source
 @
 
 
@@ -500,6 +900,7 @@ def execute(
     self,
     providers: list[str] | None = None,
     limit: int = 100,
+    filters: SearchFilters | None = None,
 ) -> list[SearchResult]:
     """
     Execute the search across specified providers.
@@ -508,6 +909,7 @@ def execute(
         providers: List of provider names to search. If None, uses the
             default providers (openalex, dblp).
         limit: Maximum number of results per provider.
+        filters: Optional SearchFilters to apply to the search.
 
     Returns:
         List of SearchResult objects, one per provider.
@@ -532,13 +934,14 @@ def execute(
     # Query each provider
     for provider in provider_list:
         logger.debug(f"Querying {provider.name} with limit={limit}")
-        papers = provider.search(self.query, limit=limit)
+        papers = provider.search(self.query, limit=limit, filters=filters)
         logger.info(f"{provider.name}: Retrieved {len(papers)} papers")
         result = SearchResult(
             query=self.query,
             provider=provider.name,
             timestamp=timestamp,
             papers=papers,
+            filters=filters.as_dict() if filters else None,
         )
         self.results.append(result)
 

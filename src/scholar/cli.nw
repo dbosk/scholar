@@ -279,8 +279,8 @@ def search(
 
     Examples:
         scholar search "machine learning privacy"
-        scholar search "federated learning" -p semantic_scholar -f json
-        scholar search "neural networks" -p openalex -p dblp -p semantic_scholar
+        scholar search "federated learning" -p s2 -f json
+        scholar search "neural networks" -p openalex -p dblp -p s2
     """
     <<execute search and display results>>
 @
@@ -422,8 +422,9 @@ limit: Annotated[
     typer.Option(
         "--limit", "-l",
         help="Maximum results per provider (default: 100). "
-             "Provider limits: DBLP=1000, WoS=50, IEEE=200. "
-             "Semantic Scholar and OpenAlex have no documented limit.",
+             "Large limits fetch multiple pages automatically, which "
+             "increases response time and API usage. "
+             "Consider API rate limits and quotas for large requests.",
     ),
 ] = 100,
 enrich: Annotated[
@@ -440,17 +441,76 @@ report: Annotated[
         "--report", "-R",
         help="Prompt to save reports (LaTeX, BibTeX, CSV) after review.",
     ),
-] = False
+] = False,
+<<search filter options>>
+@
+
+\subsection{Filter options}
+
+We provide CLI options for common search filters.
+Each filter is documented with its provider support limitations:
+
+<<search filter options>>=
+year: Annotated[
+    Optional[str],
+    typer.Option(
+        "--year", "-y",
+        help="Publication year or range (e.g., 2020, 2020-2024, 2020-, -2024). "
+             "Supported: all providers.",
+    ),
+] = None,
+open_access: Annotated[
+    bool,
+    typer.Option(
+        "--open-access", "-oa",
+        help="Only return open access papers. "
+             "Supported: Semantic Scholar, OpenAlex, IEEE. "
+             "Ignored: DBLP, WoS.",
+    ),
+] = False,
+venue: Annotated[
+    Optional[str],
+    typer.Option(
+        "--venue", "-v",
+        help="Filter by venue/journal name. "
+             "Supported: Semantic Scholar, OpenAlex, DBLP (query), WoS (query). "
+             "Ignored: IEEE.",
+    ),
+] = None,
+min_citations: Annotated[
+    Optional[int],
+    typer.Option(
+        "--min-citations", "-c",
+        help="Minimum citation count. "
+             "Supported: Semantic Scholar, OpenAlex. "
+             "Ignored: DBLP, WoS, IEEE.",
+    ),
+] = None,
+pub_type: Annotated[
+    Optional[list[str]],
+    typer.Option(
+        "--type", "-t",
+        help="Publication type(s): article, conference, review, book, preprint, dataset. "
+             "Repeatable. Supported: all providers (with varying type mappings).",
+    ),
+] = None
 @
 
 \subsection{Executing the search}
 
 We import the [[Search]] class from the core module and execute the query.
-The results are then passed to the appropriate formatter:
+The results are then passed to the appropriate formatter.
+
+Since providers now automatically paginate to fetch results beyond their per-request
+limits, users can request any number of results.
+However, large limits have trade-offs: each page requires an additional API call,
+which increases response time and consumes API quotas.
+We warn users when requesting more than 500 results to make them aware of these
+considerations:
 
 <<execute search and display results>>=
-from scholar import Search
-from scholar.providers import get_provider_limits, get_default_providers
+from scholar import Search, SearchFilters
+from scholar.providers import get_default_providers
 import sys
 
 # Determine which providers will be used
@@ -472,8 +532,27 @@ for pname in provider_names:
             f"{pname} caps results at {max_limit} (requested {limit})"
         )
 
+# Warn about large limits that may consume API quotas or trigger rate limits
+if limit > 500:
+    logger.warning(
+        f"Large limit ({limit}) requested. "
+        "This requires multiple API calls per provider, "
+        "which may be slow and consume API quotas."
+    )
+
+# Build search filters from CLI options
+filters = None
+if any([year, open_access, venue, min_citations is not None, pub_type]):
+    filters = SearchFilters(
+        year=year,
+        open_access=open_access,
+        venue=venue,
+        min_citations=min_citations,
+        pub_types=pub_type,
+    )
+
 s = Search(query)
-results = s.execute(providers=provider, limit=limit)
+results = s.execute(providers=provider, limit=limit, filters=filters)
 
 logger.debug(f"Retrieved {len(results)} result sets")
 
@@ -487,7 +566,13 @@ logger.debug(f"Retrieved {len(results)} result sets")
 if review:
     from scholar.tui import run_review
     session_name = name if name else query
-    run_review(merged_results, query, session_name, prompt_report=report)
+    run_review(
+        merged_results, 
+        query, 
+        session_name, 
+        prompt_report=report,
+        search_filters=filters,
+    )
     return
 
 # Auto-detect format based on TTY
@@ -724,7 +809,7 @@ it is user-facing documentation, not implementation details:
 
 <<add provider rows to table>>=
 provider_info = {
-    "semantic_scholar": {
+    "s2": {
         "required": False,
         "env_var": "S2_API_KEY",
         "how_to_get": "api.semanticscholar.org (optional, higher rate limits)",
@@ -741,8 +826,8 @@ provider_info = {
     },
     "wos": {
         "required": True,
-        "env_var": "WOS_API_KEY",
-        "how_to_get": "developer.clarivate.com",
+        "env_var": "WOS_EXPANDED_API_KEY or WOS_STARTER_API_KEY",
+        "how_to_get": "developer.clarivate.com (Expanded API preferred)",
     },
     "ieee": {
         "required": True,
@@ -1574,6 +1659,38 @@ humans, while [[scholar search "query" | wc -l]] counts lines correctly.
 
 We implement a formatter for each and dispatch based on the user's choice.
 
+\subsection{Testing Formatters}
+
+Before implementing formatters, let's establish the testing framework.
+All formatter tests share a common fixture providing sample search results:
+
+<<test functions>>=
+class TestFormatters:
+    """Tests for output formatters."""
+
+    @pytest.fixture
+    def sample_results(self):
+        """Create sample search results for testing."""
+        papers = [
+            Paper(
+                title="Test Paper",
+                authors=["Alice", "Bob"],
+                year=2024,
+                doi="10.1234/test",
+            ),
+        ]
+        return [
+            SearchResult(
+                query="test",
+                provider="test_provider",
+                timestamp="2024-01-01T00:00:00",
+                papers=papers,
+            )
+        ]
+@
+
+Individual formatter tests appear after each formatter's implementation below.
+
 \subsection{The display function}
 
 This function selects the appropriate formatter and invokes it:
@@ -1647,6 +1764,17 @@ class TableFormatter:
                 self.console.print("[dim]No results found.[/dim]")
 @
 
+Let's verify the table formatter produces correct output:
+
+<<test functions>>=
+    def test_table_formatter(self, sample_results, capsys):
+        """TableFormatter produces output."""
+        formatter = TableFormatter()
+        formatter.format(sample_results)
+        captured = capsys.readouterr()
+        assert "Test Paper" in captured.out
+@
+
 
 \subsection{CSV formatter}
 
@@ -1681,6 +1809,24 @@ class CSVFormatter:
             print()
 @
 
+Let's verify the CSV formatter produces correct tab-separated output with the
+expected header and metadata comments:
+
+<<test functions>>=
+    def test_csv_formatter(self, sample_results, capsys):
+        """CSVFormatter produces tab-separated output with header."""
+        formatter = CSVFormatter()
+        formatter.format(sample_results)
+        captured = capsys.readouterr()
+        # Check metadata comments
+        assert "# Query: test" in captured.out
+        assert "# Provider: test_provider" in captured.out
+        # Check header row
+        assert "title\tauthors\tyear\tdoi\tvenue\turl" in captured.out
+        # Check data row
+        assert "Test Paper\tAlice; Bob\t2024\t10.1234/test" in captured.out
+@
+
 
 \subsection{JSON formatter}
 
@@ -1712,6 +1858,21 @@ class JSONFormatter:
                 ],
             })
         print(json.dumps(output, indent=2))
+@
+
+Let's verify the JSON formatter produces valid, parseable JSON with the correct
+structure:
+
+<<test functions>>=
+    def test_json_formatter(self, sample_results, capsys):
+        """JSONFormatter produces valid JSON."""
+        formatter = JSONFormatter()
+        formatter.format(sample_results)
+        captured = capsys.readouterr()
+        import json
+        data = json.loads(captured.out)
+        assert data[0]["query"] == "test"
+        assert data[0]["papers"][0]["title"] == "Test Paper"
 @
 
 
@@ -1751,51 +1912,10 @@ class BibTeXFormatter:
         print()
 @
 
-\subsection{Testing formatters}
-
-We test each formatter with sample data:
+Let's verify the BibTeX formatter produces valid entries with the correct
+structure:
 
 <<test functions>>=
-class TestFormatters:
-    """Tests for output formatters."""
-
-    @pytest.fixture
-    def sample_results(self):
-        """Create sample search results for testing."""
-        papers = [
-            Paper(
-                title="Test Paper",
-                authors=["Alice", "Bob"],
-                year=2024,
-                doi="10.1234/test",
-            ),
-        ]
-        return [
-            SearchResult(
-                query="test",
-                provider="test_provider",
-                timestamp="2024-01-01T00:00:00",
-                papers=papers,
-            )
-        ]
-
-    def test_table_formatter(self, sample_results, capsys):
-        """TableFormatter produces output."""
-        formatter = TableFormatter()
-        formatter.format(sample_results)
-        captured = capsys.readouterr()
-        assert "Test Paper" in captured.out
-
-    def test_json_formatter(self, sample_results, capsys):
-        """JSONFormatter produces valid JSON."""
-        formatter = JSONFormatter()
-        formatter.format(sample_results)
-        captured = capsys.readouterr()
-        import json
-        data = json.loads(captured.out)
-        assert data[0]["query"] == "test"
-        assert data[0]["papers"][0]["title"] == "Test Paper"
-
     def test_bibtex_formatter(self, sample_results, capsys):
         """BibTeXFormatter produces BibTeX entries."""
         formatter = BibTeXFormatter()
@@ -1875,6 +1995,7 @@ class TestCLI:
         result = runner.invoke(app, ["--help"])
         assert result.exit_code == 0
         assert "search" in result.stdout
+
 @
 
 

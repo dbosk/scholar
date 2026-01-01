@@ -88,6 +88,7 @@ from simple widgets to complex screens, culminating in the main application:
 <<tui discard modal>>
 <<tui sort modal>>
 <<tui filter modal>>
+<<tui search filters modal>>
 <<tui main app>>
 <<tui report generation>>
 <<tui entry point>>
@@ -116,6 +117,16 @@ from scholar.tui import *
 <<test functions>>
 @
 
+TUI tests require a running Textual application, which makes them more
+integration-like than unit tests. The TUI module is primarily tested
+through manual interaction and the existing review module tests.
+
+<<test functions>>=
+# TUI tests are primarily integration tests that require
+# a running Textual application. The core review logic is
+# tested in the review module tests.
+@
+
 
 \section{Data Structures}
 
@@ -142,14 +153,14 @@ from textual import work
 from rich.text import Text
 from rich.console import Console
 
-from scholar.scholar import Paper, SearchResult
+from scholar.scholar import Paper, SearchResult, SearchFilters
 from scholar.notes import (
     get_note, has_note, edit_note_in_editor,
 )
 from scholar.review import (
     DecisionStatus, ReviewDecision, ReviewSession,
     create_review_session, save_search_decisions, save_session,
-    escape_latex,
+    escape_latex, filter_decisions,
     generate_csv_report, generate_latex_report,
 )
 from scholar.pdf import (
@@ -981,6 +992,304 @@ class FilterModal(ModalScreen[str | None]):
         self.dismiss("pending")
 @
 
+\section{Search Filters Modal}
+\label{SearchFiltersModal}
+
+\subsection{Motivation: Why Filter in the TUI?}
+
+The CLI already supports search filters (year, open access, venue, etc.), so why
+add them to the TUI as well? Consider a typical literature review workflow:
+
+\begin{enumerate}
+\item Researcher runs [[scholar search "machine learning" --review]]
+\item Reviews 50 papers, keeps 10, discards 20, leaves 20 pending
+\item Realizes they only want papers from 2020 onwards
+\item Without TUI filtering, must quit, re-run search with [[--year 2020-]], 
+  lose progress
+\end{enumerate}
+
+By adding filter controls to the TUI, researchers can narrow down their view
+without losing review progress. The TUI preserves all decisions; filtering
+simply hides papers that don't match the criteria. Clearing the filters
+reveals all papers again with their decisions intact.
+
+\subsection{Design Decision: Local Filtering}
+
+The TUI filters work entirely locally on the already-fetched results. When you
+apply filters:
+
+\begin{enumerate}
+\item No new API calls are made to providers
+\item Papers not matching the filter are hidden from view (not deleted)
+\item All review decisions are preserved
+\item Clearing filters restores the full list
+\end{enumerate}
+
+This approach has several advantages:
+\begin{description}
+\item[Speed] Filtering is instant since no network requests are needed.
+\item[Preserves work] Review decisions are never lost when adjusting filters.
+\item[Works offline] Once results are loaded, filtering works without network.
+\item[Supports merged sessions] Users can merge multiple searches into one 
+  session, then filter within the combined results.
+\end{description}
+
+The limitation is that filtering only works on fields present in the fetched
+results. For example, if a provider didn't return citation counts, filtering
+by citations won't work for those papers.
+
+\subsection{Modal Structure}
+
+The search filters modal follows the same pattern as other modals in the TUI,
+appearing as an overlay that captures keyboard input until dismissed.
+
+<<tui search filters modal>>=
+class SearchFiltersModal(ModalScreen[SearchFilters | None]):
+    """Modal dialog to configure search filters."""
+    
+    <<search filters modal bindings>>
+    <<search filters modal styling>>
+    
+    def __init__(self, current_filters: SearchFilters | None = None) -> None:
+        super().__init__()
+        self.current_filters = current_filters or SearchFilters()
+    
+    <<search filters modal composition>>
+    <<search filters modal actions>>
+@
+
+\subsection{Keybindings}
+
+We use [[Ctrl+S]] to apply filters, mirroring the common \enquote{save} shortcut.
+This feels natural since applying filters \enquote{saves} the new filter
+configuration. Escape cancels without changes, as users expect.
+
+<<search filters modal bindings>>=
+BINDINGS = [
+    Binding("escape", "cancel", "Cancel"),
+    Binding("ctrl+s", "apply", "Apply", priority=True),
+]
+@
+
+\subsection{Visual Styling}
+
+The modal uses a centered dialog with consistent styling matching other modals.
+We set a maximum height to ensure the modal remains usable even with many
+filter options, allowing scrolling if needed.
+
+<<search filters modal styling>>=
+DEFAULT_CSS = """
+SearchFiltersModal {
+    align: center middle;
+}
+#search-filters-dialog {
+    width: 60;
+    height: auto;
+    max-height: 80%;
+    border: thick $primary;
+    background: $surface;
+    padding: 1 2;
+}
+#search-filters-title {
+    text-align: center;
+    width: 100%;
+    margin-bottom: 1;
+}
+.filter-row {
+    height: auto;
+    margin-bottom: 1;
+}
+.filter-label {
+    width: 20;
+}
+.filter-input {
+    width: 1fr;
+}
+#pub-types-list {
+    height: 8;
+    border: solid $primary-darken-2;
+}
+.help-text {
+    color: $text-muted;
+    text-style: italic;
+}
+"""
+@
+
+\subsection{Filter Input Fields}
+
+The modal presents each filter type with an appropriate input widget. We
+pre-populate fields with current filter values so users can see and modify
+their existing filters.
+
+\begin{description}
+\item[Year] A text input accepting flexible year formats: single year
+  ([[2020]]), range ([[2020-2024]]), or open-ended ([[2020-]] or [[-2024]]).
+\item[Venue] A text input for journal or conference names.
+\item[Min Citations] A numeric input; we validate this is a positive integer.
+\item[Open Access] A selection list acting as a checkbox.
+\item[Publication Types] A multi-select list for article, conference, etc.
+\end{description}
+
+<<search filters modal composition>>=
+def compose(self) -> ComposeResult:
+    with Container(id="search-filters-dialog"):
+        yield Static("[bold]Search Filters[/bold]", id="search-filters-title")
+        yield Static(
+            "[dim]Modify filters and press Ctrl+S to apply[/dim]",
+            classes="help-text"
+        )
+        yield Static("")
+        
+        <<year filter input>>
+        <<venue filter input>>
+        <<citations filter input>>
+        <<open access filter input>>
+        <<publication types filter input>>
+        
+        yield Static("")
+        <<filter modal buttons>>
+@
+
+Each filter row follows a consistent layout with a label and input field:
+
+<<year filter input>>=
+with Horizontal(classes="filter-row"):
+    yield Static("Year:", classes="filter-label")
+    yield Input(
+        value=self.current_filters.year or "",
+        placeholder="e.g., 2020, 2020-2024, 2020-, -2024",
+        id="year-input",
+        classes="filter-input",
+    )
+@
+
+<<venue filter input>>=
+with Horizontal(classes="filter-row"):
+    yield Static("Venue:", classes="filter-label")
+    yield Input(
+        value=self.current_filters.venue or "",
+        placeholder="Journal or conference name",
+        id="venue-input",
+        classes="filter-input",
+    )
+@
+
+<<citations filter input>>=
+with Horizontal(classes="filter-row"):
+    yield Static("Min Citations:", classes="filter-label")
+    yield Input(
+        value=str(self.current_filters.min_citations) 
+              if self.current_filters.min_citations else "",
+        placeholder="e.g., 10",
+        id="citations-input",
+        classes="filter-input",
+    )
+@
+
+For boolean and multi-select options, we use [[SelectionList]] widgets:
+
+<<open access filter input>>=
+with Horizontal(classes="filter-row"):
+    yield Static("Open Access:", classes="filter-label")
+    yield SelectionList[str](
+        Selection("Only open access papers", "open_access", 
+                 self.current_filters.open_access),
+        id="open-access-list",
+    )
+@
+
+<<publication types filter input>>=
+yield Static("Publication Types:", classes="filter-label")
+pub_types = self.current_filters.pub_types or []
+yield SelectionList[str](
+    Selection("Article", "article", "article" in pub_types),
+    Selection("Conference", "conference", "conference" in pub_types),
+    Selection("Review", "review", "review" in pub_types),
+    Selection("Book", "book", "book" in pub_types),
+    Selection("Preprint", "preprint", "preprint" in pub_types),
+    Selection("Dataset", "dataset", "dataset" in pub_types),
+    id="pub-types-list",
+)
+@
+
+<<filter modal buttons>>=
+with Horizontal(classes="filter-row"):
+    yield Button("Apply (Ctrl+S)", id="apply-btn", variant="primary")
+    yield Button("Clear All", id="clear-btn", variant="warning")
+    yield Button("Cancel", id="cancel-btn")
+@
+
+\subsection{Modal Actions}
+
+The modal handles three actions: applying filters, clearing all filters, and
+cancelling. When applying, we build a [[SearchFilters]] object from the current
+input values and dismiss the modal with that result.
+
+<<search filters modal actions>>=
+def on_button_pressed(self, event: Button.Pressed) -> None:
+    if event.button.id == "apply-btn":
+        self.action_apply()
+    elif event.button.id == "clear-btn":
+        self._clear_all_filters()
+    elif event.button.id == "cancel-btn":
+        self.action_cancel()
+
+def _clear_all_filters(self) -> None:
+    """Clear all filter inputs to their default (empty) state."""
+    self.query_one("#year-input", Input).value = ""
+    self.query_one("#venue-input", Input).value = ""
+    self.query_one("#citations-input", Input).value = ""
+    self.query_one("#open-access-list", SelectionList).deselect_all()
+    self.query_one("#pub-types-list", SelectionList).deselect_all()
+
+def action_cancel(self) -> None:
+    self.dismiss(None)
+
+def action_apply(self) -> None:
+    filters = self._build_filters()
+    self.dismiss(filters)
+
+<<build filters from inputs>>
+@
+
+Building the [[SearchFilters]] object requires extracting values from each
+input widget and handling empty/invalid values gracefully:
+
+<<build filters from inputs>>=
+def _build_filters(self) -> SearchFilters | None:
+    """Build SearchFilters from current input values.
+    
+    Returns None if all filters are empty (indicating no filtering),
+    otherwise returns a SearchFilters with the specified values.
+    """
+    year = self.query_one("#year-input", Input).value.strip() or None
+    venue = self.query_one("#venue-input", Input).value.strip() or None
+    
+    # Parse citations as integer, defaulting to None if invalid
+    citations_str = self.query_one("#citations-input", Input).value.strip()
+    min_citations = int(citations_str) if citations_str.isdigit() else None
+    
+    open_access_list = self.query_one("#open-access-list", SelectionList)
+    open_access = "open_access" in open_access_list.selected
+    
+    pub_types_list = self.query_one("#pub-types-list", SelectionList)
+    pub_types = list(pub_types_list.selected) if pub_types_list.selected else None
+    
+    # Return None if no filters are set (semantically: no filtering)
+    if not any([year, venue, min_citations, open_access, pub_types]):
+        return None
+    
+    return SearchFilters(
+        year=year,
+        open_access=open_access,
+        venue=venue,
+        min_citations=min_citations,
+        pub_types=pub_types,
+    )
+@
+
+
 \section{Main Application}
 \label{sec:main-app}
 
@@ -1002,6 +1311,26 @@ The app maintains two key state variables beyond the session:
 \item [[current_index]]: Which paper is selected (for restoring position)
 \item [[current_filter]]: Which papers are shown (all/kept/discarded/pending)
 \end{itemize}
+
+\subsection{Search Filter State}
+\label{sec:search-filter-state}
+
+To support re-searching with modified filters (see \cref{SearchFiltersModal}),
+the app also stores the search parameters that produced the current results:
+
+\begin{description}
+\item[search\_filters] The current [[SearchFilters]] object, or [[None]] if no
+  filters are applied. This is passed to the [[SearchFiltersModal]] to show
+  current values and updated when the user applies new filters.
+\item[providers] The list of provider names to query, or [[None]] for defaults.
+  We need this to re-execute searches with the same providers.
+\item[limit] The maximum results per provider. Preserved so re-searches use
+  consistent limits.
+\end{description}
+
+These parameters enable the TUI to re-execute searches when the user modifies
+filters via the [[F]] keybinding, without requiring the user to restart the
+entire search workflow.
 
 \subsection{Filtering by Decision Status}
 
@@ -1091,15 +1420,18 @@ class PaperReviewApp(App):
         Binding("d", "discard", "Discard"),
         Binding("s", "sort", "Sort"),
         Binding("f", "filter", "Filter"),
+        Binding("F", "search_filters", "Search"),
         Binding("n", "edit_notes", "Notes"),
     ]
     
-    def __init__(self, session: ReviewSession, review_mode: bool = True) -> None:
+    def __init__(self, session: ReviewSession, review_mode: bool = True,
+                 search_filters: SearchFilters | None = None) -> None:
         super().__init__()
         self.session = session
         self.review_mode = review_mode
         self.current_index = 0
         self.current_filter = "all"
+        self.search_filters = search_filters
     
     def compose(self) -> ComposeResult:
         yield Header()
@@ -1112,24 +1444,40 @@ class PaperReviewApp(App):
         self._refresh_list()
         self._update_status()
     
-    def _get_filtered_decisions(self) -> list[ReviewDecision]:
-        """Get decisions filtered by current filter."""
+    def get_filtered_decisions(self) -> list[ReviewDecision]:
+        """Get decisions filtered by current status filter and search filters.
+        
+        This method applies both the status filter (all/kept/discarded/pending)
+        and any paper-level filters (year, venue, etc.) to return the currently
+        visible decisions.
+        
+        Returns:
+            List of ReviewDecision objects matching current filters.
+        """
+        # First filter by decision status
         if self.current_filter == "all":
-            return self.session.decisions
+            decisions = self.session.decisions
         elif self.current_filter == "kept":
-            return self.session.kept_papers
+            decisions = self.session.kept_papers
         elif self.current_filter == "discarded":
-            return self.session.discarded_papers
+            decisions = self.session.discarded_papers
         elif self.current_filter == "pending":
-            return self.session.pending_papers
-        return self.session.decisions
+            decisions = self.session.pending_papers
+        else:
+            decisions = self.session.decisions
+        
+        # Then apply paper-level filters (year, venue, etc.)
+        if self.search_filters is None or self.search_filters.is_empty():
+            return decisions
+        
+        return filter_decisions(decisions, self.search_filters)
     
     def _refresh_list(self) -> None:
         """Refresh the paper list display."""
         list_view = self.query_one("#paper-list", ListView)
         list_view.clear()
         
-        filtered = self._get_filtered_decisions()
+        filtered = self.get_filtered_decisions()
         for i, decision in enumerate(filtered):
             list_view.append(PaperListItem(decision, i, self.review_mode))
         
@@ -1152,7 +1500,7 @@ class PaperReviewApp(App):
         discarded = len(self.session.discarded_papers)
         pending = len(self.session.pending_papers)
         total = len(self.session.decisions)
-        filtered_count = len(self._get_filtered_decisions())
+        filtered_count = len(self.get_filtered_decisions())
         
         # Build filter indicator
         filter_text = ""
@@ -1178,10 +1526,15 @@ class PaperReviewApp(App):
                 f"{filter_text}"
             )
     
-    def _get_current_decision(self) -> ReviewDecision | None:
-        """Get the currently selected decision from filtered list."""
+    def get_current_decision(self) -> ReviewDecision | None:
+        """Get the currently selected decision from filtered list.
+        
+        Returns:
+            The ReviewDecision for the currently highlighted paper,
+            or None if no paper is selected.
+        """
         list_view = self.query_one("#paper-list", ListView)
-        filtered = self._get_filtered_decisions()
+        filtered = self.get_filtered_decisions()
         if list_view.index is not None and list_view.index < len(filtered):
             self.current_index = list_view.index
             return filtered[list_view.index]
@@ -1201,7 +1554,7 @@ class PaperReviewApp(App):
     
     def action_view_abstract(self) -> None:
         """Show the abstract screen for current paper."""
-        decision = self._get_current_decision()
+        decision = self.get_current_decision()
         if decision:
             self.push_screen(
                 AbstractScreen(decision, self.session, self.review_mode), 
@@ -1216,7 +1569,7 @@ class PaperReviewApp(App):
     
     def action_edit_notes(self) -> None:
         """Open editor to edit notes for current paper."""
-        decision = self._get_current_decision()
+        decision = self.get_current_decision()
         if decision:
             with self.suspend():
                 edit_note_in_editor(decision.paper)
@@ -1227,7 +1580,7 @@ class PaperReviewApp(App):
         if not self.review_mode:
             self.notify("Keep/discard disabled in notes mode", severity="warning")
             return
-        decision = self._get_current_decision()
+        decision = self.get_current_decision()
         if decision:
             decision.status = DecisionStatus.KEPT
             decision.clear_tags()
@@ -1239,7 +1592,7 @@ class PaperReviewApp(App):
         if not self.review_mode:
             self.notify("Keep/discard disabled in notes mode", severity="warning")
             return
-        decision = self._get_current_decision()
+        decision = self.get_current_decision()
         if decision:
             self.push_screen(
                 TagSelectionModal(
@@ -1255,7 +1608,7 @@ class PaperReviewApp(App):
     def _on_themes_closed(self, result: list[str] | None) -> None:
         """Called when theme selection modal is closed."""
         if result is not None:  # None means cancelled
-            decision = self._get_current_decision()
+            decision = self.get_current_decision()
             if decision:
                 decision.status = DecisionStatus.KEPT
                 decision.tags = result
@@ -1268,7 +1621,7 @@ class PaperReviewApp(App):
         if not self.review_mode:
             self.notify("Keep/discard disabled in notes mode", severity="warning")
             return
-        decision = self._get_current_decision()
+        decision = self.get_current_decision()
         if decision:
             self.push_screen(
                 TagSelectionModal(
@@ -1284,7 +1637,7 @@ class PaperReviewApp(App):
     def _on_discard_closed(self, result: list[str] | None) -> None:
         """Called when motivation selection modal is closed."""
         if result is not None:  # None means cancelled
-            decision = self._get_current_decision()
+            decision = self.get_current_decision()
             if decision:
                 decision.status = DecisionStatus.DISCARDED
                 decision.tags = result
@@ -1327,6 +1680,101 @@ class PaperReviewApp(App):
             self._refresh_list()
             self._update_status()
         self.query_one("#paper-list", ListView).focus()
+    
+    <<search filters action>>
+@
+
+\subsection{Search Filters Action}
+\label{sec:search-filters-action}
+
+The [[F]] keybinding opens the search filters modal (see \cref{SearchFiltersModal}),
+allowing users to filter papers locally by bibliographic attributes. Unlike the
+provider-level filtering that happens during search, this filters the existing
+session results without making new API calls.
+
+This design supports a key workflow: users can merge multiple searches into a
+single named session, then use filters to navigate within those combined results.
+For example, a user might search for \enquote{machine learning} and 
+\enquote{deep learning} separately, merge them into one session, then filter
+to show only papers from 2020 onwards.
+
+The workflow proceeds as follows:
+\begin{enumerate}
+\item User presses [[F]] to open the search filters modal
+\item Modal displays current filter values (if any)
+\item User modifies filters and presses [[Ctrl+S]] to apply
+\item Papers not matching the filters are hidden (but not deleted)
+\item Clearing filters restores all papers
+\end{enumerate}
+
+<<search filters action>>=
+def action_search_filters(self) -> None:
+    """Open search filters modal to modify bibliographic filters."""
+    if not self.review_mode:
+        self.notify(
+            "Search filters only available in review mode",
+            severity="warning"
+        )
+        return
+    self.push_screen(
+        SearchFiltersModal(self.search_filters), 
+        self._on_search_filters_closed
+    )
+
+<<handle search filters result>>
+<<apply local filters>>
+@
+
+When the modal closes, we update the stored filters and refresh the display.
+The filtering is applied during [[get_filtered_decisions]], so we just need
+to store the new filters and refresh the list.
+
+<<handle search filters result>>=
+def _on_search_filters_closed(self, result: SearchFilters | None) -> None:
+    """Handle search filters modal result and apply local filtering."""
+    # result is None if user cancelled
+    if result is None:
+        self.query_one("#paper-list", ListView).focus()
+        return
+    
+    # Update filters and refresh display
+    self.search_filters = result
+    self.current_index = 0
+    self._refresh_list()
+    self._update_status()
+    
+    # Notify user about filter status
+    if result.is_empty():
+        self.notify("Filters cleared", severity="information")
+    else:
+        filtered = self.get_filtered_decisions()
+        self.notify(
+            f"Showing {len(filtered)} of {len(self.session.decisions)} papers",
+            severity="information"
+        )
+    self.query_one("#paper-list", ListView).focus()
+@
+
+\subsubsection{Applying Local Filters}
+
+The actual filtering happens in [[get_filtered_decisions]], which filters by
+decision status (kept/discarded/pending) and then applies bibliographic filters
+using the [[filter_decisions]] function from the review module.
+
+The [[filter_decisions]] function uses [[SearchFilters.matches()]] to check if
+each paper matches the filter criteria:
+\begin{description}
+\item[Year] Paper's year falls within the specified range (if set)
+\item[Venue] Paper's venue contains the filter string (case-insensitive, if set)
+\item[Citations] Paper has at least the minimum citation count (if set)
+\item[Open access] Paper is open access (if filter is enabled)
+\item[Publication types] Paper's type matches one of the selected types (if any selected)
+\end{description}
+
+<<apply local filters>>=
+# Local filtering is now handled by filter_decisions() from scholar.review
+# which uses SearchFilters.matches() to check each paper.
+# See get_filtered_decisions() for the implementation.
 @
 
 \section{Report Generation}
@@ -1470,7 +1918,8 @@ The entry point supports two distinct modes:
 <<tui entry point>>=
 def run_review(results: list[SearchResult], query: str, 
                session_name: str | None = None,
-               prompt_report: bool = False) -> ReviewSession:
+               prompt_report: bool = False,
+               search_filters: SearchFilters | None = None) -> ReviewSession:
     """
     Run the interactive review TUI for search results.
     
@@ -1486,6 +1935,7 @@ def run_review(results: list[SearchResult], query: str,
                       or multiple queries with the same name (appending results).
         prompt_report: If True, prompt the user to save reports after the review
                        session. If False (the default), no prompt is shown.
+        search_filters: Initial search filters for local filtering within TUI
     """
     # Use session_name for persistence, fall back to query
     persistence_key = session_name if session_name else query
@@ -1494,7 +1944,11 @@ def run_review(results: list[SearchResult], query: str,
     session = create_review_session(results, query, session_name)
     
     # Run the TUI in review mode
-    app = PaperReviewApp(session, review_mode=True)
+    app = PaperReviewApp(
+        session, 
+        review_mode=True,
+        search_filters=search_filters,
+    )
     app.run()
     
     # Save decisions for this session (legacy per-query storage)

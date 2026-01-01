@@ -60,6 +60,7 @@ The test file collects all distributed test chunks:
 <<test [[providers.py]]>>=
 """Tests for the providers module."""
 import pytest
+import requests
 from unittest.mock import Mock, patch
 
 from scholar import *
@@ -108,13 +109,19 @@ class SearchProvider(Protocol):
 
     name: str
 
-    def search(self, query: str, limit: int = 100) -> list[Paper]:
+    def search(
+        self,
+        query: str,
+        limit: int = 100,
+        filters: "SearchFilters | None" = None,
+    ) -> list[Paper]:
         """
         Search for papers matching the query.
 
         Args:
             query: The search query string.
             limit: Maximum number of results to return.
+            filters: Optional SearchFilters to apply.
 
         Returns:
             List of Paper objects matching the query.
@@ -185,11 +192,11 @@ The registry should store and retrieve providers:
 class TestProviderRegistry:
     """Tests for the provider registry."""
 
-    def test_semantic_scholar_registered(self):
+    def test_s2_registered(self):
         """Semantic Scholar provider is auto-registered."""
-        provider = get_provider("semantic_scholar")
+        provider = get_provider("s2")
         assert provider is not None
-        assert provider.name == "semantic_scholar"
+        assert provider.name == "s2"
 
     def test_openalex_registered(self):
         """OpenAlex provider is auto-registered."""
@@ -220,7 +227,7 @@ class TestProviderRegistry:
         providers = get_all_providers()
         assert len(providers) >= 5
         names = [p.name for p in providers]
-        assert "semantic_scholar" in names
+        assert "s2" in names
         assert "openalex" in names
         assert "dblp" in names
         assert "wos" in names
@@ -238,10 +245,11 @@ class TestProviderRegistry:
     def test_get_provider_limits(self):
         """get_provider_limits returns correct limits."""
         limits = get_provider_limits()
-        assert limits["semantic_scholar"] is None
+        assert limits["s2"] is None
         assert limits["openalex"] is None
         assert limits["dblp"] == 1000
-        assert limits["wos"] == 50
+        # WoS limit depends on API tier: 50 for Starter, 100 for Expanded
+        assert limits["wos"] in (50, 100)
         assert limits["ieee"] == 200
 @
 
@@ -252,7 +260,7 @@ class TestProviderRegistry:
 Default providers are determined \emph{dynamically} based on availability.
 A provider is available (and thus included as a default) if it either:
 \begin{itemize}
-\item Does not require an API key ([[semantic_scholar]], [[openalex]],
+\item Does not require an API key ([[s2]], [[openalex]],
   [[dblp]]), or
 \item Requires an API key and has one configured in the environment
   ([[wos]] with [[WOS_API_KEY]], [[ieee]] with [[IEEE_API_KEY]]).
@@ -269,7 +277,7 @@ def get_default_providers() -> list[SearchProvider]:
     Get providers that are currently available for use.
 
     Returns all providers where [[is_available()]] returns [[True]].
-    This includes providers that don't require API keys (semantic_scholar,
+    This includes providers that don't require API keys (s2,
     openalex, dblp) and providers with required API keys that are configured
     in the environment (wos, ieee).
     """
@@ -311,17 +319,20 @@ class TestDefaultProviders:
         defaults = get_default_providers()
         default_names = [p.name for p in defaults]
         # These providers don't require API keys
-        assert "semantic_scholar" in default_names
+        assert "s2" in default_names
         assert "openalex" in default_names
         assert "dblp" in default_names
 
     def test_wos_in_defaults_only_with_key(self, monkeypatch):
-        """WoS is in defaults only when WOS_API_KEY is set."""
-        # Without key
+        """WoS is in defaults only when API keys are set."""
+        # Without any keys
         monkeypatch.delenv("WOS_API_KEY", raising=False)
-        # Re-register provider without key
-        wos_provider = WebOfScienceProvider(api_key=None)
-        wos_provider.api_key = None
+        monkeypatch.delenv("WOS_STARTER_API_KEY", raising=False)
+        monkeypatch.delenv("WOS_EXPANDED_API_KEY", raising=False)
+        # Re-register provider without keys
+        wos_provider = WebOfScienceProvider(
+            starter_api_key=None, expanded_api_key=None
+        )
         register_provider(wos_provider)
         defaults = get_default_providers()
         assert "wos" not in [p.name for p in defaults]
@@ -390,7 +401,7 @@ missing API keys.
 class SemanticScholarProvider:
     """Search provider for Semantic Scholar."""
 
-    name = "semantic_scholar"
+    name = "s2"
     MAX_LIMIT: int | None = None   # No documented maximum
     API_URL = "https://api.semanticscholar.org/graph/v1/paper/search"
     RATE_LIMIT_WITH_KEY = 1.0      # 1 second between requests
@@ -462,72 +473,164 @@ def _wait_for_rate_limit(self) -> None:
 
 \subsubsection{Search method}
 
-The search method calls the API with rate limiting and handles errors:
+The search method calls the API with rate limiting and handles errors.
+When the user requests more results than a single API call can return (the
+Semantic Scholar API caps at 100 results per request), we automatically fetch
+multiple pages using the [[offset]] parameter.
+
+This pagination is transparent to the caller: they simply request the number of
+results they want, and the provider handles the underlying paging.
+The loop terminates when we have fetched enough results, when the API returns
+no more data, or when we reach the total number of available results.
 
 <<semantic scholar search method>>=
-def search(self, query: str, limit: int = 100) -> list[Paper]:
-    """Search Semantic Scholar for papers matching the query."""
-    # Check cache and log hit/miss
-    cache_key = (query, limit)
-    if cache_key in self._cache:
-        logger.info(f"semantic_scholar: Cache hit for query '{query}'")
-    else:
-        logger.info(f"semantic_scholar: Cache miss for query '{query}', fetching from API")
-    
-    return self._search_impl(query, limit)
+@cachedmethod(lambda self: self._cache, key=lambda self, query, limit=100, filters=None: (query, limit, filters.cache_key() if filters else ""))
+def search(
+    self,
+    query: str,
+    limit: int = 100,
+    filters: SearchFilters | None = None,
+) -> list[Paper]:
+    """
+    Search Semantic Scholar for papers matching the query.
 
-@cachedmethod(lambda self: self._cache)
-def _search_impl(self, query: str, limit: int = 100) -> list[Paper]:
-    """Internal search implementation (cached)."""
+    Automatically fetches multiple pages if the requested limit exceeds
+    the API's per-request maximum (100 results per page).
+    """
+    all_papers: list[Paper] = []
+    offset = 0
+    page_size = min(limit, 100)  # S2 API returns max 100 per request
+
     try:
-        logger.debug(f"semantic_scholar: Searching for '{query}' with limit={limit}")
-        self._wait_for_rate_limit()
+        while len(all_papers) < limit:
+            self._wait_for_rate_limit()
 
-        headers = {}
-        if self.api_key:
-            headers["x-api-key"] = self.api_key
-            logger.debug("semantic_scholar: Using API key")
+            headers = {}
+            if self.api_key:
+                headers["x-api-key"] = self.api_key
+                logger.debug("semantic_scholar: Using API key")
 
-        response = self._session.get(
-            self.API_URL,
-            params={
+            # Calculate how many results we still need
+            remaining = limit - len(all_papers)
+            current_page_size = min(page_size, remaining)
+
+            params = {
                 "query": query,
-                "limit": limit,
-                "fields": "title,authors,year,abstract,venue,externalIds,url,openAccessPdf",
-            },
-            headers=headers,
-            timeout=30,
-        )
+                "limit": current_page_size,
+                "offset": offset,
+                "fields": "title,authors,year,abstract,venue,externalIds,url,openAccessPdf,citationCount,publicationTypes",
+            }
 
-        if response.status_code == 429:
-            logger.warning(
-                "semantic_scholar: Rate limited. "
-                "Get a free API key at "
-                "https://www.semanticscholar.org/product/api#api-key-form "
-                "and set S2_API_KEY environment variable."
+            # Apply filters (Semantic Scholar supports most filters natively)
+            <<semantic scholar apply filters>>
+
+            response = self._session.get(
+                self.API_URL,
+                params=params,
+                headers=headers,
+                timeout=30,
             )
-            return []
 
-        response.raise_for_status()
-        data = response.json()
-        
-        results = [self._convert_paper(p) for p in data.get("data", [])]
-        logger.debug(f"semantic_scholar: Retrieved {len(results)} papers")
-        return results
+            if response.status_code == 429:
+                logger.warning(
+                    "s2: Rate limited. "
+                    "Get a free API key at "
+                    "https://www.semanticscholar.org/product/api#api-key-form "
+                    "and set S2_API_KEY environment variable."
+                )
+                break
+
+            response.raise_for_status()
+            data = response.json()
+
+            papers = data.get("data", [])
+            if not papers:
+                # No more results available
+                break
+
+            all_papers.extend(self._convert_paper(p) for p in papers)
+            offset += len(papers)
+
+            # Check if we've fetched all available results
+            total = data.get("total", 0)
+            if offset >= total:
+                break
+
+        logger.debug(f"semantic_scholar: Retrieved {len(all_papers)} papers")
+        return all_papers
     except requests.exceptions.RetryError:
         logger.warning(
-            "semantic_scholar: Rate limited after retries. "
+            "s2: Rate limited after retries. "
             "Get a free API key at "
             "https://www.semanticscholar.org/product/api#api-key-form "
             "and set S2_API_KEY environment variable."
         )
-        return []
+        return all_papers
     except requests.exceptions.HTTPError as e:
-        logger.warning("semantic_scholar: HTTP error: %s", e)
-        return []
+        logger.warning("s2: HTTP error: %s", e)
+        return all_papers
     except Exception as e:
-        logger.warning("semantic_scholar: %s", e)
-        return []
+        logger.warning("s2: %s", e)
+        return all_papers
+@
+
+\subsubsection{Applying filters}
+
+Semantic Scholar supports most of our filters natively via API parameters:
+\begin{description}
+\item[year] Supports [[year]] parameter with format [[YYYY]] or [[YYYY-YYYY]].
+\item[open\_access] Use [[openAccessPdf]] field filter.
+\item[venue] Supports [[venue]] parameter for exact venue match.
+\item[min\_citations] Supports [[minCitationCount]] parameter.
+\item[pub\_types] Supports [[publicationTypes]] parameter with values like
+  [[JournalArticle]], [[Conference]], [[Review]], [[Book]], [[Dataset]].
+\end{description}
+
+<<semantic scholar apply filters>>=
+if filters:
+    # Year filter: Semantic Scholar accepts "YYYY" or "YYYY-YYYY"
+    if filters.year:
+        start, end = filters.year_range()
+        if start and end:
+            if start == end:
+                params["year"] = str(start)
+            else:
+                params["year"] = f"{start}-{end}"
+        elif start:
+            # Open end: from start year onwards
+            params["year"] = f"{start}-"
+        elif end:
+            # Open start: up to end year
+            params["year"] = f"-{end}"
+
+    # Open access: filter via openAccessPdf field
+    if filters.open_access:
+        params["openAccessPdf"] = ""
+
+    # Venue filter
+    if filters.venue:
+        params["venue"] = filters.venue
+
+    # Minimum citations
+    if filters.min_citations is not None:
+        params["minCitationCount"] = filters.min_citations
+
+    # Publication types: map our normalized types to S2 values
+    if filters.pub_types:
+        s2_types = []
+        type_mapping = {
+            "article": "JournalArticle",
+            "conference": "Conference",
+            "review": "Review",
+            "book": "Book",
+            "preprint": "Preprint",
+            "dataset": "Dataset",
+        }
+        for pt in filters.pub_types:
+            if pt.lower() in type_mapping:
+                s2_types.append(type_mapping[pt.lower()])
+        if s2_types:
+            params["publicationTypes"] = ",".join(s2_types)
 @
 
 \subsubsection{DOI lookup}
@@ -585,7 +688,7 @@ def get_paper_by_doi(self, doi: str) -> Paper | None:
             return None
 
         if response.status_code == 429:
-            logger.warning("semantic_scholar: Rate limited during DOI lookup")
+            logger.warning("s2: Rate limited during DOI lookup")
             return None
 
         response.raise_for_status()
@@ -596,10 +699,10 @@ def get_paper_by_doi(self, doi: str) -> Paper | None:
         return paper
 
     except requests.exceptions.HTTPError as e:
-        logger.warning("semantic_scholar: DOI lookup error: %s", e)
+        logger.warning("s2: DOI lookup error: %s", e)
         return None
     except Exception as e:
-        logger.warning("semantic_scholar: DOI lookup failed: %s", e)
+        logger.warning("s2: DOI lookup failed: %s", e)
         return None
 @
 
@@ -711,7 +814,7 @@ class TestSemanticScholarProvider:
             assert paper.title == "Test Paper"
             assert paper.year == 2024
             assert paper.doi == "10.1234/test"
-            assert paper.source == "semantic_scholar"
+            assert paper.source == "s2"
             assert "Alice" in paper.authors
             assert "Bob" in paper.authors
             assert paper.pdf_url == "https://arxiv.org/pdf/1234.5678.pdf"
@@ -793,7 +896,7 @@ class TestSemanticScholarGetPaperByDoi:
             assert paper.title == "Test Paper"
             assert paper.abstract == "This is the abstract"
             assert paper.doi == "10.1234/test"
-            assert paper.source == "semantic_scholar"
+            assert paper.source == "s2"
 
     def test_get_paper_by_doi_returns_none_on_404(self):
         """get_paper_by_doi() returns None when paper not found."""
@@ -846,6 +949,86 @@ class TestSemanticScholarGetPaperByDoi:
             assert paper1.title == paper2.title
 
 
+class TestSemanticScholarPagination:
+    """Tests for Semantic Scholar pagination."""
+
+    def test_search_fetches_multiple_pages(self):
+        """search() fetches multiple pages when limit exceeds page size."""
+        provider = SemanticScholarProvider()
+
+        # Create responses for two pages
+        page1_response = Mock()
+        page1_response.status_code = 200
+        page1_response.json.return_value = {
+            "total": 150,
+            "data": [{"title": f"Paper {i}", "authors": []} for i in range(100)],
+        }
+
+        page2_response = Mock()
+        page2_response.status_code = 200
+        page2_response.json.return_value = {
+            "total": 150,
+            "data": [{"title": f"Paper {i}", "authors": []} for i in range(100, 150)],
+        }
+
+        with patch.object(
+            provider._session, "get", side_effect=[page1_response, page2_response]
+        ) as mock_get:
+            results = provider.search("test query", limit=150)
+
+            assert len(results) == 150
+            assert mock_get.call_count == 2
+            # Verify offset was used correctly
+            calls = mock_get.call_args_list
+            assert calls[0][1]["params"]["offset"] == 0
+            assert calls[1][1]["params"]["offset"] == 100
+
+    def test_search_stops_when_no_more_results(self):
+        """search() stops pagination when API returns empty data."""
+        provider = SemanticScholarProvider()
+
+        page1_response = Mock()
+        page1_response.status_code = 200
+        page1_response.json.return_value = {
+            "total": 50,
+            "data": [{"title": f"Paper {i}", "authors": []} for i in range(50)],
+        }
+
+        page2_response = Mock()
+        page2_response.status_code = 200
+        page2_response.json.return_value = {"total": 50, "data": []}
+
+        with patch.object(
+            provider._session, "get", side_effect=[page1_response, page2_response]
+        ):
+            results = provider.search("test query", limit=200)
+
+            # Should stop after getting 50 results even though limit is 200
+            assert len(results) == 50
+
+    def test_search_returns_partial_results_on_rate_limit(self):
+        """search() returns collected results when rate limited mid-pagination."""
+        provider = SemanticScholarProvider()
+
+        page1_response = Mock()
+        page1_response.status_code = 200
+        page1_response.json.return_value = {
+            "total": 200,
+            "data": [{"title": f"Paper {i}", "authors": []} for i in range(100)],
+        }
+
+        page2_response = Mock()
+        page2_response.status_code = 429  # Rate limited
+
+        with patch.object(
+            provider._session, "get", side_effect=[page1_response, page2_response]
+        ):
+            results = provider.search("test query", limit=200)
+
+            # Should return partial results from first page
+            assert len(results) == 100
+
+
 class TestSemanticScholarIntegration:
     """Integration test for the SemanticScholar provider."""
 
@@ -861,7 +1044,7 @@ class TestSemanticScholarIntegration:
             paper = papers[0]
             assert isinstance(paper, Paper)
             assert paper.title
-            assert paper.source == "semantic_scholar"
+            assert paper.source == "s2"
         except Exception as e:
             pytest.skip(f"Semantic Scholar API unavailable: {e}")
 @
@@ -889,13 +1072,20 @@ pool of API resources with faster response times for identified users.
 This is OpenAlex's approach to encouraging good API citizenship without
 creating barriers to access.
 
-\subsection{Rate Limiting}
+\subsection{Rate Limiting and Pagination}
 
 OpenAlex allows up to 10 requests per second.
 We implement proactive rate limiting by tracking the time of the last request
 and waiting if necessary before making a new one.
 This ensures we stay well within limits even during batch operations like
 paper enrichment.
+
+The [[pyalex]] library provides a convenient [[paginate()]] method that
+automatically handles pagination.
+When the user requests more results than a single API page can return (200
+results per page), we iterate through the paginated results until we reach
+the requested limit.
+This makes large result sets transparent to the caller.
 
 \subsection{Provider implementation}
 
@@ -933,33 +1123,104 @@ class OpenAlexProvider:
             time.sleep(self.RATE_LIMIT - elapsed)
         self._last_request_time = time.time()
 
-    def search(self, query: str, limit: int = 100) -> list[Paper]:
-        """Search OpenAlex for papers matching the query."""
-        # Check cache and log hit/miss
-        cache_key = (query, limit)
-        if cache_key in self._cache:
-            logger.info(f"openalex: Cache hit for query '{query}'")
-        else:
-            logger.info(f"openalex: Cache miss for query '{query}', fetching from API")
-        
-        return self._search_impl(query, limit)
+    @cachedmethod(lambda self: self._cache, key=lambda self, query, limit=100, filters=None: (query, limit, filters.cache_key() if filters else ""))
+    def search(
+        self,
+        query: str,
+        limit: int = 100,
+        filters: SearchFilters | None = None,
+    ) -> list[Paper]:
+        """
+        Search OpenAlex for papers matching the query.
 
-    @cachedmethod(lambda self: self._cache)
-    def _search_impl(self, query: str, limit: int = 100) -> list[Paper]:
-        """Internal search implementation (cached)."""
+        Automatically fetches multiple pages if the requested limit exceeds
+        the API's per-request maximum (200 results per page).
+        """
         try:
+            all_papers: list[Paper] = []
+            page_size = min(limit, 200)  # OpenAlex returns max 200 per page
+
             logger.debug(f"openalex: Searching for '{query}' with limit={limit}")
             self._wait_for_rate_limit()
-            works = pyalex.Works().search(query).get(per_page=limit)
-            results = [self._convert_work(w) for w in works]
-            logger.debug(f"openalex: Retrieved {len(results)} papers")
-            return results
+            works = pyalex.Works().search(query)
+
+            # Apply filters (OpenAlex supports most filters natively)
+            <<openalex apply filters>>
+
+            # Use pagination to fetch all results up to the limit
+            for page in works.paginate(per_page=page_size):
+                self._wait_for_rate_limit()
+                for work in page:
+                    all_papers.append(self._convert_work(work))
+                    if len(all_papers) >= limit:
+                        logger.debug(f"openalex: Retrieved {len(all_papers)} papers")
+                        return all_papers
+
+            logger.debug(f"openalex: Retrieved {len(all_papers)} papers")
+            return all_papers
         except Exception as e:
             logger.warning("openalex: %s", e)
             return []
 
     <<openalex get paper by doi>>
     <<convert openalex work>>
+@
+
+\subsubsection{Applying filters}
+
+OpenAlex supports filtering via its query builder. We chain filter calls:
+\begin{description}
+\item[year] Use [[publication_year]] filter.
+\item[open\_access] Use [[is_oa]] filter.
+\item[venue] Use [[primary_location.source.display_name]] for venue filtering.
+\item[min\_citations] Use [[cited_by_count]] filter with [[>]] operator.
+\item[pub\_types] Use [[type]] filter with OpenAlex type values.
+\end{description}
+
+<<openalex apply filters>>=
+if filters:
+    # Year filter
+    if filters.year:
+        start, end = filters.year_range()
+        if start and end:
+            if start == end:
+                works = works.filter(publication_year=start)
+            else:
+                works = works.filter(publication_year=f"{start}-{end}")
+        elif start:
+            works = works.filter(publication_year=f">{start-1}")
+        elif end:
+            works = works.filter(publication_year=f"<{end+1}")
+
+    # Open access filter
+    if filters.open_access:
+        works = works.filter(is_oa=True)
+
+    # Venue filter (search in source display name)
+    if filters.venue:
+        works = works.filter(primary_location={"source": {"display_name": filters.venue}})
+
+    # Minimum citations
+    if filters.min_citations is not None:
+        works = works.filter(cited_by_count=f">{filters.min_citations-1}")
+
+    # Publication types: map our normalized types to OpenAlex values
+    if filters.pub_types:
+        oa_types = []
+        type_mapping = {
+            "article": "article",
+            "conference": "proceedings-article",
+            "review": "review",
+            "book": "book",
+            "preprint": "preprint",
+            "dataset": "dataset",
+        }
+        for pt in filters.pub_types:
+            if pt.lower() in type_mapping:
+                oa_types.append(type_mapping[pt.lower()])
+        if oa_types:
+            # OpenAlex uses pipe for OR in filters
+            works = works.filter(type="|".join(oa_types))
 @
 
 \subsubsection{Converting work format}
@@ -1110,8 +1371,9 @@ class TestOpenAlexProvider:
         }
 
         with patch("pyalex.Works") as mock_works:
-            mock_works.return_value.search.return_value.get.return_value = [
-                mock_work
+            # paginate() returns an iterator of pages, where each page is a list
+            mock_works.return_value.search.return_value.paginate.return_value = [
+                [mock_work]  # Single page with one result
             ]
 
             results = provider.search("test query")
@@ -1131,7 +1393,8 @@ class TestOpenAlexProvider:
         provider = OpenAlexProvider()
 
         with patch("pyalex.Works") as mock_works:
-            mock_works.return_value.search.return_value.get.return_value = []
+            # paginate() returns an iterator of pages - empty list means no pages
+            mock_works.return_value.search.return_value.paginate.return_value = []
 
             results = provider.search("obscure query")
             assert results == []
@@ -1157,8 +1420,9 @@ class TestOpenAlexProvider:
         }
 
         with patch("pyalex.Works") as mock_works:
-            mock_works.return_value.search.return_value.get.return_value = [
-                mock_work
+            # paginate() returns an iterator of pages
+            mock_works.return_value.search.return_value.paginate.return_value = [
+                [mock_work]  # Single page with one result
             ]
 
             results = provider.search("test")
@@ -1296,6 +1560,15 @@ we already depend on.
 No API key is required.
 The API returns JSON with publication data that we parse directly.
 
+\subsection{Pagination}
+
+The DBLP API supports pagination through the [[h]] (hits) and [[f]] (first)
+parameters.
+The [[h]] parameter specifies the maximum number of results per request (capped
+at 1000), while [[f]] specifies the offset (0-indexed).
+When the user requests more than 1000 results, we automatically fetch multiple
+pages.
+
 \subsection{Provider implementation}
 
 <<dblp provider>>=
@@ -1314,44 +1587,131 @@ class DBLPProvider:
         """DBLP is always available (no API key needed)."""
         return True
 
-    def search(self, query: str, limit: int = 100) -> list[Paper]:
-        """Search DBLP for papers matching the query."""
-        # Check cache and log hit/miss
-        cache_key = (query, limit)
-        if cache_key in self._cache:
-            logger.info(f"dblp: Cache hit for query '{query}'")
-        else:
-            logger.info(f"dblp: Cache miss for query '{query}', fetching from API")
-        
-        return self._search_impl(query, limit)
+    @cachedmethod(lambda self: self._cache, key=lambda self, query, limit=100, filters=None: (query, limit, filters.cache_key() if filters else ""))
+    def search(
+        self,
+        query: str,
+        limit: int = 100,
+        filters: SearchFilters | None = None,
+    ) -> list[Paper]:
+        """
+        Search DBLP for papers matching the query.
 
-    @cachedmethod(lambda self: self._cache)
-    def _search_impl(self, query: str, limit: int = 100) -> list[Paper]:
-        """Internal search implementation (cached)."""
+        Automatically fetches multiple pages if the requested limit exceeds
+        the API's per-request maximum (1000 results per page).
+        """
+        all_papers: list[Paper] = []
+        offset = 0
+        page_size = min(limit, 1000)  # DBLP API caps at 1000 per request
+
         try:
-            logger.debug(f"dblp: Searching for '{query}' with limit={limit}")
-            # DBLP API caps at 1000 results per request
-            effective_limit = min(limit, 1000)
-            if effective_limit < limit:
-                logger.debug(f"dblp: Limiting to {effective_limit} (API maximum)")
-            
-            response = requests.get(
-                DBLP_API_URL,
-                params={"q": query, "format": "json", "h": effective_limit},
-                timeout=30,
-            )
-            response.raise_for_status()
-            data = response.json()
+            # Build query with embedded filters
+            effective_query = query
+            <<dblp apply filters>>
 
-            hits = data.get("result", {}).get("hits", {}).get("hit", [])
-            results = [self._convert_hit(hit) for hit in hits]
-            logger.debug(f"dblp: Retrieved {len(results)} papers")
-            return results
+            logger.debug(f"dblp: Searching for '{query}' with limit={limit}")
+
+            while len(all_papers) < limit:
+                # Calculate how many results we still need
+                remaining = limit - len(all_papers)
+                current_page_size = min(page_size, remaining)
+
+                response = requests.get(
+                    DBLP_API_URL,
+                    params={
+                        "q": effective_query,
+                        "format": "json",
+                        "h": current_page_size,
+                        "f": offset,
+                    },
+                    timeout=30,
+                )
+                response.raise_for_status()
+                data = response.json()
+
+                hits = data.get("result", {}).get("hits", {}).get("hit", [])
+                if not hits:
+                    # No more results available
+                    break
+
+                all_papers.extend(self._convert_hit(hit) for hit in hits)
+                offset += len(hits)
+
+                # Check if we've fetched all available results
+                total_str = data.get("result", {}).get("hits", {}).get("@total", "0")
+                try:
+                    total = int(total_str)
+                except (ValueError, TypeError):
+                    total = 0
+                if offset >= total:
+                    break
+
+            logger.debug(f"dblp: Retrieved {len(all_papers)} papers")
+            return all_papers
         except Exception as e:
             logger.warning("dblp: %s", e)
-            return []
+            return all_papers
 
     <<convert dblp hit>>
+@
+
+\subsubsection{Applying filters}
+
+DBLP supports limited filtering via query syntax:
+\begin{description}
+\item[year] Embed [[year:YYYY]] or [[year:YYYY:YYYY]] in query.
+\item[venue] Embed [[venue:X]] in query (matches venue abbreviation).
+\item[pub\_types] Embed [[type:X]] in query (Conference, Journal, etc.).
+\item[open\_access] Not supported---warn and ignore.
+\item[min\_citations] Not supported---warn and ignore.
+\end{description}
+
+<<dblp apply filters>>=
+if filters:
+    # Year filter: DBLP uses "year:YYYY" or "year:YYYY:YYYY" syntax
+    if filters.year:
+        start, end = filters.year_range()
+        if start and end:
+            if start == end:
+                effective_query += f" year:{start}"
+            else:
+                effective_query += f" year:{start}:{end}"
+        elif start:
+            # Open end: DBLP doesn't support this well, use current year
+            import datetime
+            current_year = datetime.datetime.now().year
+            effective_query += f" year:{start}:{current_year}"
+        elif end:
+            # Open start: use 1900 as earliest
+            effective_query += f" year:1900:{end}"
+
+    # Venue filter
+    if filters.venue:
+        effective_query += f" venue:{filters.venue}"
+
+    # Publication types: map to DBLP type syntax
+    if filters.pub_types:
+        dblp_types = []
+        type_mapping = {
+            "article": "Journal_Articles",
+            "conference": "Conference_and_Workshop_Papers",
+            "book": "Books_and_Theses",
+        }
+        for pt in filters.pub_types:
+            if pt.lower() in type_mapping:
+                dblp_types.append(type_mapping[pt.lower()])
+            else:
+                logger.warning(
+                    "dblp: Publication type '%s' not supported, ignoring", pt
+                )
+        if dblp_types:
+            effective_query += f" type:{dblp_types[0]}"  # DBLP only supports one type
+
+    # Warn about unsupported filters
+    if filters.open_access:
+        logger.warning("dblp: Open access filter not supported, ignoring")
+    if filters.min_citations is not None:
+        logger.warning("dblp: Citation count filter not supported, ignoring")
 @
 
 \subsubsection{Converting publication format}
@@ -1570,7 +1930,7 @@ class TestDBLPProvider:
         provider = DBLPProvider()
 
         mock_response = Mock()
-        mock_response.json.return_value = {"result": {"hits": {"hit": []}}}
+        mock_response.json.return_value = {"result": {"hits": {"hit": [], "@total": "0"}}}
         mock_response.raise_for_status = Mock()
 
         with patch("requests.get") as mock_get:
@@ -1582,21 +1942,64 @@ class TestDBLPProvider:
             call_args = mock_get.call_args
             assert call_args[1]["params"]["h"] == 50
 
-    def test_caps_limit_at_1000(self):
-        """search() caps limit at DBLP's maximum of 1000."""
+    def test_fetches_multiple_pages(self):
+        """search() fetches multiple pages when limit exceeds page size."""
         provider = DBLPProvider()
 
-        mock_response = Mock()
-        mock_response.json.return_value = {"result": {"hits": {"hit": []}}}
-        mock_response.raise_for_status = Mock()
+        # Create responses for two pages
+        page1_response = Mock()
+        page1_response.json.return_value = {
+            "result": {
+                "hits": {
+                    "@total": "1500",
+                    "hit": [{"info": {"title": f"Paper {i}"}} for i in range(1000)],
+                }
+            }
+        }
+        page1_response.raise_for_status = Mock()
 
-        with patch("requests.get") as mock_get:
-            mock_get.return_value = mock_response
+        page2_response = Mock()
+        page2_response.json.return_value = {
+            "result": {
+                "hits": {
+                    "@total": "1500",
+                    "hit": [{"info": {"title": f"Paper {i}"}} for i in range(1000, 1500)],
+                }
+            }
+        }
+        page2_response.raise_for_status = Mock()
 
-            provider.search("test", limit=2000)
+        with patch("requests.get", side_effect=[page1_response, page2_response]) as mock_get:
+            results = provider.search("test", limit=1500)
 
-            call_args = mock_get.call_args
-            assert call_args[1]["params"]["h"] == 1000
+            assert len(results) == 1500
+            assert mock_get.call_count == 2
+            # Verify offset was used correctly
+            calls = mock_get.call_args_list
+            assert calls[0][1]["params"]["f"] == 0
+            assert calls[1][1]["params"]["f"] == 1000
+
+    def test_stops_when_total_reached(self):
+        """search() stops pagination when all results have been fetched."""
+        provider = DBLPProvider()
+
+        page1_response = Mock()
+        page1_response.json.return_value = {
+            "result": {
+                "hits": {
+                    "@total": "50",
+                    "hit": [{"info": {"title": f"Paper {i}"}} for i in range(50)],
+                }
+            }
+        }
+        page1_response.raise_for_status = Mock()
+
+        with patch("requests.get", return_value=page1_response) as mock_get:
+            results = provider.search("test", limit=200)
+
+            # Should stop after first page since total (50) < limit (200)
+            assert len(results) == 50
+            assert mock_get.call_count == 1
 
 
 class TestDBLPIntegration:
@@ -1630,111 +2033,440 @@ It is maintained by Clarivate and requires institutional access or an API key.
 
 \subsection{API options}
 
-Clarivate provides several API options:
+Clarivate provides two API tiers with different capabilities:
 
 \begin{description}
-\item[Web of Science API Expanded] Full access with advanced features.
-  Requires institutional subscription.
 \item[Web of Science Starter API] Basic search with bibliographic metadata.
   Has a free tier (50 requests/day) and institutional tiers (5,000--20,000
   requests/day).
+  Maximum 50 results per page.
+  Does \emph{not} include abstracts.
+  Environment variable: [[WOS_STARTER_API_KEY]].
+\item[Web of Science API Expanded] Full access with advanced features including
+  abstracts, affiliations, funding data, and citation operations (related
+  records, citing articles, cited references, citation reports).
+  Requires institutional subscription.
+  Maximum 100 results per page.
+  Environment variable: [[WOS_EXPANDED_API_KEY]].
 \end{description}
+
+We support both APIs, preferring the Expanded API when available since it
+provides richer metadata (including abstracts).
+For backward compatibility, we also check the legacy [[WOS_API_KEY]] environment
+variable and try it with both APIs.
 
 The official Python client ([[wosstarter_python_client]]) is only available
 from GitHub, not PyPI.
-For consistency with our DBLP implementation, we use the Starter API's REST
-endpoint directly via [[requests]].
+For consistency with our other providers, we use the REST APIs directly via
+[[requests]].
 
 \subsection{Provider implementation}
 
+The provider detects which API tier is available based on configured environment
+variables, preferring the Expanded API when both are available.
+
 <<wos provider>>=
 class WebOfScienceProvider:
-    """Search provider for Web of Science."""
+    """Search provider for Web of Science.
+
+    Supports both Starter and Expanded APIs, preferring Expanded when available.
+    """
 
     name = "wos"
-    MAX_LIMIT = 50  # WoS Starter API caps at 50 results per page
 
-    def __init__(self, api_key: str | None = None):
-        """
-        Initialize the Web of Science provider.
+    <<wos init>>
+    <<wos is available>>
+    <<wos search>>
+    <<wos convert starter hit>>
+    <<wos convert expanded hit>>
+    <<wos extended methods>>
+@
 
-        Args:
-            api_key: API key for WoS Starter API.
-                     If not provided, uses WOS_API_KEY environment variable.
-        """
-        self.api_key = api_key or os.environ.get("WOS_API_KEY")
-        self._cache: dict = load_cache(self.name)
-        register_cache(self.name, self._cache)
+\subsubsection{Initialization}
 
-    def is_available(self) -> bool:
-        """Web of Science requires an API key to be configured."""
-        return bool(self.api_key)
+During initialization, we check for API keys in the following order:
+\begin{enumerate}
+\item [[WOS_EXPANDED_API_KEY]]---use Expanded API
+\item [[WOS_STARTER_API_KEY]]---use Starter API
+\item [[WOS_API_KEY]] (legacy)---try both APIs
+\end{enumerate}
 
-    def search(self, query: str, limit: int = 100) -> list[Paper]:
-        """Search Web of Science for papers matching the query."""
-        if not self.api_key:
-            return []  # No API key configured
-        
-        # Check cache and log hit/miss
-        cache_key = (query, limit)
-        if cache_key in self._cache:
-            logger.info(f"wos: Cache hit for query '{query}'")
-        else:
-            logger.info(f"wos: Cache miss for query '{query}', fetching from API")
-        
-        return self._search_impl(query, limit)
+When only the legacy [[WOS_API_KEY]] is set, we try it with the Expanded API
+first.
+If that fails during search, we fall back to the Starter API.
 
-    @cachedmethod(lambda self: self._cache)
-    def _search_impl(self, query: str, limit: int = 100) -> list[Paper]:
-        """Internal search implementation (cached)."""
-        if not self.api_key:
-            return []  # No API key configured
+We use a sentinel value to distinguish between \enquote{not provided} (use
+environment variable) and \enquote{explicitly set to None} (disable this key).
+This distinction matters for testing: when we want to test the Starter API in
+isolation, we must be able to explicitly disable the Expanded API even if the
+[[WOS_EXPANDED_API_KEY]] environment variable is set.
+Without a sentinel, passing [[None]] would be indistinguishable from not passing
+the argument at all, and the constructor would fall back to the environment
+variable.
 
-        try:
-            # WoS Starter API has max 50 results per page
-            effective_limit = min(limit, 50)
+<<wos init>>=
+def __init__(
+    self,
+    starter_api_key: str | None | object = _WOS_NOT_PROVIDED,
+    expanded_api_key: str | None | object = _WOS_NOT_PROVIDED,
+):
+    """
+    Initialize the Web of Science provider.
+
+    Args:
+        starter_api_key: API key for WoS Starter API.
+                         If not provided, uses WOS_STARTER_API_KEY env var.
+                         Pass None explicitly to disable.
+        expanded_api_key: API key for WoS Expanded API.
+                          If not provided, uses WOS_EXPANDED_API_KEY env var.
+                          Pass None explicitly to disable.
+
+    The legacy WOS_API_KEY environment variable is also checked and tried
+    with both APIs for backward compatibility.
+    """
+    # Use env var only if argument was not provided at all
+    if starter_api_key is _WOS_NOT_PROVIDED:
+        self._starter_key = os.environ.get("WOS_STARTER_API_KEY")
+    else:
+        self._starter_key = starter_api_key
+
+    if expanded_api_key is _WOS_NOT_PROVIDED:
+        self._expanded_key = os.environ.get("WOS_EXPANDED_API_KEY")
+    else:
+        self._expanded_key = expanded_api_key
+
+    # Legacy support: WOS_API_KEY can be used with either API
+    legacy_key = os.environ.get("WOS_API_KEY")
+    if legacy_key:
+        if not self._expanded_key:
+            self._expanded_key = legacy_key
+        if not self._starter_key:
+            self._starter_key = legacy_key
+
+    # Determine which API tier to use (prefer Expanded)
+    if self._expanded_key:
+        self._api_tier = "expanded"
+        self._api_key = self._expanded_key
+        self._api_url = WOS_EXPANDED_API_URL
+        self.MAX_LIMIT = 100
+    elif self._starter_key:
+        self._api_tier = "starter"
+        self._api_key = self._starter_key
+        self._api_url = WOS_STARTER_API_URL
+        self.MAX_LIMIT = 50
+    else:
+        self._api_tier = None
+        self._api_key = None
+        self._api_url = None
+        self.MAX_LIMIT = 50
+
+    self._cache: dict = load_cache(self.name)
+    register_cache(self.name, self._cache)
+@
+
+\subsubsection{Availability check}
+
+<<wos is available>>=
+def is_available(self) -> bool:
+    """Web of Science requires an API key to be configured."""
+    return bool(self._api_key)
+@
+
+\subsubsection{Search dispatch}
+
+The [[search]] method dispatches to the appropriate API-specific implementation
+based on the detected tier.
+
+<<wos search>>=
+@cachedmethod(lambda self: self._cache, key=lambda self, query, limit=100, filters=None: (query, limit, filters.cache_key() if filters else ""))
+def search(
+    self,
+    query: str,
+    limit: int = 100,
+    filters: SearchFilters | None = None,
+) -> list[Paper]:
+    """Search Web of Science for papers matching the query."""
+    if not self._api_key:
+        return []
+
+    logger.debug(f"wos: Searching for '{query}' with limit={limit}")
+
+    if self._api_tier == "expanded":
+        return self._search_expanded(query, limit, filters)
+    else:
+        return self._search_starter(query, limit, filters)
+
+<<wos format query>>
+<<wos search starter>>
+<<wos search expanded>>
+@
+
+\subsubsection{Query formatting}
+
+Both WoS APIs require field tags in queries (e.g., [[TS=]], [[TI=]], [[AU=]]).
+Plain queries like \enquote{machine learning} fail with a 400 Bad Request error.
+We wrap plain queries with [[TS=()]] to search across topic fields (title,
+abstract, keywords).
+Queries that already contain field tags are preserved as-is.
+
+<<wos format query>>=
+def _format_query(self, query: str) -> str:
+    """
+    Format a query for the WoS APIs.
+
+    Both Starter and Expanded APIs require field tags (e.g., TS=, TI=, AU=).
+    If the query doesn't contain a field tag, wrap it with TS=()
+    to search across topic fields (title, abstract, keywords).
+    """
+    if re.search(r'\b[A-Z]{2,3}=', query):
+        return query
+    return f"TS=({query})"
+@
+
+\subsubsection{Starter API search}
+
+The Starter API uses a simpler request format with [[q]], [[limit]], and [[page]]
+parameters.
+The [[page]] parameter is 1-indexed.
+When the user requests more than 50 results (the per-page maximum), we
+automatically fetch multiple pages.
+
+<<wos search starter>>=
+def _search_starter(
+    self,
+    query: str,
+    limit: int,
+    filters: SearchFilters | None,
+) -> list[Paper]:
+    """
+    Search using the WoS Starter API.
+
+    Automatically fetches multiple pages if the requested limit exceeds
+    the API's per-request maximum (50 results per page).
+    """
+    all_papers: list[Paper] = []
+    page = 1
+    page_size = 50  # Starter API max per page
+
+    try:
+        effective_query = self._format_query(query)
+        <<wos apply filters starter>>
+
+        while len(all_papers) < limit:
+            # Calculate how many results we still need
+            remaining = limit - len(all_papers)
+            current_page_size = min(page_size, remaining)
+
             response = requests.get(
-                WOS_API_URL,
+                WOS_STARTER_API_URL,
                 params={
-                    "q": query,
+                    "q": effective_query,
                     "db": "WOS",
-                    "limit": effective_limit,
-                    "page": 1,
+                    "limit": current_page_size,
+                    "page": page,
                 },
-                headers={"X-ApiKey": self.api_key},
+                headers={"X-ApiKey": self._api_key},
                 timeout=30,
             )
             response.raise_for_status()
             data = response.json()
 
             hits = data.get("hits", [])
-            return [self._convert_hit(hit) for hit in hits]
-        except Exception as e:
-            logger.warning("wos: %s", e)
-            return []
+            if not hits:
+                # No more results available
+                break
 
-    <<convert wos hit>>
+            all_papers.extend(self._convert_starter_hit(hit) for hit in hits)
+            page += 1
+
+            # Check if we've fetched all available results
+            metadata = data.get("metadata", {})
+            total = metadata.get("total", 0)
+            if len(all_papers) >= total:
+                break
+
+        return all_papers
+    except Exception as e:
+        logger.warning("wos (starter): %s", e)
+        return all_papers
 @
 
-\subsubsection{Converting document format}
+\subsubsection{Expanded API search}
 
-The WoS Starter API returns documents with fields including:
-\begin{description}
-\item[uid] Unique WoS identifier.
-\item[title] The document title.
-\item[names] Object with [[authors]] array containing author names.
-\item[source] Source publication information including [[sourceTitle]].
-\item[links] Object with [[record]] URL to WoS page.
-\item[identifiers] Object with DOI and other identifiers.
-\item[keywords] Object with [[authorKeywords]] array.
-\end{description}
+The Expanded API uses [[usrQuery]], [[count]], and [[firstRecord]] parameters.
+The [[firstRecord]] parameter is 1-indexed (the first record is 1, not 0).
+It returns a more complex nested structure with full metadata including abstracts.
+When the user requests more than 100 results (the per-page maximum), we
+automatically fetch multiple pages.
 
-We convert each hit to our common [[Paper]] type:
+<<wos search expanded>>=
+def _search_expanded(
+    self,
+    query: str,
+    limit: int,
+    filters: SearchFilters | None,
+) -> list[Paper]:
+    """
+    Search using the WoS Expanded API.
 
-<<convert wos hit>>=
-def _convert_hit(self, hit: dict) -> Paper:
-    """Convert a WoS API hit to our Paper type."""
-    # Extract publication year from source
+    Automatically fetches multiple pages if the requested limit exceeds
+    the API's per-request maximum (100 results per page).
+    """
+    all_papers: list[Paper] = []
+    first_record = 1  # 1-indexed
+    page_size = 100  # Expanded API max per page
+
+    try:
+        effective_query = self._format_query(query)
+        <<wos apply filters expanded>>
+
+        while len(all_papers) < limit:
+            # Calculate how many results we still need
+            remaining = limit - len(all_papers)
+            current_page_size = min(page_size, remaining)
+
+            response = requests.get(
+                WOS_EXPANDED_API_URL,
+                params={
+                    "databaseId": "WOS",
+                    "usrQuery": effective_query,
+                    "count": current_page_size,
+                    "firstRecord": first_record,
+                },
+                headers={"X-ApiKey": self._api_key},
+                timeout=30,
+            )
+            response.raise_for_status()
+            data = response.json()
+
+            # Navigate the nested structure to get records
+            records = (
+                data.get("Data", {})
+                .get("Records", {})
+                .get("records", {})
+                .get("REC", [])
+            )
+
+            if not records:
+                # No more results available
+                break
+
+            # Store query ID for potential citation report requests
+            query_result = data.get("QueryResult", {})
+            self._last_query_id = query_result.get("QueryID")
+
+            all_papers.extend(self._convert_expanded_hit(rec) for rec in records)
+            first_record += len(records)
+
+            # Check if we've fetched all available results
+            total = query_result.get("RecordsFound", 0)
+            if first_record > total:
+                break
+
+        return all_papers
+    except Exception as e:
+        logger.warning("wos (expanded): %s", e)
+        # Try falling back to Starter API if we have a starter key
+        if self._starter_key and self._starter_key != self._expanded_key:
+            logger.info("wos: Falling back to Starter API")
+            self._api_tier = "starter"
+            self._api_key = self._starter_key
+            self._api_url = WOS_STARTER_API_URL
+            self.MAX_LIMIT = 50
+            return self._search_starter(query, limit, filters)
+        return all_papers
+@
+
+\subsubsection{Applying filters}
+
+Web of Science uses advanced query syntax for filtering.
+Both APIs support the same query syntax, but the Expanded API also supports
+some filters as separate parameters.
+
+For the Starter API, we embed all filters in the query:
+
+<<wos apply filters starter>>=
+if filters:
+    <<wos embed year filter>>
+    <<wos embed venue filter>>
+    <<wos embed pub types filter>>
+
+    # Warn about unsupported filters in Starter API
+    if filters.open_access:
+        logger.warning("wos: Open access filter not supported in Starter API, ignoring")
+    if filters.min_citations is not None:
+        logger.warning("wos: Citation count filter not supported in Starter API, ignoring")
+@
+
+For the Expanded API, we also embed filters in the query but support additional
+filter types:
+
+<<wos apply filters expanded>>=
+if filters:
+    <<wos embed year filter>>
+    <<wos embed venue filter>>
+    <<wos embed pub types filter>>
+
+    # Open access is supported in Expanded API via OA field
+    if filters.open_access:
+        effective_query += " AND OA=(gold OR green OR bronze)"
+
+    # Citation count filtering requires local filtering after results
+    if filters.min_citations is not None:
+        logger.warning("wos: Citation count filter applied locally after search")
+@
+
+The shared filter embedding chunks:
+
+<<wos embed year filter>>=
+if filters.year:
+    start, end = filters.year_range()
+    if start and end:
+        if start == end:
+            effective_query += f" AND PY={start}"
+        else:
+            effective_query += f" AND PY={start}-{end}"
+    elif start:
+        import datetime
+        current_year = datetime.datetime.now().year
+        effective_query += f" AND PY={start}-{current_year}"
+    elif end:
+        effective_query += f" AND PY=1900-{end}"
+@
+
+<<wos embed venue filter>>=
+if filters.venue:
+    effective_query += f' AND SO="{filters.venue}"'
+@
+
+<<wos embed pub types filter>>=
+if filters.pub_types:
+    wos_types = []
+    type_mapping = {
+        "article": "Article",
+        "conference": "Proceedings Paper",
+        "review": "Review",
+        "book": "Book",
+    }
+    for pt in filters.pub_types:
+        if pt.lower() in type_mapping:
+            wos_types.append(type_mapping[pt.lower()])
+        else:
+            logger.warning(
+                "wos: Publication type '%s' not supported, ignoring", pt
+            )
+    if wos_types:
+        types_query = " OR ".join(f'DT="{t}"' for t in wos_types)
+        effective_query += f" AND ({types_query})"
+@
+
+\subsubsection{Converting Starter API response}
+
+The WoS Starter API returns documents with a relatively flat structure:
+
+<<wos convert starter hit>>=
+def _convert_starter_hit(self, hit: dict) -> Paper:
+    """Convert a WoS Starter API hit to our Paper type."""
     source = hit.get("source", {})
     year = None
     pub_year = source.get("publishYear")
@@ -1744,7 +2476,6 @@ def _convert_hit(self, hit: dict) -> Paper:
         except (ValueError, TypeError):
             pass
 
-    # Extract author names
     authors = []
     names = hit.get("names", {})
     for author in names.get("authors", []):
@@ -1752,13 +2483,9 @@ def _convert_hit(self, hit: dict) -> Paper:
         if name:
             authors.append(name)
 
-    # Extract DOI from identifiers
-    doi = None
     identifiers = hit.get("identifiers", {})
     doi = identifiers.get("doi")
 
-    # Extract URL from links
-    url = None
     links = hit.get("links", {})
     url = links.get("record")
 
@@ -1774,6 +2501,324 @@ def _convert_hit(self, hit: dict) -> Paper:
     )
 @
 
+\subsubsection{Converting Expanded API response}
+
+The WoS Expanded API returns documents with a deeply nested structure that
+includes full metadata such as abstracts, affiliations, and citation counts.
+
+<<wos convert expanded hit>>=
+def _convert_expanded_hit(self, rec: dict) -> Paper:
+    """Convert a WoS Expanded API record to our Paper type."""
+    static_data = rec.get("static_data", {})
+    summary = static_data.get("summary", {})
+    fullrecord = static_data.get("fullrecord_metadata", {})
+
+    # Extract title (look for type="item")
+    title = ""
+    titles = summary.get("titles", {}).get("title", [])
+    for t in titles:
+        if t.get("type") == "item":
+            title = t.get("content", "")
+            break
+    if not title and titles:
+        title = titles[0].get("content", "") if isinstance(titles[0], dict) else ""
+
+    # Extract publication year
+    year = None
+    pub_info = summary.get("pub_info", {})
+    pub_year = pub_info.get("pubyear")
+    if pub_year:
+        try:
+            year = int(pub_year)
+        except (ValueError, TypeError):
+            pass
+
+    # Extract authors
+    authors = []
+    names = summary.get("names", {})
+    for author in names.get("name", []):
+        if author.get("role") == "author":
+            name = author.get("display_name") or author.get("full_name")
+            if name:
+                authors.append(name)
+
+    # Extract DOI from cluster_related identifiers
+    doi = None
+    dynamic_data = rec.get("dynamic_data", {})
+    cluster = dynamic_data.get("cluster_related", {})
+    identifiers = cluster.get("identifiers", {}).get("identifier", [])
+    for ident in identifiers:
+        if ident.get("type") == "doi":
+            doi = ident.get("value")
+            break
+
+    # Extract abstract
+    abstract = None
+    abstracts = fullrecord.get("abstracts", {})
+    abstract_obj = abstracts.get("abstract", {})
+    if abstract_obj:
+        abstract_text = abstract_obj.get("abstract_text", {})
+        abstract = abstract_text.get("p", "")
+
+    # Extract venue (source title)
+    venue = None
+    for t in titles:
+        if t.get("type") == "source":
+            venue = t.get("content")
+            break
+
+    # Construct URL from UID
+    uid = rec.get("UID", "")
+    url = f"https://www.webofscience.com/wos/woscc/full-record/{uid}" if uid else None
+
+    return Paper(
+        title=title,
+        authors=authors,
+        year=year,
+        doi=doi,
+        abstract=abstract,
+        venue=venue,
+        url=url,
+        source=self.name,
+    )
+@
+
+\subsection{Extended functionality (Expanded API only)}
+
+The Expanded API provides additional operations for citation analysis that are
+not available in the Starter API.
+These methods raise [[NotImplementedError]] if called when only the Starter API
+is configured.
+
+<<wos extended methods>>=
+def _require_expanded_api(self, operation: str) -> None:
+    """Raise an error if the Expanded API is not available."""
+    if self._api_tier != "expanded":
+        raise NotImplementedError(
+            f"WoS {operation} requires the Expanded API. "
+            f"Set WOS_EXPANDED_API_KEY environment variable."
+        )
+
+def get_related_records(self, uid: str, limit: int = 10) -> list[Paper]:
+    """
+    Find records that share cited references with the given paper.
+
+    Args:
+        uid: Web of Science unique identifier (e.g., "WOS:000270372400005")
+        limit: Maximum number of related records to return (1-100)
+
+    Returns:
+        List of related papers
+
+    Raises:
+        NotImplementedError: If Expanded API is not configured
+    """
+    self._require_expanded_api("get_related_records")
+
+    try:
+        response = requests.get(
+            f"{WOS_EXPANDED_API_URL}/related",
+            params={
+                "databaseId": "WOS",
+                "uniqueId": uid,
+                "count": min(limit, 100),
+                "firstRecord": 1,
+            },
+            headers={"X-ApiKey": self._api_key},
+            timeout=30,
+        )
+        response.raise_for_status()
+        data = response.json()
+
+        records = (
+            data.get("Data", {})
+            .get("Records", {})
+            .get("records", {})
+            .get("REC", [])
+        )
+        return [self._convert_expanded_hit(rec) for rec in records]
+    except NotImplementedError:
+        raise
+    except Exception as e:
+        logger.warning("wos: get_related_records failed: %s", e)
+        return []
+
+def get_citing_articles(self, uid: str, limit: int = 10) -> list[Paper]:
+    """
+    Find articles that cite the given paper.
+
+    Args:
+        uid: Web of Science unique identifier (e.g., "WOS:000270372400005")
+        limit: Maximum number of citing articles to return (1-100)
+
+    Returns:
+        List of citing papers
+
+    Raises:
+        NotImplementedError: If Expanded API is not configured
+    """
+    self._require_expanded_api("get_citing_articles")
+
+    try:
+        response = requests.get(
+            f"{WOS_EXPANDED_API_URL}/citing",
+            params={
+                "databaseId": "WOS",
+                "uniqueId": uid,
+                "count": min(limit, 100),
+                "firstRecord": 1,
+            },
+            headers={"X-ApiKey": self._api_key},
+            timeout=30,
+        )
+        response.raise_for_status()
+        data = response.json()
+
+        records = (
+            data.get("Data", {})
+            .get("Records", {})
+            .get("records", {})
+            .get("REC", [])
+        )
+        return [self._convert_expanded_hit(rec) for rec in records]
+    except NotImplementedError:
+        raise
+    except Exception as e:
+        logger.warning("wos: get_citing_articles failed: %s", e)
+        return []
+
+def get_cited_references(self, uid: str, limit: int = 10) -> list[dict]:
+    """
+    Find references cited by the given paper.
+
+    Args:
+        uid: Web of Science unique identifier (e.g., "WOS:000270372400005")
+        limit: Maximum number of references to return (1-100)
+
+    Returns:
+        List of reference dictionaries with fields:
+        - uid: WoS identifier (if available)
+        - citedAuthor: Author name
+        - citedTitle: Title of cited work
+        - citedWork: Source/journal name
+        - year: Publication year
+        - doi: DOI (if available)
+        - timesCited: Citation count
+
+    Raises:
+        NotImplementedError: If Expanded API is not configured
+    """
+    self._require_expanded_api("get_cited_references")
+
+    try:
+        response = requests.get(
+            f"{WOS_EXPANDED_API_URL}/references",
+            params={
+                "databaseId": "WOS",
+                "uniqueId": uid,
+                "count": min(limit, 100),
+                "firstRecord": 1,
+            },
+            headers={"X-ApiKey": self._api_key},
+            timeout=30,
+        )
+        response.raise_for_status()
+        data = response.json()
+
+        # References have a different structure than regular records
+        references = data.get("Data", [])
+        return [
+            {
+                "uid": ref.get("UID"),
+                "citedAuthor": ref.get("citedAuthor"),
+                "citedTitle": ref.get("citedTitle"),
+                "citedWork": ref.get("citedWork"),
+                "year": ref.get("year"),
+                "doi": ref.get("doi"),
+                "timesCited": ref.get("timesCited"),
+            }
+            for ref in references
+        ]
+    except NotImplementedError:
+        raise
+    except Exception as e:
+        logger.warning("wos: get_cited_references failed: %s", e)
+        return []
+
+def search_for_citation_report(
+    self,
+    query: str,
+    limit: int = 100,
+) -> dict | None:
+    """
+    Run a search and return citation statistics for the results.
+
+    This method first performs a search to obtain a query ID, then fetches
+    the citation report for that query.
+
+    Args:
+        query: Search query string
+        limit: Maximum number of records to include in report (max 10000)
+
+    Returns:
+        Citation report dictionary with fields like:
+        - TimesCited: Total citations
+        - TimesCitedSansSelf: Citations excluding self-citations
+        - AveragePerItem: Average citations per paper
+        - AveragePerYear: Average citations per year
+        - HValue: h-index for the result set
+        - CitingYears: Breakdown by year
+        Or None if the request fails
+
+    Raises:
+        NotImplementedError: If Expanded API is not configured
+    """
+    self._require_expanded_api("search_for_citation_report")
+
+    try:
+        # First, run a search to get a query ID
+        response = requests.get(
+            WOS_EXPANDED_API_URL,
+            params={
+                "databaseId": "WOS",
+                "usrQuery": query,
+                "count": min(limit, 100),
+                "firstRecord": 1,
+            },
+            headers={"X-ApiKey": self._api_key},
+            timeout=30,
+        )
+        response.raise_for_status()
+        data = response.json()
+
+        query_result = data.get("QueryResult", {})
+        query_id = query_result.get("QueryID")
+
+        if not query_id:
+            logger.warning("wos: No query ID returned for citation report")
+            return None
+
+        # Now fetch the citation report
+        report_response = requests.get(
+            f"{WOS_EXPANDED_API_URL}/citation-report/{query_id}",
+            params={"reportLevel": "WOS"},
+            headers={"X-ApiKey": self._api_key},
+            timeout=30,
+        )
+        report_response.raise_for_status()
+        report_data = report_response.json()
+
+        # Return the first (WOS) report level
+        if report_data and len(report_data) > 0:
+            return report_data[0]
+        return None
+    except NotImplementedError:
+        raise
+    except Exception as e:
+        logger.warning("wos: search_for_citation_report failed: %s", e)
+        return None
+@
+
 \subsection{Auto-registration}
 
 <<wos provider>>=
@@ -1783,42 +2828,118 @@ register_provider(WebOfScienceProvider())
 
 \subsection{Dependencies}
 
-Since the provider uses the same [[requests]] library as DBLP, we only need
-to define the API URL constant:
+The WoS provider uses [[requests]] for HTTP calls and [[re]] for detecting
+field tags in queries (the Starter API requires queries to have explicit field
+tags like [[TS=]] or [[TI=]]).
+
+<<wos imports>>=
+import re
+import requests
+@
+
+We also define the API URL constants for both tiers, plus a sentinel value
+for distinguishing \enquote{argument not provided} from \enquote{explicitly
+set to None} in the constructor:
 
 <<wos constants>>=
-WOS_API_URL = "https://api.clarivate.com/apis/wos-starter/v1/documents"
+WOS_STARTER_API_URL = "https://api.clarivate.com/apis/wos-starter/v1/documents"
+WOS_EXPANDED_API_URL = "https://wos-api.clarivate.com/api/wos"
+_WOS_NOT_PROVIDED = object()  # Sentinel for "argument not passed"
 @
 
 \subsection{Testing Web of Science provider}
 
-We test the WoS provider with mocked API responses.
-First, we verify the availability depends on having an API key configured:
+We test the WoS provider with mocked API responses, covering both API tiers.
+
+\subsubsection{Configuration tests}
+
+First, we verify the API tier selection and availability logic.
+To isolate tests from environment variables, we explicitly pass [[None]] for
+keys we don't want to use.
 
 <<test functions>>=
 class TestWebOfScienceProvider:
     """Tests for the Web of Science provider."""
 
     def test_is_available_false_without_key(self):
-        """Web of Science is unavailable without API key."""
-        provider = WebOfScienceProvider(api_key=None)
-        provider.api_key = None  # Ensure no key
+        """Web of Science is unavailable without any API key."""
+        provider = WebOfScienceProvider(
+            starter_api_key=None, expanded_api_key=None
+        )
         assert provider.is_available() is False
 
-    def test_is_available_true_with_key(self):
-        """Web of Science is available with API key."""
-        provider = WebOfScienceProvider(api_key="test_key")
+    def test_is_available_true_with_starter_key(self):
+        """Web of Science is available with Starter API key."""
+        provider = WebOfScienceProvider(
+            starter_api_key="test_key", expanded_api_key=None
+        )
         assert provider.is_available() is True
+        assert provider._api_tier == "starter"
+
+    def test_is_available_true_with_expanded_key(self):
+        """Web of Science is available with Expanded API key."""
+        provider = WebOfScienceProvider(
+            starter_api_key=None, expanded_api_key="test_key"
+        )
+        assert provider.is_available() is True
+        assert provider._api_tier == "expanded"
+
+    def test_prefers_expanded_when_both_keys_available(self):
+        """Provider prefers Expanded API when both keys are set."""
+        provider = WebOfScienceProvider(
+            starter_api_key="starter_key",
+            expanded_api_key="expanded_key",
+        )
+        assert provider._api_tier == "expanded"
+        assert provider._api_key == "expanded_key"
+        assert provider.MAX_LIMIT == 100
+
+    def test_uses_starter_when_only_starter_key(self):
+        """Provider uses Starter API when only starter key is set."""
+        provider = WebOfScienceProvider(
+            starter_api_key="starter_key", expanded_api_key=None
+        )
+        assert provider._api_tier == "starter"
+        assert provider._api_key == "starter_key"
+        assert provider.MAX_LIMIT == 50
+
+    def test_legacy_wos_api_key_sets_both(self, monkeypatch):
+        """Legacy WOS_API_KEY environment variable is tried with both APIs."""
+        monkeypatch.setenv("WOS_API_KEY", "legacy_key")
+        monkeypatch.delenv("WOS_STARTER_API_KEY", raising=False)
+        monkeypatch.delenv("WOS_EXPANDED_API_KEY", raising=False)
+
+        provider = WebOfScienceProvider()
+
+        # Should prefer expanded (tries legacy key as expanded first)
+        assert provider._api_tier == "expanded"
+        assert provider._expanded_key == "legacy_key"
+        assert provider._starter_key == "legacy_key"
 
     def test_search_returns_empty_without_api_key(self):
         """search() returns empty list when no API key is configured."""
-        provider = WebOfScienceProvider(api_key=None)
+        provider = WebOfScienceProvider(
+            starter_api_key=None, expanded_api_key=None
+        )
         results = provider.search("test")
         assert results == []
+@
+
+\subsubsection{Starter API tests}
+
+Tests for the Starter API search functionality.
+To ensure we test the Starter API specifically (not the Expanded API), we pass
+[[expanded_api_key=None]] to override any environment variables that may be set.
+
+<<test functions>>=
+class TestWebOfScienceStarterAPI:
+    """Tests for Web of Science Starter API."""
 
     def test_search_converts_documents(self):
-        """search() converts API results to Paper objects."""
-        provider = WebOfScienceProvider(api_key="test_key")
+        """search() converts Starter API results to Paper objects."""
+        provider = WebOfScienceProvider(
+            starter_api_key="test_key", expanded_api_key=None
+        )
 
         mock_response = Mock()
         mock_response.json.return_value = {
@@ -1853,11 +2974,14 @@ class TestWebOfScienceProvider:
             assert paper.year == 2024
             assert paper.doi == "10.1234/test"
             assert paper.venue == "Nature"
+            assert paper.abstract is None  # Starter API has no abstracts
             assert paper.source == "wos"
 
     def test_search_handles_empty_results(self):
         """search() returns empty list when no results."""
-        provider = WebOfScienceProvider(api_key="test_key")
+        provider = WebOfScienceProvider(
+            starter_api_key="test_key", expanded_api_key=None
+        )
 
         mock_response = Mock()
         mock_response.json.return_value = {"hits": []}
@@ -1871,7 +2995,9 @@ class TestWebOfScienceProvider:
 
     def test_search_handles_api_error(self):
         """search() returns empty list on API error."""
-        provider = WebOfScienceProvider(api_key="test_key")
+        provider = WebOfScienceProvider(
+            starter_api_key="test_key", expanded_api_key=None
+        )
 
         with patch("requests.get") as mock_get:
             mock_get.side_effect = Exception("API error")
@@ -1881,7 +3007,9 @@ class TestWebOfScienceProvider:
 
     def test_handles_missing_fields(self):
         """search() handles documents with missing optional fields."""
-        provider = WebOfScienceProvider(api_key="test_key")
+        provider = WebOfScienceProvider(
+            starter_api_key="test_key", expanded_api_key=None
+        )
 
         mock_response = Mock()
         mock_response.json.return_value = {
@@ -1902,25 +3030,42 @@ class TestWebOfScienceProvider:
             assert paper.doi is None
             assert paper.abstract is None
 
-    def test_caps_limit_at_50(self):
-        """search() caps limit at WoS Starter API's maximum of 50."""
-        provider = WebOfScienceProvider(api_key="test_key")
+    def test_fetches_multiple_pages(self):
+        """Starter API fetches multiple pages when limit exceeds page size."""
+        provider = WebOfScienceProvider(
+            starter_api_key="test_key", expanded_api_key=None
+        )
 
-        mock_response = Mock()
-        mock_response.json.return_value = {"hits": []}
-        mock_response.raise_for_status = Mock()
+        # Create responses for two pages
+        page1_response = Mock()
+        page1_response.json.return_value = {
+            "metadata": {"total": 75},
+            "hits": [{"title": f"Paper {i}"} for i in range(50)],
+        }
+        page1_response.raise_for_status = Mock()
 
-        with patch("requests.get") as mock_get:
-            mock_get.return_value = mock_response
+        page2_response = Mock()
+        page2_response.json.return_value = {
+            "metadata": {"total": 75},
+            "hits": [{"title": f"Paper {i}"} for i in range(50, 75)],
+        }
+        page2_response.raise_for_status = Mock()
 
-            provider.search("test", limit=100)
+        with patch("requests.get", side_effect=[page1_response, page2_response]) as mock_get:
+            results = provider.search("test", limit=75)
 
-            call_args = mock_get.call_args
-            assert call_args[1]["params"]["limit"] == 50
+            assert len(results) == 75
+            assert mock_get.call_count == 2
+            # Verify page parameter increments
+            calls = mock_get.call_args_list
+            assert calls[0][1]["params"]["page"] == 1
+            assert calls[1][1]["params"]["page"] == 2
 
     def test_sends_api_key_header(self):
         """search() sends API key in header."""
-        provider = WebOfScienceProvider(api_key="my_secret_key")
+        provider = WebOfScienceProvider(
+            starter_api_key="my_secret_key", expanded_api_key=None
+        )
 
         mock_response = Mock()
         mock_response.json.return_value = {"hits": []}
@@ -1934,21 +3079,527 @@ class TestWebOfScienceProvider:
             call_args = mock_get.call_args
             assert call_args[1]["headers"]["X-ApiKey"] == "my_secret_key"
 
+    def test_uses_starter_api_url(self):
+        """Starter API uses correct URL."""
+        provider = WebOfScienceProvider(
+            starter_api_key="test_key", expanded_api_key=None
+        )
 
+        mock_response = Mock()
+        mock_response.json.return_value = {"hits": []}
+        mock_response.raise_for_status = Mock()
+
+        with patch("requests.get") as mock_get:
+            mock_get.return_value = mock_response
+
+            provider.search("test")
+
+            call_args = mock_get.call_args
+            assert "wos-starter" in call_args[0][0]
+
+    def test_formats_plain_query_with_ts_tag(self):
+        """Plain queries are wrapped with TS= for topic search."""
+        provider = WebOfScienceProvider(
+            starter_api_key="test_key", expanded_api_key=None
+        )
+
+        mock_response = Mock()
+        mock_response.json.return_value = {"hits": []}
+        mock_response.raise_for_status = Mock()
+
+        with patch("requests.get") as mock_get:
+            mock_get.return_value = mock_response
+
+            provider.search("machine learning")
+
+            call_args = mock_get.call_args
+            # Query should be wrapped with TS=()
+            assert call_args[1]["params"]["q"] == "TS=(machine learning)"
+
+    def test_preserves_existing_field_tags(self):
+        """Queries with field tags are not double-wrapped."""
+        provider = WebOfScienceProvider(
+            starter_api_key="test_key", expanded_api_key=None
+        )
+
+        mock_response = Mock()
+        mock_response.json.return_value = {"hits": []}
+        mock_response.raise_for_status = Mock()
+
+        with patch("requests.get") as mock_get:
+            mock_get.return_value = mock_response
+
+            provider.search("TI=(machine learning) AND AU=Smith")
+
+            call_args = mock_get.call_args
+            # Query should NOT be wrapped again
+            assert call_args[1]["params"]["q"] == "TI=(machine learning) AND AU=Smith"
+@
+
+\subsubsection{Expanded API tests}
+
+Tests for the Expanded API search functionality.
+Like the Starter API, the Expanded API requires field tags in queries, so we
+verify that plain queries are wrapped with [[TS=()]] and that queries with
+existing field tags are preserved.
+
+<<test functions>>=
+class TestWebOfScienceExpandedAPI:
+    """Tests for Web of Science Expanded API."""
+
+    def test_search_converts_documents_with_abstracts(self):
+        """search() converts Expanded API results including abstracts."""
+        provider = WebOfScienceProvider(
+            starter_api_key=None, expanded_api_key="test_key"
+        )
+
+        mock_response = Mock()
+        mock_response.json.return_value = {
+            "Data": {
+                "Records": {
+                    "records": {
+                        "REC": [{
+                            "UID": "WOS:000123456789",
+                            "static_data": {
+                                "summary": {
+                                    "titles": {
+                                        "title": [
+                                            {"type": "item", "content": "Test Paper"},
+                                            {"type": "source", "content": "Nature"},
+                                        ]
+                                    },
+                                    "names": {
+                                        "name": [
+                                            {"role": "author", "display_name": "Alice Smith"},
+                                            {"role": "author", "display_name": "Bob Jones"},
+                                        ]
+                                    },
+                                    "pub_info": {"pubyear": 2024},
+                                },
+                                "fullrecord_metadata": {
+                                    "abstracts": {
+                                        "abstract": {
+                                            "abstract_text": {"p": "This is the abstract."}
+                                        }
+                                    }
+                                },
+                            },
+                            "dynamic_data": {
+                                "cluster_related": {
+                                    "identifiers": {
+                                        "identifier": [
+                                            {"type": "doi", "value": "10.1234/test"}
+                                        ]
+                                    }
+                                }
+                            },
+                        }]
+                    }
+                }
+            },
+            "QueryResult": {"QueryID": 1, "RecordsFound": 1},
+        }
+        mock_response.raise_for_status = Mock()
+
+        with patch("requests.get") as mock_get:
+            mock_get.return_value = mock_response
+
+            results = provider.search("test query")
+
+            assert len(results) == 1
+            paper = results[0]
+            assert isinstance(paper, Paper)
+            assert paper.title == "Test Paper"
+            assert paper.authors == ["Alice Smith", "Bob Jones"]
+            assert paper.year == 2024
+            assert paper.doi == "10.1234/test"
+            assert paper.venue == "Nature"
+            assert paper.abstract == "This is the abstract."
+            assert paper.source == "wos"
+
+    def test_fetches_multiple_pages(self):
+        """Expanded API fetches multiple pages when limit exceeds page size."""
+        provider = WebOfScienceProvider(
+            starter_api_key=None, expanded_api_key="test_key"
+        )
+
+        # Create responses for two pages
+        page1_response = Mock()
+        page1_response.json.return_value = {
+            "Data": {
+                "Records": {
+                    "records": {
+                        "REC": [
+                            {
+                                "UID": f"WOS:{i}",
+                                "static_data": {
+                                    "summary": {
+                                        "titles": {"title": [{"type": "item", "content": f"Paper {i}"}]},
+                                        "names": {"name": []},
+                                        "pub_info": {},
+                                    },
+                                    "fullrecord_metadata": {},
+                                },
+                                "dynamic_data": {},
+                            }
+                            for i in range(100)
+                        ]
+                    }
+                }
+            },
+            "QueryResult": {"QueryID": 1, "RecordsFound": 150},
+        }
+        page1_response.raise_for_status = Mock()
+
+        page2_response = Mock()
+        page2_response.json.return_value = {
+            "Data": {
+                "Records": {
+                    "records": {
+                        "REC": [
+                            {
+                                "UID": f"WOS:{i}",
+                                "static_data": {
+                                    "summary": {
+                                        "titles": {"title": [{"type": "item", "content": f"Paper {i}"}]},
+                                        "names": {"name": []},
+                                        "pub_info": {},
+                                    },
+                                    "fullrecord_metadata": {},
+                                },
+                                "dynamic_data": {},
+                            }
+                            for i in range(100, 150)
+                        ]
+                    }
+                }
+            },
+            "QueryResult": {"QueryID": 1, "RecordsFound": 150},
+        }
+        page2_response.raise_for_status = Mock()
+
+        with patch("requests.get", side_effect=[page1_response, page2_response]) as mock_get:
+            results = provider.search("test", limit=150)
+
+            assert len(results) == 150
+            assert mock_get.call_count == 2
+            # Verify firstRecord parameter increments
+            calls = mock_get.call_args_list
+            assert calls[0][1]["params"]["firstRecord"] == 1
+            assert calls[1][1]["params"]["firstRecord"] == 101
+
+    def test_uses_expanded_api_url(self):
+        """Expanded API uses correct URL."""
+        provider = WebOfScienceProvider(
+            starter_api_key=None, expanded_api_key="test_key"
+        )
+
+        mock_response = Mock()
+        mock_response.json.return_value = {
+            "Data": {"Records": {"records": {"REC": []}}},
+            "QueryResult": {"QueryID": 1},
+        }
+        mock_response.raise_for_status = Mock()
+
+        with patch("requests.get") as mock_get:
+            mock_get.return_value = mock_response
+
+            provider.search("test")
+
+            call_args = mock_get.call_args
+            assert "wos-api.clarivate.com" in call_args[0][0]
+
+    def test_uses_usrquery_parameter(self):
+        """Expanded API uses usrQuery parameter with formatted query."""
+        provider = WebOfScienceProvider(
+            starter_api_key=None, expanded_api_key="test_key"
+        )
+
+        mock_response = Mock()
+        mock_response.json.return_value = {
+            "Data": {"Records": {"records": {"REC": []}}},
+            "QueryResult": {"QueryID": 1},
+        }
+        mock_response.raise_for_status = Mock()
+
+        with patch("requests.get") as mock_get:
+            mock_get.return_value = mock_response
+
+            provider.search("machine learning")
+
+            call_args = mock_get.call_args
+            # Plain queries are wrapped with TS=()
+            assert call_args[1]["params"]["usrQuery"] == "TS=(machine learning)"
+
+    def test_formats_plain_query_with_ts_tag(self):
+        """Plain queries are wrapped with TS= for topic search."""
+        provider = WebOfScienceProvider(
+            starter_api_key=None, expanded_api_key="test_key"
+        )
+
+        mock_response = Mock()
+        mock_response.json.return_value = {
+            "Data": {"Records": {"records": {"REC": []}}},
+            "QueryResult": {"QueryID": 1},
+        }
+        mock_response.raise_for_status = Mock()
+
+        with patch("requests.get") as mock_get:
+            mock_get.return_value = mock_response
+
+            provider.search("deep learning")
+
+            call_args = mock_get.call_args
+            assert call_args[1]["params"]["usrQuery"] == "TS=(deep learning)"
+
+    def test_preserves_existing_field_tags(self):
+        """Queries with field tags are not double-wrapped."""
+        provider = WebOfScienceProvider(
+            starter_api_key=None, expanded_api_key="test_key"
+        )
+
+        mock_response = Mock()
+        mock_response.json.return_value = {
+            "Data": {"Records": {"records": {"REC": []}}},
+            "QueryResult": {"QueryID": 1},
+        }
+        mock_response.raise_for_status = Mock()
+
+        with patch("requests.get") as mock_get:
+            mock_get.return_value = mock_response
+
+            provider.search("TI=(neural networks) AND AU=LeCun")
+
+            call_args = mock_get.call_args
+            assert call_args[1]["params"]["usrQuery"] == "TI=(neural networks) AND AU=LeCun"
+
+    def test_fallback_to_starter_on_expanded_error(self):
+        """Falls back to Starter API when Expanded API fails."""
+        provider = WebOfScienceProvider(
+            starter_api_key="starter_key",
+            expanded_api_key="expanded_key",
+        )
+
+        # First call (Expanded) fails, second call (Starter) succeeds
+        expanded_error = Exception("Expanded API error")
+        starter_response = Mock()
+        starter_response.json.return_value = {
+            "hits": [{"title": "Fallback Paper"}]
+        }
+        starter_response.raise_for_status = Mock()
+
+        with patch("requests.get") as mock_get:
+            mock_get.side_effect = [expanded_error, starter_response]
+
+            results = provider.search("test")
+
+            assert len(results) == 1
+            assert results[0].title == "Fallback Paper"
+            # Provider should have switched to starter tier
+            assert provider._api_tier == "starter"
+@
+
+\subsubsection{Extended methods tests}
+
+Tests for the Expanded API extended functionality:
+
+<<test functions>>=
+class TestWebOfScienceExtendedMethods:
+    """Tests for WoS extended methods (Expanded API only)."""
+
+    def test_extended_methods_require_expanded_api(self):
+        """Extended methods raise NotImplementedError on Starter API."""
+        provider = WebOfScienceProvider(
+            starter_api_key="test_key", expanded_api_key=None
+        )
+
+        with pytest.raises(NotImplementedError):
+            provider.get_related_records("WOS:000123")
+
+        with pytest.raises(NotImplementedError):
+            provider.get_citing_articles("WOS:000123")
+
+        with pytest.raises(NotImplementedError):
+            provider.get_cited_references("WOS:000123")
+
+        with pytest.raises(NotImplementedError):
+            provider.search_for_citation_report("test query")
+
+    def test_get_related_records_returns_papers(self):
+        """get_related_records() returns list of Paper objects."""
+        provider = WebOfScienceProvider(
+            starter_api_key=None, expanded_api_key="test_key"
+        )
+
+        mock_response = Mock()
+        mock_response.json.return_value = {
+            "Data": {
+                "Records": {
+                    "records": {
+                        "REC": [{
+                            "UID": "WOS:000999999",
+                            "static_data": {
+                                "summary": {
+                                    "titles": {"title": [{"type": "item", "content": "Related Paper"}]},
+                                    "names": {"name": []},
+                                    "pub_info": {"pubyear": 2023},
+                                },
+                                "fullrecord_metadata": {},
+                            },
+                            "dynamic_data": {},
+                        }]
+                    }
+                }
+            },
+        }
+        mock_response.raise_for_status = Mock()
+
+        with patch("requests.get") as mock_get:
+            mock_get.return_value = mock_response
+
+            results = provider.get_related_records("WOS:000123456")
+
+            assert len(results) == 1
+            assert results[0].title == "Related Paper"
+            # Verify correct endpoint was called
+            call_args = mock_get.call_args
+            assert "/related" in call_args[0][0]
+
+    def test_get_citing_articles_returns_papers(self):
+        """get_citing_articles() returns list of Paper objects."""
+        provider = WebOfScienceProvider(
+            starter_api_key=None, expanded_api_key="test_key"
+        )
+
+        mock_response = Mock()
+        mock_response.json.return_value = {
+            "Data": {
+                "Records": {
+                    "records": {
+                        "REC": [{
+                            "UID": "WOS:000888888",
+                            "static_data": {
+                                "summary": {
+                                    "titles": {"title": [{"type": "item", "content": "Citing Paper"}]},
+                                    "names": {"name": []},
+                                    "pub_info": {"pubyear": 2024},
+                                },
+                                "fullrecord_metadata": {},
+                            },
+                            "dynamic_data": {},
+                        }]
+                    }
+                }
+            },
+        }
+        mock_response.raise_for_status = Mock()
+
+        with patch("requests.get") as mock_get:
+            mock_get.return_value = mock_response
+
+            results = provider.get_citing_articles("WOS:000123456")
+
+            assert len(results) == 1
+            assert results[0].title == "Citing Paper"
+            call_args = mock_get.call_args
+            assert "/citing" in call_args[0][0]
+
+    def test_get_cited_references_returns_dicts(self):
+        """get_cited_references() returns list of reference dicts."""
+        provider = WebOfScienceProvider(
+            starter_api_key=None, expanded_api_key="test_key"
+        )
+
+        mock_response = Mock()
+        mock_response.json.return_value = {
+            "Data": [{
+                "UID": "WOS:000111111",
+                "citedAuthor": "Smith, J",
+                "citedTitle": "A Referenced Paper",
+                "citedWork": "Science",
+                "year": 2020,
+                "doi": "10.1234/ref",
+                "timesCited": 100,
+            }],
+        }
+        mock_response.raise_for_status = Mock()
+
+        with patch("requests.get") as mock_get:
+            mock_get.return_value = mock_response
+
+            results = provider.get_cited_references("WOS:000123456")
+
+            assert len(results) == 1
+            assert results[0]["citedAuthor"] == "Smith, J"
+            assert results[0]["citedTitle"] == "A Referenced Paper"
+            assert results[0]["doi"] == "10.1234/ref"
+            call_args = mock_get.call_args
+            assert "/references" in call_args[0][0]
+
+    def test_search_for_citation_report_returns_stats(self):
+        """search_for_citation_report() returns citation statistics."""
+        provider = WebOfScienceProvider(
+            starter_api_key=None, expanded_api_key="test_key"
+        )
+
+        # First response: search that returns query ID
+        search_response = Mock()
+        search_response.json.return_value = {
+            "Data": {"Records": {"records": {"REC": []}}},
+            "QueryResult": {"QueryID": 42, "RecordsFound": 10},
+        }
+        search_response.raise_for_status = Mock()
+
+        # Second response: citation report
+        report_response = Mock()
+        report_response.json.return_value = [{
+            "ReportLevel": "WOS",
+            "TimesCited": "500",
+            "TimesCitedSansSelf": "450",
+            "AveragePerItem": "50.0",
+            "HValue": "10",
+        }]
+        report_response.raise_for_status = Mock()
+
+        with patch("requests.get") as mock_get:
+            mock_get.side_effect = [search_response, report_response]
+
+            result = provider.search_for_citation_report("machine learning")
+
+            assert result is not None
+            assert result["TimesCited"] == "500"
+            assert result["HValue"] == "10"
+
+            # Verify citation-report endpoint was called
+            calls = mock_get.call_args_list
+            assert len(calls) == 2
+            assert "/citation-report/42" in calls[1][0][0]
+@
+
+\subsubsection{Integration tests}
+
+<<test functions>>=
 class TestWebOfScienceIntegration:
     """Integration test for the Web of Science provider."""
 
     @pytest.mark.integration
-    @pytest.mark.skip(reason="Skipped by default; requires WOS_API_KEY")
+    @pytest.mark.skip(reason="Skipped by default; requires WOS API key")
     def test_real_api_call(self):
         """Make one real API call to verify the provider works."""
         import os
 
-        api_key = os.environ.get("WOS_API_KEY")
-        if not api_key:
-            pytest.skip("WOS_API_KEY environment variable not set")
+        # Try expanded key first, then starter, then legacy
+        expanded_key = os.environ.get("WOS_EXPANDED_API_KEY")
+        starter_key = os.environ.get("WOS_STARTER_API_KEY")
+        legacy_key = os.environ.get("WOS_API_KEY")
 
-        provider = WebOfScienceProvider(api_key=api_key)
+        if not (expanded_key or starter_key or legacy_key):
+            pytest.skip("No WOS API key environment variable set")
+
+        provider = WebOfScienceProvider(
+            expanded_api_key=expanded_key,
+            starter_api_key=starter_key,
+        )
 
         try:
             papers = provider.search("machine learning", limit=1)
@@ -1983,6 +3634,72 @@ on PyPI---it must be downloaded from the Developer Portal.
 For consistency with our other providers, we use the REST API directly via
 [[requests]].
 
+\subsection{Error handling}
+\label{sec:ieee-error-handling}
+
+A common problem with the IEEE API is that searches silently return no results
+even when the API key is configured.
+This typically happens because IEEE developer accounts become inactive after
+periods of non-use, or when the developer needs to accept updated terms of
+service.
+
+Unlike a missing API key (which we detect via [[is_available()]]), an inactive
+account still \emph{has} a valid key---it just won't work.
+The API returns HTTP 403 with detailed error information in response headers:
+\begin{description}
+\item[[[X-Error-Detail-Header]]] Human-readable error message (e.g.,
+  \enquote{Account Inactive}).
+\item[[[X-Mashery-Error-Code]]] Machine-readable code (e.g.,
+  [[ERR_403_DEVELOPER_INACTIVE]]).
+\end{description}
+
+We extract these details to provide actionable guidance rather than a generic
+\enquote{403 Forbidden} message.
+Users encountering this error should visit the IEEE Developer Portal to
+reactivate their account.
+
+<<ieee handle response errors>>=
+if response.status_code != 200:
+    error_detail = response.headers.get("X-Error-Detail-Header", "Unknown error")
+    error_code = response.headers.get("X-Mashery-Error-Code", "")
+
+    if "DEVELOPER_INACTIVE" in error_code or "Inactive" in error_detail:
+        logger.warning(
+            "ieee: Account inactive. "
+            "Visit https://developer.ieee.org/ to reactivate your API key. "
+            "Error: %s",
+            error_detail,
+        )
+    elif response.status_code == 403:
+        logger.warning(
+            "ieee: Access denied (HTTP 403). Error: %s. "
+            "Check your API key at https://developer.ieee.org/",
+            error_detail,
+        )
+    elif response.status_code == 429:
+        logger.warning(
+            "ieee: Rate limited (HTTP 429). "
+            "Wait before making more requests. Error: %s",
+            error_detail,
+        )
+    else:
+        logger.warning(
+            "ieee: API error (HTTP %d): %s",
+            response.status_code,
+            error_detail,
+        )
+    response.raise_for_status()
+@
+
+\subsection{Pagination}
+
+The IEEE Xplore API supports pagination through the [[max_records]] and
+[[start_record]] parameters.
+The [[max_records]] parameter specifies the maximum number of results per request
+(capped at 200), while [[start_record]] specifies the offset (1-indexed).
+When the user requests more than 200 results, we automatically fetch multiple
+pages.
+
 \subsection{Provider implementation}
 
 <<ieee provider>>=
@@ -2008,48 +3725,125 @@ class IEEEXploreProvider:
         """IEEE Xplore requires an API key to be configured."""
         return bool(self.api_key)
 
-    def search(self, query: str, limit: int = 100) -> list[Paper]:
-        """Search IEEE Xplore for papers matching the query."""
-        if not self.api_key:
-            return []  # No API key configured
-        
-        # Check cache and log hit/miss
-        cache_key = (query, limit)
-        if cache_key in self._cache:
-            logger.info(f"ieee: Cache hit for query '{query}'")
-        else:
-            logger.info(f"ieee: Cache miss for query '{query}', fetching from API")
-        
-        return self._search_impl(query, limit)
+    @cachedmethod(lambda self: self._cache, key=lambda self, query, limit=100, filters=None: (query, limit, filters.cache_key() if filters else ""))
+    def search(
+        self,
+        query: str,
+        limit: int = 100,
+        filters: SearchFilters | None = None,
+    ) -> list[Paper]:
+        """
+        Search IEEE Xplore for papers matching the query.
 
-    @cachedmethod(lambda self: self._cache)
-    def _search_impl(self, query: str, limit: int = 100) -> list[Paper]:
-        """Internal search implementation (cached)."""
+        Automatically fetches multiple pages if the requested limit exceeds
+        the API's per-request maximum (200 results per page).
+        """
         if not self.api_key:
             return []  # No API key configured
+
+        logger.debug(f"ieee: Searching for '{query}' with limit={limit}")
+
+        all_papers: list[Paper] = []
+        start_record = 1  # 1-indexed
+        page_size = 200  # IEEE API max per request
 
         try:
-            # IEEE API returns max 200 results per request
-            effective_limit = min(limit, 200)
-            response = requests.get(
-                IEEE_API_URL,
-                params={
-                    "querytext": query,
-                    "max_records": effective_limit,
-                    "apikey": self.api_key,
-                },
-                timeout=30,
-            )
-            response.raise_for_status()
-            data = response.json()
+            while len(all_papers) < limit:
+                # Calculate how many results we still need
+                remaining = limit - len(all_papers)
+                current_page_size = min(page_size, remaining)
 
-            articles = data.get("articles", [])
-            return [self._convert_article(article) for article in articles]
+                params = {
+                    "querytext": query,
+                    "max_records": current_page_size,
+                    "start_record": start_record,
+                    "apikey": self.api_key,
+                }
+
+                # Apply filters (IEEE supports some filters natively)
+                <<ieee apply filters>>
+
+                response = requests.get(
+                    IEEE_API_URL,
+                    params=params,
+                    timeout=30,
+                )
+                <<ieee handle response errors>>
+                data = response.json()
+
+                articles = data.get("articles", [])
+                if not articles:
+                    # No more results available
+                    break
+
+                all_papers.extend(self._convert_article(article) for article in articles)
+                start_record += len(articles)
+
+                # Check if we've fetched all available results
+                total = data.get("total_records", 0)
+                if start_record > total:
+                    break
+
+            logger.debug(f"ieee: Retrieved {len(all_papers)} papers")
+            return all_papers
+        except requests.exceptions.HTTPError:
+            # Already logged with details in handle response errors
+            return all_papers
         except Exception as e:
             logger.warning("ieee: %s", e)
-            return []
+            return all_papers
 
     <<convert ieee article>>
+@
+
+\subsubsection{Applying filters}
+
+IEEE Xplore supports some filters via API parameters:
+\begin{description}
+\item[year] Use [[start_year]] and [[end_year]] parameters.
+\item[open\_access] Use [[open_access]] parameter (true/false).
+\item[pub\_types] Use [[content_type]] parameter (Journals, Conferences, etc.).
+\item[venue] Not supported natively---warn and ignore.
+\item[min\_citations] Not supported---warn and ignore.
+\end{description}
+
+<<ieee apply filters>>=
+if filters:
+    # Year filter: IEEE uses start_year and end_year parameters
+    if filters.year:
+        start, end = filters.year_range()
+        if start:
+            params["start_year"] = start
+        if end:
+            params["end_year"] = end
+
+    # Open access filter
+    if filters.open_access:
+        params["open_access"] = "true"
+
+    # Publication types: map to IEEE content_type values
+    if filters.pub_types:
+        ieee_types = []
+        type_mapping = {
+            "article": "Journals",
+            "conference": "Conferences",
+            "book": "Books",
+        }
+        for pt in filters.pub_types:
+            if pt.lower() in type_mapping:
+                ieee_types.append(type_mapping[pt.lower()])
+            else:
+                logger.warning(
+                    "ieee: Publication type '%s' not supported, ignoring", pt
+                )
+        if ieee_types:
+            params["content_type"] = ieee_types[0]  # IEEE only supports one type
+
+    # Warn about unsupported filters
+    if filters.venue:
+        logger.warning("ieee: Venue filter not supported, ignoring")
+    if filters.min_citations is not None:
+        logger.warning("ieee: Citation count filter not supported, ignoring")
 @
 
 \subsubsection{Converting article format}
@@ -2149,6 +3943,7 @@ class TestIEEEXploreProvider:
         provider = IEEEXploreProvider(api_key="test_key")
 
         mock_response = Mock()
+        mock_response.status_code = 200
         mock_response.json.return_value = {
             "articles": [{
                 "title": "Test Paper on Neural Networks",
@@ -2188,6 +3983,7 @@ class TestIEEEXploreProvider:
         provider = IEEEXploreProvider(api_key="test_key")
 
         mock_response = Mock()
+        mock_response.status_code = 200
         mock_response.json.return_value = {"articles": []}
         mock_response.raise_for_status = Mock()
 
@@ -2212,6 +4008,7 @@ class TestIEEEXploreProvider:
         provider = IEEEXploreProvider(api_key="test_key")
 
         mock_response = Mock()
+        mock_response.status_code = 200
         mock_response.json.return_value = {
             "articles": [{"title": "Minimal Paper"}]
         }
@@ -2235,6 +4032,7 @@ class TestIEEEXploreProvider:
         provider = IEEEXploreProvider(api_key="test_key")
 
         mock_response = Mock()
+        mock_response.status_code = 200
         mock_response.json.return_value = {"articles": []}
         mock_response.raise_for_status = Mock()
 
@@ -2251,6 +4049,7 @@ class TestIEEEXploreProvider:
         provider = IEEEXploreProvider(api_key="my_ieee_key")
 
         mock_response = Mock()
+        mock_response.status_code = 200
         mock_response.json.return_value = {"articles": []}
         mock_response.raise_for_status = Mock()
 
@@ -2267,6 +4066,7 @@ class TestIEEEXploreProvider:
         provider = IEEEXploreProvider(api_key="test_key")
 
         mock_response = Mock()
+        mock_response.status_code = 200
         mock_response.json.return_value = {
             "articles": [{
                 "title": "Paper",
@@ -2281,6 +4081,93 @@ class TestIEEEXploreProvider:
             results = provider.search("test")
 
             assert results[0].url == "https://ieeexplore.ieee.org/abstract/1234"
+
+    def test_search_handles_inactive_account(self):
+        """search() returns empty list and logs warning for inactive account."""
+        provider = IEEEXploreProvider(api_key="test_key")
+
+        mock_response = Mock()
+        mock_response.status_code = 403
+        mock_response.headers = {
+            "X-Error-Detail-Header": "Account Inactive",
+            "X-Mashery-Error-Code": "ERR_403_DEVELOPER_INACTIVE",
+        }
+        mock_response.raise_for_status.side_effect = requests.exceptions.HTTPError(
+            "403 Client Error: Forbidden"
+        )
+
+        with patch("requests.get") as mock_get:
+            mock_get.return_value = mock_response
+
+            results = provider.search("test")
+
+            assert results == []
+
+    def test_search_handles_rate_limit(self):
+        """search() returns empty list and logs warning for rate limiting."""
+        provider = IEEEXploreProvider(api_key="test_key")
+
+        mock_response = Mock()
+        mock_response.status_code = 429
+        mock_response.headers = {
+            "X-Error-Detail-Header": "Rate limit exceeded",
+            "X-Mashery-Error-Code": "ERR_429_RATE_LIMIT_EXCEEDED",
+        }
+        mock_response.raise_for_status.side_effect = requests.exceptions.HTTPError(
+            "429 Client Error: Too Many Requests"
+        )
+
+        with patch("requests.get") as mock_get:
+            mock_get.return_value = mock_response
+
+            results = provider.search("test")
+
+            assert results == []
+
+    def test_fetches_multiple_pages(self):
+        """IEEE fetches multiple pages when limit exceeds page size."""
+        provider = IEEEXploreProvider(api_key="test_key")
+
+        # Create responses for two pages (IEEE returns max 200 per page)
+        page1_response = Mock()
+        page1_response.status_code = 200
+        page1_response.json.return_value = {
+            "total_records": 350,
+            "articles": [
+                {
+                    "title": f"Paper {i}",
+                    "authors": {"authors": []},
+                    "publication_year": "2024",
+                }
+                for i in range(200)
+            ],
+        }
+        page1_response.raise_for_status = Mock()
+
+        page2_response = Mock()
+        page2_response.status_code = 200
+        page2_response.json.return_value = {
+            "total_records": 350,
+            "articles": [
+                {
+                    "title": f"Paper {i}",
+                    "authors": {"authors": []},
+                    "publication_year": "2024",
+                }
+                for i in range(200, 350)
+            ],
+        }
+        page2_response.raise_for_status = Mock()
+
+        with patch("requests.get", side_effect=[page1_response, page2_response]) as mock_get:
+            results = provider.search("test", limit=350)
+
+            assert len(results) == 350
+            assert mock_get.call_count == 2
+            # Verify start_record parameter increments (1-indexed)
+            calls = mock_get.call_args_list
+            assert calls[0][1]["params"]["start_record"] == 1
+            assert calls[1][1]["params"]["start_record"] == 201
 
 
 class TestIEEEXploreIntegration:
@@ -2325,11 +4212,12 @@ from typing import Protocol
 
 from cachetools import cachedmethod
 
-from scholar import Paper
+from scholar import Paper, SearchFilters
 from scholar.cache import load_cache, register_cache
 <<semantic scholar imports>>
 <<openalex imports>>
 <<dblp imports>>
+<<wos imports>>
 
 logger = logging.getLogger(__name__)
 @
