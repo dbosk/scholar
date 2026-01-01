@@ -303,7 +303,59 @@ report: Annotated[
         "--report", "-R",
         help="Prompt to save reports (LaTeX, BibTeX, CSV) after review.",
     ),
-] = False
+] = False,
+<<search filter options>>
+@
+
+\subsection{Filter options}
+
+We provide CLI options for common search filters.
+Each filter is documented with its provider support limitations:
+
+<<search filter options>>=
+year: Annotated[
+    Optional[str],
+    typer.Option(
+        "--year", "-y",
+        help="Publication year or range (e.g., 2020, 2020-2024, 2020-, -2024). "
+             "Supported: all providers.",
+    ),
+] = None,
+open_access: Annotated[
+    bool,
+    typer.Option(
+        "--open-access", "-oa",
+        help="Only return open access papers. "
+             "Supported: Semantic Scholar, OpenAlex, IEEE. "
+             "Ignored: DBLP, WoS.",
+    ),
+] = False,
+venue: Annotated[
+    Optional[str],
+    typer.Option(
+        "--venue", "-v",
+        help="Filter by venue/journal name. "
+             "Supported: Semantic Scholar, OpenAlex, DBLP (query), WoS (query). "
+             "Ignored: IEEE.",
+    ),
+] = None,
+min_citations: Annotated[
+    Optional[int],
+    typer.Option(
+        "--min-citations", "-c",
+        help="Minimum citation count. "
+             "Supported: Semantic Scholar, OpenAlex. "
+             "Ignored: DBLP, WoS, IEEE.",
+    ),
+] = None,
+pub_type: Annotated[
+    Optional[list[str]],
+    typer.Option(
+        "--type", "-t",
+        help="Publication type(s): article, conference, review, book, preprint, dataset. "
+             "Repeatable. Supported: all providers (with varying type mappings).",
+    ),
+] = None
 @
 
 \subsection{Executing the search}
@@ -312,7 +364,7 @@ We import the [[Search]] class from the core module and execute the query.
 The results are then passed to the appropriate formatter:
 
 <<execute search and display results>>=
-from scholar import Search
+from scholar import Search, SearchFilters
 from scholar.providers import get_provider_limits, get_default_providers
 import sys
 
@@ -331,8 +383,19 @@ for pname in provider_names:
             f"{pname} caps results at {max_limit} (requested {limit})"
         )
 
+# Build search filters from CLI options
+filters = None
+if any([year, open_access, venue, min_citations is not None, pub_type]):
+    filters = SearchFilters(
+        year=year,
+        open_access=open_access,
+        venue=venue,
+        min_citations=min_citations,
+        pub_types=pub_type,
+    )
+
 s = Search(query)
-results = s.execute(providers=provider, limit=limit)
+results = s.execute(providers=provider, limit=limit, filters=filters)
 
 # Merge results from all providers (deduplicates and consolidates data)
 <<merge search results>>
@@ -344,7 +407,13 @@ results = s.execute(providers=provider, limit=limit)
 if review:
     from scholar.tui import run_review
     session_name = name if name else query
-    run_review(merged_results, query, session_name, prompt_report=report)
+    run_review(
+        merged_results, 
+        query, 
+        session_name, 
+        prompt_report=report,
+        search_filters=filters,
+    )
     return
 
 # Auto-detect format based on TTY

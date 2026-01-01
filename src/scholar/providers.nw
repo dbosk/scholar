@@ -108,13 +108,19 @@ class SearchProvider(Protocol):
 
     name: str
 
-    def search(self, query: str, limit: int = 100) -> list[Paper]:
+    def search(
+        self,
+        query: str,
+        limit: int = 100,
+        filters: "SearchFilters | None" = None,
+    ) -> list[Paper]:
         """
         Search for papers matching the query.
 
         Args:
             query: The search query string.
             limit: Maximum number of results to return.
+            filters: Optional SearchFilters to apply.
 
         Returns:
             List of Paper objects matching the query.
@@ -465,8 +471,13 @@ def _wait_for_rate_limit(self) -> None:
 The search method calls the API with rate limiting and handles errors:
 
 <<semantic scholar search method>>=
-@cachedmethod(lambda self: self._cache)
-def search(self, query: str, limit: int = 100) -> list[Paper]:
+@cachedmethod(lambda self: self._cache, key=lambda self, query, limit=100, filters=None: (query, limit, filters.cache_key() if filters else ""))
+def search(
+    self,
+    query: str,
+    limit: int = 100,
+    filters: SearchFilters | None = None,
+) -> list[Paper]:
     """Search Semantic Scholar for papers matching the query."""
     try:
         self._wait_for_rate_limit()
@@ -475,13 +486,18 @@ def search(self, query: str, limit: int = 100) -> list[Paper]:
         if self.api_key:
             headers["x-api-key"] = self.api_key
 
+        params = {
+            "query": query,
+            "limit": limit,
+            "fields": "title,authors,year,abstract,venue,externalIds,url,openAccessPdf,citationCount,publicationTypes",
+        }
+
+        # Apply filters (Semantic Scholar supports most filters natively)
+        <<semantic scholar apply filters>>
+
         response = self._session.get(
             self.API_URL,
-            params={
-                "query": query,
-                "limit": limit,
-                "fields": "title,authors,year,abstract,venue,externalIds,url,openAccessPdf",
-            },
+            params=params,
             headers=headers,
             timeout=30,
         )
@@ -513,6 +529,65 @@ def search(self, query: str, limit: int = 100) -> list[Paper]:
     except Exception as e:
         logger.warning("semantic_scholar: %s", e)
         return []
+@
+
+\subsubsection{Applying filters}
+
+Semantic Scholar supports most of our filters natively via API parameters:
+\begin{description}
+\item[year] Supports [[year]] parameter with format [[YYYY]] or [[YYYY-YYYY]].
+\item[open\_access] Use [[openAccessPdf]] field filter.
+\item[venue] Supports [[venue]] parameter for exact venue match.
+\item[min\_citations] Supports [[minCitationCount]] parameter.
+\item[pub\_types] Supports [[publicationTypes]] parameter with values like
+  [[JournalArticle]], [[Conference]], [[Review]], [[Book]], [[Dataset]].
+\end{description}
+
+<<semantic scholar apply filters>>=
+if filters:
+    # Year filter: Semantic Scholar accepts "YYYY" or "YYYY-YYYY"
+    if filters.year:
+        start, end = filters.year_range()
+        if start and end:
+            if start == end:
+                params["year"] = str(start)
+            else:
+                params["year"] = f"{start}-{end}"
+        elif start:
+            # Open end: from start year onwards
+            params["year"] = f"{start}-"
+        elif end:
+            # Open start: up to end year
+            params["year"] = f"-{end}"
+
+    # Open access: filter via openAccessPdf field
+    if filters.open_access:
+        params["openAccessPdf"] = ""
+
+    # Venue filter
+    if filters.venue:
+        params["venue"] = filters.venue
+
+    # Minimum citations
+    if filters.min_citations is not None:
+        params["minCitationCount"] = filters.min_citations
+
+    # Publication types: map our normalized types to S2 values
+    if filters.pub_types:
+        s2_types = []
+        type_mapping = {
+            "article": "JournalArticle",
+            "conference": "Conference",
+            "review": "Review",
+            "book": "Book",
+            "preprint": "Preprint",
+            "dataset": "Dataset",
+        }
+        for pt in filters.pub_types:
+            if pt.lower() in type_mapping:
+                s2_types.append(type_mapping[pt.lower()])
+        if s2_types:
+            params["publicationTypes"] = ",".join(s2_types)
 @
 
 \subsubsection{DOI lookup}
@@ -915,19 +990,86 @@ class OpenAlexProvider:
             time.sleep(self.RATE_LIMIT - elapsed)
         self._last_request_time = time.time()
 
-    @cachedmethod(lambda self: self._cache)
-    def search(self, query: str, limit: int = 100) -> list[Paper]:
+    @cachedmethod(lambda self: self._cache, key=lambda self, query, limit=100, filters=None: (query, limit, filters.cache_key() if filters else ""))
+    def search(
+        self,
+        query: str,
+        limit: int = 100,
+        filters: SearchFilters | None = None,
+    ) -> list[Paper]:
         """Search OpenAlex for papers matching the query."""
         try:
             self._wait_for_rate_limit()
-            works = pyalex.Works().search(query).get(per_page=limit)
-            return [self._convert_work(w) for w in works]
+            works = pyalex.Works().search(query)
+
+            # Apply filters (OpenAlex supports most filters natively)
+            <<openalex apply filters>>
+
+            results = works.get(per_page=limit)
+            return [self._convert_work(w) for w in results]
         except Exception as e:
             logger.warning("openalex: %s", e)
             return []
 
     <<openalex get paper by doi>>
     <<convert openalex work>>
+@
+
+\subsubsection{Applying filters}
+
+OpenAlex supports filtering via its query builder. We chain filter calls:
+\begin{description}
+\item[year] Use [[publication_year]] filter.
+\item[open\_access] Use [[is_oa]] filter.
+\item[venue] Use [[primary_location.source.display_name]] for venue filtering.
+\item[min\_citations] Use [[cited_by_count]] filter with [[>]] operator.
+\item[pub\_types] Use [[type]] filter with OpenAlex type values.
+\end{description}
+
+<<openalex apply filters>>=
+if filters:
+    # Year filter
+    if filters.year:
+        start, end = filters.year_range()
+        if start and end:
+            if start == end:
+                works = works.filter(publication_year=start)
+            else:
+                works = works.filter(publication_year=f"{start}-{end}")
+        elif start:
+            works = works.filter(publication_year=f">{start-1}")
+        elif end:
+            works = works.filter(publication_year=f"<{end+1}")
+
+    # Open access filter
+    if filters.open_access:
+        works = works.filter(is_oa=True)
+
+    # Venue filter (search in source display name)
+    if filters.venue:
+        works = works.filter(primary_location={"source": {"display_name": filters.venue}})
+
+    # Minimum citations
+    if filters.min_citations is not None:
+        works = works.filter(cited_by_count=f">{filters.min_citations-1}")
+
+    # Publication types: map our normalized types to OpenAlex values
+    if filters.pub_types:
+        oa_types = []
+        type_mapping = {
+            "article": "article",
+            "conference": "proceedings-article",
+            "review": "review",
+            "book": "book",
+            "preprint": "preprint",
+            "dataset": "dataset",
+        }
+        for pt in filters.pub_types:
+            if pt.lower() in type_mapping:
+                oa_types.append(type_mapping[pt.lower()])
+        if oa_types:
+            # OpenAlex uses pipe for OR in filters
+            works = works.filter(type="|".join(oa_types))
 @
 
 \subsubsection{Converting work format}
@@ -1279,15 +1421,25 @@ class DBLPProvider:
         """DBLP is always available (no API key needed)."""
         return True
 
-    @cachedmethod(lambda self: self._cache)
-    def search(self, query: str, limit: int = 100) -> list[Paper]:
+    @cachedmethod(lambda self: self._cache, key=lambda self, query, limit=100, filters=None: (query, limit, filters.cache_key() if filters else ""))
+    def search(
+        self,
+        query: str,
+        limit: int = 100,
+        filters: SearchFilters | None = None,
+    ) -> list[Paper]:
         """Search DBLP for papers matching the query."""
         try:
             # DBLP API caps at 1000 results per request
             effective_limit = min(limit, 1000)
+
+            # Build query with embedded filters
+            effective_query = query
+            <<dblp apply filters>>
+
             response = requests.get(
                 DBLP_API_URL,
-                params={"q": query, "format": "json", "h": effective_limit},
+                params={"q": effective_query, "format": "json", "h": effective_limit},
                 timeout=30,
             )
             response.raise_for_status()
@@ -1300,6 +1452,65 @@ class DBLPProvider:
             return []
 
     <<convert dblp hit>>
+@
+
+\subsubsection{Applying filters}
+
+DBLP supports limited filtering via query syntax:
+\begin{description}
+\item[year] Embed [[year:YYYY]] or [[year:YYYY:YYYY]] in query.
+\item[venue] Embed [[venue:X]] in query (matches venue abbreviation).
+\item[pub\_types] Embed [[type:X]] in query (Conference, Journal, etc.).
+\item[open\_access] Not supported---warn and ignore.
+\item[min\_citations] Not supported---warn and ignore.
+\end{description}
+
+<<dblp apply filters>>=
+if filters:
+    # Year filter: DBLP uses "year:YYYY" or "year:YYYY:YYYY" syntax
+    if filters.year:
+        start, end = filters.year_range()
+        if start and end:
+            if start == end:
+                effective_query += f" year:{start}"
+            else:
+                effective_query += f" year:{start}:{end}"
+        elif start:
+            # Open end: DBLP doesn't support this well, use current year
+            import datetime
+            current_year = datetime.datetime.now().year
+            effective_query += f" year:{start}:{current_year}"
+        elif end:
+            # Open start: use 1900 as earliest
+            effective_query += f" year:1900:{end}"
+
+    # Venue filter
+    if filters.venue:
+        effective_query += f" venue:{filters.venue}"
+
+    # Publication types: map to DBLP type syntax
+    if filters.pub_types:
+        dblp_types = []
+        type_mapping = {
+            "article": "Journal_Articles",
+            "conference": "Conference_and_Workshop_Papers",
+            "book": "Books_and_Theses",
+        }
+        for pt in filters.pub_types:
+            if pt.lower() in type_mapping:
+                dblp_types.append(type_mapping[pt.lower()])
+            else:
+                logger.warning(
+                    "dblp: Publication type '%s' not supported, ignoring", pt
+                )
+        if dblp_types:
+            effective_query += f" type:{dblp_types[0]}"  # DBLP only supports one type
+
+    # Warn about unsupported filters
+    if filters.open_access:
+        logger.warning("dblp: Open access filter not supported, ignoring")
+    if filters.min_citations is not None:
+        logger.warning("dblp: Citation count filter not supported, ignoring")
 @
 
 \subsubsection{Converting publication format}
@@ -1618,8 +1829,13 @@ class WebOfScienceProvider:
         """Web of Science requires an API key to be configured."""
         return bool(self.api_key)
 
-    @cachedmethod(lambda self: self._cache)
-    def search(self, query: str, limit: int = 100) -> list[Paper]:
+    @cachedmethod(lambda self: self._cache, key=lambda self, query, limit=100, filters=None: (query, limit, filters.cache_key() if filters else ""))
+    def search(
+        self,
+        query: str,
+        limit: int = 100,
+        filters: SearchFilters | None = None,
+    ) -> list[Paper]:
         """Search Web of Science for papers matching the query."""
         if not self.api_key:
             return []  # No API key configured
@@ -1627,10 +1843,15 @@ class WebOfScienceProvider:
         try:
             # WoS Starter API has max 50 results per page
             effective_limit = min(limit, 50)
+
+            # Build query with embedded filters (WoS uses advanced query syntax)
+            effective_query = query
+            <<wos apply filters>>
+
             response = requests.get(
                 WOS_API_URL,
                 params={
-                    "q": query,
+                    "q": effective_query,
                     "db": "WOS",
                     "limit": effective_limit,
                     "page": 1,
@@ -1648,6 +1869,65 @@ class WebOfScienceProvider:
             return []
 
     <<convert wos hit>>
+@
+
+\subsubsection{Applying filters}
+
+Web of Science uses advanced query syntax for filtering:
+\begin{description}
+\item[year] Embed [[PY=YYYY]] or [[PY=YYYY-YYYY]] in query.
+\item[venue] Embed [[SO=venue]] in query (source title).
+\item[pub\_types] Embed [[DT=type]] in query (Article, Proceedings Paper, etc.).
+\item[open\_access] Not supported in Starter API---warn and ignore.
+\item[min\_citations] Not supported in Starter API---warn and ignore.
+\end{description}
+
+<<wos apply filters>>=
+if filters:
+    # Year filter: WoS uses "PY=YYYY" syntax
+    if filters.year:
+        start, end = filters.year_range()
+        if start and end:
+            if start == end:
+                effective_query += f" AND PY={start}"
+            else:
+                effective_query += f" AND PY={start}-{end}"
+        elif start:
+            import datetime
+            current_year = datetime.datetime.now().year
+            effective_query += f" AND PY={start}-{current_year}"
+        elif end:
+            effective_query += f" AND PY=1900-{end}"
+
+    # Venue filter (source title)
+    if filters.venue:
+        effective_query += f' AND SO="{filters.venue}"'
+
+    # Publication types: map to WoS document types
+    if filters.pub_types:
+        wos_types = []
+        type_mapping = {
+            "article": "Article",
+            "conference": "Proceedings Paper",
+            "review": "Review",
+            "book": "Book",
+        }
+        for pt in filters.pub_types:
+            if pt.lower() in type_mapping:
+                wos_types.append(type_mapping[pt.lower()])
+            else:
+                logger.warning(
+                    "wos: Publication type '%s' not supported, ignoring", pt
+                )
+        if wos_types:
+            types_query = " OR ".join(f'DT="{t}"' for t in wos_types)
+            effective_query += f" AND ({types_query})"
+
+    # Warn about unsupported filters
+    if filters.open_access:
+        logger.warning("wos: Open access filter not supported in Starter API, ignoring")
+    if filters.min_citations is not None:
+        logger.warning("wos: Citation count filter not supported in Starter API, ignoring")
 @
 
 \subsubsection{Converting document format}
@@ -1942,8 +2222,13 @@ class IEEEXploreProvider:
         """IEEE Xplore requires an API key to be configured."""
         return bool(self.api_key)
 
-    @cachedmethod(lambda self: self._cache)
-    def search(self, query: str, limit: int = 100) -> list[Paper]:
+    @cachedmethod(lambda self: self._cache, key=lambda self, query, limit=100, filters=None: (query, limit, filters.cache_key() if filters else ""))
+    def search(
+        self,
+        query: str,
+        limit: int = 100,
+        filters: SearchFilters | None = None,
+    ) -> list[Paper]:
         """Search IEEE Xplore for papers matching the query."""
         if not self.api_key:
             return []  # No API key configured
@@ -1951,13 +2236,19 @@ class IEEEXploreProvider:
         try:
             # IEEE API returns max 200 results per request
             effective_limit = min(limit, 200)
+
+            params = {
+                "querytext": query,
+                "max_records": effective_limit,
+                "apikey": self.api_key,
+            }
+
+            # Apply filters (IEEE supports some filters natively)
+            <<ieee apply filters>>
+
             response = requests.get(
                 IEEE_API_URL,
-                params={
-                    "querytext": query,
-                    "max_records": effective_limit,
-                    "apikey": self.api_key,
-                },
+                params=params,
                 timeout=30,
             )
             response.raise_for_status()
@@ -1970,6 +2261,56 @@ class IEEEXploreProvider:
             return []
 
     <<convert ieee article>>
+@
+
+\subsubsection{Applying filters}
+
+IEEE Xplore supports some filters via API parameters:
+\begin{description}
+\item[year] Use [[start_year]] and [[end_year]] parameters.
+\item[open\_access] Use [[open_access]] parameter (true/false).
+\item[pub\_types] Use [[content_type]] parameter (Journals, Conferences, etc.).
+\item[venue] Not supported natively---warn and ignore.
+\item[min\_citations] Not supported---warn and ignore.
+\end{description}
+
+<<ieee apply filters>>=
+if filters:
+    # Year filter: IEEE uses start_year and end_year parameters
+    if filters.year:
+        start, end = filters.year_range()
+        if start:
+            params["start_year"] = start
+        if end:
+            params["end_year"] = end
+
+    # Open access filter
+    if filters.open_access:
+        params["open_access"] = "true"
+
+    # Publication types: map to IEEE content_type values
+    if filters.pub_types:
+        ieee_types = []
+        type_mapping = {
+            "article": "Journals",
+            "conference": "Conferences",
+            "book": "Books",
+        }
+        for pt in filters.pub_types:
+            if pt.lower() in type_mapping:
+                ieee_types.append(type_mapping[pt.lower()])
+            else:
+                logger.warning(
+                    "ieee: Publication type '%s' not supported, ignoring", pt
+                )
+        if ieee_types:
+            params["content_type"] = ieee_types[0]  # IEEE only supports one type
+
+    # Warn about unsupported filters
+    if filters.venue:
+        logger.warning("ieee: Venue filter not supported, ignoring")
+    if filters.min_citations is not None:
+        logger.warning("ieee: Citation count filter not supported, ignoring")
 @
 
 \subsubsection{Converting article format}
@@ -2245,7 +2586,7 @@ from typing import Protocol
 
 from cachetools import cachedmethod
 
-from scholar import Paper
+from scholar import Paper, SearchFilters
 from scholar.cache import load_cache, register_cache
 <<semantic scholar imports>>
 <<openalex imports>>
