@@ -285,8 +285,9 @@ limit: Annotated[
     typer.Option(
         "--limit", "-l",
         help="Maximum results per provider (default: 100). "
-             "Provider limits: DBLP=1000, WoS=50, IEEE=200. "
-             "Semantic Scholar and OpenAlex have no documented limit.",
+             "Large limits fetch multiple pages automatically, which "
+             "increases response time and API usage. "
+             "Consider API rate limits and quotas for large requests.",
     ),
 ] = 100,
 enrich: Annotated[
@@ -361,11 +362,18 @@ pub_type: Annotated[
 \subsection{Executing the search}
 
 We import the [[Search]] class from the core module and execute the query.
-The results are then passed to the appropriate formatter:
+The results are then passed to the appropriate formatter.
+
+Since providers now automatically paginate to fetch results beyond their per-request
+limits, users can request any number of results.
+However, large limits have trade-offs: each page requires an additional API call,
+which increases response time and consumes API quotas.
+We warn users when requesting more than 500 results to make them aware of these
+considerations:
 
 <<execute search and display results>>=
 from scholar import Search, SearchFilters
-from scholar.providers import get_provider_limits, get_default_providers
+from scholar.providers import get_default_providers
 import sys
 
 # Determine which providers will be used
@@ -374,14 +382,13 @@ if provider is None:
 else:
     provider_names = provider
 
-# Warn about provider limits
-limits = get_provider_limits()
-for pname in provider_names:
-    max_limit = limits.get(pname)
-    if max_limit is not None and limit > max_limit:
-        logger.warning(
-            f"{pname} caps results at {max_limit} (requested {limit})"
-        )
+# Warn about large limits that may consume API quotas or trigger rate limits
+if limit > 500:
+    logger.warning(
+        f"Large limit ({limit}) requested. "
+        "This requires multiple API calls per provider, "
+        "which may be slow and consume API quotas."
+    )
 
 # Build search filters from CLI options
 filters = None
