@@ -60,6 +60,7 @@ The test file collects all distributed test chunks:
 <<test [[providers.py]]>>=
 """Tests for the providers module."""
 import pytest
+import requests
 from unittest.mock import Mock, patch
 
 from scholar import *
@@ -2197,6 +2198,63 @@ on PyPI---it must be downloaded from the Developer Portal.
 For consistency with our other providers, we use the REST API directly via
 [[requests]].
 
+\subsection{Error handling}
+\label{sec:ieee-error-handling}
+
+A common problem with the IEEE API is that searches silently return no results
+even when the API key is configured.
+This typically happens because IEEE developer accounts become inactive after
+periods of non-use, or when the developer needs to accept updated terms of
+service.
+
+Unlike a missing API key (which we detect via [[is_available()]]), an inactive
+account still \emph{has} a valid key---it just won't work.
+The API returns HTTP 403 with detailed error information in response headers:
+\begin{description}
+\item[[[X-Error-Detail-Header]]] Human-readable error message (e.g.,
+  \enquote{Account Inactive}).
+\item[[[X-Mashery-Error-Code]]] Machine-readable code (e.g.,
+  [[ERR_403_DEVELOPER_INACTIVE]]).
+\end{description}
+
+We extract these details to provide actionable guidance rather than a generic
+\enquote{403 Forbidden} message.
+Users encountering this error should visit the IEEE Developer Portal to
+reactivate their account.
+
+<<ieee handle response errors>>=
+if response.status_code != 200:
+    error_detail = response.headers.get("X-Error-Detail-Header", "Unknown error")
+    error_code = response.headers.get("X-Mashery-Error-Code", "")
+
+    if "DEVELOPER_INACTIVE" in error_code or "Inactive" in error_detail:
+        logger.warning(
+            "ieee: Account inactive. "
+            "Visit https://developer.ieee.org/ to reactivate your API key. "
+            "Error: %s",
+            error_detail,
+        )
+    elif response.status_code == 403:
+        logger.warning(
+            "ieee: Access denied (HTTP 403). Error: %s. "
+            "Check your API key at https://developer.ieee.org/",
+            error_detail,
+        )
+    elif response.status_code == 429:
+        logger.warning(
+            "ieee: Rate limited (HTTP 429). "
+            "Wait before making more requests. Error: %s",
+            error_detail,
+        )
+    else:
+        logger.warning(
+            "ieee: API error (HTTP %d): %s",
+            response.status_code,
+            error_detail,
+        )
+    response.raise_for_status()
+@
+
 \subsection{Provider implementation}
 
 <<ieee provider>>=
@@ -2251,11 +2309,14 @@ class IEEEXploreProvider:
                 params=params,
                 timeout=30,
             )
-            response.raise_for_status()
+            <<ieee handle response errors>>
             data = response.json()
 
             articles = data.get("articles", [])
             return [self._convert_article(article) for article in articles]
+        except requests.exceptions.HTTPError:
+            # Already logged with details in handle response errors
+            return []
         except Exception as e:
             logger.warning("ieee: %s", e)
             return []
@@ -2410,6 +2471,7 @@ class TestIEEEXploreProvider:
         provider = IEEEXploreProvider(api_key="test_key")
 
         mock_response = Mock()
+        mock_response.status_code = 200
         mock_response.json.return_value = {
             "articles": [{
                 "title": "Test Paper on Neural Networks",
@@ -2449,6 +2511,7 @@ class TestIEEEXploreProvider:
         provider = IEEEXploreProvider(api_key="test_key")
 
         mock_response = Mock()
+        mock_response.status_code = 200
         mock_response.json.return_value = {"articles": []}
         mock_response.raise_for_status = Mock()
 
@@ -2473,6 +2536,7 @@ class TestIEEEXploreProvider:
         provider = IEEEXploreProvider(api_key="test_key")
 
         mock_response = Mock()
+        mock_response.status_code = 200
         mock_response.json.return_value = {
             "articles": [{"title": "Minimal Paper"}]
         }
@@ -2496,6 +2560,7 @@ class TestIEEEXploreProvider:
         provider = IEEEXploreProvider(api_key="test_key")
 
         mock_response = Mock()
+        mock_response.status_code = 200
         mock_response.json.return_value = {"articles": []}
         mock_response.raise_for_status = Mock()
 
@@ -2512,6 +2577,7 @@ class TestIEEEXploreProvider:
         provider = IEEEXploreProvider(api_key="my_ieee_key")
 
         mock_response = Mock()
+        mock_response.status_code = 200
         mock_response.json.return_value = {"articles": []}
         mock_response.raise_for_status = Mock()
 
@@ -2528,6 +2594,7 @@ class TestIEEEXploreProvider:
         provider = IEEEXploreProvider(api_key="test_key")
 
         mock_response = Mock()
+        mock_response.status_code = 200
         mock_response.json.return_value = {
             "articles": [{
                 "title": "Paper",
@@ -2542,6 +2609,48 @@ class TestIEEEXploreProvider:
             results = provider.search("test")
 
             assert results[0].url == "https://ieeexplore.ieee.org/abstract/1234"
+
+    def test_search_handles_inactive_account(self):
+        """search() returns empty list and logs warning for inactive account."""
+        provider = IEEEXploreProvider(api_key="test_key")
+
+        mock_response = Mock()
+        mock_response.status_code = 403
+        mock_response.headers = {
+            "X-Error-Detail-Header": "Account Inactive",
+            "X-Mashery-Error-Code": "ERR_403_DEVELOPER_INACTIVE",
+        }
+        mock_response.raise_for_status.side_effect = requests.exceptions.HTTPError(
+            "403 Client Error: Forbidden"
+        )
+
+        with patch("requests.get") as mock_get:
+            mock_get.return_value = mock_response
+
+            results = provider.search("test")
+
+            assert results == []
+
+    def test_search_handles_rate_limit(self):
+        """search() returns empty list and logs warning for rate limiting."""
+        provider = IEEEXploreProvider(api_key="test_key")
+
+        mock_response = Mock()
+        mock_response.status_code = 429
+        mock_response.headers = {
+            "X-Error-Detail-Header": "Rate limit exceeded",
+            "X-Mashery-Error-Code": "ERR_429_RATE_LIMIT_EXCEEDED",
+        }
+        mock_response.raise_for_status.side_effect = requests.exceptions.HTTPError(
+            "429 Client Error: Too Many Requests"
+        )
+
+        with patch("requests.get") as mock_get:
+            mock_get.return_value = mock_response
+
+            results = provider.search("test")
+
+            assert results == []
 
 
 class TestIEEEXploreIntegration:
