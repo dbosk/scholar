@@ -508,6 +508,7 @@ def search(
             headers = {}
             if self.api_key:
                 headers["x-api-key"] = self.api_key
+                logger.debug("semantic_scholar: Using API key")
 
             # Calculate how many results we still need
             remaining = limit - len(all_papers)
@@ -555,6 +556,7 @@ def search(
             if offset >= total:
                 break
 
+        logger.debug(f"semantic_scholar: Retrieved {len(all_papers)} papers")
         return all_papers
     except requests.exceptions.RetryError:
         logger.warning(
@@ -657,7 +659,10 @@ def get_paper_by_doi(self, doi: str) -> Paper | None:
     # Check cache first
     cache_key = ("doi", doi)
     if cache_key in self._cache:
+        logger.info(f"semantic_scholar: Cache hit for DOI {doi}")
         return self._cache[cache_key]
+    
+    logger.info(f"semantic_scholar: Cache miss for DOI {doi}, fetching from API")
 
     try:
         self._wait_for_rate_limit()
@@ -1135,6 +1140,7 @@ class OpenAlexProvider:
             all_papers: list[Paper] = []
             page_size = min(limit, 200)  # OpenAlex returns max 200 per page
 
+            logger.debug(f"openalex: Searching for '{query}' with limit={limit}")
             self._wait_for_rate_limit()
             works = pyalex.Works().search(query)
 
@@ -1147,8 +1153,10 @@ class OpenAlexProvider:
                 for work in page:
                     all_papers.append(self._convert_work(work))
                     if len(all_papers) >= limit:
+                        logger.debug(f"openalex: Retrieved {len(all_papers)} papers")
                         return all_papers
 
+            logger.debug(f"openalex: Retrieved {len(all_papers)} papers")
             return all_papers
         except Exception as e:
             logger.warning("openalex: %s", e)
@@ -1287,7 +1295,10 @@ def get_paper_by_doi(self, doi: str) -> Paper | None:
     # Check cache first
     cache_key = ("doi", doi)
     if cache_key in self._cache:
+        logger.info(f"openalex: Cache hit for DOI {doi}")
         return self._cache[cache_key]
+    
+    logger.info(f"openalex: Cache miss for DOI {doi}, fetching from API")
 
     try:
         self._wait_for_rate_limit()
@@ -1598,6 +1609,8 @@ class DBLPProvider:
             effective_query = query
             <<dblp apply filters>>
 
+            logger.debug(f"dblp: Searching for '{query}' with limit={limit}")
+
             while len(all_papers) < limit:
                 # Calculate how many results we still need
                 remaining = limit - len(all_papers)
@@ -1633,6 +1646,7 @@ class DBLPProvider:
                 if offset >= total:
                     break
 
+            logger.debug(f"dblp: Retrieved {len(all_papers)} papers")
             return all_papers
         except Exception as e:
             logger.warning("dblp: %s", e)
@@ -2174,6 +2188,8 @@ def search(
     """Search Web of Science for papers matching the query."""
     if not self._api_key:
         return []
+
+    logger.debug(f"wos: Searching for '{query}' with limit={limit}")
 
     if self._api_tier == "expanded":
         return self._search_expanded(query, limit, filters)
@@ -3725,6 +3741,8 @@ class IEEEXploreProvider:
         if not self.api_key:
             return []  # No API key configured
 
+        logger.debug(f"ieee: Searching for '{query}' with limit={limit}")
+
         all_papers: list[Paper] = []
         start_record = 1  # 1-indexed
         page_size = 200  # IEEE API max per request
@@ -3766,6 +3784,7 @@ class IEEEXploreProvider:
                 if start_record > total:
                     break
 
+            logger.debug(f"ieee: Retrieved {len(all_papers)} papers")
             return all_papers
         except requests.exceptions.HTTPError:
             # Already logged with details in handle response errors

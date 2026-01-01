@@ -111,13 +111,150 @@ app = typer.Typer(
 
 
 @app.callback()
-def callback() -> None:
+def callback(
+    verbose: Annotated[
+        int,
+        typer.Option(
+            "--verbose",
+            "-v",
+            count=True,
+            help="Increase verbosity (can be repeated: -v, -vv, -vvv).",
+        ),
+    ] = 0,
+    quiet: Annotated[
+        int,
+        typer.Option(
+            "--quiet",
+            "-q",
+            count=True,
+            help="Decrease verbosity (can be repeated: -q, -qq, -qqq).",
+        ),
+    ] = 0,
+) -> None:
     """
     Scholar: A tool for structured literature searches.
 
     Use 'scholar search' to query bibliographic databases.
     """
-    pass
+    <<configure logging>>
+@
+
+\subsection{Logging Configuration}
+
+The verbosity options control the logging level by computing net verbosity:
+\begin{itemize}
+\item Calculate net verbosity as [[verbose - quiet]]
+\item Map net verbosity to Python logging levels:
+  \begin{itemize}
+  \item [[net >= +2]]: DEBUG (10) - maximum verbosity
+  \item [[net = +1]]: INFO (20) - informational messages
+  \item [[net = 0]]: WARNING (30) - warnings only (default)
+  \item [[net = -1]]: ERROR (40) - errors only
+  \item [[net = -2]]: CRITICAL (50) - critical errors only
+  \item [[net <= -3]]: Silence all logging output
+  \end{itemize}
+\end{itemize}
+
+This allows flexible control: [[scholar -vv -q]] gives INFO level (net=+1),
+while [[scholar -qqq]] silences all output for scripting (errors via exit codes).
+
+<<configure logging>>=
+# Calculate net verbosity: positive = more verbose, negative = quieter
+net_verbosity = verbose - quiet
+
+# Silence level for net_verbosity <= -3
+SILENCE_LEVEL = logging.CRITICAL + 50
+
+# Map net verbosity to logging levels
+if net_verbosity >= 2:
+    log_level = logging.DEBUG  # 10
+elif net_verbosity == 1:
+    log_level = logging.INFO  # 20
+elif net_verbosity == 0:
+    log_level = logging.WARNING  # 30
+elif net_verbosity == -1:
+    log_level = logging.ERROR  # 40
+elif net_verbosity == -2:
+    log_level = logging.CRITICAL  # 50
+else:  # net_verbosity <= -3
+    log_level = SILENCE_LEVEL  # Silence everything
+
+logging.basicConfig(
+    level=log_level,
+    format="%(levelname)s: %(message)s",
+)
+@
+
+\subsection{Testing verbosity options}
+
+We test that the verbosity and quiet options properly control logging levels:
+
+<<test functions>>=
+class TestVerbosityOptions:
+    """Tests for verbosity and quiet command-line options."""
+
+    def test_verbose_option(self, monkeypatch):
+        """Verbose option increases logging level."""
+        from scholar import providers
+        import logging
+
+        mock_provider = Mock()
+        mock_provider.name = "mock"
+        mock_provider.MAX_LIMIT = None
+        mock_provider.search.return_value = []
+        monkeypatch.setattr(providers, "PROVIDERS", {"mock": mock_provider})
+
+        # Test -v option
+        result = runner.invoke(app, ["-v", "search", "test"])
+        assert result.exit_code == 0
+
+        # Test -vv option
+        result = runner.invoke(app, ["-vv", "search", "test"])
+        assert result.exit_code == 0
+
+    def test_quiet_option(self, monkeypatch):
+        """Quiet option suppresses non-error output."""
+        from scholar import providers
+
+        mock_provider = Mock()
+        mock_provider.name = "mock"
+        mock_provider.MAX_LIMIT = None
+        mock_provider.search.return_value = []
+        monkeypatch.setattr(providers, "PROVIDERS", {"mock": mock_provider})
+
+        # Test -q option
+        result = runner.invoke(app, ["-q", "search", "test"])
+        assert result.exit_code == 0
+
+        # Test -qq option
+        result = runner.invoke(app, ["-qq", "search", "test"])
+        assert result.exit_code == 0
+
+        # Test -qqq option (silence all)
+        result = runner.invoke(app, ["-qqq", "search", "test"])
+        assert result.exit_code == 0
+
+    def test_verbose_and_quiet_together(self, monkeypatch):
+        """Verbose and quiet offset each other."""
+        from scholar import providers
+
+        mock_provider = Mock()
+        mock_provider.name = "mock"
+        mock_provider.MAX_LIMIT = None
+        mock_provider.search.return_value = []
+        monkeypatch.setattr(providers, "PROVIDERS", {"mock": mock_provider})
+
+        # -v and -q cancel out (net 0 = WARNING)
+        result = runner.invoke(app, ["-v", "-q", "search", "test"])
+        assert result.exit_code == 0
+
+        # -vv and -q = net +1 = INFO
+        result = runner.invoke(app, ["-vv", "-q", "search", "test"])
+        assert result.exit_code == 0
+
+        # -v and -qq = net -1 = ERROR
+        result = runner.invoke(app, ["-v", "-qq", "search", "test"])
+        assert result.exit_code == 0
 @
 
 
@@ -373,7 +510,7 @@ considerations:
 
 <<execute search and display results>>=
 from scholar import Search, SearchFilters
-from scholar.providers import get_default_providers
+from scholar.providers import get_default_providers, get_provider_limits
 import sys
 
 # Determine which providers will be used
@@ -381,6 +518,19 @@ if provider is None:
     provider_names = [p.name for p in get_default_providers()]
 else:
     provider_names = provider
+
+logger.info(f"Searching with providers: {', '.join(provider_names)}")
+logger.debug(f"Search query: '{query}'")
+logger.debug(f"Limit per provider: {limit}")
+
+# Warn about provider limits
+limits = get_provider_limits()
+for pname in provider_names:
+    max_limit = limits.get(pname)
+    if max_limit is not None and limit > max_limit:
+        logger.warning(
+            f"{pname} caps results at {max_limit} (requested {limit})"
+        )
 
 # Warn about large limits that may consume API quotas or trigger rate limits
 if limit > 500:
@@ -403,6 +553,8 @@ if any([year, open_access, venue, min_citations is not None, pub_type]):
 
 s = Search(query)
 results = s.execute(providers=provider, limit=limit, filters=filters)
+
+logger.debug(f"Retrieved {len(results)} result sets")
 
 # Merge results from all providers (deduplicates and consolidates data)
 <<merge search results>>
@@ -431,6 +583,36 @@ if output_format == "auto":
 display_results(merged_results, actual_format)
 @
 
+\subsection{Testing the search command}
+
+We verify that the search command executes properly and handles command-line
+arguments correctly:
+
+<<test functions>>=
+class TestSearchCommand:
+    """Tests for the search command."""
+
+    def test_search_command_exists(self):
+        """The search command is registered."""
+        result = runner.invoke(app, ["search", "--help"])
+        assert result.exit_code == 0
+        assert "Search bibliographic databases" in result.stdout
+
+    def test_search_runs(self, monkeypatch):
+        """Search command executes without error."""
+        # Mock the provider to avoid real API calls
+        from scholar import providers
+
+        mock_provider = Mock()
+        mock_provider.name = "mock"
+        mock_provider.MAX_LIMIT = None
+        mock_provider.search.return_value = []
+        monkeypatch.setattr(providers, "PROVIDERS", {"mock": mock_provider})
+
+        result = runner.invoke(app, ["search", "test query"])
+        assert result.exit_code == 0
+@
+
 \subsection{Merging results from multiple providers}
 
 When searching multiple providers, the same paper may appear from different
@@ -446,11 +628,13 @@ The [[source]] field tracks which providers found the paper.
 from functools import reduce
 
 if len(results) > 1:
+    logger.info(f"Merging {len(results)} result sets")
     merged = reduce(lambda a, b: a.merge(b), results)
     merged_results = [merged]
 elif len(results) == 1:
     merged_results = results
 else:
+    logger.warning("No search results returned")
     merged_results = []
 @
 
@@ -667,6 +851,40 @@ for provider in get_all_providers():
     )
 @
 
+\subsection{Testing the providers command}
+
+We test that the providers command lists available providers and their
+configuration requirements:
+
+<<test functions>>=
+class TestProvidersCommand:
+    """Tests for the providers command."""
+
+    def test_providers_command_exists(self):
+        """The providers command is registered."""
+        result = runner.invoke(app, ["providers", "--help"])
+        assert result.exit_code == 0
+        assert "List available search providers" in result.stdout
+
+    def test_providers_lists_providers(self):
+        """The providers command lists available providers."""
+        result = runner.invoke(app, ["providers"])
+        assert result.exit_code == 0
+        # Should show at least these providers
+        assert "semantic_scholar" in result.stdout
+        assert "openalex" in result.stdout
+        assert "dblp" in result.stdout
+
+    def test_providers_shows_api_info(self):
+        """The providers command shows API key information."""
+        result = runner.invoke(app, ["providers"])
+        assert result.exit_code == 0
+        # Should show environment variable names
+        assert "S2_API_KEY" in result.stdout
+        assert "WOS_API_KEY" in result.stdout
+        assert "IEEE_API_KEY" in result.stdout
+@
+
 
 \section{Cache Management}
 \label{ch:cache-cli}
@@ -748,6 +966,52 @@ def cache(
         console.print(f"[red]Unknown action: {action}[/red]")
         console.print("Valid actions: clear, info, path")
         raise typer.Exit(1)
+@
+
+\subsection{Testing the cache command}
+
+We verify that the cache management command handles its various actions
+correctly:
+
+<<test functions>>=
+class TestCacheCommand:
+    """Tests for the cache command."""
+
+    def test_cache_command_exists(self):
+        """The cache command is registered."""
+        result = runner.invoke(app, ["cache", "--help"])
+        assert result.exit_code == 0
+        assert "Manage the search result cache" in result.stdout
+
+    def test_cache_info(self, tmp_path, monkeypatch):
+        """Cache info shows statistics."""
+        monkeypatch.setenv("SCHOLAR_CACHE_DIR", str(tmp_path))
+        result = runner.invoke(app, ["cache", "info"])
+        assert result.exit_code == 0
+        assert "Location" in result.stdout
+        assert "Total entries" in result.stdout
+
+    def test_cache_clear(self, tmp_path, monkeypatch):
+        """Cache clear removes cache files."""
+        monkeypatch.setenv("SCHOLAR_CACHE_DIR", str(tmp_path))
+        # Create a dummy cache file
+        (tmp_path / "test.pkl").touch()
+        result = runner.invoke(app, ["cache", "clear"])
+        assert result.exit_code == 0
+        assert "Cleared" in result.stdout
+
+    def test_cache_path(self, tmp_path, monkeypatch):
+        """Cache path prints directory."""
+        monkeypatch.setenv("SCHOLAR_CACHE_DIR", str(tmp_path))
+        result = runner.invoke(app, ["cache", "path"])
+        assert result.exit_code == 0
+        assert str(tmp_path) in result.stdout
+
+    def test_cache_invalid_action(self):
+        """Cache with invalid action shows error."""
+        result = runner.invoke(app, ["cache", "invalid"])
+        assert result.exit_code == 1
+        assert "Unknown action" in result.stdout
 @
 
 
@@ -1708,14 +1972,16 @@ def main() -> None:
 \subsection{Testing the CLI application}
 
 We use Typer's [[CliRunner]] to test the CLI without actually invoking
-a subprocess:
+a subprocess.
+These tests verify general CLI functionality like help text and command
+registration:
 
 <<test functions>>=
 runner = CliRunner()
 
 
 class TestCLI:
-    """Tests for the CLI application."""
+    """Tests for general CLI application functionality."""
 
     def test_help_displayed(self):
         """Running without args shows help with 'search' command listed."""
@@ -1730,85 +1996,6 @@ class TestCLI:
         assert result.exit_code == 0
         assert "search" in result.stdout
 
-    def test_search_command_exists(self):
-        """The search command is registered."""
-        result = runner.invoke(app, ["search", "--help"])
-        assert result.exit_code == 0
-        assert "Search bibliographic databases" in result.stdout
-
-    def test_search_runs(self, monkeypatch):
-        """Search command executes without error."""
-        # Mock the provider to avoid real API calls
-        from scholar import providers
-
-        mock_provider = Mock()
-        mock_provider.name = "mock"
-        mock_provider.MAX_LIMIT = None
-        mock_provider.search.return_value = []
-        monkeypatch.setattr(providers, "PROVIDERS", {"mock": mock_provider})
-
-        result = runner.invoke(app, ["search", "test query"])
-        assert result.exit_code == 0
-
-    def test_providers_command_exists(self):
-        """The providers command is registered."""
-        result = runner.invoke(app, ["providers", "--help"])
-        assert result.exit_code == 0
-        assert "List available search providers" in result.stdout
-
-    def test_providers_lists_providers(self):
-        """The providers command lists available providers."""
-        result = runner.invoke(app, ["providers"])
-        assert result.exit_code == 0
-        # Should show at least these providers
-        assert "s2" in result.stdout
-        assert "openalex" in result.stdout
-        assert "dblp" in result.stdout
-
-    def test_providers_shows_api_info(self):
-        """The providers command shows API key information."""
-        result = runner.invoke(app, ["providers"])
-        assert result.exit_code == 0
-        # Should show environment variable names
-        assert "S2_API_KEY" in result.stdout
-        assert "WOS_EXPANDED_API_KEY" in result.stdout or "WOS_STARTER_API_KEY" in result.stdout
-        assert "IEEE_API_KEY" in result.stdout
-
-    def test_cache_command_exists(self):
-        """The cache command is registered."""
-        result = runner.invoke(app, ["cache", "--help"])
-        assert result.exit_code == 0
-        assert "Manage the search result cache" in result.stdout
-
-    def test_cache_info(self, tmp_path, monkeypatch):
-        """Cache info shows statistics."""
-        monkeypatch.setenv("SCHOLAR_CACHE_DIR", str(tmp_path))
-        result = runner.invoke(app, ["cache", "info"])
-        assert result.exit_code == 0
-        assert "Location" in result.stdout
-        assert "Total entries" in result.stdout
-
-    def test_cache_clear(self, tmp_path, monkeypatch):
-        """Cache clear removes cache files."""
-        monkeypatch.setenv("SCHOLAR_CACHE_DIR", str(tmp_path))
-        # Create a dummy cache file
-        (tmp_path / "test.pkl").touch()
-        result = runner.invoke(app, ["cache", "clear"])
-        assert result.exit_code == 0
-        assert "Cleared" in result.stdout
-
-    def test_cache_path(self, tmp_path, monkeypatch):
-        """Cache path prints directory."""
-        monkeypatch.setenv("SCHOLAR_CACHE_DIR", str(tmp_path))
-        result = runner.invoke(app, ["cache", "path"])
-        assert result.exit_code == 0
-        assert str(tmp_path) in result.stdout
-
-    def test_cache_invalid_action(self):
-        """Cache with invalid action shows error."""
-        result = runner.invoke(app, ["cache", "invalid"])
-        assert result.exit_code == 1
-        assert "Unknown action" in result.stdout
 @
 
 
