@@ -192,11 +192,11 @@ The registry should store and retrieve providers:
 class TestProviderRegistry:
     """Tests for the provider registry."""
 
-    def test_semantic_scholar_registered(self):
+    def test_s2_registered(self):
         """Semantic Scholar provider is auto-registered."""
-        provider = get_provider("semantic_scholar")
+        provider = get_provider("s2")
         assert provider is not None
-        assert provider.name == "semantic_scholar"
+        assert provider.name == "s2"
 
     def test_openalex_registered(self):
         """OpenAlex provider is auto-registered."""
@@ -227,7 +227,7 @@ class TestProviderRegistry:
         providers = get_all_providers()
         assert len(providers) >= 5
         names = [p.name for p in providers]
-        assert "semantic_scholar" in names
+        assert "s2" in names
         assert "openalex" in names
         assert "dblp" in names
         assert "wos" in names
@@ -245,7 +245,7 @@ class TestProviderRegistry:
     def test_get_provider_limits(self):
         """get_provider_limits returns correct limits."""
         limits = get_provider_limits()
-        assert limits["semantic_scholar"] is None
+        assert limits["s2"] is None
         assert limits["openalex"] is None
         assert limits["dblp"] == 1000
         assert limits["wos"] == 50
@@ -259,7 +259,7 @@ class TestProviderRegistry:
 Default providers are determined \emph{dynamically} based on availability.
 A provider is available (and thus included as a default) if it either:
 \begin{itemize}
-\item Does not require an API key ([[semantic_scholar]], [[openalex]],
+\item Does not require an API key ([[s2]], [[openalex]],
   [[dblp]]), or
 \item Requires an API key and has one configured in the environment
   ([[wos]] with [[WOS_API_KEY]], [[ieee]] with [[IEEE_API_KEY]]).
@@ -276,7 +276,7 @@ def get_default_providers() -> list[SearchProvider]:
     Get providers that are currently available for use.
 
     Returns all providers where [[is_available()]] returns [[True]].
-    This includes providers that don't require API keys (semantic_scholar,
+    This includes providers that don't require API keys (s2,
     openalex, dblp) and providers with required API keys that are configured
     in the environment (wos, ieee).
     """
@@ -318,7 +318,7 @@ class TestDefaultProviders:
         defaults = get_default_providers()
         default_names = [p.name for p in defaults]
         # These providers don't require API keys
-        assert "semantic_scholar" in default_names
+        assert "s2" in default_names
         assert "openalex" in default_names
         assert "dblp" in default_names
 
@@ -400,7 +400,7 @@ missing API keys.
 class SemanticScholarProvider:
     """Search provider for Semantic Scholar."""
 
-    name = "semantic_scholar"
+    name = "s2"
     MAX_LIMIT: int | None = None   # No documented maximum
     API_URL = "https://api.semanticscholar.org/graph/v1/paper/search"
     RATE_LIMIT_WITH_KEY = 1.0      # 1 second between requests
@@ -508,7 +508,7 @@ def search(
 
         if response.status_code == 429:
             logger.warning(
-                "semantic_scholar: Rate limited. "
+                "s2: Rate limited. "
                 "Get a free API key at "
                 "https://www.semanticscholar.org/product/api#api-key-form "
                 "and set S2_API_KEY environment variable."
@@ -521,17 +521,17 @@ def search(
         return [self._convert_paper(p) for p in data.get("data", [])]
     except requests.exceptions.RetryError:
         logger.warning(
-            "semantic_scholar: Rate limited after retries. "
+            "s2: Rate limited after retries. "
             "Get a free API key at "
             "https://www.semanticscholar.org/product/api#api-key-form "
             "and set S2_API_KEY environment variable."
         )
         return []
     except requests.exceptions.HTTPError as e:
-        logger.warning("semantic_scholar: HTTP error: %s", e)
+        logger.warning("s2: HTTP error: %s", e)
         return []
     except Exception as e:
-        logger.warning("semantic_scholar: %s", e)
+        logger.warning("s2: %s", e)
         return []
 @
 
@@ -646,7 +646,7 @@ def get_paper_by_doi(self, doi: str) -> Paper | None:
             return None
 
         if response.status_code == 429:
-            logger.warning("semantic_scholar: Rate limited during DOI lookup")
+            logger.warning("s2: Rate limited during DOI lookup")
             return None
 
         response.raise_for_status()
@@ -657,10 +657,10 @@ def get_paper_by_doi(self, doi: str) -> Paper | None:
         return paper
 
     except requests.exceptions.HTTPError as e:
-        logger.warning("semantic_scholar: DOI lookup error: %s", e)
+        logger.warning("s2: DOI lookup error: %s", e)
         return None
     except Exception as e:
-        logger.warning("semantic_scholar: DOI lookup failed: %s", e)
+        logger.warning("s2: DOI lookup failed: %s", e)
         return None
 @
 
@@ -772,7 +772,7 @@ class TestSemanticScholarProvider:
             assert paper.title == "Test Paper"
             assert paper.year == 2024
             assert paper.doi == "10.1234/test"
-            assert paper.source == "semantic_scholar"
+            assert paper.source == "s2"
             assert "Alice" in paper.authors
             assert "Bob" in paper.authors
             assert paper.pdf_url == "https://arxiv.org/pdf/1234.5678.pdf"
@@ -854,7 +854,7 @@ class TestSemanticScholarGetPaperByDoi:
             assert paper.title == "Test Paper"
             assert paper.abstract == "This is the abstract"
             assert paper.doi == "10.1234/test"
-            assert paper.source == "semantic_scholar"
+            assert paper.source == "s2"
 
     def test_get_paper_by_doi_returns_none_on_404(self):
         """get_paper_by_doi() returns None when paper not found."""
@@ -922,7 +922,7 @@ class TestSemanticScholarIntegration:
             paper = papers[0]
             assert isinstance(paper, Paper)
             assert paper.title
-            assert paper.source == "semantic_scholar"
+            assert paper.source == "s2"
         except Exception as e:
             pytest.skip(f"Semantic Scholar API unavailable: {e}")
 @

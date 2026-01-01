@@ -252,7 +252,7 @@ class TestPaperMergeWith:
         p1 = Paper(title="Test", authors=["A"], doi="10.1/test", source="dblp")
         p2 = Paper(
             title="Test", authors=["A"], doi="10.1/test",
-            abstract="This is the abstract", source="semantic_scholar"
+            abstract="This is the abstract", source="s2"
         )
         merged = p1.merge_with(p2)
         assert merged.abstract == "This is the abstract"
@@ -273,10 +273,10 @@ class TestPaperMergeWith:
     def test_merge_combines_sources(self):
         """Merging combines sources from both papers."""
         p1 = Paper(title="Test", authors=["A"], source="dblp")
-        p2 = Paper(title="test", authors=["B"], source="semantic_scholar")
+        p2 = Paper(title="test", authors=["B"], source="s2")
         merged = p1.merge_with(p2)
         assert "dblp" in merged.source
-        assert "semantic_scholar" in merged.source
+        assert "s2" in merged.source
 
     def test_merge_raises_for_unequal_papers(self):
         """Cannot merge papers that aren't equal."""
@@ -798,7 +798,7 @@ class TestSearchResult:
         # Semantic Scholar paper with abstract
         p2 = Paper(
             title="Paper A", authors=["Author"], doi="10.1/a",
-            abstract="This is the abstract", source="semantic_scholar"
+            abstract="This is the abstract", source="s2"
         )
 
         r1 = SearchResult(
@@ -806,7 +806,7 @@ class TestSearchResult:
             timestamp="2024-01-01", papers=[p1]
         )
         r2 = SearchResult(
-            query="test", provider="semantic_scholar",
+            query="test", provider="s2",
             timestamp="2024-01-01", papers=[p2]
         )
 
@@ -816,7 +816,7 @@ class TestSearchResult:
         assert merged.papers[0].abstract == "This is the abstract"
         # And combined sources
         assert "dblp" in merged.papers[0].source
-        assert "semantic_scholar" in merged.papers[0].source
+        assert "s2" in merged.papers[0].source
 @
 
 

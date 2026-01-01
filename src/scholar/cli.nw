@@ -142,8 +142,8 @@ def search(
 
     Examples:
         scholar search "machine learning privacy"
-        scholar search "federated learning" -p semantic_scholar -f json
-        scholar search "neural networks" -p openalex -p dblp -p semantic_scholar
+        scholar search "federated learning" -p s2 -f json
+        scholar search "neural networks" -p openalex -p dblp -p s2
     """
     <<execute search and display results>>
 @
@@ -618,7 +618,7 @@ it is user-facing documentation, not implementation details:
 
 <<add provider rows to table>>=
 provider_info = {
-    "semantic_scholar": {
+    "s2": {
         "required": False,
         "env_var": "S2_API_KEY",
         "how_to_get": "api.semanticscholar.org (optional, higher rate limits)",
@@ -1754,7 +1754,7 @@ class TestCLI:
         result = runner.invoke(app, ["providers"])
         assert result.exit_code == 0
         # Should show at least these providers
-        assert "semantic_scholar" in result.stdout
+        assert "s2" in result.stdout
         assert "openalex" in result.stdout
         assert "dblp" in result.stdout
 
@@ -1764,7 +1764,7 @@ class TestCLI:
         assert result.exit_code == 0
         # Should show environment variable names
         assert "S2_API_KEY" in result.stdout
-        assert "WOS_API_KEY" in result.stdout
+        assert "WOS_EXPANDED_API_KEY" in result.stdout or "WOS_STARTER_API_KEY" in result.stdout
         assert "IEEE_API_KEY" in result.stdout
 
     def test_cache_command_exists(self):

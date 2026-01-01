@@ -75,7 +75,7 @@ We define which providers to use for enrichment and in what order:
 
 <<constants>>=
 # Providers that support DOI lookup and provide abstracts
-ENRICHMENT_PROVIDERS = ["semantic_scholar", "openalex"]
+ENRICHMENT_PROVIDERS = ["s2", "openalex"]
 @
 
 
@@ -168,7 +168,7 @@ class TestEnrichPaper:
             authors=["Author"],
             doi="10.1234/test",
             abstract="This is the abstract",
-            source="semantic_scholar"
+            source="s2"
         )
 
         mock_provider = MagicMock()
@@ -179,7 +179,7 @@ class TestEnrichPaper:
 
         assert result.abstract == "This is the abstract"
         assert "dblp" in result.source
-        assert "semantic_scholar" in result.source
+        assert "s2" in result.source
 
     def test_returns_original_if_no_doi(self):
         """enrich_paper returns original paper if no DOI."""
@@ -225,7 +225,7 @@ class TestEnrichPaper:
         )
 
         def mock_get_provider(name):
-            if name == "semantic_scholar":
+            if name == "s2":
                 return first_provider
             elif name == "openalex":
                 return second_provider
@@ -328,7 +328,7 @@ class TestEnrichPapers:
                 authors=[],
                 doi=doi,
                 abstract=f"Abstract for {doi}",
-                source="semantic_scholar"
+                source="s2"
             )
 
         mock_provider = MagicMock()
