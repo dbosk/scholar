@@ -473,7 +473,15 @@ def _wait_for_rate_limit(self) -> None:
 
 \subsubsection{Search method}
 
-The search method calls the API with rate limiting and handles errors:
+The search method calls the API with rate limiting and handles errors.
+When the user requests more results than a single API call can return (the
+Semantic Scholar API caps at 100 results per request), we automatically fetch
+multiple pages using the [[offset]] parameter.
+
+This pagination is transparent to the caller: they simply request the number of
+results they want, and the provider handles the underlying paging.
+The loop terminates when we have fetched enough results, when the API returns
+no more data, or when we reach the total number of available results.
 
 <<semantic scholar search method>>=
 @cachedmethod(lambda self: self._cache, key=lambda self, query, limit=100, filters=None: (query, limit, filters.cache_key() if filters else ""))
@@ -483,43 +491,71 @@ def search(
     limit: int = 100,
     filters: SearchFilters | None = None,
 ) -> list[Paper]:
-    """Search Semantic Scholar for papers matching the query."""
+    """
+    Search Semantic Scholar for papers matching the query.
+
+    Automatically fetches multiple pages if the requested limit exceeds
+    the API's per-request maximum (100 results per page).
+    """
+    all_papers: list[Paper] = []
+    offset = 0
+    page_size = min(limit, 100)  # S2 API returns max 100 per request
+
     try:
-        self._wait_for_rate_limit()
+        while len(all_papers) < limit:
+            self._wait_for_rate_limit()
 
-        headers = {}
-        if self.api_key:
-            headers["x-api-key"] = self.api_key
+            headers = {}
+            if self.api_key:
+                headers["x-api-key"] = self.api_key
 
-        params = {
-            "query": query,
-            "limit": limit,
-            "fields": "title,authors,year,abstract,venue,externalIds,url,openAccessPdf,citationCount,publicationTypes",
-        }
+            # Calculate how many results we still need
+            remaining = limit - len(all_papers)
+            current_page_size = min(page_size, remaining)
 
-        # Apply filters (Semantic Scholar supports most filters natively)
-        <<semantic scholar apply filters>>
+            params = {
+                "query": query,
+                "limit": current_page_size,
+                "offset": offset,
+                "fields": "title,authors,year,abstract,venue,externalIds,url,openAccessPdf,citationCount,publicationTypes",
+            }
 
-        response = self._session.get(
-            self.API_URL,
-            params=params,
-            headers=headers,
-            timeout=30,
-        )
+            # Apply filters (Semantic Scholar supports most filters natively)
+            <<semantic scholar apply filters>>
 
-        if response.status_code == 429:
-            logger.warning(
-                "s2: Rate limited. "
-                "Get a free API key at "
-                "https://www.semanticscholar.org/product/api#api-key-form "
-                "and set S2_API_KEY environment variable."
+            response = self._session.get(
+                self.API_URL,
+                params=params,
+                headers=headers,
+                timeout=30,
             )
-            return []
 
-        response.raise_for_status()
-        data = response.json()
+            if response.status_code == 429:
+                logger.warning(
+                    "s2: Rate limited. "
+                    "Get a free API key at "
+                    "https://www.semanticscholar.org/product/api#api-key-form "
+                    "and set S2_API_KEY environment variable."
+                )
+                break
 
-        return [self._convert_paper(p) for p in data.get("data", [])]
+            response.raise_for_status()
+            data = response.json()
+
+            papers = data.get("data", [])
+            if not papers:
+                # No more results available
+                break
+
+            all_papers.extend(self._convert_paper(p) for p in papers)
+            offset += len(papers)
+
+            # Check if we've fetched all available results
+            total = data.get("total", 0)
+            if offset >= total:
+                break
+
+        return all_papers
     except requests.exceptions.RetryError:
         logger.warning(
             "s2: Rate limited after retries. "
@@ -527,13 +563,13 @@ def search(
             "https://www.semanticscholar.org/product/api#api-key-form "
             "and set S2_API_KEY environment variable."
         )
-        return []
+        return all_papers
     except requests.exceptions.HTTPError as e:
         logger.warning("s2: HTTP error: %s", e)
-        return []
+        return all_papers
     except Exception as e:
         logger.warning("s2: %s", e)
-        return []
+        return all_papers
 @
 
 \subsubsection{Applying filters}
@@ -908,6 +944,86 @@ class TestSemanticScholarGetPaperByDoi:
             assert paper1.title == paper2.title
 
 
+class TestSemanticScholarPagination:
+    """Tests for Semantic Scholar pagination."""
+
+    def test_search_fetches_multiple_pages(self):
+        """search() fetches multiple pages when limit exceeds page size."""
+        provider = SemanticScholarProvider()
+
+        # Create responses for two pages
+        page1_response = Mock()
+        page1_response.status_code = 200
+        page1_response.json.return_value = {
+            "total": 150,
+            "data": [{"title": f"Paper {i}", "authors": []} for i in range(100)],
+        }
+
+        page2_response = Mock()
+        page2_response.status_code = 200
+        page2_response.json.return_value = {
+            "total": 150,
+            "data": [{"title": f"Paper {i}", "authors": []} for i in range(100, 150)],
+        }
+
+        with patch.object(
+            provider._session, "get", side_effect=[page1_response, page2_response]
+        ) as mock_get:
+            results = provider.search("test query", limit=150)
+
+            assert len(results) == 150
+            assert mock_get.call_count == 2
+            # Verify offset was used correctly
+            calls = mock_get.call_args_list
+            assert calls[0][1]["params"]["offset"] == 0
+            assert calls[1][1]["params"]["offset"] == 100
+
+    def test_search_stops_when_no_more_results(self):
+        """search() stops pagination when API returns empty data."""
+        provider = SemanticScholarProvider()
+
+        page1_response = Mock()
+        page1_response.status_code = 200
+        page1_response.json.return_value = {
+            "total": 50,
+            "data": [{"title": f"Paper {i}", "authors": []} for i in range(50)],
+        }
+
+        page2_response = Mock()
+        page2_response.status_code = 200
+        page2_response.json.return_value = {"total": 50, "data": []}
+
+        with patch.object(
+            provider._session, "get", side_effect=[page1_response, page2_response]
+        ):
+            results = provider.search("test query", limit=200)
+
+            # Should stop after getting 50 results even though limit is 200
+            assert len(results) == 50
+
+    def test_search_returns_partial_results_on_rate_limit(self):
+        """search() returns collected results when rate limited mid-pagination."""
+        provider = SemanticScholarProvider()
+
+        page1_response = Mock()
+        page1_response.status_code = 200
+        page1_response.json.return_value = {
+            "total": 200,
+            "data": [{"title": f"Paper {i}", "authors": []} for i in range(100)],
+        }
+
+        page2_response = Mock()
+        page2_response.status_code = 429  # Rate limited
+
+        with patch.object(
+            provider._session, "get", side_effect=[page1_response, page2_response]
+        ):
+            results = provider.search("test query", limit=200)
+
+            # Should return partial results from first page
+            assert len(results) == 100
+
+
 class TestSemanticScholarIntegration:
     """Integration test for the SemanticScholar provider."""
 
@@ -951,13 +1067,20 @@ pool of API resources with faster response times for identified users.
 This is OpenAlex's approach to encouraging good API citizenship without
 creating barriers to access.
 
-\subsection{Rate Limiting}
+\subsection{Rate Limiting and Pagination}
 
 OpenAlex allows up to 10 requests per second.
 We implement proactive rate limiting by tracking the time of the last request
 and waiting if necessary before making a new one.
 This ensures we stay well within limits even during batch operations like
 paper enrichment.
+
+The [[pyalex]] library provides a convenient [[paginate()]] method that
+automatically handles pagination.
+When the user requests more results than a single API page can return (200
+results per page), we iterate through the paginated results until we reach
+the requested limit.
+This makes large result sets transparent to the caller.
 
 \subsection{Provider implementation}
 
@@ -1002,16 +1125,31 @@ class OpenAlexProvider:
         limit: int = 100,
         filters: SearchFilters | None = None,
     ) -> list[Paper]:
-        """Search OpenAlex for papers matching the query."""
+        """
+        Search OpenAlex for papers matching the query.
+
+        Automatically fetches multiple pages if the requested limit exceeds
+        the API's per-request maximum (200 results per page).
+        """
         try:
+            all_papers: list[Paper] = []
+            page_size = min(limit, 200)  # OpenAlex returns max 200 per page
+
             self._wait_for_rate_limit()
             works = pyalex.Works().search(query)
 
             # Apply filters (OpenAlex supports most filters natively)
             <<openalex apply filters>>
 
-            results = works.get(per_page=limit)
-            return [self._convert_work(w) for w in results]
+            # Use pagination to fetch all results up to the limit
+            for page in works.paginate(per_page=page_size):
+                self._wait_for_rate_limit()
+                for work in page:
+                    all_papers.append(self._convert_work(work))
+                    if len(all_papers) >= limit:
+                        return all_papers
+
+            return all_papers
         except Exception as e:
             logger.warning("openalex: %s", e)
             return []
@@ -1222,8 +1360,9 @@ class TestOpenAlexProvider:
         }
 
         with patch("pyalex.Works") as mock_works:
-            mock_works.return_value.search.return_value.get.return_value = [
-                mock_work
+            # paginate() returns an iterator of pages, where each page is a list
+            mock_works.return_value.search.return_value.paginate.return_value = [
+                [mock_work]  # Single page with one result
             ]
 
             results = provider.search("test query")
@@ -1243,7 +1382,8 @@ class TestOpenAlexProvider:
         provider = OpenAlexProvider()
 
         with patch("pyalex.Works") as mock_works:
-            mock_works.return_value.search.return_value.get.return_value = []
+            # paginate() returns an iterator of pages - empty list means no pages
+            mock_works.return_value.search.return_value.paginate.return_value = []
 
             results = provider.search("obscure query")
             assert results == []
@@ -1269,8 +1409,9 @@ class TestOpenAlexProvider:
         }
 
         with patch("pyalex.Works") as mock_works:
-            mock_works.return_value.search.return_value.get.return_value = [
-                mock_work
+            # paginate() returns an iterator of pages
+            mock_works.return_value.search.return_value.paginate.return_value = [
+                [mock_work]  # Single page with one result
             ]
 
             results = provider.search("test")
@@ -1408,6 +1549,15 @@ we already depend on.
 No API key is required.
 The API returns JSON with publication data that we parse directly.
 
+\subsection{Pagination}
+
+The DBLP API supports pagination through the [[h]] (hits) and [[f]] (first)
+parameters.
+The [[h]] parameter specifies the maximum number of results per request (capped
+at 1000), while [[f]] specifies the offset (0-indexed).
+When the user requests more than 1000 results, we automatically fetch multiple
+pages.
+
 \subsection{Provider implementation}
 
 <<dblp provider>>=
@@ -1433,28 +1583,60 @@ class DBLPProvider:
         limit: int = 100,
         filters: SearchFilters | None = None,
     ) -> list[Paper]:
-        """Search DBLP for papers matching the query."""
-        try:
-            # DBLP API caps at 1000 results per request
-            effective_limit = min(limit, 1000)
+        """
+        Search DBLP for papers matching the query.
 
+        Automatically fetches multiple pages if the requested limit exceeds
+        the API's per-request maximum (1000 results per page).
+        """
+        all_papers: list[Paper] = []
+        offset = 0
+        page_size = min(limit, 1000)  # DBLP API caps at 1000 per request
+
+        try:
             # Build query with embedded filters
             effective_query = query
             <<dblp apply filters>>
 
-            response = requests.get(
-                DBLP_API_URL,
-                params={"q": effective_query, "format": "json", "h": effective_limit},
-                timeout=30,
-            )
-            response.raise_for_status()
-            data = response.json()
+            while len(all_papers) < limit:
+                # Calculate how many results we still need
+                remaining = limit - len(all_papers)
+                current_page_size = min(page_size, remaining)
 
-            hits = data.get("result", {}).get("hits", {}).get("hit", [])
-            return [self._convert_hit(hit) for hit in hits]
+                response = requests.get(
+                    DBLP_API_URL,
+                    params={
+                        "q": effective_query,
+                        "format": "json",
+                        "h": current_page_size,
+                        "f": offset,
+                    },
+                    timeout=30,
+                )
+                response.raise_for_status()
+                data = response.json()
+
+                hits = data.get("result", {}).get("hits", {}).get("hit", [])
+                if not hits:
+                    # No more results available
+                    break
+
+                all_papers.extend(self._convert_hit(hit) for hit in hits)
+                offset += len(hits)
+
+                # Check if we've fetched all available results
+                total_str = data.get("result", {}).get("hits", {}).get("@total", "0")
+                try:
+                    total = int(total_str)
+                except (ValueError, TypeError):
+                    total = 0
+                if offset >= total:
+                    break
+
+            return all_papers
         except Exception as e:
             logger.warning("dblp: %s", e)
-            return []
+            return all_papers
 
     <<convert dblp hit>>
 @
@@ -1734,7 +1916,7 @@ class TestDBLPProvider:
         provider = DBLPProvider()
 
         mock_response = Mock()
-        mock_response.json.return_value = {"result": {"hits": {"hit": []}}}
+        mock_response.json.return_value = {"result": {"hits": {"hit": [], "@total": "0"}}}
         mock_response.raise_for_status = Mock()
 
         with patch("requests.get") as mock_get:
@@ -1746,21 +1928,64 @@ class TestDBLPProvider:
             call_args = mock_get.call_args
             assert call_args[1]["params"]["h"] == 50
 
-    def test_caps_limit_at_1000(self):
-        """search() caps limit at DBLP's maximum of 1000."""
+    def test_fetches_multiple_pages(self):
+        """search() fetches multiple pages when limit exceeds page size."""
         provider = DBLPProvider()
 
-        mock_response = Mock()
-        mock_response.json.return_value = {"result": {"hits": {"hit": []}}}
-        mock_response.raise_for_status = Mock()
+        # Create responses for two pages
+        page1_response = Mock()
+        page1_response.json.return_value = {
+            "result": {
+                "hits": {
+                    "@total": "1500",
+                    "hit": [{"info": {"title": f"Paper {i}"}} for i in range(1000)],
+                }
+            }
+        }
+        page1_response.raise_for_status = Mock()
 
-        with patch("requests.get") as mock_get:
-            mock_get.return_value = mock_response
+        page2_response = Mock()
+        page2_response.json.return_value = {
+            "result": {
+                "hits": {
+                    "@total": "1500",
+                    "hit": [{"info": {"title": f"Paper {i}"}} for i in range(1000, 1500)],
+                }
+            }
+        }
+        page2_response.raise_for_status = Mock()
 
-            provider.search("test", limit=2000)
+        with patch("requests.get", side_effect=[page1_response, page2_response]) as mock_get:
+            results = provider.search("test", limit=1500)
 
-            call_args = mock_get.call_args
-            assert call_args[1]["params"]["h"] == 1000
+            assert len(results) == 1500
+            assert mock_get.call_count == 2
+            # Verify offset was used correctly
+            calls = mock_get.call_args_list
+            assert calls[0][1]["params"]["f"] == 0
+            assert calls[1][1]["params"]["f"] == 1000
+
+    def test_stops_when_total_reached(self):
+        """search() stops pagination when all results have been fetched."""
+        provider = DBLPProvider()
+
+        page1_response = Mock()
+        page1_response.json.return_value = {
+            "result": {
+                "hits": {
+                    "@total": "50",
+                    "hit": [{"info": {"title": f"Paper {i}"}} for i in range(50)],
+                }
+            }
+        }
+        page1_response.raise_for_status = Mock()
+
+        with patch("requests.get", return_value=page1_response) as mock_get:
+            results = provider.search("test", limit=200)
+
+            # Should stop after first page since total (50) < limit (200)
+            assert len(results) == 50
+            assert mock_get.call_count == 1
 
 
 class TestDBLPIntegration:
@@ -1986,6 +2211,9 @@ def _format_query(self, query: str) -> str:
 
 The Starter API uses a simpler request format with [[q]], [[limit]], and [[page]]
 parameters.
+The [[page]] parameter is 1-indexed.
+When the user requests more than 50 results (the per-page maximum), we
+automatically fetch multiple pages.
 
 <<wos search starter>>=
 def _search_starter(
@@ -1994,37 +2222,66 @@ def _search_starter(
     limit: int,
     filters: SearchFilters | None,
 ) -> list[Paper]:
-    """Search using the WoS Starter API."""
+    """
+    Search using the WoS Starter API.
+
+    Automatically fetches multiple pages if the requested limit exceeds
+    the API's per-request maximum (50 results per page).
+    """
+    all_papers: list[Paper] = []
+    page = 1
+    page_size = 50  # Starter API max per page
+
     try:
-        effective_limit = min(limit, 50)
         effective_query = self._format_query(query)
         <<wos apply filters starter>>
 
-        response = requests.get(
-            WOS_STARTER_API_URL,
-            params={
-                "q": effective_query,
-                "db": "WOS",
-                "limit": effective_limit,
-                "page": 1,
-            },
-            headers={"X-ApiKey": self._api_key},
-            timeout=30,
-        )
-        response.raise_for_status()
-        data = response.json()
+        while len(all_papers) < limit:
+            # Calculate how many results we still need
+            remaining = limit - len(all_papers)
+            current_page_size = min(page_size, remaining)
 
-        hits = data.get("hits", [])
-        return [self._convert_starter_hit(hit) for hit in hits]
+            response = requests.get(
+                WOS_STARTER_API_URL,
+                params={
+                    "q": effective_query,
+                    "db": "WOS",
+                    "limit": current_page_size,
+                    "page": page,
+                },
+                headers={"X-ApiKey": self._api_key},
+                timeout=30,
+            )
+            response.raise_for_status()
+            data = response.json()
+
+            hits = data.get("hits", [])
+            if not hits:
+                # No more results available
+                break
+
+            all_papers.extend(self._convert_starter_hit(hit) for hit in hits)
+            page += 1
+
+            # Check if we've fetched all available results
+            metadata = data.get("metadata", {})
+            total = metadata.get("total", 0)
+            if len(all_papers) >= total:
+                break
+
+        return all_papers
     except Exception as e:
         logger.warning("wos (starter): %s", e)
-        return []
+        return all_papers
 @
 
 \subsubsection{Expanded API search}
 
 The Expanded API uses [[usrQuery]], [[count]], and [[firstRecord]] parameters.
+The [[firstRecord]] parameter is 1-indexed (the first record is 1, not 0).
 It returns a more complex nested structure with full metadata including abstracts.
+When the user requests more than 100 results (the per-page maximum), we
+automatically fetch multiple pages.
 
 <<wos search expanded>>=
 def _search_expanded(
@@ -2033,39 +2290,64 @@ def _search_expanded(
     limit: int,
     filters: SearchFilters | None,
 ) -> list[Paper]:
-    """Search using the WoS Expanded API."""
+    """
+    Search using the WoS Expanded API.
+
+    Automatically fetches multiple pages if the requested limit exceeds
+    the API's per-request maximum (100 results per page).
+    """
+    all_papers: list[Paper] = []
+    first_record = 1  # 1-indexed
+    page_size = 100  # Expanded API max per page
+
     try:
-        effective_limit = min(limit, 100)
         effective_query = self._format_query(query)
         <<wos apply filters expanded>>
 
-        response = requests.get(
-            WOS_EXPANDED_API_URL,
-            params={
-                "databaseId": "WOS",
-                "usrQuery": effective_query,
-                "count": effective_limit,
-                "firstRecord": 1,
-            },
-            headers={"X-ApiKey": self._api_key},
-            timeout=30,
-        )
-        response.raise_for_status()
-        data = response.json()
+        while len(all_papers) < limit:
+            # Calculate how many results we still need
+            remaining = limit - len(all_papers)
+            current_page_size = min(page_size, remaining)
 
-        # Navigate the nested structure to get records
-        records = (
-            data.get("Data", {})
-            .get("Records", {})
-            .get("records", {})
-            .get("REC", [])
-        )
+            response = requests.get(
+                WOS_EXPANDED_API_URL,
+                params={
+                    "databaseId": "WOS",
+                    "usrQuery": effective_query,
+                    "count": current_page_size,
+                    "firstRecord": first_record,
+                },
+                headers={"X-ApiKey": self._api_key},
+                timeout=30,
+            )
+            response.raise_for_status()
+            data = response.json()
 
-        # Store query ID for potential citation report requests
-        query_result = data.get("QueryResult", {})
-        self._last_query_id = query_result.get("QueryID")
+            # Navigate the nested structure to get records
+            records = (
+                data.get("Data", {})
+                .get("Records", {})
+                .get("records", {})
+                .get("REC", [])
+            )
 
-        return [self._convert_expanded_hit(rec) for rec in records]
+            if not records:
+                # No more results available
+                break
+
+            # Store query ID for potential citation report requests
+            query_result = data.get("QueryResult", {})
+            self._last_query_id = query_result.get("QueryID")
+
+            all_papers.extend(self._convert_expanded_hit(rec) for rec in records)
+            first_record += len(records)
+
+            # Check if we've fetched all available results
+            total = query_result.get("RecordsFound", 0)
+            if first_record > total:
+                break
+
+        return all_papers
     except Exception as e:
         logger.warning("wos (expanded): %s", e)
         # Try falling back to Starter API if we have a starter key
@@ -2076,7 +2358,7 @@ def _search_expanded(
             self._api_url = WOS_STARTER_API_URL
             self.MAX_LIMIT = 50
             return self._search_starter(query, limit, filters)
-        return []
+        return all_papers
 @
 
 \subsubsection{Applying filters}
@@ -2732,23 +3014,36 @@ class TestWebOfScienceStarterAPI:
             assert paper.doi is None
             assert paper.abstract is None
 
-    def test_caps_limit_at_50(self):
-        """Starter API caps limit at 50."""
+    def test_fetches_multiple_pages(self):
+        """Starter API fetches multiple pages when limit exceeds page size."""
         provider = WebOfScienceProvider(
             starter_api_key="test_key", expanded_api_key=None
         )
 
-        mock_response = Mock()
-        mock_response.json.return_value = {"hits": []}
-        mock_response.raise_for_status = Mock()
+        # Create responses for two pages
+        page1_response = Mock()
+        page1_response.json.return_value = {
+            "metadata": {"total": 75},
+            "hits": [{"title": f"Paper {i}"} for i in range(50)],
+        }
+        page1_response.raise_for_status = Mock()
 
-        with patch("requests.get") as mock_get:
-            mock_get.return_value = mock_response
+        page2_response = Mock()
+        page2_response.json.return_value = {
+            "metadata": {"total": 75},
+            "hits": [{"title": f"Paper {i}"} for i in range(50, 75)],
+        }
+        page2_response.raise_for_status = Mock()
 
-            provider.search("test", limit=100)
+        with patch("requests.get", side_effect=[page1_response, page2_response]) as mock_get:
+            results = provider.search("test", limit=75)
 
-            call_args = mock_get.call_args
-            assert call_args[1]["params"]["limit"] == 50
+            assert len(results) == 75
+            assert mock_get.call_count == 2
+            # Verify page parameter increments
+            calls = mock_get.call_args_list
+            assert calls[0][1]["params"]["page"] == 1
+            assert calls[1][1]["params"]["page"] == 2
 
     def test_sends_api_key_header(self):
         """search() sends API key in header."""
@@ -2906,26 +3201,76 @@ class TestWebOfScienceExpandedAPI:
             assert paper.abstract == "This is the abstract."
             assert paper.source == "wos"
 
-    def test_caps_limit_at_100(self):
-        """Expanded API caps limit at 100."""
+    def test_fetches_multiple_pages(self):
+        """Expanded API fetches multiple pages when limit exceeds page size."""
         provider = WebOfScienceProvider(
             starter_api_key=None, expanded_api_key="test_key"
         )
 
-        mock_response = Mock()
-        mock_response.json.return_value = {
-            "Data": {"Records": {"records": {"REC": []}}},
-            "QueryResult": {"QueryID": 1},
+        # Create responses for two pages
+        page1_response = Mock()
+        page1_response.json.return_value = {
+            "Data": {
+                "Records": {
+                    "records": {
+                        "REC": [
+                            {
+                                "UID": f"WOS:{i}",
+                                "static_data": {
+                                    "summary": {
+                                        "titles": {"title": [{"type": "item", "content": f"Paper {i}"}]},
+                                        "names": {"name": []},
+                                        "pub_info": {},
+                                    },
+                                    "fullrecord_metadata": {},
+                                },
+                                "dynamic_data": {},
+                            }
+                            for i in range(100)
+                        ]
+                    }
+                }
+            },
+            "QueryResult": {"QueryID": 1, "RecordsFound": 150},
         }
-        mock_response.raise_for_status = Mock()
+        page1_response.raise_for_status = Mock()
 
-        with patch("requests.get") as mock_get:
-            mock_get.return_value = mock_response
+        page2_response = Mock()
+        page2_response.json.return_value = {
+            "Data": {
+                "Records": {
+                    "records": {
+                        "REC": [
+                            {
+                                "UID": f"WOS:{i}",
+                                "static_data": {
+                                    "summary": {
+                                        "titles": {"title": [{"type": "item", "content": f"Paper {i}"}]},
+                                        "names": {"name": []},
+                                        "pub_info": {},
+                                    },
+                                    "fullrecord_metadata": {},
+                                },
+                                "dynamic_data": {},
+                            }
+                            for i in range(100, 150)
+                        ]
+                    }
+                }
+            },
+            "QueryResult": {"QueryID": 1, "RecordsFound": 150},
+        }
+        page2_response.raise_for_status = Mock()
 
-            provider.search("test", limit=200)
+        with patch("requests.get", side_effect=[page1_response, page2_response]) as mock_get:
+            results = provider.search("test", limit=150)
 
-            call_args = mock_get.call_args
-            assert call_args[1]["params"]["count"] == 100
+            assert len(results) == 150
+            assert mock_get.call_count == 2
+            # Verify firstRecord parameter increments
+            calls = mock_get.call_args_list
+            assert calls[0][1]["params"]["firstRecord"] == 1
+            assert calls[1][1]["params"]["firstRecord"] == 101
 
     def test_uses_expanded_api_url(self):
         """Expanded API uses correct URL."""
@@ -3330,6 +3675,15 @@ if response.status_code != 200:
     response.raise_for_status()
 @
 
+\subsection{Pagination}
+
+The IEEE Xplore API supports pagination through the [[max_records]] and
+[[start_record]] parameters.
+The [[max_records]] parameter specifies the maximum number of results per request
+(capped at 200), while [[start_record]] specifies the offset (1-indexed).
+When the user requests more than 200 results, we automatically fetch multiple
+pages.
+
 \subsection{Provider implementation}
 
 <<ieee provider>>=
@@ -3362,39 +3716,63 @@ class IEEEXploreProvider:
         limit: int = 100,
         filters: SearchFilters | None = None,
     ) -> list[Paper]:
-        """Search IEEE Xplore for papers matching the query."""
+        """
+        Search IEEE Xplore for papers matching the query.
+
+        Automatically fetches multiple pages if the requested limit exceeds
+        the API's per-request maximum (200 results per page).
+        """
         if not self.api_key:
             return []  # No API key configured
 
+        all_papers: list[Paper] = []
+        start_record = 1  # 1-indexed
+        page_size = 200  # IEEE API max per request
+
         try:
-            # IEEE API returns max 200 results per request
-            effective_limit = min(limit, 200)
+            while len(all_papers) < limit:
+                # Calculate how many results we still need
+                remaining = limit - len(all_papers)
+                current_page_size = min(page_size, remaining)
 
-            params = {
-                "querytext": query,
-                "max_records": effective_limit,
-                "apikey": self.api_key,
-            }
+                params = {
+                    "querytext": query,
+                    "max_records": current_page_size,
+                    "start_record": start_record,
+                    "apikey": self.api_key,
+                }
 
-            # Apply filters (IEEE supports some filters natively)
-            <<ieee apply filters>>
+                # Apply filters (IEEE supports some filters natively)
+                <<ieee apply filters>>
 
-            response = requests.get(
-                IEEE_API_URL,
-                params=params,
-                timeout=30,
-            )
-            <<ieee handle response errors>>
-            data = response.json()
+                response = requests.get(
+                    IEEE_API_URL,
+                    params=params,
+                    timeout=30,
+                )
+                <<ieee handle response errors>>
+                data = response.json()
 
-            articles = data.get("articles", [])
-            return [self._convert_article(article) for article in articles]
+                articles = data.get("articles", [])
+                if not articles:
+                    # No more results available
+                    break
+
+                all_papers.extend(self._convert_article(article) for article in articles)
+                start_record += len(articles)
+
+                # Check if we've fetched all available results
+                total = data.get("total_records", 0)
+                if start_record > total:
+                    break
+
+            return all_papers
         except requests.exceptions.HTTPError:
             # Already logged with details in handle response errors
-            return []
+            return all_papers
         except Exception as e:
             logger.warning("ieee: %s", e)
-            return []
+            return all_papers
 
     <<convert ieee article>>
 @
@@ -3726,6 +4104,51 @@ class TestIEEEXploreProvider:
             results = provider.search("test")
 
             assert results == []
+
+    def test_fetches_multiple_pages(self):
+        """IEEE fetches multiple pages when limit exceeds page size."""
+        provider = IEEEXploreProvider(api_key="test_key")
+
+        # Create responses for two pages (IEEE returns max 200 per page)
+        page1_response = Mock()
+        page1_response.status_code = 200
+        page1_response.json.return_value = {
+            "total_records": 350,
+            "articles": [
+                {
+                    "title": f"Paper {i}",
+                    "authors": {"authors": []},
+                    "publication_year": "2024",
+                }
+                for i in range(200)
+            ],
+        }
+        page1_response.raise_for_status = Mock()
+
+        page2_response = Mock()
+        page2_response.status_code = 200
+        page2_response.json.return_value = {
+            "total_records": 350,
+            "articles": [
+                {
+                    "title": f"Paper {i}",
+                    "authors": {"authors": []},
+                    "publication_year": "2024",
+                }
+                for i in range(200, 350)
+            ],
+        }
+        page2_response.raise_for_status = Mock()
+
+        with patch("requests.get", side_effect=[page1_response, page2_response]) as mock_get:
+            results = provider.search("test", limit=350)
+
+            assert len(results) == 350
+            assert mock_get.call_count == 2
+            # Verify start_record parameter increments (1-indexed)
+            calls = mock_get.call_args_list
+            assert calls[0][1]["params"]["start_record"] == 1
+            assert calls[1][1]["params"]["start_record"] == 201
 
 
 class TestIEEEXploreIntegration:
