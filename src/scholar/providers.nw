@@ -1943,6 +1943,9 @@ def search(
 
 The Starter API uses a simpler request format with [[q]], [[limit]], and [[page]]
 parameters.
+Unlike the Expanded API, the Starter API \emph{requires} field tags in queries.
+If the user provides a plain query without field tags (like \enquote{machine learning}),
+we wrap it with [[TS=()]] to search across topic fields (title, abstract, keywords).
 
 <<wos search starter>>=
 def _search_starter(
@@ -1954,7 +1957,7 @@ def _search_starter(
     """Search using the WoS Starter API."""
     try:
         effective_limit = min(limit, 50)
-        effective_query = query
+        effective_query = self._format_starter_query(query)
         <<wos apply filters starter>>
 
         response = requests.get(
@@ -1976,6 +1979,20 @@ def _search_starter(
     except Exception as e:
         logger.warning("wos (starter): %s", e)
         return []
+
+def _format_starter_query(self, query: str) -> str:
+    """
+    Format a query for the WoS Starter API.
+
+    The Starter API requires field tags (e.g., TS=, TI=, AU=).
+    If the query doesn't contain a field tag, wrap it with TS=()
+    to search across topic fields (title, abstract, keywords).
+    """
+    # Check if query already has a field tag (two uppercase letters followed by =)
+    if re.search(r'\b[A-Z]{2,3}=', query):
+        return query
+    # Wrap plain query with TS (topic search)
+    return f"TS=({query})"
 @
 
 \subsubsection{Expanded API search}
@@ -2487,8 +2504,16 @@ register_provider(WebOfScienceProvider())
 
 \subsection{Dependencies}
 
-Since the provider uses the same [[requests]] library as DBLP, we only need
-to define the API URL constants for both tiers:
+The WoS provider uses [[requests]] for HTTP calls and [[re]] for detecting
+field tags in queries (the Starter API requires queries to have explicit field
+tags like [[TS=]] or [[TI=]]).
+
+<<wos imports>>=
+import re
+import requests
+@
+
+We also define the API URL constants for both tiers:
 
 <<wos constants>>=
 WOS_STARTER_API_URL = "https://api.clarivate.com/apis/wos-starter/v1/documents"
@@ -2705,6 +2730,40 @@ class TestWebOfScienceStarterAPI:
 
             call_args = mock_get.call_args
             assert "wos-starter" in call_args[0][0]
+
+    def test_formats_plain_query_with_ts_tag(self):
+        """Plain queries are wrapped with TS= for topic search."""
+        provider = WebOfScienceProvider(starter_api_key="test_key")
+
+        mock_response = Mock()
+        mock_response.json.return_value = {"hits": []}
+        mock_response.raise_for_status = Mock()
+
+        with patch("requests.get") as mock_get:
+            mock_get.return_value = mock_response
+
+            provider.search("machine learning")
+
+            call_args = mock_get.call_args
+            # Query should be wrapped with TS=()
+            assert call_args[1]["params"]["q"] == "TS=(machine learning)"
+
+    def test_preserves_existing_field_tags(self):
+        """Queries with field tags are not double-wrapped."""
+        provider = WebOfScienceProvider(starter_api_key="test_key")
+
+        mock_response = Mock()
+        mock_response.json.return_value = {"hits": []}
+        mock_response.raise_for_status = Mock()
+
+        with patch("requests.get") as mock_get:
+            mock_get.return_value = mock_response
+
+            provider.search("TI=(machine learning) AND AU=Smith")
+
+            call_args = mock_get.call_args
+            # Query should NOT be wrapped again
+            assert call_args[1]["params"]["q"] == "TI=(machine learning) AND AU=Smith"
 @
 
 \subsubsection{Expanded API tests}
@@ -3593,6 +3652,7 @@ from scholar.cache import load_cache, register_cache
 <<semantic scholar imports>>
 <<openalex imports>>
 <<dblp imports>>
+<<wos imports>>
 
 logger = logging.getLogger(__name__)
 @
