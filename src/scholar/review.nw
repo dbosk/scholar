@@ -83,6 +83,7 @@ from enum import Enum
 from pathlib import Path
 from typing import Any
 import json
+import logging
 
 from scholar.scholar import Paper, SearchFilters
 from scholar.notes import (
@@ -90,6 +91,8 @@ from scholar.notes import (
     load_search_decisions, save_search_decisions as notes_save_decisions,
     ReviewDecisionRecord,
 )
+
+logger = logging.getLogger(__name__)
 @
 
 <<review constants>>=
@@ -448,14 +451,19 @@ def create_review_session(
     Returns:
         A ReviewSession ready for review.
     """
+    logger.info("Creating review session for query: %s", query)
     # Use session_name for persistence, fall back to query
     persistence_key = session_name if session_name else query
     
     # Load previous decisions for this session
     previous_decisions = load_search_decisions(persistence_key)
+    if previous_decisions:
+        logger.debug("Loaded %d previous decisions for session", 
+                    len(previous_decisions.decisions))
     
     # Create review session
     providers = list(set(r.provider for r in results))
+    logger.debug("Session includes providers: %s", providers)
     session = ReviewSession(
         query=query,
         providers=providers,
@@ -536,6 +544,9 @@ def create_review_session(
                 )
             )
     
+    logger.info("Created session with %d papers (%d kept, %d discarded, %d pending)",
+               len(session.decisions), len(session.kept_papers),
+               len(session.discarded_papers), len(session.pending_papers))
     return session
 
 
@@ -622,6 +633,7 @@ def save_session(session: ReviewSession) -> Path:
         filename = f"{get_query_hash(session.query)}.json"
     
     session_path = _get_sessions_dir() / filename
+    logger.info("Saving session to %s", session_path)
     
     # Convert to serializable format
     data = {
@@ -654,6 +666,9 @@ def save_session(session: ReviewSession) -> Path:
     with open(session_path, "w", encoding="utf-8") as f:
         json.dump(data, f, indent=2, ensure_ascii=False)
     
+    logger.debug("Saved %d decisions (%d kept, %d discarded, %d pending)",
+                len(session.decisions), len(session.kept_papers),
+                len(session.discarded_papers), len(session.pending_papers))
     return session_path
 
 
@@ -667,6 +682,7 @@ def load_session(name_or_query: str) -> ReviewSession | None:
     Returns:
         The loaded ReviewSession, or None if not found.
     """
+    logger.debug("Loading session: %s", name_or_query)
     sessions_dir = _get_sessions_dir()
     
     # Try exact name first
@@ -676,8 +692,10 @@ def load_session(name_or_query: str) -> ReviewSession | None:
         session_path = sessions_dir / f"{get_query_hash(name_or_query)}.json"
     
     if not session_path.exists():
+        logger.debug("Session not found: %s", name_or_query)
         return None
     
+    logger.debug("Found session file: %s", session_path)
     try:
         with open(session_path, "r", encoding="utf-8") as f:
             data = json.load(f)
@@ -714,8 +732,10 @@ def load_session(name_or_query: str) -> ReviewSession | None:
                 )
             )
         
+        logger.info("Loaded session with %d papers", len(session.decisions))
         return session
-    except (json.JSONDecodeError, KeyError, OSError):
+    except (json.JSONDecodeError, KeyError, OSError) as e:
+        logger.warning("Failed to load session %s: %s", name_or_query, e)
         return None
 
 
@@ -734,6 +754,7 @@ def list_sessions() -> list[dict[str, Any]]:
         - path: Path to session file
     """
     sessions_dir = _get_sessions_dir()
+    logger.debug("Listing sessions from %s", sessions_dir)
     sessions = []
     
     for session_file in sessions_dir.glob("*.json"):
@@ -763,9 +784,10 @@ def list_sessions() -> list[dict[str, Any]]:
                 "pending": pending,
                 "path": session_file,
             })
-        except (json.JSONDecodeError, OSError):
-            pass
+        except (json.JSONDecodeError, OSError) as e:
+            logger.debug("Failed to read session file %s: %s", session_file, e)
     
+    logger.debug("Found %d sessions", len(sessions))
     return sorted(sessions, key=lambda s: s.get("timestamp", datetime.min), reverse=True)
 
 
@@ -780,6 +802,7 @@ def save_search_decisions(query: str, decisions: list[ReviewDecision]) -> None:
         query: The search query string.
         decisions: List of ReviewDecision objects.
     """
+    logger.debug("Saving %d decisions for query: %s", len(decisions), query)
     # Convert to notes module format
     decision_records = {}
     for d in decisions:

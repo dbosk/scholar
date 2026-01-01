@@ -510,7 +510,7 @@ considerations:
 
 <<execute search and display results>>=
 from scholar import Search, SearchFilters
-from scholar.providers import get_default_providers
+from scholar.providers import get_default_providers, get_provider_limits
 import sys
 
 # Determine which providers will be used
