@@ -248,7 +248,8 @@ class TestProviderRegistry:
         assert limits["s2"] is None
         assert limits["openalex"] is None
         assert limits["dblp"] == 1000
-        assert limits["wos"] == 50
+        # WoS limit depends on API tier: 50 for Starter, 100 for Expanded
+        assert limits["wos"] in (50, 100)
         assert limits["ieee"] == 200
 @
 
@@ -1855,11 +1856,20 @@ When only the legacy [[WOS_API_KEY]] is set, we try it with the Expanded API
 first.
 If that fails during search, we fall back to the Starter API.
 
+We use a sentinel value to distinguish between \enquote{not provided} (use
+environment variable) and \enquote{explicitly set to None} (disable this key).
+This distinction matters for testing: when we want to test the Starter API in
+isolation, we must be able to explicitly disable the Expanded API even if the
+[[WOS_EXPANDED_API_KEY]] environment variable is set.
+Without a sentinel, passing [[None]] would be indistinguishable from not passing
+the argument at all, and the constructor would fall back to the environment
+variable.
+
 <<wos init>>=
 def __init__(
     self,
-    starter_api_key: str | None = None,
-    expanded_api_key: str | None = None,
+    starter_api_key: str | None | object = _WOS_NOT_PROVIDED,
+    expanded_api_key: str | None | object = _WOS_NOT_PROVIDED,
 ):
     """
     Initialize the Web of Science provider.
@@ -1867,14 +1877,24 @@ def __init__(
     Args:
         starter_api_key: API key for WoS Starter API.
                          If not provided, uses WOS_STARTER_API_KEY env var.
+                         Pass None explicitly to disable.
         expanded_api_key: API key for WoS Expanded API.
                           If not provided, uses WOS_EXPANDED_API_KEY env var.
+                          Pass None explicitly to disable.
 
     The legacy WOS_API_KEY environment variable is also checked and tried
     with both APIs for backward compatibility.
     """
-    self._starter_key = starter_api_key or os.environ.get("WOS_STARTER_API_KEY")
-    self._expanded_key = expanded_api_key or os.environ.get("WOS_EXPANDED_API_KEY")
+    # Use env var only if argument was not provided at all
+    if starter_api_key is _WOS_NOT_PROVIDED:
+        self._starter_key = os.environ.get("WOS_STARTER_API_KEY")
+    else:
+        self._starter_key = starter_api_key
+
+    if expanded_api_key is _WOS_NOT_PROVIDED:
+        self._expanded_key = os.environ.get("WOS_EXPANDED_API_KEY")
+    else:
+        self._expanded_key = expanded_api_key
 
     # Legacy support: WOS_API_KEY can be used with either API
     legacy_key = os.environ.get("WOS_API_KEY")
@@ -1935,17 +1955,37 @@ def search(
     else:
         return self._search_starter(query, limit, filters)
 
+<<wos format query>>
 <<wos search starter>>
 <<wos search expanded>>
+@
+
+\subsubsection{Query formatting}
+
+Both WoS APIs require field tags in queries (e.g., [[TS=]], [[TI=]], [[AU=]]).
+Plain queries like \enquote{machine learning} fail with a 400 Bad Request error.
+We wrap plain queries with [[TS=()]] to search across topic fields (title,
+abstract, keywords).
+Queries that already contain field tags are preserved as-is.
+
+<<wos format query>>=
+def _format_query(self, query: str) -> str:
+    """
+    Format a query for the WoS APIs.
+
+    Both Starter and Expanded APIs require field tags (e.g., TS=, TI=, AU=).
+    If the query doesn't contain a field tag, wrap it with TS=()
+    to search across topic fields (title, abstract, keywords).
+    """
+    if re.search(r'\b[A-Z]{2,3}=', query):
+        return query
+    return f"TS=({query})"
 @
 
 \subsubsection{Starter API search}
 
 The Starter API uses a simpler request format with [[q]], [[limit]], and [[page]]
 parameters.
-Unlike the Expanded API, the Starter API \emph{requires} field tags in queries.
-If the user provides a plain query without field tags (like \enquote{machine learning}),
-we wrap it with [[TS=()]] to search across topic fields (title, abstract, keywords).
 
 <<wos search starter>>=
 def _search_starter(
@@ -1957,7 +1997,7 @@ def _search_starter(
     """Search using the WoS Starter API."""
     try:
         effective_limit = min(limit, 50)
-        effective_query = self._format_starter_query(query)
+        effective_query = self._format_query(query)
         <<wos apply filters starter>>
 
         response = requests.get(
@@ -1979,20 +2019,6 @@ def _search_starter(
     except Exception as e:
         logger.warning("wos (starter): %s", e)
         return []
-
-def _format_starter_query(self, query: str) -> str:
-    """
-    Format a query for the WoS Starter API.
-
-    The Starter API requires field tags (e.g., TS=, TI=, AU=).
-    If the query doesn't contain a field tag, wrap it with TS=()
-    to search across topic fields (title, abstract, keywords).
-    """
-    # Check if query already has a field tag (two uppercase letters followed by =)
-    if re.search(r'\b[A-Z]{2,3}=', query):
-        return query
-    # Wrap plain query with TS (topic search)
-    return f"TS=({query})"
 @
 
 \subsubsection{Expanded API search}
@@ -2010,7 +2036,7 @@ def _search_expanded(
     """Search using the WoS Expanded API."""
     try:
         effective_limit = min(limit, 100)
-        effective_query = query
+        effective_query = self._format_query(query)
         <<wos apply filters expanded>>
 
         response = requests.get(
@@ -2513,11 +2539,14 @@ import re
 import requests
 @
 
-We also define the API URL constants for both tiers:
+We also define the API URL constants for both tiers, plus a sentinel value
+for distinguishing \enquote{argument not provided} from \enquote{explicitly
+set to None} in the constructor:
 
 <<wos constants>>=
 WOS_STARTER_API_URL = "https://api.clarivate.com/apis/wos-starter/v1/documents"
 WOS_EXPANDED_API_URL = "https://wos-api.clarivate.com/api/wos"
+_WOS_NOT_PROVIDED = object()  # Sentinel for "argument not passed"
 @
 
 \subsection{Testing Web of Science provider}
@@ -2526,7 +2555,9 @@ We test the WoS provider with mocked API responses, covering both API tiers.
 
 \subsubsection{Configuration tests}
 
-First, we verify the API tier selection and availability logic:
+First, we verify the API tier selection and availability logic.
+To isolate tests from environment variables, we explicitly pass [[None]] for
+keys we don't want to use.
 
 <<test functions>>=
 class TestWebOfScienceProvider:
@@ -2534,19 +2565,24 @@ class TestWebOfScienceProvider:
 
     def test_is_available_false_without_key(self):
         """Web of Science is unavailable without any API key."""
-        provider = WebOfScienceProvider()
-        provider._api_key = None  # Ensure no key
+        provider = WebOfScienceProvider(
+            starter_api_key=None, expanded_api_key=None
+        )
         assert provider.is_available() is False
 
     def test_is_available_true_with_starter_key(self):
         """Web of Science is available with Starter API key."""
-        provider = WebOfScienceProvider(starter_api_key="test_key")
+        provider = WebOfScienceProvider(
+            starter_api_key="test_key", expanded_api_key=None
+        )
         assert provider.is_available() is True
         assert provider._api_tier == "starter"
 
     def test_is_available_true_with_expanded_key(self):
         """Web of Science is available with Expanded API key."""
-        provider = WebOfScienceProvider(expanded_api_key="test_key")
+        provider = WebOfScienceProvider(
+            starter_api_key=None, expanded_api_key="test_key"
+        )
         assert provider.is_available() is True
         assert provider._api_tier == "expanded"
 
@@ -2562,7 +2598,9 @@ class TestWebOfScienceProvider:
 
     def test_uses_starter_when_only_starter_key(self):
         """Provider uses Starter API when only starter key is set."""
-        provider = WebOfScienceProvider(starter_api_key="starter_key")
+        provider = WebOfScienceProvider(
+            starter_api_key="starter_key", expanded_api_key=None
+        )
         assert provider._api_tier == "starter"
         assert provider._api_key == "starter_key"
         assert provider.MAX_LIMIT == 50
@@ -2582,15 +2620,18 @@ class TestWebOfScienceProvider:
 
     def test_search_returns_empty_without_api_key(self):
         """search() returns empty list when no API key is configured."""
-        provider = WebOfScienceProvider()
-        provider._api_key = None
+        provider = WebOfScienceProvider(
+            starter_api_key=None, expanded_api_key=None
+        )
         results = provider.search("test")
         assert results == []
 @
 
 \subsubsection{Starter API tests}
 
-Tests for the Starter API search functionality:
+Tests for the Starter API search functionality.
+To ensure we test the Starter API specifically (not the Expanded API), we pass
+[[expanded_api_key=None]] to override any environment variables that may be set.
 
 <<test functions>>=
 class TestWebOfScienceStarterAPI:
@@ -2598,7 +2639,9 @@ class TestWebOfScienceStarterAPI:
 
     def test_search_converts_documents(self):
         """search() converts Starter API results to Paper objects."""
-        provider = WebOfScienceProvider(starter_api_key="test_key")
+        provider = WebOfScienceProvider(
+            starter_api_key="test_key", expanded_api_key=None
+        )
 
         mock_response = Mock()
         mock_response.json.return_value = {
@@ -2638,7 +2681,9 @@ class TestWebOfScienceStarterAPI:
 
     def test_search_handles_empty_results(self):
         """search() returns empty list when no results."""
-        provider = WebOfScienceProvider(starter_api_key="test_key")
+        provider = WebOfScienceProvider(
+            starter_api_key="test_key", expanded_api_key=None
+        )
 
         mock_response = Mock()
         mock_response.json.return_value = {"hits": []}
@@ -2652,7 +2697,9 @@ class TestWebOfScienceStarterAPI:
 
     def test_search_handles_api_error(self):
         """search() returns empty list on API error."""
-        provider = WebOfScienceProvider(starter_api_key="test_key")
+        provider = WebOfScienceProvider(
+            starter_api_key="test_key", expanded_api_key=None
+        )
 
         with patch("requests.get") as mock_get:
             mock_get.side_effect = Exception("API error")
@@ -2662,7 +2709,9 @@ class TestWebOfScienceStarterAPI:
 
     def test_handles_missing_fields(self):
         """search() handles documents with missing optional fields."""
-        provider = WebOfScienceProvider(starter_api_key="test_key")
+        provider = WebOfScienceProvider(
+            starter_api_key="test_key", expanded_api_key=None
+        )
 
         mock_response = Mock()
         mock_response.json.return_value = {
@@ -2685,7 +2734,9 @@ class TestWebOfScienceStarterAPI:
 
     def test_caps_limit_at_50(self):
         """Starter API caps limit at 50."""
-        provider = WebOfScienceProvider(starter_api_key="test_key")
+        provider = WebOfScienceProvider(
+            starter_api_key="test_key", expanded_api_key=None
+        )
 
         mock_response = Mock()
         mock_response.json.return_value = {"hits": []}
@@ -2701,7 +2752,9 @@ class TestWebOfScienceStarterAPI:
 
     def test_sends_api_key_header(self):
         """search() sends API key in header."""
-        provider = WebOfScienceProvider(starter_api_key="my_secret_key")
+        provider = WebOfScienceProvider(
+            starter_api_key="my_secret_key", expanded_api_key=None
+        )
 
         mock_response = Mock()
         mock_response.json.return_value = {"hits": []}
@@ -2717,7 +2770,9 @@ class TestWebOfScienceStarterAPI:
 
     def test_uses_starter_api_url(self):
         """Starter API uses correct URL."""
-        provider = WebOfScienceProvider(starter_api_key="test_key")
+        provider = WebOfScienceProvider(
+            starter_api_key="test_key", expanded_api_key=None
+        )
 
         mock_response = Mock()
         mock_response.json.return_value = {"hits": []}
@@ -2733,7 +2788,9 @@ class TestWebOfScienceStarterAPI:
 
     def test_formats_plain_query_with_ts_tag(self):
         """Plain queries are wrapped with TS= for topic search."""
-        provider = WebOfScienceProvider(starter_api_key="test_key")
+        provider = WebOfScienceProvider(
+            starter_api_key="test_key", expanded_api_key=None
+        )
 
         mock_response = Mock()
         mock_response.json.return_value = {"hits": []}
@@ -2750,7 +2807,9 @@ class TestWebOfScienceStarterAPI:
 
     def test_preserves_existing_field_tags(self):
         """Queries with field tags are not double-wrapped."""
-        provider = WebOfScienceProvider(starter_api_key="test_key")
+        provider = WebOfScienceProvider(
+            starter_api_key="test_key", expanded_api_key=None
+        )
 
         mock_response = Mock()
         mock_response.json.return_value = {"hits": []}
@@ -2768,7 +2827,10 @@ class TestWebOfScienceStarterAPI:
 
 \subsubsection{Expanded API tests}
 
-Tests for the Expanded API search functionality:
+Tests for the Expanded API search functionality.
+Like the Starter API, the Expanded API requires field tags in queries, so we
+verify that plain queries are wrapped with [[TS=()]] and that queries with
+existing field tags are preserved.
 
 <<test functions>>=
 class TestWebOfScienceExpandedAPI:
@@ -2776,7 +2838,9 @@ class TestWebOfScienceExpandedAPI:
 
     def test_search_converts_documents_with_abstracts(self):
         """search() converts Expanded API results including abstracts."""
-        provider = WebOfScienceProvider(expanded_api_key="test_key")
+        provider = WebOfScienceProvider(
+            starter_api_key=None, expanded_api_key="test_key"
+        )
 
         mock_response = Mock()
         mock_response.json.return_value = {
@@ -2844,7 +2908,9 @@ class TestWebOfScienceExpandedAPI:
 
     def test_caps_limit_at_100(self):
         """Expanded API caps limit at 100."""
-        provider = WebOfScienceProvider(expanded_api_key="test_key")
+        provider = WebOfScienceProvider(
+            starter_api_key=None, expanded_api_key="test_key"
+        )
 
         mock_response = Mock()
         mock_response.json.return_value = {
@@ -2863,7 +2929,9 @@ class TestWebOfScienceExpandedAPI:
 
     def test_uses_expanded_api_url(self):
         """Expanded API uses correct URL."""
-        provider = WebOfScienceProvider(expanded_api_key="test_key")
+        provider = WebOfScienceProvider(
+            starter_api_key=None, expanded_api_key="test_key"
+        )
 
         mock_response = Mock()
         mock_response.json.return_value = {
@@ -2881,8 +2949,10 @@ class TestWebOfScienceExpandedAPI:
             assert "wos-api.clarivate.com" in call_args[0][0]
 
     def test_uses_usrquery_parameter(self):
-        """Expanded API uses usrQuery parameter."""
-        provider = WebOfScienceProvider(expanded_api_key="test_key")
+        """Expanded API uses usrQuery parameter with formatted query."""
+        provider = WebOfScienceProvider(
+            starter_api_key=None, expanded_api_key="test_key"
+        )
 
         mock_response = Mock()
         mock_response.json.return_value = {
@@ -2897,7 +2967,50 @@ class TestWebOfScienceExpandedAPI:
             provider.search("machine learning")
 
             call_args = mock_get.call_args
-            assert call_args[1]["params"]["usrQuery"] == "machine learning"
+            # Plain queries are wrapped with TS=()
+            assert call_args[1]["params"]["usrQuery"] == "TS=(machine learning)"
+
+    def test_formats_plain_query_with_ts_tag(self):
+        """Plain queries are wrapped with TS= for topic search."""
+        provider = WebOfScienceProvider(
+            starter_api_key=None, expanded_api_key="test_key"
+        )
+
+        mock_response = Mock()
+        mock_response.json.return_value = {
+            "Data": {"Records": {"records": {"REC": []}}},
+            "QueryResult": {"QueryID": 1},
+        }
+        mock_response.raise_for_status = Mock()
+
+        with patch("requests.get") as mock_get:
+            mock_get.return_value = mock_response
+
+            provider.search("deep learning")
+
+            call_args = mock_get.call_args
+            assert call_args[1]["params"]["usrQuery"] == "TS=(deep learning)"
+
+    def test_preserves_existing_field_tags(self):
+        """Queries with field tags are not double-wrapped."""
+        provider = WebOfScienceProvider(
+            starter_api_key=None, expanded_api_key="test_key"
+        )
+
+        mock_response = Mock()
+        mock_response.json.return_value = {
+            "Data": {"Records": {"records": {"REC": []}}},
+            "QueryResult": {"QueryID": 1},
+        }
+        mock_response.raise_for_status = Mock()
+
+        with patch("requests.get") as mock_get:
+            mock_get.return_value = mock_response
+
+            provider.search("TI=(neural networks) AND AU=LeCun")
+
+            call_args = mock_get.call_args
+            assert call_args[1]["params"]["usrQuery"] == "TI=(neural networks) AND AU=LeCun"
 
     def test_fallback_to_starter_on_expanded_error(self):
         """Falls back to Starter API when Expanded API fails."""
@@ -2935,7 +3048,9 @@ class TestWebOfScienceExtendedMethods:
 
     def test_extended_methods_require_expanded_api(self):
         """Extended methods raise NotImplementedError on Starter API."""
-        provider = WebOfScienceProvider(starter_api_key="test_key")
+        provider = WebOfScienceProvider(
+            starter_api_key="test_key", expanded_api_key=None
+        )
 
         with pytest.raises(NotImplementedError):
             provider.get_related_records("WOS:000123")
@@ -2951,7 +3066,9 @@ class TestWebOfScienceExtendedMethods:
 
     def test_get_related_records_returns_papers(self):
         """get_related_records() returns list of Paper objects."""
-        provider = WebOfScienceProvider(expanded_api_key="test_key")
+        provider = WebOfScienceProvider(
+            starter_api_key=None, expanded_api_key="test_key"
+        )
 
         mock_response = Mock()
         mock_response.json.return_value = {
@@ -2989,7 +3106,9 @@ class TestWebOfScienceExtendedMethods:
 
     def test_get_citing_articles_returns_papers(self):
         """get_citing_articles() returns list of Paper objects."""
-        provider = WebOfScienceProvider(expanded_api_key="test_key")
+        provider = WebOfScienceProvider(
+            starter_api_key=None, expanded_api_key="test_key"
+        )
 
         mock_response = Mock()
         mock_response.json.return_value = {
@@ -3026,7 +3145,9 @@ class TestWebOfScienceExtendedMethods:
 
     def test_get_cited_references_returns_dicts(self):
         """get_cited_references() returns list of reference dicts."""
-        provider = WebOfScienceProvider(expanded_api_key="test_key")
+        provider = WebOfScienceProvider(
+            starter_api_key=None, expanded_api_key="test_key"
+        )
 
         mock_response = Mock()
         mock_response.json.return_value = {
@@ -3056,7 +3177,9 @@ class TestWebOfScienceExtendedMethods:
 
     def test_search_for_citation_report_returns_stats(self):
         """search_for_citation_report() returns citation statistics."""
-        provider = WebOfScienceProvider(expanded_api_key="test_key")
+        provider = WebOfScienceProvider(
+            starter_api_key=None, expanded_api_key="test_key"
+        )
 
         # First response: search that returns query ID
         search_response = Mock()
