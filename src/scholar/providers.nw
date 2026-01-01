@@ -2078,6 +2078,7 @@ class WebOfScienceProvider:
     <<wos is available>>
     <<wos search>>
     <<wos convert starter hit>>
+    <<wos safe get nested>>
     <<wos convert expanded hit>>
     <<wos extended methods>>
 @
@@ -2501,6 +2502,27 @@ def _convert_starter_hit(self, hit: dict) -> Paper:
     )
 @
 
+\subsubsection{Safe nested dictionary access}
+
+The WoS Expanded API can return unexpected types for nested fields.
+When data is missing or malformed, the API may return strings instead of
+dictionaries, causing [[AttributeError]] when we attempt to call [[.get()]]
+on non-dict values.
+
+This helper safely navigates nested dictionaries, returning a default value
+if any level in the chain is not a dictionary.
+
+<<wos safe get nested>>=
+@staticmethod
+def _safe_get_nested(obj: Any, *keys: str, default: Any = None) -> Any:
+    """Safely navigate nested dicts, returning default if any level is not a dict."""
+    for key in keys:
+        if not isinstance(obj, dict):
+            return default
+        obj = obj.get(key, default)
+    return obj
+@
+
 \subsubsection{Converting Expanded API response}
 
 The WoS Expanded API returns documents with a deeply nested structure that
@@ -2515,7 +2537,7 @@ def _convert_expanded_hit(self, rec: dict) -> Paper:
 
     # Extract title (look for type="item")
     title = ""
-    titles = summary.get("titles", {}).get("title", [])
+    titles = self._safe_get_nested(summary, "titles", "title", default=[])
     for t in titles:
         if t.get("type") == "item":
             title = t.get("content", "")
@@ -2525,8 +2547,7 @@ def _convert_expanded_hit(self, rec: dict) -> Paper:
 
     # Extract publication year
     year = None
-    pub_info = summary.get("pub_info", {})
-    pub_year = pub_info.get("pubyear")
+    pub_year = self._safe_get_nested(summary, "pub_info", "pubyear", default=None)
     if pub_year:
         try:
             year = int(pub_year)
@@ -2535,8 +2556,8 @@ def _convert_expanded_hit(self, rec: dict) -> Paper:
 
     # Extract authors
     authors = []
-    names = summary.get("names", {})
-    for author in names.get("name", []):
+    names = self._safe_get_nested(summary, "names", "name", default=[])
+    for author in names:
         if author.get("role") == "author":
             name = author.get("display_name") or author.get("full_name")
             if name:
@@ -2546,19 +2567,16 @@ def _convert_expanded_hit(self, rec: dict) -> Paper:
     doi = None
     dynamic_data = rec.get("dynamic_data", {})
     cluster = dynamic_data.get("cluster_related", {})
-    identifiers = cluster.get("identifiers", {}).get("identifier", [])
+    identifiers = self._safe_get_nested(cluster, "identifiers", "identifier", default=[])
     for ident in identifiers:
         if ident.get("type") == "doi":
             doi = ident.get("value")
             break
 
     # Extract abstract
-    abstract = None
-    abstracts = fullrecord.get("abstracts", {})
-    abstract_obj = abstracts.get("abstract", {})
-    if abstract_obj:
-        abstract_text = abstract_obj.get("abstract_text", {})
-        abstract = abstract_text.get("p", "")
+    abstract = self._safe_get_nested(
+        fullrecord, "abstracts", "abstract", "abstract_text", "p", default=None
+    )
 
     # Extract venue (source title)
     venue = None
@@ -2835,6 +2853,7 @@ tags like [[TS=]] or [[TI=]]).
 <<wos imports>>=
 import re
 import requests
+from typing import Any
 @
 
 We also define the API URL constants for both tiers, plus a sentinel value
@@ -3215,6 +3234,58 @@ class TestWebOfScienceExpandedAPI:
             assert paper.doi == "10.1234/test"
             assert paper.venue == "Nature"
             assert paper.abstract == "This is the abstract."
+            assert paper.source == "wos"
+
+    def test_handles_malformed_nested_fields(self):
+        """search() handles cases where nested fields are strings instead of dicts."""
+        provider = WebOfScienceProvider(
+            starter_api_key=None, expanded_api_key="test_key"
+        )
+
+        # This mock response simulates the bug: titles, names, identifiers
+        # are strings instead of the expected dict structure
+        mock_response = Mock()
+        mock_response.json.return_value = {
+            "Data": {
+                "Records": {
+                    "records": {
+                        "REC": [{
+                            "UID": "WOS:000123456789",
+                            "static_data": {
+                                "summary": {
+                                    "titles": "Some malformed string",  # Should be dict
+                                    "names": "Another malformed string",  # Should be dict
+                                    "pub_info": "Not a dict either",  # Should be dict
+                                },
+                                "fullrecord_metadata": {
+                                    "abstracts": "String instead of dict"
+                                },
+                            },
+                            "dynamic_data": {
+                                "cluster_related": {
+                                    "identifiers": "String instead of dict"
+                                }
+                            },
+                        }]
+                    }
+                }
+            },
+            "QueryResult": {"QueryID": 1, "RecordsFound": 1},
+        }
+        mock_response.raise_for_status = Mock()
+
+        with patch("requests.get", return_value=mock_response):
+            # This should not raise AttributeError: 'str' object has no attribute 'get'
+            results = provider.search("test", limit=10)
+
+            # Should still return a Paper with empty/None fields
+            assert len(results) == 1
+            paper = results[0]
+            assert paper.title == ""
+            assert paper.authors == []
+            assert paper.year is None
+            assert paper.doi is None
+            assert paper.abstract is None
             assert paper.source == "wos"
 
     def test_fetches_multiple_pages(self):
