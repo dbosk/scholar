@@ -158,7 +158,7 @@ from scholar.notes import (
     get_note, has_note, edit_note_in_editor,
 )
 from scholar.review import (
-    DecisionStatus, ReviewDecision, ReviewSession,
+    DecisionStatus, ReviewDecision, ReviewSession, ReviewSource,
     create_review_session, save_search_decisions, save_session,
     escape_latex, filter_decisions,
     generate_csv_report, generate_latex_report,
@@ -238,20 +238,35 @@ doesn't apply---the user is just browsing papers with notes.
 <<tui paper list widget>>=
 class PaperListItem(ListItem):
     """A list item displaying a paper with its review status."""
-    
+
     def __init__(self, decision: ReviewDecision, index: int, review_mode: bool = True) -> None:
         super().__init__()
         self.decision = decision
         self.index = index
         self.review_mode = review_mode
-    
+
     def compose(self) -> ComposeResult:
         paper = self.decision.paper
         status = self.decision.status
-        
+        source = self.decision.source
+
         # Note indicator
         note_indicator = "[yellow]📝[/yellow] " if has_note(paper) else "   "
-        
+
+        # LLM source indicator
+        if source == ReviewSource.LLM_UNREVIEWED:
+            # Show confidence if available
+            conf = self.decision.llm_confidence
+            if conf is not None:
+                conf_pct = int(conf * 100)
+                llm_indicator = f"[magenta]🤖{conf_pct}%[/magenta] "
+            else:
+                llm_indicator = "[magenta]🤖[/magenta] "
+        elif source == ReviewSource.LLM_REVIEWED:
+            llm_indicator = "[cyan]🤖✓[/cyan] "
+        else:
+            llm_indicator = ""
+
         # Color code by status (only in review mode)
         if self.review_mode:
             if status == DecisionStatus.KEPT:
@@ -262,17 +277,21 @@ class PaperListItem(ListItem):
                 status_indicator = "[dim]○[/dim]"
         else:
             status_indicator = " "
-        
+
         # Format authors (truncate if too many)
         authors = ", ".join(paper.authors[:3])
         if len(paper.authors) > 3:
             authors += " et al."
-        
+
         year = paper.year or "n/a"
         provider = f"[dim]{self.decision.provider}[/dim]"
-        
+
+        # Truncate title accounting for LLM indicator width
+        max_title = 55 - len(llm_indicator.replace("[", "").replace("]", "").split("/")[0]) if llm_indicator else 55
+        title_display = paper.title[:max_title] + ("..." if len(paper.title) > max_title else "")
+
         yield Static(
-            f"{status_indicator} {note_indicator}{paper.title[:55]}{'...' if len(paper.title) > 55 else ''}\n"
+            f"{status_indicator} {note_indicator}{llm_indicator}{title_display}\n"
             f"   [dim]{authors} ({year})[/dim] {provider}"
         )
 @
@@ -306,6 +325,37 @@ The distinction between \texttt{K} (quick keep) and \texttt{T} (keep with themes
 supports different workflows. During initial screening, reviewers often want to
 quickly mark obviously relevant papers. Later, when organizing kept papers for
 thematic analysis, they can use \texttt{T} to add themes.
+
+\subsection{LLM Decision Handling}
+\label{sec:abstract-llm-handling}
+
+When reviewing papers that have been pre-classified by an LLM (marked with
+[[LLM_UNREVIEWED]] source), any keep or discard action in this screen will
+update the review source appropriately. If the user confirms the LLM's decision,
+the paper is marked as [[LLM_REVIEWED]]. If the user changes the decision (for
+example, keeping a paper that the LLM had discarded), the paper is also marked
+as [[LLM_REVIEWED]] and flagged with [[is_example=True]] to serve as training
+data for future LLM rounds.
+
+This behavior mirrors the main review screen's handling, ensuring consistent
+behavior whether the user makes decisions from the paper list or from the
+detailed abstract view.
+
+\paragraph{Closure capture for asynchronous state.}
+The key insight is that we must capture the LLM state \emph{before} any modal
+dialogs open, since the user's selection in the modal determines the final
+decision. When working with modal dialogs in TUI frameworks like Textual, the
+callback pattern introduces a timing challenge: variables like [[was_llm]] and
+[[was_discarded]] must be captured \emph{before} the modal opens, since the
+dialog is asynchronous and the decision object might change between the modal
+opening and the callback executing.
+
+Python closures solve this elegantly. When we define a nested function like
+[[handle_themes]] inside [[action_keep_with_themes]], the function captures
+references to local variables from the enclosing scope. By reading [[was_llm]]
+and [[was_discarded]] before calling [[push_screen]], we freeze these values at
+the moment the action was initiated---exactly when we need to know whether the
+user is changing an LLM decision.
 
 \subsection{External Editor Integration}
 
@@ -460,8 +510,24 @@ class AbstractScreen(Screen[None]):
         if not self.review_mode:
             self.notify("Keep/discard disabled in notes mode", severity="warning")
             return
+
+        # Check if changing an LLM decision
+        was_llm = self.decision.source == ReviewSource.LLM_UNREVIEWED
+        was_discarded = self.decision.status == DecisionStatus.DISCARDED
+
         self.decision.status = DecisionStatus.KEPT
         self.decision.clear_tags()
+
+        # Mark as reviewed if it was an LLM decision
+        if was_llm:
+            from scholar.llm_review import mark_as_reviewed
+            mark_as_reviewed(
+                self.decision,
+                user_agrees=not was_discarded,
+                new_status=DecisionStatus.KEPT,
+                new_tags=[],
+            )
+
         self.dismiss(None)
     
     def action_keep_with_themes(self) -> None:
@@ -469,13 +535,28 @@ class AbstractScreen(Screen[None]):
         if not self.review_mode:
             self.notify("Keep/discard disabled in notes mode", severity="warning")
             return
-        
+
+        # Capture LLM state before modal opens
+        was_llm = self.decision.source == ReviewSource.LLM_UNREVIEWED
+        was_discarded = self.decision.status == DecisionStatus.DISCARDED
+
         def handle_themes(result: list[str] | None) -> None:
             if result is not None:  # None means cancelled
                 self.decision.status = DecisionStatus.KEPT
                 self.decision.tags = result
+
+                # Mark as reviewed if it was an LLM decision
+                if was_llm:
+                    from scholar.llm_review import mark_as_reviewed
+                    mark_as_reviewed(
+                        self.decision,
+                        user_agrees=not was_discarded,
+                        new_status=DecisionStatus.KEPT,
+                        new_tags=result,
+                    )
+
                 self.dismiss(None)
-        
+
         self.app.push_screen(
             TagSelectionModal(
                 title=f"Themes: {self.decision.paper.title[:50]}...",
@@ -486,19 +567,34 @@ class AbstractScreen(Screen[None]):
             ),
             handle_themes,
         )
-    
+
     def action_discard(self) -> None:
         """Open motivation selection modal."""
         if not self.review_mode:
             self.notify("Keep/discard disabled in notes mode", severity="warning")
             return
-        
+
+        # Capture LLM state before modal opens
+        was_llm = self.decision.source == ReviewSource.LLM_UNREVIEWED
+        was_kept = self.decision.status == DecisionStatus.KEPT
+
         def handle_discard(result: list[str] | None) -> None:
             if result is not None:  # None means cancelled
                 self.decision.status = DecisionStatus.DISCARDED
                 self.decision.tags = result
+
+                # Mark as reviewed if it was an LLM decision
+                if was_llm:
+                    from scholar.llm_review import mark_as_reviewed
+                    mark_as_reviewed(
+                        self.decision,
+                        user_agrees=not was_kept,
+                        new_status=DecisionStatus.DISCARDED,
+                        new_tags=result,
+                    )
+
                 self.dismiss(None)
-        
+
         self.app.push_screen(
             TagSelectionModal(
                 title=f"Motivations: {self.decision.paper.title[:50]}...",
@@ -938,21 +1034,24 @@ consistent mental model throughout the interface.
 <<tui filter modal>>=
 class FilterModal(ModalScreen[str | None]):
     """Modal dialog to select paper filter by decision status."""
-    
+
     BINDINGS = [
         Binding("escape", "cancel", "Cancel"),
         Binding("a", "filter_all", "All", priority=True),
         Binding("K", "filter_kept", "Kept", priority=True),
         Binding("d", "filter_discarded", "Discarded", priority=True),
         Binding("p", "filter_pending", "Pending", priority=True),
+        Binding("l", "filter_llm_unreviewed", "LLM Unreviewed", priority=True),
+        Binding("L", "filter_llm_reviewed", "LLM Reviewed", priority=True),
+        Binding("e", "filter_examples", "Examples", priority=True),
     ]
-    
+
     DEFAULT_CSS = """
     FilterModal {
         align: center middle;
     }
     #filter-dialog {
-        width: 40;
+        width: 45;
         height: auto;
         border: thick $primary;
         background: $surface;
@@ -964,7 +1063,7 @@ class FilterModal(ModalScreen[str | None]):
         margin-bottom: 1;
     }
     """
-    
+
     def compose(self) -> ComposeResult:
         with Container(id="filter-dialog"):
             yield Static("[bold]Filter Papers[/bold]", id="filter-title")
@@ -974,22 +1073,36 @@ class FilterModal(ModalScreen[str | None]):
             yield Static("[bold yellow]d[/] Discarded only")
             yield Static("[bold yellow]p[/] Pending only")
             yield Static("")
+            yield Static("[dim]LLM Filters:[/dim]")
+            yield Static("[bold yellow]l[/] LLM unreviewed (need review)")
+            yield Static("[bold yellow]L[/] LLM reviewed")
+            yield Static("[bold yellow]e[/] Training examples")
+            yield Static("")
             yield Static("[dim]Press [bold]Escape[/bold] to cancel[/dim]")
-    
+
     def action_cancel(self) -> None:
         self.dismiss(None)
-    
+
     def action_filter_all(self) -> None:
         self.dismiss("all")
-    
+
     def action_filter_kept(self) -> None:
         self.dismiss("kept")
-    
+
     def action_filter_discarded(self) -> None:
         self.dismiss("discarded")
-    
+
     def action_filter_pending(self) -> None:
         self.dismiss("pending")
+
+    def action_filter_llm_unreviewed(self) -> None:
+        self.dismiss("llm_unreviewed")
+
+    def action_filter_llm_reviewed(self) -> None:
+        self.dismiss("llm_reviewed")
+
+    def action_filter_examples(self) -> None:
+        self.dismiss("examples")
 @
 
 \section{Search Filters Modal}
@@ -1355,7 +1468,9 @@ the filter never loses data; it simply changes what is currently visible.
 
 When a filter is active, the status bar displays the current filter name and 
 the count of matching papers, providing clear feedback about what subset is 
-being viewed.
+being viewed. The status bar also shows a session identifier: the session name
+if one was provided, \enquote{N queries} if multiple query-provider pairs exist,
+or the query string for simple single-query sessions.
 
 <<tui main app>>=
 class PaperReviewApp(App):
@@ -1418,6 +1533,7 @@ class PaperReviewApp(App):
         Binding("K", "keep", "Keep"),
         Binding("T", "keep_with_themes", "Themes"),
         Binding("d", "discard", "Discard"),
+        Binding("c", "confirm_llm", "Confirm"),
         Binding("s", "sort", "Sort"),
         Binding("f", "filter", "Filter"),
         Binding("F", "search_filters", "Search"),
@@ -1446,15 +1562,15 @@ class PaperReviewApp(App):
     
     def get_filtered_decisions(self) -> list[ReviewDecision]:
         """Get decisions filtered by current status filter and search filters.
-        
-        This method applies both the status filter (all/kept/discarded/pending)
-        and any paper-level filters (year, venue, etc.) to return the currently
-        visible decisions.
-        
+
+        This method applies both the status filter (all/kept/discarded/pending
+        plus LLM-specific filters) and any paper-level filters (year, venue,
+        etc.) to return the currently visible decisions.
+
         Returns:
             List of ReviewDecision objects matching current filters.
         """
-        # First filter by decision status
+        # First filter by decision status or source
         if self.current_filter == "all":
             decisions = self.session.decisions
         elif self.current_filter == "kept":
@@ -1463,13 +1579,31 @@ class PaperReviewApp(App):
             decisions = self.session.discarded_papers
         elif self.current_filter == "pending":
             decisions = self.session.pending_papers
+        elif self.current_filter == "llm_unreviewed":
+            # LLM decisions pending user review
+            decisions = [
+                d for d in self.session.decisions
+                if d.source == ReviewSource.LLM_UNREVIEWED
+            ]
+        elif self.current_filter == "llm_reviewed":
+            # LLM decisions that user has reviewed
+            decisions = [
+                d for d in self.session.decisions
+                if d.source == ReviewSource.LLM_REVIEWED
+            ]
+        elif self.current_filter == "examples":
+            # Training examples for LLM
+            decisions = [
+                d for d in self.session.decisions
+                if d.is_example
+            ]
         else:
             decisions = self.session.decisions
-        
+
         # Then apply paper-level filters (year, venue, etc.)
         if self.search_filters is None or self.search_filters.is_empty():
             return decisions
-        
+
         return filter_decisions(decisions, self.search_filters)
     
     def _refresh_list(self) -> None:
@@ -1507,10 +1641,18 @@ class PaperReviewApp(App):
         if self.current_filter != "all":
             filter_text = f" | [yellow]Filter: {self.current_filter} ({filtered_count})[/yellow]"
         
+        # Build session identifier for status bar
+        if self.session.name:
+            session_id = self.session.name
+        elif len(self.session.query_provider_pairs) > 1:
+            session_id = f"{len(self.session.query_provider_pairs)} queries"
+        else:
+            session_id = self.session.query
+        
         status = self.query_one("#status-bar", Static)
         if self.review_mode:
             status.update(
-                f"Query: {self.session.query} | "
+                f"Session: {session_id} | "
                 f"[green]Kept: {kept}[/green] | "
                 f"[red]Discarded: {discarded}[/red] | "
                 f"Pending: {pending} | "
@@ -1582,8 +1724,23 @@ class PaperReviewApp(App):
             return
         decision = self.get_current_decision()
         if decision:
+            # Check if changing an LLM decision
+            was_llm = decision.source == ReviewSource.LLM_UNREVIEWED
+            was_discarded = decision.status == DecisionStatus.DISCARDED
+
             decision.status = DecisionStatus.KEPT
             decision.clear_tags()
+
+            # Mark as reviewed if it was an LLM decision
+            if was_llm:
+                from scholar.llm_review import mark_as_reviewed
+                mark_as_reviewed(
+                    decision,
+                    user_agrees=not was_discarded,
+                    new_status=DecisionStatus.KEPT,
+                    new_tags=[],
+                )
+
             self._refresh_list()
             self._update_status()
     
@@ -1610,8 +1767,23 @@ class PaperReviewApp(App):
         if result is not None:  # None means cancelled
             decision = self.get_current_decision()
             if decision:
+                # Check if this is changing an LLM decision
+                was_llm = decision.source == ReviewSource.LLM_UNREVIEWED
+                was_discarded = decision.status == DecisionStatus.DISCARDED
+
                 decision.status = DecisionStatus.KEPT
                 decision.tags = result
+
+                # Mark as reviewed if it was an LLM decision
+                if was_llm:
+                    from scholar.llm_review import mark_as_reviewed
+                    # User changed it if it was discarded, or agrees if already kept
+                    mark_as_reviewed(
+                        decision,
+                        user_agrees=not was_discarded,
+                        new_status=DecisionStatus.KEPT,
+                        new_tags=result,
+                    )
         self._refresh_list()
         self._update_status()
         self.query_one("#paper-list", ListView).focus()
@@ -1639,12 +1811,46 @@ class PaperReviewApp(App):
         if result is not None:  # None means cancelled
             decision = self.get_current_decision()
             if decision:
+                # Check if this is changing an LLM decision
+                was_llm = decision.source == ReviewSource.LLM_UNREVIEWED
+                was_kept = decision.status == DecisionStatus.KEPT
+
                 decision.status = DecisionStatus.DISCARDED
                 decision.tags = result
+
+                # Mark as reviewed if it was an LLM decision
+                if was_llm:
+                    from scholar.llm_review import mark_as_reviewed
+                    # User changed it if it was kept, or agrees if already discarded
+                    mark_as_reviewed(
+                        decision,
+                        user_agrees=not was_kept,
+                        new_status=DecisionStatus.DISCARDED,
+                        new_tags=result,
+                    )
         self._refresh_list()
         self._update_status()
         self.query_one("#paper-list", ListView).focus()
     
+    def action_confirm_llm(self) -> None:
+        """Confirm current LLM decision as correct (mark as reviewed)."""
+        if not self.review_mode:
+            self.notify("Keep/discard disabled in notes mode", severity="warning")
+            return
+        decision = self.get_current_decision()
+        if not decision:
+            return
+        if decision.source != ReviewSource.LLM_UNREVIEWED:
+            self.notify("Not an unreviewed LLM decision", severity="warning")
+            return
+
+        # Mark as reviewed without changing the decision
+        from scholar.llm_review import mark_as_reviewed
+        mark_as_reviewed(decision, user_agrees=True)
+        self.notify(f"Confirmed LLM decision: {decision.status.value}")
+        self._refresh_list()
+        self._update_status()
+
     def action_sort(self) -> None:
         """Open sort modal."""
         self.push_screen(SortModal(), self._on_sort_closed)

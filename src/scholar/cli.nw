@@ -54,6 +54,7 @@ across bibliographic databases.
 <<pdf command>>
 <<notes command>>
 <<sessions command>>
+<<llm command>>
 <<submodule registration>>
 <<main entry point>>
 @
@@ -435,6 +436,18 @@ enrich: Annotated[
              "Only works for papers with DOIs.",
     ),
 ] = False,
+<<report option>>
+<<search filter options>>
+@
+
+\subsection{Report option}
+
+The [[--report/-R]] option controls whether to prompt for saving reports
+(LaTeX, BibTeX, CSV) after an interactive review session.
+This option is shared between the [[search]] command (with [[--review]])
+and the [[sessions resume]] command:
+
+<<report option>>=
 report: Annotated[
     bool,
     typer.Option(
@@ -442,7 +455,6 @@ report: Annotated[
         help="Prompt to save reports (LaTeX, BibTeX, CSV) after review.",
     ),
 ] = False,
-<<search filter options>>
 @
 
 \subsection{Filter options}
@@ -871,7 +883,7 @@ class TestProvidersCommand:
         result = runner.invoke(app, ["providers"])
         assert result.exit_code == 0
         # Should show at least these providers
-        assert "semantic_scholar" in result.stdout
+        assert "s2" in result.stdout
         assert "openalex" in result.stdout
         assert "dblp" in result.stdout
 
@@ -881,7 +893,7 @@ class TestProvidersCommand:
         assert result.exit_code == 0
         # Should show environment variable names
         assert "S2_API_KEY" in result.stdout
-        assert "WOS_API_KEY" in result.stdout
+        assert "WOS_EXPANDED_API_KEY" in result.stdout
         assert "IEEE_API_KEY" in result.stdout
 @
 
@@ -1358,7 +1370,8 @@ The [[sessions]] command provides access to saved review sessions without
 launching the full TUI. Users can:
 \begin{description}
 \item[sessions list] View all saved review sessions with their statistics
-\item[sessions show] Display details of a specific session
+\item[sessions show] Display details of a specific session, including
+query-provider pairs when multiple queries were used
 \item[sessions export] Generate reports (CSV, \LaTeX{}) from a saved session
 \item[sessions resume] Continue reviewing a saved session in the TUI
 \end{description}
@@ -1463,6 +1476,7 @@ def sessions_show(
         output = {
             "query": session.query,
             "providers": session.providers,
+            "query_provider_pairs": session.query_provider_pairs,
             "timestamp": session.timestamp.isoformat(),
             "decisions": [
                 {
@@ -1488,7 +1502,14 @@ def sessions_show(
         
         render_console.print(f"[bold]Session: {session.query}[/bold]")
         render_console.print(f"[dim]Date: {session.timestamp.strftime('%Y-%m-%d %H:%M')}[/dim]")
-        render_console.print(f"[dim]Providers: {', '.join(session.providers)}[/dim]")
+        
+        # Show query-provider pairs if multiple, else simple providers list
+        if len(session.query_provider_pairs) > 1:
+            render_console.print("[dim]Queries by provider:[/dim]")
+            for query, provider in session.query_provider_pairs:
+                render_console.print(f"[dim]  {provider}: {query}[/dim]")
+        else:
+            render_console.print(f"[dim]Providers: {', '.join(session.providers)}[/dim]")
         render_console.print()
 
         # Show kept papers
@@ -1604,11 +1625,13 @@ def sessions_resume(
             autocompletion=complete_session_name,
         ),
     ],
+    <<report option>>
 ) -> None:
     """
     Resume reviewing a saved session in the TUI.
 
     Opens the interactive review interface with the saved session loaded.
+    Use --report/-R to be prompted for saving reports after review.
     """
     from scholar.review import load_session, save_session
     from scholar.tui import PaperReviewApp, prompt_for_report
@@ -1628,7 +1651,260 @@ def sessions_resume(
     # Save updated session
     save_session(session)
 
-    prompt_for_report(session)
+    if report:
+        prompt_for_report(session)
+@
+
+
+\section{LLM-Assisted Review}
+\label{sec:llm-commands}
+
+The [[llm]] command group provides LLM-assisted paper classification for
+systematic literature reviews. This integrates with Simon Willison's [[llm]]
+package for unified access to various language models.
+
+The workflow is:
+\begin{enumerate}
+\item User reviews some papers manually, tagging them as examples
+\item LLM classifies remaining papers based on examples
+\item User reviews LLM decisions, corrections become new examples
+\item Repeat until all papers are classified
+\end{enumerate}
+
+\subsection{The llm command group}
+
+<<llm command>>=
+llm_app = typer.Typer(
+    name="llm",
+    help="LLM-assisted paper classification.",
+    no_args_is_help=True,
+)
+app.add_typer(llm_app, name="llm")
+
+
+@llm_app.command("classify")
+def llm_classify(
+    session_name: Annotated[
+        str,
+        typer.Argument(
+            help="Session name to classify papers in.",
+            autocompletion=complete_session_name,
+        ),
+    ],
+    count: Annotated[
+        int,
+        typer.Option(
+            "--count", "-n",
+            help="Number of papers to classify in this batch.",
+        ),
+    ] = 10,
+    model: Annotated[
+        str | None,
+        typer.Option(
+            "--model", "-m",
+            help="LLM model to use (uses llm default if not specified).",
+        ),
+    ] = None,
+    dry_run: Annotated[
+        bool,
+        typer.Option(
+            "--dry-run",
+            help="Show the prompt without calling LLM.",
+        ),
+    ] = False,
+    no_enrich: Annotated[
+        bool,
+        typer.Option(
+            "--no-enrich",
+            help="Skip automatic enrichment of papers without abstracts.",
+        ),
+    ] = False,
+) -> None:
+    """
+    Classify pending papers using LLM.
+
+    Uses human-reviewed papers as training examples. Requires at least
+    5 tagged examples (minimum 1 kept, 1 discarded) before classification.
+
+    Example:
+        scholar llm classify "my review" --count 20
+    """
+    from scholar.review import load_session, save_session
+    from scholar.llm_review import (
+        classify_papers_with_llm,
+        apply_llm_decisions,
+        get_review_statistics,
+    )
+
+    console = Console()
+    session = load_session(session_name)
+
+    if session is None:
+        console.print(f"[red]Session not found: {session_name}[/red]")
+        raise typer.Exit(1)
+
+    try:
+        result = classify_papers_with_llm(
+            session=session,
+            count=count,
+            model_id=model,
+            enrich_missing=not no_enrich,
+            dry_run=dry_run,
+        )
+
+        if dry_run:
+            console.print("[bold]Prompt (dry run):[/bold]")
+            console.print(result)
+            return
+
+        # Apply decisions
+        updated = apply_llm_decisions(session, result)
+
+        # Save session
+        save_session(session)
+
+        # Show summary
+        stats = get_review_statistics(session)
+        console.print(f"[green]Classified {len(updated)} papers[/green]")
+        console.print(f"  Model: {result.model_id}")
+        console.print(f"  LLM unreviewed: {stats['llm_unreviewed']}")
+        console.print(f"  Pending: {stats['pending']}")
+
+    except ValueError as e:
+        console.print(f"[red]Error: {e}[/red]")
+        raise typer.Exit(1)
+    except ImportError as e:
+        console.print(f"[red]{e}[/red]")
+        raise typer.Exit(1)
+
+
+@llm_app.command("status")
+def llm_status(
+    session_name: Annotated[
+        str,
+        typer.Argument(
+            help="Session name to show status for.",
+            autocompletion=complete_session_name,
+        ),
+    ],
+    output_format: Annotated[
+        str,
+        typer.Option(
+            "--format", "-f",
+            help="Output format: table or json.",
+        ),
+    ] = "table",
+) -> None:
+    """
+    Show LLM review status for a session.
+
+    Displays counts of human decisions, LLM decisions pending review,
+    reviewed LLM decisions, and training examples.
+    """
+    from scholar.review import load_session
+    from scholar.llm_review import get_review_statistics
+
+    console = Console()
+    session = load_session(session_name)
+
+    if session is None:
+        console.print(f"[red]Session not found: {session_name}[/red]")
+        raise typer.Exit(1)
+
+    stats = get_review_statistics(session)
+
+    if output_format == "json":
+        print(json.dumps(stats, indent=2))
+    else:
+        table = Table(title=f"LLM Review Status: {session.query}", box=box.ROUNDED)
+        table.add_column("Category", style="cyan")
+        table.add_column("Count", justify="right")
+
+        table.add_row("Human decisions", str(stats["human"]))
+        table.add_row("LLM (unreviewed)", str(stats["llm_unreviewed"]))
+        table.add_row("LLM (reviewed)", str(stats["llm_reviewed"]))
+        table.add_row("Training examples", str(stats["examples"]))
+        table.add_row("Pending", str(stats["pending"]))
+        table.add_row("Total", str(stats["total"]), style="bold")
+
+        console.print(table)
+
+
+@llm_app.command("context")
+def llm_context(
+    session_name: Annotated[
+        str,
+        typer.Argument(
+            help="Session name.",
+            autocompletion=complete_session_name,
+        ),
+    ],
+    context: Annotated[
+        str | None,
+        typer.Argument(
+            help="Research context to set (omit to show current).",
+        ),
+    ] = None,
+) -> None:
+    """
+    Get or set the research context for LLM classification.
+
+    The research context helps the LLM understand your review criteria.
+    It should describe your research question and what makes papers relevant.
+
+    Example:
+        scholar llm context "my review" "I'm reviewing papers on ..."
+    """
+    from scholar.review import load_session, save_session
+
+    console = Console()
+    session = load_session(session_name)
+
+    if session is None:
+        console.print(f"[red]Session not found: {session_name}[/red]")
+        raise typer.Exit(1)
+
+    if context is None:
+        # Show current context
+        if session.research_context:
+            console.print("[bold]Research context:[/bold]")
+            console.print(session.research_context)
+        else:
+            console.print("[dim]No research context set.[/dim]")
+            console.print(
+                "[dim]Use: scholar llm context \"session\" \"your context\"[/dim]"
+            )
+    else:
+        # Set context
+        session.research_context = context
+        save_session(session)
+        console.print("[green]Research context updated.[/green]")
+@
+
+
+\subsection{Testing LLM Commands}
+
+<<test functions>>=
+class TestLLMCommands:
+    """Tests for LLM command group."""
+
+    def test_llm_status_session_not_found(self):
+        """llm status shows error for missing session."""
+        result = runner.invoke(app, ["llm", "status", "nonexistent"])
+        assert result.exit_code == 1
+        assert "not found" in result.stdout.lower()
+
+    def test_llm_context_session_not_found(self):
+        """llm context shows error for missing session."""
+        result = runner.invoke(app, ["llm", "context", "nonexistent"])
+        assert result.exit_code == 1
+        assert "not found" in result.stdout.lower()
+
+    def test_llm_classify_session_not_found(self):
+        """llm classify shows error for missing session."""
+        result = runner.invoke(app, ["llm", "classify", "nonexistent"])
+        assert result.exit_code == 1
+        assert "not found" in result.stdout.lower()
 @
 
 

@@ -1,0 +1,1574 @@
+\chapter{LLM-Assisted Paper Review}
+\label{llm-review-module}
+
+\section{Introduction}
+
+This module provides LLM-assisted paper classification for systematic
+literature reviews. Rather than replacing human judgment, the LLM learns
+from human-tagged examples and applies similar classifications to pending
+papers in a round-based workflow.
+
+\subsection{Design Goals}
+
+\begin{description}
+\item[Interface Independence] All functions are usable from Python code,
+  CLI, and TUI without coupling to any specific interface.
+\item[Round-Based Learning] LLM decisions are reviewed by humans;
+  corrections become training examples for future rounds.
+\item[Source Tracking] Decisions track whether they are human, LLM-unreviewed,
+  or LLM-reviewed, enabling progress monitoring and confidence prioritization.
+\item[Example Requirements] Only tagged papers count as training examples;
+  a minimum of 5 total examples (at least 1 kept, 1 discarded) are required.
+\item[Automatic Enrichment] Papers without abstracts are automatically
+  enriched before classification, ensuring the LLM has sufficient context.
+\end{description}
+
+\subsection{Workflow Overview}
+
+The typical LLM-assisted review workflow:
+\begin{enumerate}
+\item User reviews some papers manually, tagging them with themes/motivations
+\item User sets a research context describing the review's focus
+\item User invokes LLM classification on a batch of pending papers
+\item LLM classifies papers based on examples, returning confidence scores
+\item User reviews LLM decisions, prioritizing low-confidence ones
+\item Corrections become new training examples for the next round
+\item Repeat until all papers are reviewed
+\end{enumerate}
+
+
+\section{Module Structure}
+
+<<[[llm_review.py]]>>=
+"""
+LLM-assisted paper classification for systematic reviews.
+
+Provides functions for classifying papers using large language models,
+learning from human-tagged examples in a round-based workflow.
+"""
+<<llm review imports>>
+<<llm review constants>>
+<<llm review data structures>>
+<<llm review example gathering>>
+<<llm review prompt construction>>
+<<llm review llm interaction>>
+<<llm review decision application>>
+<<llm review statistics>>
+@
+
+
+\section{Testing}
+\label{sec:llm-review-tests}
+
+Tests are distributed throughout this document, appearing after each
+implementation section they verify.
+
+<<test [[llm_review.py]]>>=
+"""Tests for the LLM review module."""
+import json
+import pytest
+from datetime import datetime
+from unittest.mock import Mock, patch, MagicMock
+
+from scholar.llm_review import *
+from scholar.llm_review import _format_paper_for_prompt, _collect_available_tags
+from scholar.review import (
+    ReviewSession, ReviewDecision, DecisionStatus, ReviewSource
+)
+from scholar.scholar import Paper
+
+
+<<test functions>>
+@
+
+
+\section{Imports and Constants}
+
+We use Simon Willison's [[llm]] package for unified access to various
+language models. This provides a consistent interface regardless of whether
+the user wants to use OpenAI, Anthropic, local models, or other providers.
+
+<<llm review imports>>=
+from dataclasses import dataclass, field
+from datetime import datetime
+from typing import Any
+import json
+import logging
+import re
+
+from scholar.review import (
+    ReviewSession, ReviewDecision, DecisionStatus, ReviewSource
+)
+from scholar.scholar import Paper
+
+logger = logging.getLogger(__name__)
+@
+
+<<llm review constants>>=
+# Minimum requirements for LLM classification
+MIN_TOTAL_EXAMPLES = 5
+MIN_KEPT_EXAMPLES = 1
+MIN_DISCARDED_EXAMPLES = 1
+
+# Default batch size for classification
+DEFAULT_BATCH_SIZE = 10
+
+# Maximum examples to include in prompt (to manage token limits)
+MAX_KEPT_EXAMPLES = 10
+MAX_DISCARDED_EXAMPLES = 10
+@
+
+
+\section{Data Structures}
+
+\subsection{LLM Decision}
+
+An [[LLMDecision]] represents the LLM's classification of a single paper,
+including its confidence score and reasoning.
+
+<<llm review data structures>>=
+@dataclass
+class LLMDecision:
+    """
+    A single LLM classification decision for a paper.
+
+    Attributes:
+        paper_id: Identifier of the classified paper
+        status: Classification result ("kept" or "discarded")
+        tags: Themes (kept) or motivations (discarded) assigned
+        confidence: LLM's confidence in the decision (0.0-1.0)
+        reasoning: Brief explanation of the classification
+    """
+    paper_id: str
+    status: str  # "kept" or "discarded"
+    tags: list[str]
+    confidence: float
+    reasoning: str
+@
+
+
+\subsection{LLM Batch Result}
+
+An [[LLMBatchResult]] collects all decisions from a single LLM invocation,
+along with metadata about the model and timing.
+
+<<llm review data structures>>=
+@dataclass
+class LLMBatchResult:
+    """
+    Results from a batch LLM classification.
+
+    Attributes:
+        decisions: List of individual paper decisions
+        model_id: Identifier of the LLM model used
+        timestamp: When the classification was performed
+        prompt_tokens: Optional token count for the prompt
+        completion_tokens: Optional token count for the response
+    """
+    decisions: list[LLMDecision]
+    model_id: str
+    timestamp: str
+    prompt_tokens: int | None = None
+    completion_tokens: int | None = None
+@
+
+
+\subsection{Testing Data Structures}
+
+<<test functions>>=
+class TestDataStructures:
+    """Tests for LLM review data structures."""
+
+    def test_llm_decision_creation(self):
+        """Can create an LLM decision."""
+        decision = LLMDecision(
+            paper_id="doi:10.1234/test",
+            status="kept",
+            tags=["relevant", "ml-focused"],
+            confidence=0.85,
+            reasoning="Paper discusses machine learning methods.",
+        )
+        assert decision.paper_id == "doi:10.1234/test"
+        assert decision.status == "kept"
+        assert decision.confidence == 0.85
+
+    def test_llm_batch_result_creation(self):
+        """Can create a batch result."""
+        decisions = [
+            LLMDecision(
+                paper_id="doi:1",
+                status="kept",
+                tags=["good"],
+                confidence=0.9,
+                reasoning="Relevant.",
+            ),
+        ]
+        result = LLMBatchResult(
+            decisions=decisions,
+            model_id="gpt-4",
+            timestamp="2024-01-01T00:00:00",
+        )
+        assert len(result.decisions) == 1
+        assert result.model_id == "gpt-4"
+@
+
+
+\section{Example Gathering}
+\label{sec:example-gathering}
+
+Before invoking the LLM, we need training examples---papers that humans have
+already classified with tags. The quality of examples directly impacts
+classification accuracy.
+
+\subsection{What Makes a Good Example}
+
+For a paper to serve as an example:
+\begin{enumerate}
+\item It must be classified (kept or discarded), not pending
+\item It must have at least one tag (theme or motivation)
+\item Papers where the user corrected an LLM decision are prioritized
+  (they represent edge cases the LLM got wrong)
+\end{enumerate}
+
+<<llm review example gathering>>=
+def get_example_decisions(
+    session: ReviewSession,
+    max_kept: int = MAX_KEPT_EXAMPLES,
+    max_discarded: int = MAX_DISCARDED_EXAMPLES,
+) -> tuple[list[ReviewDecision], list[ReviewDecision]]:
+    """
+    Gather tagged examples from a review session.
+
+    Prioritizes user-corrected LLM decisions (is_example=True) as these
+    represent cases where the LLM's initial classification was wrong.
+
+    Args:
+        session: The review session to gather examples from
+        max_kept: Maximum number of kept examples to include
+        max_discarded: Maximum number of discarded examples to include
+
+    Returns:
+        Tuple of (kept_examples, discarded_examples)
+    """
+    kept_examples: list[ReviewDecision] = []
+    discarded_examples: list[ReviewDecision] = []
+
+    for decision in session.decisions:
+        # Only include papers with tags (our example requirement)
+        if not decision.tags:
+            continue
+
+        if decision.status == DecisionStatus.KEPT:
+            kept_examples.append(decision)
+        elif decision.status == DecisionStatus.DISCARDED:
+            discarded_examples.append(decision)
+
+    # Sort to prioritize corrected examples (is_example=True first)
+    # Then by confidence (lower first, as these are harder cases)
+    def sort_key(d: ReviewDecision) -> tuple[int, float]:
+        # is_example=True should come first (0), then False (1)
+        example_priority = 0 if d.is_example else 1
+        # Lower confidence first (more informative examples)
+        confidence = d.llm_confidence if d.llm_confidence is not None else 1.0
+        return (example_priority, confidence)
+
+    kept_examples.sort(key=sort_key)
+    discarded_examples.sort(key=sort_key)
+
+    # Limit to max
+    return kept_examples[:max_kept], discarded_examples[:max_discarded]
+@
+
+
+\subsection{Validating Example Requirements}
+
+We require a minimum number of examples before allowing LLM classification.
+This ensures the LLM has enough context to make reasonable decisions.
+
+<<llm review example gathering>>=
+def validate_examples(
+    kept_examples: list[ReviewDecision],
+    discarded_examples: list[ReviewDecision],
+    min_total: int = MIN_TOTAL_EXAMPLES,
+    min_kept: int = MIN_KEPT_EXAMPLES,
+    min_discarded: int = MIN_DISCARDED_EXAMPLES,
+) -> tuple[bool, str]:
+    """
+    Check if examples meet minimum requirements for LLM classification.
+
+    Args:
+        kept_examples: List of kept paper examples
+        discarded_examples: List of discarded paper examples
+        min_total: Minimum total examples required
+        min_kept: Minimum kept examples required
+        min_discarded: Minimum discarded examples required
+
+    Returns:
+        Tuple of (is_valid, error_message)
+        If valid, error_message is empty string.
+    """
+    total = len(kept_examples) + len(discarded_examples)
+
+    if total < min_total:
+        return False, (
+            f"Need at least {min_total} tagged examples, "
+            f"but only have {total}."
+        )
+
+    if len(kept_examples) < min_kept:
+        return False, (
+            f"Need at least {min_kept} kept example(s) with tags, "
+            f"but only have {len(kept_examples)}."
+        )
+
+    if len(discarded_examples) < min_discarded:
+        return False, (
+            f"Need at least {min_discarded} discarded example(s) with tags, "
+            f"but only have {len(discarded_examples)}."
+        )
+
+    return True, ""
+@
+
+
+\subsection{Testing Example Gathering}
+
+<<test functions>>=
+class TestExampleGathering:
+    """Tests for example gathering functions."""
+
+    def _create_session_with_examples(self):
+        """Helper to create a session with various examples."""
+        session = ReviewSession(
+            query="test query",
+            providers=["test"],
+            timestamp=datetime.now(),
+        )
+
+        # Add some kept papers with tags
+        for i in range(3):
+            paper = Paper(
+                title=f"Kept Paper {i}",
+                authors=["Author"],
+                year=2024,
+                doi=f"10.1234/kept{i}",
+            )
+            decision = ReviewDecision(
+                paper=paper,
+                provider="test",
+                status=DecisionStatus.KEPT,
+                tags=["relevant", "ml"],
+            )
+            session.decisions.append(decision)
+
+        # Add some discarded papers with tags
+        for i in range(3):
+            paper = Paper(
+                title=f"Discarded Paper {i}",
+                authors=["Author"],
+                year=2024,
+                doi=f"10.1234/discarded{i}",
+            )
+            decision = ReviewDecision(
+                paper=paper,
+                provider="test",
+                status=DecisionStatus.DISCARDED,
+                tags=["off-topic"],
+            )
+            session.decisions.append(decision)
+
+        return session
+
+    def test_get_example_decisions(self):
+        """Gathers tagged examples correctly."""
+        session = self._create_session_with_examples()
+
+        kept, discarded = get_example_decisions(session)
+
+        assert len(kept) == 3
+        assert len(discarded) == 3
+        assert all(d.status == DecisionStatus.KEPT for d in kept)
+        assert all(d.status == DecisionStatus.DISCARDED for d in discarded)
+
+    def test_excludes_untagged_papers(self):
+        """Papers without tags are excluded from examples."""
+        session = self._create_session_with_examples()
+
+        # Add untagged paper
+        paper = Paper(
+            title="Untagged Paper",
+            authors=["Author"],
+            year=2024,
+            doi="10.1234/untagged",
+        )
+        session.decisions.append(ReviewDecision(
+            paper=paper,
+            provider="test",
+            status=DecisionStatus.KEPT,
+            tags=[],  # No tags
+        ))
+
+        kept, discarded = get_example_decisions(session)
+
+        # Untagged paper should not be included
+        assert len(kept) == 3  # Still only the original 3
+
+    def test_prioritizes_corrected_examples(self):
+        """Corrected LLM decisions are prioritized."""
+        session = ReviewSession(
+            query="test",
+            providers=["test"],
+            timestamp=datetime.now(),
+        )
+
+        # Add regular example
+        paper1 = Paper(title="Regular", authors=["A"], year=2024, doi="1")
+        session.decisions.append(ReviewDecision(
+            paper=paper1,
+            provider="test",
+            status=DecisionStatus.KEPT,
+            tags=["good"],
+            is_example=False,
+        ))
+
+        # Add corrected example
+        paper2 = Paper(title="Corrected", authors=["A"], year=2024, doi="2")
+        session.decisions.append(ReviewDecision(
+            paper=paper2,
+            provider="test",
+            status=DecisionStatus.KEPT,
+            tags=["also-good"],
+            is_example=True,  # User corrected LLM
+        ))
+
+        kept, _ = get_example_decisions(session)
+
+        # Corrected example should be first
+        assert kept[0].is_example is True
+
+    def test_validate_examples_success(self):
+        """Validation passes with sufficient examples."""
+        kept = [Mock() for _ in range(3)]
+        discarded = [Mock() for _ in range(2)]
+
+        is_valid, error = validate_examples(kept, discarded)
+
+        assert is_valid is True
+        assert error == ""
+
+    def test_validate_examples_insufficient_total(self):
+        """Validation fails with insufficient total examples."""
+        kept = [Mock()]
+        discarded = [Mock()]
+
+        is_valid, error = validate_examples(kept, discarded)
+
+        assert is_valid is False
+        assert "at least 5" in error
+
+    def test_validate_examples_no_kept(self):
+        """Validation fails with no kept examples."""
+        kept = []
+        discarded = [Mock() for _ in range(5)]
+
+        is_valid, error = validate_examples(kept, discarded)
+
+        assert is_valid is False
+        assert "kept" in error.lower()
+
+    def test_validate_examples_no_discarded(self):
+        """Validation fails with no discarded examples."""
+        kept = [Mock() for _ in range(5)]
+        discarded = []
+
+        is_valid, error = validate_examples(kept, discarded)
+
+        assert is_valid is False
+        assert "discarded" in error.lower()
+@
+
+
+\section{Prompt Construction}
+\label{sec:prompt-construction}
+
+The prompt is critical for effective classification. We structure it to:
+\begin{enumerate}
+\item Provide research context (what the review is about)
+\item Show available tags (themes and motivations already used)
+\item Give concrete examples of kept and discarded papers
+\item Present papers to classify with their abstracts
+\item Request structured JSON output
+\end{enumerate}
+
+\subsection{Formatting Examples}
+
+We format paper examples to show the key information the LLM should consider.
+
+<<llm review prompt construction>>=
+def _format_paper_for_prompt(
+    decision: ReviewDecision,
+    include_abstract: bool = True,
+) -> str:
+    """
+    Format a paper decision for inclusion in the prompt.
+
+    Args:
+        decision: The review decision containing the paper
+        include_abstract: Whether to include the abstract
+
+    Returns:
+        Formatted string representation of the paper
+    """
+    paper = decision.paper
+    lines = [
+        f"Title: {paper.title}",
+        f"Authors: {', '.join(paper.authors[:3])}"
+        + (" et al." if len(paper.authors) > 3 else ""),
+    ]
+
+    if paper.year:
+        lines.append(f"Year: {paper.year}")
+
+    if paper.venue:
+        lines.append(f"Venue: {paper.venue}")
+
+    if include_abstract and paper.abstract:
+        # Truncate very long abstracts
+        abstract = paper.abstract
+        if len(abstract) > 1000:
+            abstract = abstract[:1000] + "..."
+        lines.append(f"Abstract: {abstract}")
+
+    lines.append(f"Tags: {', '.join(decision.tags)}")
+
+    return "\n".join(lines)
+
+
+def _format_paper_to_classify(
+    decision: ReviewDecision,
+    index: int,
+) -> str:
+    """
+    Format a paper for classification request.
+
+    Args:
+        decision: The review decision containing the paper
+        index: Zero-based index for reference in response
+
+    Returns:
+        Formatted string representation
+    """
+    paper = decision.paper
+    lines = [
+        f"[Paper {index}]",
+        f"Title: {paper.title}",
+        f"Authors: {', '.join(paper.authors[:3])}"
+        + (" et al." if len(paper.authors) > 3 else ""),
+    ]
+
+    if paper.year:
+        lines.append(f"Year: {paper.year}")
+
+    if paper.venue:
+        lines.append(f"Venue: {paper.venue}")
+
+    if paper.abstract:
+        abstract = paper.abstract
+        if len(abstract) > 1000:
+            abstract = abstract[:1000] + "..."
+        lines.append(f"Abstract: {abstract}")
+    else:
+        lines.append("Abstract: [Not available]")
+
+    return "\n".join(lines)
+@
+
+
+\subsection{Collecting Available Tags}
+
+We gather all tags already used in the session to encourage consistency.
+
+<<llm review prompt construction>>=
+def _collect_available_tags(
+    session: ReviewSession,
+) -> tuple[set[str], set[str]]:
+    """
+    Collect all tags used in the session.
+
+    Args:
+        session: The review session
+
+    Returns:
+        Tuple of (themes_for_kept, motivations_for_discarded)
+    """
+    themes: set[str] = set()
+    motivations: set[str] = set()
+
+    for decision in session.decisions:
+        if decision.status == DecisionStatus.KEPT:
+            themes.update(decision.tags)
+        elif decision.status == DecisionStatus.DISCARDED:
+            motivations.update(decision.tags)
+
+    return themes, motivations
+@
+
+
+\subsection{Building the Complete Prompt}
+
+<<llm review prompt construction>>=
+def build_classification_prompt(
+    papers_to_classify: list[ReviewDecision],
+    kept_examples: list[ReviewDecision],
+    discarded_examples: list[ReviewDecision],
+    research_context: str | None = None,
+    available_themes: set[str] | None = None,
+    available_motivations: set[str] | None = None,
+) -> str:
+    """
+    Construct the LLM prompt for paper classification.
+
+    Args:
+        papers_to_classify: Papers needing classification
+        kept_examples: Example papers that were kept
+        discarded_examples: Example papers that were discarded
+        research_context: Description of the research focus
+        available_themes: Tags used for kept papers
+        available_motivations: Tags used for discarded papers
+
+    Returns:
+        Complete prompt string for the LLM
+    """
+    sections = []
+
+    # Introduction
+    sections.append(
+        "You are helping with a systematic literature review. "
+        "Your task is to classify papers as 'kept' (relevant to the review) "
+        "or 'discarded' (not relevant)."
+    )
+
+    # Research context
+    if research_context:
+        sections.append(f"\n## Research Context\n\n{research_context}")
+
+    # Available tags
+    if available_themes:
+        themes_list = ", ".join(sorted(available_themes))
+        sections.append(
+            f"\n## Available Themes (for kept papers)\n\n{themes_list}"
+        )
+
+    if available_motivations:
+        motivations_list = ", ".join(sorted(available_motivations))
+        sections.append(
+            f"\n## Available Motivations (for discarded papers)\n\n"
+            f"{motivations_list}"
+        )
+
+    # Kept examples
+    if kept_examples:
+        sections.append("\n## Examples of KEPT Papers\n")
+        for example in kept_examples:
+            sections.append(_format_paper_for_prompt(example))
+            sections.append("")
+
+    # Discarded examples
+    if discarded_examples:
+        sections.append("\n## Examples of DISCARDED Papers\n")
+        for example in discarded_examples:
+            sections.append(_format_paper_for_prompt(example))
+            sections.append("")
+
+    # Papers to classify
+    sections.append("\n## Papers to Classify\n")
+    for i, decision in enumerate(papers_to_classify):
+        sections.append(_format_paper_to_classify(decision, i))
+        sections.append("")
+
+    # Instructions
+    sections.append("""
+## Instructions
+
+For each paper above, classify it as 'kept' or 'discarded'.
+Respond with a JSON object in exactly this format:
+
+```json
+{
+  "classifications": [
+    {
+      "paper_index": 0,
+      "decision": "kept",
+      "tags": ["theme1", "theme2"],
+      "confidence": 0.85,
+      "reasoning": "Brief explanation of why this paper is relevant."
+    },
+    {
+      "paper_index": 1,
+      "decision": "discarded",
+      "tags": ["motivation1"],
+      "confidence": 0.90,
+      "reasoning": "Brief explanation of why this paper is not relevant."
+    }
+  ]
+}
+```
+
+Guidelines:
+- Use existing themes/motivations when appropriate
+- Create new tags only when existing ones don't fit
+- Confidence should reflect how certain you are (0.0 to 1.0)
+- Keep reasoning brief (1-2 sentences)
+- Every discarded paper MUST have at least one motivation tag
+""")
+
+    return "\n".join(sections)
+@
+
+
+\subsection{Testing Prompt Construction}
+
+<<test functions>>=
+class TestPromptConstruction:
+    """Tests for prompt construction functions."""
+
+    def test_format_paper_for_prompt(self):
+        """Papers are formatted correctly for prompts."""
+        paper = Paper(
+            title="Test Paper",
+            authors=["Alice", "Bob", "Charlie", "David"],
+            year=2024,
+            abstract="This is the abstract.",
+            venue="ICML",
+        )
+        decision = ReviewDecision(
+            paper=paper,
+            provider="test",
+            status=DecisionStatus.KEPT,
+            tags=["ml", "relevant"],
+        )
+
+        result = _format_paper_for_prompt(decision)
+
+        assert "Test Paper" in result
+        assert "Alice" in result
+        assert "et al." in result  # More than 3 authors
+        assert "2024" in result
+        assert "ICML" in result
+        assert "abstract" in result.lower()
+        assert "ml, relevant" in result
+
+    def test_format_paper_truncates_long_abstract(self):
+        """Long abstracts are truncated."""
+        paper = Paper(
+            title="Test",
+            authors=["A"],
+            year=2024,
+            abstract="x" * 2000,  # Very long
+        )
+        decision = ReviewDecision(
+            paper=paper,
+            provider="test",
+            status=DecisionStatus.KEPT,
+            tags=["test"],
+        )
+
+        result = _format_paper_for_prompt(decision)
+
+        assert len(result) < 2000
+        assert "..." in result
+
+    def test_build_classification_prompt_includes_context(self):
+        """Prompt includes research context when provided."""
+        paper = Paper(title="Test", authors=["A"], year=2024)
+        decision = ReviewDecision(
+            paper=paper,
+            provider="test",
+            status=DecisionStatus.PENDING,
+            tags=[],
+        )
+
+        prompt = build_classification_prompt(
+            papers_to_classify=[decision],
+            kept_examples=[],
+            discarded_examples=[],
+            research_context="Focus on privacy-preserving ML.",
+        )
+
+        assert "privacy-preserving" in prompt.lower()
+
+    def test_build_classification_prompt_includes_examples(self):
+        """Prompt includes kept and discarded examples."""
+        paper = Paper(title="Test", authors=["A"], year=2024)
+        to_classify = ReviewDecision(
+            paper=paper,
+            provider="test",
+            status=DecisionStatus.PENDING,
+            tags=[],
+        )
+
+        kept_paper = Paper(title="Kept Example", authors=["B"], year=2024)
+        kept_example = ReviewDecision(
+            paper=kept_paper,
+            provider="test",
+            status=DecisionStatus.KEPT,
+            tags=["relevant"],
+        )
+
+        discarded_paper = Paper(
+            title="Discarded Example", authors=["C"], year=2024
+        )
+        discarded_example = ReviewDecision(
+            paper=discarded_paper,
+            provider="test",
+            status=DecisionStatus.DISCARDED,
+            tags=["off-topic"],
+        )
+
+        prompt = build_classification_prompt(
+            papers_to_classify=[to_classify],
+            kept_examples=[kept_example],
+            discarded_examples=[discarded_example],
+        )
+
+        assert "Kept Example" in prompt
+        assert "Discarded Example" in prompt
+        assert "KEPT Papers" in prompt
+        assert "DISCARDED Papers" in prompt
+@
+
+
+\section{LLM Interaction}
+\label{sec:llm-interaction}
+
+This section handles the actual interaction with the LLM. We use the [[llm]]
+package which provides a unified interface to various language models.
+
+\subsection{Parsing LLM Response}
+
+The LLM returns JSON which we parse into [[LLMDecision]] objects. We need
+to handle potential parsing errors gracefully.
+
+<<llm review llm interaction>>=
+def parse_llm_response(
+    response_text: str,
+    papers: list[ReviewDecision],
+) -> list[LLMDecision]:
+    """
+    Parse JSON response from LLM into decisions.
+
+    Args:
+        response_text: Raw text response from LLM
+        papers: The papers that were classified (for ID lookup)
+
+    Returns:
+        List of LLMDecision objects
+
+    Raises:
+        ValueError: If response cannot be parsed
+    """
+    from scholar.notes import get_paper_id
+
+    # Extract JSON from response (may be wrapped in markdown code block)
+    json_match = re.search(
+        r"```(?:json)?\s*(\{.*?\})\s*```",
+        response_text,
+        re.DOTALL,
+    )
+    if json_match:
+        json_str = json_match.group(1)
+    else:
+        # Try to find raw JSON
+        json_match = re.search(r"\{.*\}", response_text, re.DOTALL)
+        if json_match:
+            json_str = json_match.group(0)
+        else:
+            raise ValueError("No JSON found in LLM response")
+
+    try:
+        data = json.loads(json_str)
+    except json.JSONDecodeError as e:
+        raise ValueError(f"Invalid JSON in LLM response: {e}")
+
+    if "classifications" not in data:
+        raise ValueError("Response missing 'classifications' key")
+
+    decisions = []
+    for item in data["classifications"]:
+        paper_index = item.get("paper_index", 0)
+        if paper_index < 0 or paper_index >= len(papers):
+            logger.warning(f"Invalid paper_index {paper_index}, skipping")
+            continue
+
+        paper_decision = papers[paper_index]
+        paper_id = get_paper_id(paper_decision.paper)
+
+        # Validate status
+        status = item.get("decision", "").lower()
+        if status not in ("kept", "discarded"):
+            logger.warning(f"Invalid decision '{status}', defaulting to kept")
+            status = "kept"
+
+        # Ensure tags are present
+        tags = item.get("tags", [])
+        if not isinstance(tags, list):
+            tags = [str(tags)]
+
+        # Validate confidence
+        confidence = item.get("confidence", 0.5)
+        try:
+            confidence = float(confidence)
+            confidence = max(0.0, min(1.0, confidence))
+        except (TypeError, ValueError):
+            confidence = 0.5
+
+        decisions.append(
+            LLMDecision(
+                paper_id=paper_id,
+                status=status,
+                tags=tags,
+                confidence=confidence,
+                reasoning=item.get("reasoning", ""),
+            )
+        )
+
+    return decisions
+@
+
+
+\subsection{Identifying Papers Needing Enrichment}
+
+Papers without abstracts are poor candidates for LLM classification. We
+identify them so they can be enriched before classification.
+
+<<llm review llm interaction>>=
+def get_papers_needing_enrichment(
+    papers: list[ReviewDecision],
+) -> list[Paper]:
+    """
+    Return papers that lack abstracts (required for LLM classification).
+
+    Args:
+        papers: List of review decisions to check
+
+    Returns:
+        List of Paper objects that need enrichment
+    """
+    return [
+        decision.paper
+        for decision in papers
+        if not decision.paper.abstract
+    ]
+@
+
+
+\subsection{Main Classification Function}
+
+This is the primary entry point for LLM classification. It coordinates
+example gathering, prompt construction, LLM invocation, and response parsing.
+
+<<llm review llm interaction>>=
+def classify_papers_with_llm(
+    session: ReviewSession,
+    count: int = DEFAULT_BATCH_SIZE,
+    model_id: str | None = None,
+    enrich_missing: bool = True,
+    dry_run: bool = False,
+) -> LLMBatchResult | str:
+    """
+    Classify pending papers using LLM.
+
+    This is the main entry point for LLM-assisted classification. It:
+    1. Gathers training examples from human-reviewed papers
+    2. Validates minimum example requirements
+    3. Optionally enriches papers lacking abstracts
+    4. Constructs a prompt with examples and papers to classify
+    5. Invokes the LLM and parses the response
+
+    Args:
+        session: The review session
+        count: Number of papers to classify in this batch
+        model_id: LLM model to use (uses llm default if None)
+        enrich_missing: Whether to auto-enrich papers without abstracts
+        dry_run: If True, return the prompt without calling LLM
+
+    Returns:
+        LLMBatchResult with decisions, or prompt string if dry_run=True
+
+    Raises:
+        ValueError: If insufficient examples or no papers to classify
+        ImportError: If llm package is not installed
+    """
+    # Gather examples
+    kept_examples, discarded_examples = get_example_decisions(session)
+
+    # Validate
+    is_valid, error = validate_examples(kept_examples, discarded_examples)
+    if not is_valid:
+        raise ValueError(error)
+
+    # Get pending papers
+    pending = [
+        d for d in session.decisions
+        if d.status == DecisionStatus.PENDING
+    ]
+
+    if not pending:
+        raise ValueError("No pending papers to classify")
+
+    # Limit to requested count
+    to_classify = pending[:count]
+
+    # Check for papers needing enrichment
+    if enrich_missing:
+        needing_enrichment = get_papers_needing_enrichment(to_classify)
+        if needing_enrichment:
+            try:
+                from scholar.enrich import enrich_papers
+                logger.info(
+                    f"Enriching {len(needing_enrichment)} papers "
+                    "before classification"
+                )
+                enrich_papers(needing_enrichment)
+            except ImportError:
+                logger.warning(
+                    "Enrich module not available, "
+                    "some papers may lack abstracts"
+                )
+
+    # Collect available tags
+    themes, motivations = _collect_available_tags(session)
+
+    # Build prompt
+    prompt = build_classification_prompt(
+        papers_to_classify=to_classify,
+        kept_examples=kept_examples,
+        discarded_examples=discarded_examples,
+        research_context=session.research_context,
+        available_themes=themes,
+        available_motivations=motivations,
+    )
+
+    if dry_run:
+        return prompt
+
+    # Import llm and call
+    try:
+        import llm
+    except ImportError:
+        raise ImportError(
+            "The 'llm' package is required for LLM classification. "
+            "Install it with: pip install llm"
+        )
+
+    model = llm.get_model(model_id) if model_id else llm.get_model()
+    logger.info(f"Classifying {len(to_classify)} papers with {model.model_id}")
+
+    response = model.prompt(prompt)
+    response_text = response.text()
+
+    # Parse response
+    decisions = parse_llm_response(response_text, to_classify)
+
+    return LLMBatchResult(
+        decisions=decisions,
+        model_id=model.model_id,
+        timestamp=datetime.now().isoformat(),
+        prompt_tokens=getattr(response, "prompt_tokens", None),
+        completion_tokens=getattr(response, "completion_tokens", None),
+    )
+@
+
+
+\subsection{Testing LLM Interaction}
+
+<<test functions>>=
+class TestLLMInteraction:
+    """Tests for LLM interaction functions."""
+
+    def test_parse_llm_response_json_in_code_block(self):
+        """Parses JSON wrapped in markdown code block."""
+        paper = Paper(title="Test", authors=["A"], year=2024, doi="1")
+        decision = ReviewDecision(
+            paper=paper,
+            provider="test",
+            status=DecisionStatus.PENDING,
+            tags=[],
+        )
+
+        response = '''
+Here's my classification:
+
+```json
+{
+  "classifications": [
+    {
+      "paper_index": 0,
+      "decision": "kept",
+      "tags": ["relevant"],
+      "confidence": 0.9,
+      "reasoning": "Looks good."
+    }
+  ]
+}
+```
+'''
+        results = parse_llm_response(response, [decision])
+
+        assert len(results) == 1
+        assert results[0].status == "kept"
+        assert results[0].confidence == 0.9
+
+    def test_parse_llm_response_raw_json(self):
+        """Parses raw JSON without code block."""
+        paper = Paper(title="Test", authors=["A"], year=2024, doi="1")
+        decision = ReviewDecision(
+            paper=paper,
+            provider="test",
+            status=DecisionStatus.PENDING,
+            tags=[],
+        )
+
+        response = '''{"classifications": [{"paper_index": 0, "decision": "discarded", "tags": ["off-topic"], "confidence": 0.8, "reasoning": "Not relevant."}]}'''
+
+        results = parse_llm_response(response, [decision])
+
+        assert len(results) == 1
+        assert results[0].status == "discarded"
+
+    def test_parse_llm_response_invalid_json(self):
+        """Raises error for invalid JSON."""
+        paper = Paper(title="Test", authors=["A"], year=2024, doi="1")
+        decision = ReviewDecision(
+            paper=paper,
+            provider="test",
+            status=DecisionStatus.PENDING,
+            tags=[],
+        )
+
+        with pytest.raises(ValueError, match="Invalid JSON"):
+            parse_llm_response("{invalid json}", [decision])
+
+    def test_parse_llm_response_no_json(self):
+        """Raises error when no JSON found."""
+        paper = Paper(title="Test", authors=["A"], year=2024, doi="1")
+        decision = ReviewDecision(
+            paper=paper,
+            provider="test",
+            status=DecisionStatus.PENDING,
+            tags=[],
+        )
+
+        with pytest.raises(ValueError, match="No JSON found"):
+            parse_llm_response("No JSON here", [decision])
+
+    def test_get_papers_needing_enrichment(self):
+        """Identifies papers without abstracts."""
+        paper_with = Paper(
+            title="With", authors=["A"], year=2024,
+            abstract="Has abstract"
+        )
+        paper_without = Paper(
+            title="Without", authors=["A"], year=2024,
+            abstract=None
+        )
+
+        decisions = [
+            ReviewDecision(
+                paper=paper_with,
+                provider="test",
+                status=DecisionStatus.PENDING,
+            ),
+            ReviewDecision(
+                paper=paper_without,
+                provider="test",
+                status=DecisionStatus.PENDING,
+            ),
+        ]
+
+        needing = get_papers_needing_enrichment(decisions)
+
+        assert len(needing) == 1
+        assert needing[0].title == "Without"
+@
+
+
+\section{Decision Application}
+\label{sec:decision-application}
+
+After the LLM returns its classifications, we need to apply them to the
+session and provide functions for users to review and correct them.
+
+\subsection{Applying LLM Decisions}
+
+<<llm review decision application>>=
+def _build_paper_id_lookup(
+    session: ReviewSession,
+) -> dict[str, ReviewDecision]:
+    """Build a lookup dict from paper_id to decision."""
+    from scholar.notes import get_paper_id
+    return {get_paper_id(d.paper): d for d in session.decisions}
+
+
+def apply_llm_decisions(
+    session: ReviewSession,
+    batch_result: LLMBatchResult,
+) -> list[ReviewDecision]:
+    """
+    Apply LLM decisions to session, marking as LLM_UNREVIEWED.
+
+    Args:
+        session: The review session to update
+        batch_result: Results from LLM classification
+
+    Returns:
+        List of ReviewDecision objects that were updated
+    """
+    updated = []
+
+    # Build lookup for efficient paper_id matching
+    paper_id_lookup = _build_paper_id_lookup(session)
+
+    for llm_decision in batch_result.decisions:
+        if llm_decision.paper_id not in paper_id_lookup:
+            logger.warning(
+                f"Paper {llm_decision.paper_id} not in session, skipping"
+            )
+            continue
+
+        decision = paper_id_lookup[llm_decision.paper_id]
+
+        # Only update pending papers
+        if decision.status != DecisionStatus.PENDING:
+            logger.debug(
+                f"Paper {llm_decision.paper_id} already decided, skipping"
+            )
+            continue
+
+        # Apply LLM decision
+        decision.status = (
+            DecisionStatus.KEPT if llm_decision.status == "kept"
+            else DecisionStatus.DISCARDED
+        )
+        decision.tags = llm_decision.tags
+        decision.source = ReviewSource.LLM_UNREVIEWED
+        decision.llm_confidence = llm_decision.confidence
+        decision.is_example = False  # Not an example until user reviews
+
+        updated.append(decision)
+
+    logger.info(f"Applied LLM decisions to {len(updated)} papers")
+    return updated
+@
+
+
+\subsection{Marking Decisions as Reviewed}
+
+When a user reviews an LLM decision, we update its source and potentially
+mark it as an example if the user made corrections.
+
+<<llm review decision application>>=
+def mark_as_reviewed(
+    decision: ReviewDecision,
+    user_agrees: bool,
+    new_status: DecisionStatus | None = None,
+    new_tags: list[str] | None = None,
+) -> None:
+    """
+    Mark an LLM decision as reviewed by user.
+
+    If the user changed the decision (disagrees), the paper becomes a
+    training example for future LLM rounds.
+
+    Args:
+        decision: The decision to mark as reviewed
+        user_agrees: Whether user agrees with LLM classification
+        new_status: New status if user disagrees (ignored if agrees)
+        new_tags: New tags if user disagrees (ignored if agrees)
+    """
+    if decision.source != ReviewSource.LLM_UNREVIEWED:
+        logger.warning("Decision is not LLM_UNREVIEWED, nothing to mark")
+        return
+
+    decision.source = ReviewSource.LLM_REVIEWED
+
+    if not user_agrees:
+        # User corrected the LLM - this becomes an example
+        decision.is_example = True
+
+        if new_status is not None:
+            decision.status = new_status
+
+        if new_tags is not None:
+            decision.tags = new_tags
+@
+
+
+\subsection{Getting Unreviewed LLM Decisions}
+
+<<llm review decision application>>=
+def get_unreviewed_llm_decisions(
+    session: ReviewSession,
+    sort_by_confidence: bool = True,
+) -> list[ReviewDecision]:
+    """
+    Get LLM decisions that haven't been reviewed by user.
+
+    Args:
+        session: The review session
+        sort_by_confidence: If True, sort by confidence (lowest first)
+            so users review uncertain decisions first
+
+    Returns:
+        List of ReviewDecision objects pending user review
+    """
+    unreviewed = [
+        d for d in session.decisions
+        if d.source == ReviewSource.LLM_UNREVIEWED
+    ]
+
+    if sort_by_confidence:
+        # Sort by confidence, lowest first (most uncertain)
+        unreviewed.sort(
+            key=lambda d: d.llm_confidence if d.llm_confidence else 0.5
+        )
+
+    return unreviewed
+@
+
+
+\subsection{Testing Decision Application}
+
+<<test functions>>=
+class TestDecisionApplication:
+    """Tests for decision application functions."""
+
+    def test_apply_llm_decisions(self):
+        """LLM decisions are applied correctly."""
+        from scholar.notes import get_paper_id
+
+        paper = Paper(
+            title="Test", authors=["A"], year=2024, doi="10.1234/test"
+        )
+        decision = ReviewDecision(
+            paper=paper,
+            provider="test",
+            status=DecisionStatus.PENDING,
+            tags=[],
+        )
+
+        session = ReviewSession(
+            query="test",
+            providers=["test"],
+            timestamp=datetime.now(),
+        )
+        session.decisions.append(decision)
+
+        # Get the actual paper_id that will be used
+        paper_id = get_paper_id(paper)
+
+        # Create LLM result with matching paper_id
+        llm_decision = LLMDecision(
+            paper_id=paper_id,
+            status="kept",
+            tags=["relevant"],
+            confidence=0.85,
+            reasoning="Good paper.",
+        )
+        batch = LLMBatchResult(
+            decisions=[llm_decision],
+            model_id="test",
+            timestamp="2024-01-01",
+        )
+
+        updated = apply_llm_decisions(session, batch)
+
+        # Should update correctly
+        assert len(updated) == 1
+        assert updated[0].status == DecisionStatus.KEPT
+        assert updated[0].source == ReviewSource.LLM_UNREVIEWED
+        assert updated[0].llm_confidence == 0.85
+
+    def test_mark_as_reviewed_agrees(self):
+        """Marking as reviewed when user agrees."""
+        paper = Paper(title="Test", authors=["A"], year=2024)
+        decision = ReviewDecision(
+            paper=paper,
+            provider="test",
+            status=DecisionStatus.KEPT,
+            tags=["relevant"],
+            source=ReviewSource.LLM_UNREVIEWED,
+        )
+
+        mark_as_reviewed(decision, user_agrees=True)
+
+        assert decision.source == ReviewSource.LLM_REVIEWED
+        assert decision.is_example is False  # Not an example if agreed
+
+    def test_mark_as_reviewed_disagrees(self):
+        """Marking as reviewed when user disagrees becomes example."""
+        paper = Paper(title="Test", authors=["A"], year=2024)
+        decision = ReviewDecision(
+            paper=paper,
+            provider="test",
+            status=DecisionStatus.KEPT,
+            tags=["relevant"],
+            source=ReviewSource.LLM_UNREVIEWED,
+        )
+
+        mark_as_reviewed(
+            decision,
+            user_agrees=False,
+            new_status=DecisionStatus.DISCARDED,
+            new_tags=["off-topic"],
+        )
+
+        assert decision.source == ReviewSource.LLM_REVIEWED
+        assert decision.is_example is True  # Becomes example
+        assert decision.status == DecisionStatus.DISCARDED
+        assert decision.tags == ["off-topic"]
+
+    def test_get_unreviewed_llm_decisions(self):
+        """Gets unreviewed decisions sorted by confidence."""
+        session = ReviewSession(
+            query="test",
+            providers=["test"],
+            timestamp=datetime.now(),
+        )
+
+        # Add papers with different confidence levels
+        for i, conf in enumerate([0.9, 0.3, 0.7]):
+            paper = Paper(title=f"Paper {i}", authors=["A"], year=2024)
+            decision = ReviewDecision(
+                paper=paper,
+                provider="test",
+                status=DecisionStatus.KEPT,
+                source=ReviewSource.LLM_UNREVIEWED,
+                llm_confidence=conf,
+            )
+            session.decisions.append(decision)
+
+        unreviewed = get_unreviewed_llm_decisions(session)
+
+        assert len(unreviewed) == 3
+        # Lowest confidence first
+        assert unreviewed[0].llm_confidence == 0.3
+        assert unreviewed[1].llm_confidence == 0.7
+        assert unreviewed[2].llm_confidence == 0.9
+@
+
+
+\section{Review Statistics}
+\label{sec:review-statistics}
+
+Provide an overview of the review session's LLM-related statistics.
+
+<<llm review statistics>>=
+def get_review_statistics(session: ReviewSession) -> dict[str, int]:
+    """
+    Get counts of decisions by source and status.
+
+    Args:
+        session: The review session
+
+    Returns:
+        Dictionary with counts:
+        - human: Decisions made by human directly
+        - llm_unreviewed: LLM decisions pending review
+        - llm_reviewed: LLM decisions reviewed by user
+        - examples: Papers marked as training examples
+        - pending: Papers not yet decided
+        - total: Total papers in session
+    """
+    stats = {
+        "human": 0,
+        "llm_unreviewed": 0,
+        "llm_reviewed": 0,
+        "examples": 0,
+        "pending": 0,
+        "total": len(session.decisions),
+    }
+
+    for decision in session.decisions:
+        if decision.status == DecisionStatus.PENDING:
+            stats["pending"] += 1
+        elif decision.source == ReviewSource.HUMAN:
+            stats["human"] += 1
+        elif decision.source == ReviewSource.LLM_UNREVIEWED:
+            stats["llm_unreviewed"] += 1
+        elif decision.source == ReviewSource.LLM_REVIEWED:
+            stats["llm_reviewed"] += 1
+
+        if decision.is_example:
+            stats["examples"] += 1
+
+    return stats
+@
+
+
+\subsection{Testing Statistics}
+
+<<test functions>>=
+class TestStatistics:
+    """Tests for statistics functions."""
+
+    def test_get_review_statistics(self):
+        """Computes statistics correctly."""
+        session = ReviewSession(
+            query="test",
+            providers=["test"],
+            timestamp=datetime.now(),
+        )
+
+        # Add various decisions
+        for i in range(3):
+            paper = Paper(title=f"Human {i}", authors=["A"], year=2024)
+            session.decisions.append(
+                ReviewDecision(
+                    paper=paper,
+                    provider="test",
+                    status=DecisionStatus.KEPT,
+                    source=ReviewSource.HUMAN,
+                )
+            )
+
+        for i in range(2):
+            paper = Paper(title=f"LLM {i}", authors=["A"], year=2024)
+            session.decisions.append(
+                ReviewDecision(
+                    paper=paper,
+                    provider="test",
+                    status=DecisionStatus.KEPT,
+                    source=ReviewSource.LLM_UNREVIEWED,
+                )
+            )
+
+        paper = Paper(title="Pending", authors=["A"], year=2024)
+        session.decisions.append(
+            ReviewDecision(
+                paper=paper,
+                provider="test",
+                status=DecisionStatus.PENDING,
+            )
+        )
+
+        paper = Paper(title="Example", authors=["A"], year=2024)
+        session.decisions.append(
+            ReviewDecision(
+                paper=paper,
+                provider="test",
+                status=DecisionStatus.DISCARDED,
+                source=ReviewSource.LLM_REVIEWED,
+                is_example=True,
+            )
+        )
+
+        stats = get_review_statistics(session)
+
+        assert stats["human"] == 3
+        assert stats["llm_unreviewed"] == 2
+        assert stats["llm_reviewed"] == 1
+        assert stats["pending"] == 1
+        assert stats["examples"] == 1
+        assert stats["total"] == 7
+@

@@ -114,6 +114,27 @@ class DecisionStatus(Enum):
     DISCARDED = "discarded"
 @
 
+\subsection{Review Source}
+
+When using LLM-assisted review, we track where each decision originated.
+This enables:
+\begin{description}
+\item[Learning from corrections] When a user corrects an LLM decision, that
+  paper becomes a training example for future LLM rounds.
+\item[Progress tracking] Users can see how many papers were reviewed by humans
+  versus the LLM, and how many LLM decisions are pending review.
+\item[Confidence prioritization] LLM decisions with low confidence can be
+  prioritized for human review.
+\end{description}
+
+<<review data structures>>=
+class ReviewSource(Enum):
+    """Source of a review decision."""
+    HUMAN = "human"              # User decided directly
+    LLM_UNREVIEWED = "llm"       # LLM decided, not yet reviewed by user
+    LLM_REVIEWED = "llm_reviewed"  # LLM decided, user confirmed or changed
+@
+
 \subsection{Review Decision}
 
 A [[ReviewDecision]] captures the review state of a single paper, including
@@ -124,20 +145,26 @@ its status and associated tags.
 class ReviewDecision:
     """
     A review decision for a single paper.
-    
+
     Tracks whether the paper was kept or discarded during review,
     along with tags (themes for kept, motivations for discarded).
-    
+
     Attributes:
         paper: The Paper being reviewed.
         provider: Which search provider returned this paper.
         status: Current decision status (pending/kept/discarded).
         tags: List of tags (themes for kept, motivations for discarded).
+        source: Where the decision came from (human or LLM).
+        is_example: True if this paper is a training example for LLM.
+        llm_confidence: Confidence score from LLM (0.0-1.0), if applicable.
     """
     paper: Paper
     provider: str
     status: DecisionStatus = DecisionStatus.PENDING
     tags: list[str] = field(default_factory=list)
+    source: ReviewSource = ReviewSource.HUMAN
+    is_example: bool = False
+    llm_confidence: float | None = None
     
     @property
     def is_decided(self) -> bool:
@@ -245,14 +272,45 @@ class TestReviewDecision:
         """motivation property works for backward compatibility."""
         paper = Paper(title="Test", authors=["Author"], year=2024)
         decision = ReviewDecision(paper=paper, provider="test")
-        
+
         decision.motivation = "Not relevant"
         assert decision.tags == ["Not relevant"]
         assert decision.motivation == "Not relevant"
-        
+
         decision.motivation = ""
         assert decision.tags == []
         assert decision.motivation == ""
+
+    def test_default_source_is_human(self):
+        """New decisions default to human source."""
+        paper = Paper(title="Test", authors=["Author"], year=2024)
+        decision = ReviewDecision(paper=paper, provider="test")
+        assert decision.source == ReviewSource.HUMAN
+        assert not decision.is_example
+        assert decision.llm_confidence is None
+
+    def test_llm_source_tracking(self):
+        """Can track LLM source and confidence."""
+        paper = Paper(title="Test", authors=["Author"], year=2024)
+        decision = ReviewDecision(
+            paper=paper,
+            provider="test",
+            status=DecisionStatus.KEPT,
+            source=ReviewSource.LLM_UNREVIEWED,
+            llm_confidence=0.85,
+        )
+        assert decision.source == ReviewSource.LLM_UNREVIEWED
+        assert decision.llm_confidence == 0.85
+
+    def test_example_flag(self):
+        """Can mark a decision as a training example."""
+        paper = Paper(title="Test", authors=["Author"], year=2024)
+        decision = ReviewDecision(
+            paper=paper,
+            provider="test",
+            is_example=True,
+        )
+        assert decision.is_example
 @
 
 
@@ -261,20 +319,32 @@ class TestReviewDecision:
 A [[ReviewSession]] contains all decisions for a review, along with metadata
 about the search and analysis methods.
 
+The session tracks which query was used with which provider through the
+[[query_provider_pairs]] field. This enables using different query syntaxes for
+different providers---for example, natural language queries for OpenAlex and
+Boolean syntax for Web of Science. The [[query]] and [[providers]] fields are
+retained for backward compatibility with older session files.
+
 <<review data structures>>=
-@dataclass 
+@dataclass
 class ReviewSession:
     """
     A complete review session with all papers and decisions.
-    
+
     Maintains the search parameters and all review decisions,
     supporting sorting, filtering, and analysis operations.
+
+    The [[research_context]] field stores a description of the research goals,
+    which is used by the LLM to understand what types of papers to keep or
+    discard. This context is reused across LLM classification rounds.
     """
     query: str
     providers: list[str]
     timestamp: datetime
     decisions: list[ReviewDecision] = field(default_factory=list)
     name: str | None = None  # Optional session name for persistence
+    research_context: str | None = None  # Research goals for LLM review
+    query_provider_pairs: list[tuple[str, str]] = field(default_factory=list)
     
     @property
     def kept_papers(self) -> list[ReviewDecision]:
@@ -342,6 +412,152 @@ class ReviewSession:
             )
         elif key == "provider":
             self.decisions.sort(key=lambda d: d.provider.lower(), reverse=reverse)
+
+    def llm_unreviewed_papers(self) -> list[ReviewDecision]:
+        """Get papers decided by LLM but not yet reviewed by user."""
+        return [
+            d for d in self.decisions
+            if d.source == ReviewSource.LLM_UNREVIEWED
+        ]
+
+    def example_papers(self) -> list[ReviewDecision]:
+        """
+        Get papers that serve as training examples for LLM.
+
+        This includes:
+        - Human decisions that have tags (themes or motivations)
+        - User corrections of LLM decisions (is_example=True)
+        """
+        return [
+            d for d in self.decisions
+            if d.is_decided and d.tags and (
+                d.source == ReviewSource.HUMAN or d.is_example
+            )
+        ]
+
+    def llm_review_statistics(self) -> dict[str, int]:
+        """
+        Get statistics about LLM review progress.
+
+        Returns dict with counts:
+        - human: Human-only decisions
+        - llm_unreviewed: LLM decisions pending review
+        - llm_reviewed: LLM decisions confirmed by user
+        - examples: Training examples for LLM
+        - pending: Papers not yet decided
+        """
+        human = sum(
+            1 for d in self.decisions
+            if d.source == ReviewSource.HUMAN and d.is_decided
+        )
+        llm_unreviewed = sum(
+            1 for d in self.decisions
+            if d.source == ReviewSource.LLM_UNREVIEWED
+        )
+        llm_reviewed = sum(
+            1 for d in self.decisions
+            if d.source == ReviewSource.LLM_REVIEWED
+        )
+        examples = len(self.example_papers())
+        pending = len(self.pending_papers)
+
+        return {
+            "human": human,
+            "llm_unreviewed": llm_unreviewed,
+            "llm_reviewed": llm_reviewed,
+            "examples": examples,
+            "pending": pending,
+        }
+
+    <<query-provider pair methods>>
+@
+
+Different providers often require different query syntaxes. OpenAlex works well
+with natural language queries like \enquote{llm programming education}, while
+Web of Science requires Boolean syntax like \enquote{llm AND programming AND
+education}. When building a review session across multiple providers, we need to
+track which query was used with which provider so that reports accurately
+reflect the search methodology.
+
+We provide helper methods for managing these pairs. The
+[[add_query_provider_pair]] method adds a pair only if it doesn't already exist,
+preventing duplicates when appending results to an existing session. The
+[[queries_for_provider]] method retrieves all queries used with a specific
+provider.
+
+<<query-provider pair methods>>=
+def add_query_provider_pair(self, query: str, provider: str) -> None:
+    """
+    Add a query-provider pair if not already present.
+
+    This tracks which query was used with which provider, enabling
+    different queries for different providers (e.g., natural language
+    for OpenAlex, Boolean syntax for Web of Science).
+    """
+    pair = (query, provider)
+    if pair not in self.query_provider_pairs:
+        self.query_provider_pairs.append(pair)
+
+def queries_for_provider(self, provider: str) -> list[str]:
+    """
+    Get all queries used with a specific provider.
+
+    Returns a list of queries that were used to search the given provider.
+    """
+    return [q for q, p in self.query_provider_pairs if p == provider]
+@
+
+We verify that pairs are added correctly and that duplicates are prevented:
+
+<<test functions>>=
+class TestQueryProviderPairs:
+    """Tests for query-provider pair tracking."""
+
+    def test_add_query_provider_pair(self):
+        """Adding pairs associates queries with their providers."""
+        session = ReviewSession(
+            query="test",
+            providers=["openalex", "wos"],
+            timestamp=datetime.now(),
+        )
+        session.add_query_provider_pair("llm programming education", "openalex")
+        session.add_query_provider_pair("llm AND programming AND education", "wos")
+        
+        assert len(session.query_provider_pairs) == 2
+        assert ("llm programming education", "openalex") in session.query_provider_pairs
+        assert ("llm AND programming AND education", "wos") in session.query_provider_pairs
+
+    def test_add_query_provider_pair_no_duplicates(self):
+        """Duplicate pairs are silently ignored."""
+        session = ReviewSession(
+            query="test",
+            providers=["openalex"],
+            timestamp=datetime.now(),
+        )
+        session.add_query_provider_pair("test query", "openalex")
+        session.add_query_provider_pair("test query", "openalex")  # duplicate
+        
+        assert len(session.query_provider_pairs) == 1
+
+    def test_queries_for_provider(self):
+        """Can retrieve all queries used with a specific provider."""
+        session = ReviewSession(
+            query="test",
+            providers=["openalex", "wos"],
+            timestamp=datetime.now(),
+        )
+        session.add_query_provider_pair("natural language query", "openalex")
+        session.add_query_provider_pair("another query", "openalex")
+        session.add_query_provider_pair("boolean AND query", "wos")
+        
+        openalex_queries = session.queries_for_provider("openalex")
+        wos_queries = session.queries_for_provider("wos")
+        
+        assert len(openalex_queries) == 2
+        assert "natural language query" in openalex_queries
+        assert "another query" in openalex_queries
+        assert len(wos_queries) == 1
+        assert "boolean AND query" in wos_queries
 @
 
 \subsection{Testing ReviewSession}
@@ -422,6 +638,140 @@ class TestReviewSession:
         sample_session.sort_by("year", reverse=True)
         years = [d.paper.year for d in sample_session.decisions]
         assert years == [2022, 2021, 2020]
+
+    def test_llm_unreviewed_papers(self):
+        """Test getting LLM unreviewed papers."""
+        session = ReviewSession(
+            query="test",
+            providers=["test"],
+            timestamp=datetime.now(),
+        )
+        papers = [
+            Paper(title="Human", authors=["A"], year=2024),
+            Paper(title="LLM Unreviewed", authors=["B"], year=2024),
+            Paper(title="LLM Reviewed", authors=["C"], year=2024),
+        ]
+        session.decisions = [
+            ReviewDecision(
+                paper=papers[0], provider="test",
+                status=DecisionStatus.KEPT,
+                source=ReviewSource.HUMAN,
+            ),
+            ReviewDecision(
+                paper=papers[1], provider="test",
+                status=DecisionStatus.KEPT,
+                source=ReviewSource.LLM_UNREVIEWED,
+            ),
+            ReviewDecision(
+                paper=papers[2], provider="test",
+                status=DecisionStatus.KEPT,
+                source=ReviewSource.LLM_REVIEWED,
+            ),
+        ]
+        unreviewed = session.llm_unreviewed_papers()
+        assert len(unreviewed) == 1
+        assert unreviewed[0].paper.title == "LLM Unreviewed"
+
+    def test_example_papers(self):
+        """Test getting training example papers."""
+        session = ReviewSession(
+            query="test",
+            providers=["test"],
+            timestamp=datetime.now(),
+        )
+        papers = [
+            Paper(title="Human with tags", authors=["A"], year=2024),
+            Paper(title="Human without tags", authors=["B"], year=2024),
+            Paper(title="LLM corrected", authors=["C"], year=2024),
+            Paper(title="LLM not example", authors=["D"], year=2024),
+        ]
+        session.decisions = [
+            ReviewDecision(
+                paper=papers[0], provider="test",
+                status=DecisionStatus.KEPT,
+                tags=["ml"],
+                source=ReviewSource.HUMAN,
+            ),
+            ReviewDecision(
+                paper=papers[1], provider="test",
+                status=DecisionStatus.KEPT,
+                source=ReviewSource.HUMAN,
+            ),
+            ReviewDecision(
+                paper=papers[2], provider="test",
+                status=DecisionStatus.KEPT,
+                tags=["corrected"],
+                source=ReviewSource.LLM_REVIEWED,
+                is_example=True,
+            ),
+            ReviewDecision(
+                paper=papers[3], provider="test",
+                status=DecisionStatus.KEPT,
+                tags=["ml"],
+                source=ReviewSource.LLM_REVIEWED,
+                is_example=False,
+            ),
+        ]
+        examples = session.example_papers()
+        assert len(examples) == 2
+        titles = {e.paper.title for e in examples}
+        assert "Human with tags" in titles
+        assert "LLM corrected" in titles
+
+    def test_llm_review_statistics(self):
+        """Test LLM review statistics."""
+        session = ReviewSession(
+            query="test",
+            providers=["test"],
+            timestamp=datetime.now(),
+        )
+        papers = [
+            Paper(title=f"Paper {i}", authors=["A"], year=2024)
+            for i in range(5)
+        ]
+        session.decisions = [
+            ReviewDecision(
+                paper=papers[0], provider="test",
+                status=DecisionStatus.KEPT, tags=["ml"],
+                source=ReviewSource.HUMAN,
+            ),
+            ReviewDecision(
+                paper=papers[1], provider="test",
+                status=DecisionStatus.KEPT,
+                source=ReviewSource.LLM_UNREVIEWED,
+            ),
+            ReviewDecision(
+                paper=papers[2], provider="test",
+                status=DecisionStatus.DISCARDED, tags=["off-topic"],
+                source=ReviewSource.LLM_REVIEWED,
+            ),
+            ReviewDecision(
+                paper=papers[3], provider="test",
+                status=DecisionStatus.PENDING,
+            ),
+            ReviewDecision(
+                paper=papers[4], provider="test",
+                status=DecisionStatus.KEPT, tags=["corrected"],
+                source=ReviewSource.LLM_REVIEWED,
+                is_example=True,
+            ),
+        ]
+        stats = session.llm_review_statistics()
+        assert stats["human"] == 1
+        assert stats["llm_unreviewed"] == 1
+        assert stats["llm_reviewed"] == 2
+        assert stats["examples"] == 2  # Human with tags + corrected
+        assert stats["pending"] == 1
+
+    def test_research_context(self):
+        """Test research context field."""
+        session = ReviewSession(
+            query="test",
+            providers=["test"],
+            timestamp=datetime.now(),
+            research_context="Focus on privacy-preserving machine learning",
+        )
+        assert session.research_context == "Focus on privacy-preserving machine learning"
 @
 
 
@@ -430,8 +780,38 @@ class TestReviewSession:
 \subsection{Creating Sessions}
 
 We provide factory functions for creating review sessions from search results.
+When appending to an existing session (using the [[-n]] flag), the function
+merges query-provider pairs from the previous session with pairs from the new
+search results. This allows different queries to be used with different
+providers across multiple searches.
+
+\subsubsection{Preserving Decision Data When Merging}
+
+When adding new search results to an existing session, we must preserve all
+decision data from the previous session---not just the keep/discard status, but
+also LLM-related fields like [[source]], [[is_example]], and [[llm_confidence]].
+Papers that appear in both the previous session and the new search results must
+retain their full decision history.
+
+We use the saved session file ([[load_session]]) as the primary source of
+previous decisions because it contains complete [[ReviewDecision]] objects with
+all fields. The notes module ([[load_search_decisions]]) serves as a fallback
+for older sessions that predate the session persistence feature.
 
 <<review session functions>>=
+def _build_previous_decision_lookup(
+    previous_session: ReviewSession | None,
+) -> dict[str, ReviewDecision]:
+    """
+    Build a lookup dict from paper_id to ReviewDecision from previous session.
+    
+    This preserves ALL decision fields including LLM-related metadata.
+    """
+    if not previous_session:
+        return {}
+    return {get_paper_id(d.paper): d for d in previous_session.decisions}
+
+
 def create_review_session(
     results: list[Any],  # list[SearchResult]
     query: str,
@@ -441,7 +821,7 @@ def create_review_session(
     Create a review session from search results.
     
     Loads any previous decisions for the same query/session and merges
-    them with the new search results.
+    them with the new search results, preserving all decision metadata.
     
     Args:
         results: List of SearchResult objects from a search.
@@ -455,11 +835,22 @@ def create_review_session(
     # Use session_name for persistence, fall back to query
     persistence_key = session_name if session_name else query
     
-    # Load previous decisions for this session
-    previous_decisions = load_search_decisions(persistence_key)
-    if previous_decisions:
-        logger.debug("Loaded %d previous decisions for session", 
-                    len(previous_decisions.decisions))
+    # Load previous session (primary source - has complete decision data)
+    previous_session = load_session(persistence_key)
+    
+    # Build lookup for efficient merging
+    prev_decision_lookup = _build_previous_decision_lookup(previous_session)
+    if prev_decision_lookup:
+        logger.debug("Loaded %d previous decisions from session",
+                    len(prev_decision_lookup))
+    
+    # Fallback: load from notes module for older sessions
+    previous_decisions = None
+    if not prev_decision_lookup:
+        previous_decisions = load_search_decisions(persistence_key)
+        if previous_decisions:
+            logger.debug("Loaded %d previous decisions from notes module", 
+                        len(previous_decisions.decisions))
     
     # Create review session
     providers = list(set(r.provider for r in results))
@@ -471,69 +862,136 @@ def create_review_session(
         name=session_name,
     )
     
-    # Track existing paper IDs to handle merging
-    existing_paper_ids: set[str] = set()
-    if previous_decisions:
-        existing_paper_ids = set(previous_decisions.decisions.keys())
-        
-        # First, restore decisions for papers from previous session
-        # that are NOT in the current search results
-        current_paper_ids = set()
-        for result in results:
-            for paper in result.papers:
-                current_paper_ids.add(get_paper_id(paper))
-        
-        # Add papers from previous session that aren't in current results
-        for paper_id, prev in previous_decisions.decisions.items():
-            if paper_id not in current_paper_ids:
-                # Reconstruct paper from stored data
-                paper = Paper(
-                    title=prev.title,
-                    authors=prev.authors if prev.authors else [],
-                    year=prev.year,
-                    doi=prev.doi,
-                    abstract=prev.abstract,
-                    venue=prev.venue,
-                    url=prev.url,
-                    pdf_url=prev.pdf_url,
-                    source=getattr(prev, 'source', "previous"),
-                )
-                status = DecisionStatus.PENDING
-                if prev.status == "kept":
-                    status = DecisionStatus.KEPT
-                elif prev.status == "discarded":
-                    status = DecisionStatus.DISCARDED
-                
-                # Handle both old (motivation) and new (tags) formats
-                tags = _extract_tags_from_record(prev)
-                
-                session.decisions.append(
-                    ReviewDecision(
-                        paper=paper,
-                        provider=getattr(prev, 'provider', "previous"),
-                        status=status,
-                        tags=tags,
-                    )
-                )
+    # Preserve research context from previous session
+    if previous_session and previous_session.research_context:
+        session.research_context = previous_session.research_context
     
-    # Convert search results to review decisions
+    # Build query-provider pairs from results
+    for result in results:
+        session.add_query_provider_pair(result.query, result.provider)
+    
+    # Merge with previous session's query-provider pairs (if any)
+    if previous_session:
+        for pair_query, pair_provider in previous_session.query_provider_pairs:
+            session.add_query_provider_pair(pair_query, pair_provider)
+    
+    # Collect paper IDs from current search results
+    current_paper_ids = set()
     for result in results:
         for paper in result.papers:
-            paper_id = get_paper_id(paper)
-            
-            # Check for previous decision
-            prev = None
-            if previous_decisions:
-                prev = previous_decisions.decisions.get(paper_id)
-            
+            current_paper_ids.add(get_paper_id(paper))
+    
+    # First, restore decisions for papers NOT in current search results
+    <<restore papers not in current results>>
+    
+    # Convert search results to review decisions, merging with previous
+    <<convert search results to decisions>>
+    
+    logger.info("Created session with %d papers (%d kept, %d discarded, %d pending)",
+               len(session.decisions), len(session.kept_papers),
+               len(session.discarded_papers), len(session.pending_papers))
+    return session
+@
+
+Papers from the previous session that do not appear in the current search
+results must still be included---the user has already reviewed them. We copy
+them directly from the previous session to preserve all metadata.
+
+<<restore papers not in current results>>=
+if prev_decision_lookup:
+    # Use session data (preserves all fields)
+    for paper_id, prev_dec in prev_decision_lookup.items():
+        if paper_id not in current_paper_ids:
+            session.decisions.append(prev_dec)
+elif previous_decisions:
+    # Fallback to notes module (older format, no LLM fields)
+    for paper_id, prev in previous_decisions.decisions.items():
+        if paper_id not in current_paper_ids:
+            paper = Paper(
+                title=prev.title,
+                authors=prev.authors if prev.authors else [],
+                year=prev.year,
+                doi=prev.doi,
+                abstract=prev.abstract,
+                venue=prev.venue,
+                url=prev.url,
+                pdf_url=prev.pdf_url,
+                source=getattr(prev, 'source', "previous"),
+            )
             status = DecisionStatus.PENDING
-            tags: list[str] = []
-            if prev:
-                if prev.status == "kept":
-                    status = DecisionStatus.KEPT
-                elif prev.status == "discarded":
-                    status = DecisionStatus.DISCARDED
-                tags = _extract_tags_from_record(prev)
+            if prev.status == "kept":
+                status = DecisionStatus.KEPT
+            elif prev.status == "discarded":
+                status = DecisionStatus.DISCARDED
+            
+            tags = _extract_tags_from_record(prev)
+            
+            # Restore LLM fields from notes if available
+            source = ReviewSource.HUMAN
+            source_str = getattr(prev, 'source', 'human')
+            try:
+                source = ReviewSource(source_str)
+            except ValueError:
+                pass
+            
+            session.decisions.append(
+                ReviewDecision(
+                    paper=paper,
+                    provider=getattr(prev, 'provider', "previous"),
+                    status=status,
+                    tags=tags,
+                    source=source,
+                    is_example=getattr(prev, 'is_example', False),
+                    llm_confidence=getattr(prev, 'llm_confidence', None),
+                )
+            )
+@
+
+For papers in the current search results, we merge with any existing decision
+data. If the paper was previously reviewed, we preserve the decision status,
+tags, and LLM metadata while using the fresh paper data from the search (which
+may have updated abstracts or other fields from enrichment).
+
+<<convert search results to decisions>>=
+for result in results:
+    for paper in result.papers:
+        paper_id = get_paper_id(paper)
+        
+        # Check for previous decision (prefer session data over notes)
+        prev_dec = prev_decision_lookup.get(paper_id)
+        prev_record = None
+        if not prev_dec and previous_decisions:
+            prev_record = previous_decisions.decisions.get(paper_id)
+        
+        if prev_dec:
+            # Use previous decision but with fresh paper data
+            session.decisions.append(
+                ReviewDecision(
+                    paper=paper,  # Fresh paper data from search
+                    provider=result.provider,
+                    status=prev_dec.status,
+                    tags=prev_dec.tags,
+                    source=prev_dec.source,
+                    is_example=prev_dec.is_example,
+                    llm_confidence=prev_dec.llm_confidence,
+                )
+            )
+        elif prev_record:
+            # Fallback to notes module format
+            status = DecisionStatus.PENDING
+            if prev_record.status == "kept":
+                status = DecisionStatus.KEPT
+            elif prev_record.status == "discarded":
+                status = DecisionStatus.DISCARDED
+            tags = _extract_tags_from_record(prev_record)
+            
+            # Restore LLM fields from notes if available
+            source = ReviewSource.HUMAN
+            source_str = getattr(prev_record, 'source', 'human')
+            try:
+                source = ReviewSource(source_str)
+            except ValueError:
+                pass
             
             session.decisions.append(
                 ReviewDecision(
@@ -541,13 +999,20 @@ def create_review_session(
                     provider=result.provider,
                     status=status,
                     tags=tags,
+                    source=source,
+                    is_example=getattr(prev_record, 'is_example', False),
+                    llm_confidence=getattr(prev_record, 'llm_confidence', None),
                 )
             )
-    
-    logger.info("Created session with %d papers (%d kept, %d discarded, %d pending)",
-               len(session.decisions), len(session.kept_papers),
-               len(session.discarded_papers), len(session.pending_papers))
-    return session
+        else:
+            # New paper, no previous decision
+            session.decisions.append(
+                ReviewDecision(
+                    paper=paper,
+                    provider=result.provider,
+                    status=DecisionStatus.PENDING,
+                )
+            )
 
 
 def _extract_tags_from_record(record: ReviewDecisionRecord) -> list[str]:
@@ -606,7 +1071,11 @@ def create_notes_session() -> ReviewSession:
 
 \subsection{Session Persistence}
 
-Sessions can be saved and loaded for interrupted workflows.
+Sessions can be saved and loaded for interrupted workflows. The session file
+includes [[query_provider_pairs]] to track which queries were used with which
+providers. For backward compatibility, when loading old session files without
+this field, we reconstruct the pairs by pairing the single [[query]] with each
+provider in [[providers]].
 
 <<review session functions>>=
 def _get_sessions_dir() -> Path:
@@ -641,12 +1110,17 @@ def save_session(session: ReviewSession) -> Path:
         "name": session.name,
         "providers": session.providers,
         "timestamp": session.timestamp.isoformat(),
+        "research_context": session.research_context,
+        "query_provider_pairs": session.query_provider_pairs,
         "decisions": [
             {
                 "paper_id": get_paper_id(d.paper),
                 "provider": d.provider,
                 "status": d.status.value,
                 "tags": d.tags,
+                "source": d.source.value,
+                "is_example": d.is_example,
+                "llm_confidence": d.llm_confidence,
                 "paper": {
                     "title": d.paper.title,
                     "authors": list(d.paper.authors),
@@ -705,8 +1179,19 @@ def load_session(name_or_query: str) -> ReviewSession | None:
             providers=data["providers"],
             timestamp=datetime.fromisoformat(data["timestamp"]),
             name=data.get("name"),
+            research_context=data.get("research_context"),
         )
         
+        # Load query_provider_pairs with backward compatibility
+        if "query_provider_pairs" in data:
+            session.query_provider_pairs = [
+                tuple(pair) for pair in data["query_provider_pairs"]
+            ]
+        else:
+            # Reconstruct from query and providers for old sessions
+            for provider in data["providers"]:
+                session.add_query_provider_pair(data["query"], provider)
+
         for dec_data in data["decisions"]:
             paper_data = dec_data["paper"]
             paper = Paper(
@@ -722,13 +1207,25 @@ def load_session(name_or_query: str) -> ReviewSession | None:
             )
             status = DecisionStatus(dec_data["status"])
             tags = dec_data.get("tags", [])
-            
+
+            # Load LLM-related fields with backward compatibility
+            source_str = dec_data.get("source", "human")
+            try:
+                source = ReviewSource(source_str)
+            except ValueError:
+                source = ReviewSource.HUMAN
+            is_example = dec_data.get("is_example", False)
+            llm_confidence = dec_data.get("llm_confidence")
+
             session.decisions.append(
                 ReviewDecision(
                     paper=paper,
                     provider=dec_data["provider"],
                     status=status,
                     tags=tags,
+                    source=source,
+                    is_example=is_example,
+                    llm_confidence=llm_confidence,
                 )
             )
         
@@ -737,8 +1234,79 @@ def load_session(name_or_query: str) -> ReviewSession | None:
     except (json.JSONDecodeError, KeyError, OSError) as e:
         logger.warning("Failed to load session %s: %s", name_or_query, e)
         return None
+@
 
+\subsubsection{Persisting Query-Provider Pairs}
 
+Query-provider pairs are serialized to JSON along with the rest of the session
+data. We verify that pairs survive a round-trip through [[save_session]] and
+[[load_session]]:
+
+<<test functions>>=
+class TestQueryProviderPairsPersistence:
+    """Tests for query-provider pair persistence."""
+
+    def test_save_and_load_query_provider_pairs(self, tmp_path, monkeypatch):
+        """Query-provider pairs are saved and loaded correctly."""
+        monkeypatch.setenv("SCHOLAR_DATA_DIR", str(tmp_path))
+        
+        session = ReviewSession(
+            query="test query",
+            providers=["openalex", "wos"],
+            timestamp=datetime.now(),
+            name="pairs-session",
+        )
+        session.add_query_provider_pair("natural language", "openalex")
+        session.add_query_provider_pair("boolean AND query", "wos")
+        
+        save_session(session)
+        loaded = load_session("pairs-session")
+        
+        assert loaded is not None
+        assert len(loaded.query_provider_pairs) == 2
+        assert ("natural language", "openalex") in loaded.query_provider_pairs
+        assert ("boolean AND query", "wos") in loaded.query_provider_pairs
+@
+
+\paragraph{Backward Compatibility}
+
+Users may have sessions saved before we added query-provider pairs. These old
+session files lack the [[query_provider_pairs]] field entirely. Rather than
+failing to load or losing information, we reconstruct reasonable pairs from the
+existing [[query]] and [[providers]] fields. This assumes the same query was
+used for all providers---which was true before this feature existed---and
+preserves session usability without requiring manual migration.
+
+<<test functions>>=
+def test_load_session_backward_compatibility(tmp_path, monkeypatch):
+    """Old sessions without query_provider_pairs get pairs reconstructed."""
+    monkeypatch.setenv("SCHOLAR_DATA_DIR", str(tmp_path))
+    
+    # Create session file in old format (no query_provider_pairs)
+    sessions_dir = tmp_path / "review_sessions"
+    sessions_dir.mkdir(parents=True)
+    old_session_data = {
+        "query": "old query",
+        "name": "old-session",
+        "providers": ["openalex", "wos"],
+        "timestamp": datetime.now().isoformat(),
+        "research_context": None,
+        "decisions": [],
+    }
+    session_file = sessions_dir / "old-session.json"
+    with open(session_file, "w") as f:
+        json.dump(old_session_data, f)
+    
+    loaded = load_session("old-session")
+    
+    assert loaded is not None
+    # Backward compat: pairs should be reconstructed from query + providers
+    assert len(loaded.query_provider_pairs) == 2
+    assert ("old query", "openalex") in loaded.query_provider_pairs
+    assert ("old query", "wos") in loaded.query_provider_pairs
+@
+
+<<review session functions>>=
 def list_sessions() -> list[dict[str, Any]]:
     """
     List all saved review sessions.
@@ -819,6 +1387,10 @@ def save_search_decisions(query: str, decisions: list[ReviewDecision]) -> None:
             url=d.paper.url,
             pdf_url=d.paper.pdf_url,
             provider=d.provider,
+            # LLM-related fields
+            source=d.source.value,
+            is_example=d.is_example,
+            llm_confidence=d.llm_confidence,
         )
     
     notes_save_decisions(query, decision_records)
@@ -835,6 +1407,7 @@ class TestSessionFunctions:
         # Create mock search result
         result = Mock()
         result.provider = "test"
+        result.query = "test query"
         result.papers = [
             Paper(title="Paper 1", authors=["Author"], year=2024),
         ]
@@ -844,6 +1417,9 @@ class TestSessionFunctions:
         assert session.query == "test query"
         assert len(session.decisions) == 1
         assert session.decisions[0].status == DecisionStatus.PENDING
+        # Check query_provider_pairs is populated
+        assert len(session.query_provider_pairs) == 1
+        assert ("test query", "test") in session.query_provider_pairs
 
     def test_save_and_load_session(self, tmp_path, monkeypatch):
         """Can save and load a session."""
@@ -892,6 +1468,153 @@ class TestSessionFunctions:
         
         sessions = list_sessions()
         assert len(sessions) == 2
+
+    def test_create_session_preserves_llm_fields(self, tmp_path, monkeypatch):
+        """Adding search to session preserves LLM decision metadata."""
+        monkeypatch.setenv("SCHOLAR_DATA_DIR", str(tmp_path))
+        
+        # Create initial session with LLM-reviewed paper
+        paper1 = Paper(
+            title="Paper 1", authors=["Author 1"], year=2024,
+            doi="10.1234/paper1"
+        )
+        session = ReviewSession(
+            query="test query",
+            providers=["openalex"],
+            timestamp=datetime.now(),
+            name="merge-test",
+        )
+        session.decisions.append(
+            ReviewDecision(
+                paper=paper1,
+                provider="openalex",
+                status=DecisionStatus.KEPT,
+                tags=["ml", "privacy"],
+                source=ReviewSource.LLM_REVIEWED,
+                is_example=True,
+                llm_confidence=0.85,
+            )
+        )
+        save_session(session)
+        
+        # Add new search that includes same paper
+        result = Mock()
+        result.provider = "openalex"
+        result.query = "new query"
+        result.papers = [
+            Paper(
+                title="Paper 1", authors=["Author 1"], year=2024,
+                doi="10.1234/paper1"  # Same paper
+            ),
+            Paper(
+                title="Paper 2", authors=["Author 2"], year=2023,
+                doi="10.1234/paper2"  # New paper
+            ),
+        ]
+        
+        new_session = create_review_session([result], "new query", "merge-test")
+        
+        # Find the previously-reviewed paper
+        paper1_decisions = [
+            d for d in new_session.decisions 
+            if d.paper.doi == "10.1234/paper1"
+        ]
+        assert len(paper1_decisions) == 1
+        dec = paper1_decisions[0]
+        
+        # All LLM fields should be preserved
+        assert dec.status == DecisionStatus.KEPT
+        assert dec.tags == ["ml", "privacy"]
+        assert dec.source == ReviewSource.LLM_REVIEWED
+        assert dec.is_example is True
+        assert dec.llm_confidence == 0.85
+        
+        # New paper should be pending
+        paper2_decisions = [
+            d for d in new_session.decisions
+            if d.paper.doi == "10.1234/paper2"
+        ]
+        assert len(paper2_decisions) == 1
+        assert paper2_decisions[0].status == DecisionStatus.PENDING
+
+    def test_create_session_preserves_papers_not_in_new_search(
+        self, tmp_path, monkeypatch
+    ):
+        """Papers from previous session not in new search are preserved."""
+        monkeypatch.setenv("SCHOLAR_DATA_DIR", str(tmp_path))
+        
+        # Create initial session with reviewed paper
+        paper1 = Paper(
+            title="Old Paper", authors=["Author"], year=2020,
+            doi="10.1234/old"
+        )
+        session = ReviewSession(
+            query="old query",
+            providers=["openalex"],
+            timestamp=datetime.now(),
+            name="preserve-test",
+        )
+        session.decisions.append(
+            ReviewDecision(
+                paper=paper1,
+                provider="openalex",
+                status=DecisionStatus.DISCARDED,
+                tags=["off-topic"],
+                source=ReviewSource.HUMAN,
+            )
+        )
+        save_session(session)
+        
+        # Add new search with different paper
+        result = Mock()
+        result.provider = "dblp"
+        result.query = "new query"
+        result.papers = [
+            Paper(
+                title="New Paper", authors=["Author 2"], year=2024,
+                doi="10.1234/new"
+            ),
+        ]
+        
+        new_session = create_review_session([result], "new query", "preserve-test")
+        
+        # Should have both papers
+        assert len(new_session.decisions) == 2
+        
+        # Old paper should be preserved with all metadata
+        old_decisions = [
+            d for d in new_session.decisions
+            if d.paper.doi == "10.1234/old"
+        ]
+        assert len(old_decisions) == 1
+        assert old_decisions[0].status == DecisionStatus.DISCARDED
+        assert old_decisions[0].tags == ["off-topic"]
+
+    def test_create_session_preserves_research_context(
+        self, tmp_path, monkeypatch
+    ):
+        """Research context from previous session is preserved."""
+        monkeypatch.setenv("SCHOLAR_DATA_DIR", str(tmp_path))
+        
+        session = ReviewSession(
+            query="test",
+            providers=["openalex"],
+            timestamp=datetime.now(),
+            name="context-test",
+            research_context="Focus on privacy in ML",
+        )
+        save_session(session)
+        
+        result = Mock()
+        result.provider = "openalex"
+        result.query = "new query"
+        result.papers = [
+            Paper(title="Paper", authors=["Author"], year=2024),
+        ]
+        
+        new_session = create_review_session([result], "new query", "context-test")
+        
+        assert new_session.research_context == "Focus on privacy in ML"
 @
 
 
@@ -1010,7 +1733,10 @@ class TestFilterDecisions:
 \section{Report Generation}
 
 The module provides \LaTeX\ report generation with theme and motivation
-groupings, enabling systematic documentation of review decisions.
+groupings, enabling systematic documentation of review decisions. When a session
+has multiple query-provider pairs (from using different queries with different
+providers), the report shows them as a table mapping providers to their
+respective queries, rather than a single query field.
 
 <<review report generation>>=
 def escape_bibtex(text: str) -> str:
@@ -1216,9 +1942,34 @@ def generate_latex_report(session: ReviewSession, output_path: Path) -> None:
         r"\maketitle",
         r"",
         r"\section{Search Parameters}",
+    ]
+    
+    # Show query-provider pairs as table if multiple, else simple list
+    if len(session.query_provider_pairs) > 1:
+        lines.extend([
+            r"\begin{longtable}{lp{10cm}}",
+            r"\toprule",
+            r"Provider & Query \\",
+            r"\midrule",
+        ])
+        for query, provider in session.query_provider_pairs:
+            lines.append(
+                f"{escape_latex(provider)} & {escape_latex(query)} \\\\"
+            )
+        lines.extend([
+            r"\bottomrule",
+            r"\end{longtable}",
+        ])
+    else:
+        lines.extend([
+            r"\begin{description}",
+            f"\\item[Query] {escape_latex(session.query)}",
+            f"\\item[Providers] {', '.join(session.providers)}",
+            r"\end{description}",
+        ])
+    
+    lines.extend([
         r"\begin{description}",
-        f"\\item[Query] {escape_latex(session.query)}",
-        f"\\item[Providers] {', '.join(session.providers)}",
         f"\\item[Date] {session.timestamp.strftime('%Y-%m-%d %H:%M')}",
         f"\\item[Total Papers] {len(session.decisions)}",
         r"\end{description}",
@@ -1230,7 +1981,7 @@ def generate_latex_report(session: ReviewSession, output_path: Path) -> None:
         f"\\item[Pending] {len(session.pending_papers)}",
         r"\end{description}",
         r"",
-    ]
+    ])
 
     # Summary Tables section
     if session.kept_papers or session.discarded_papers:
