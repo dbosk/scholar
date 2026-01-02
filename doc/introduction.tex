@@ -89,6 +89,27 @@ The terminal-based user interface (TUI) supports systematic review workflows:
   Filter to show only kept, discarded, or pending papers.
 \end{description}
 
+\subsection{LLM-Assisted Review}
+
+For large result sets, Scholar can use large language models to assist with 
+paper classification:
+\begin{description}
+\item[Learning from Examples] The LLM learns from papers you have already 
+  reviewed and tagged, using them as examples to classify pending papers.
+\item[Round-Based Workflow] LLM decisions are marked for human review.
+  You can accept, correct, or reject each classification, and corrections 
+  become training examples for future rounds.
+\item[Confidence Scores] Each LLM decision includes a confidence score 
+  (0.0--1.0), allowing you to prioritize reviewing uncertain classifications.
+\item[Source Tracking] Decisions track whether they were made by a human, 
+  by the LLM and unreviewed, or by the LLM and reviewed.
+  This enables progress monitoring and ensures transparency.
+\item[Automatic Enrichment] Papers without abstracts are automatically 
+  enriched before classification, ensuring the LLM has sufficient context.
+\item[Model Flexibility] Uses Simon Willison's \texttt{llm} package, 
+  supporting OpenAI, Anthropic, local models, and other providers.
+\end{description}
+
 \subsection{Session Management}
 
 Review sessions can be saved and resumed:
@@ -122,6 +143,7 @@ In the TUI, browse through papers:
 \item Press \texttt{d} to discard (you must provide a motivation)
 \item Press \texttt{n} to add notes
 \item Press \texttt{p} to view the PDF
+\item Press \texttt{L} to invoke LLM-assisted classification
 \item Press \texttt{q} to quit and save progress
 \end{itemize}
 
@@ -203,6 +225,8 @@ It is organized as follows:
   system, and provider implementations.
 \item[Part II: User Interface] The command-line interface and interactive 
   terminal UI for paper review.
+\item[Part III: LLM-Assisted Review] The module for using large language models 
+  to assist with paper classification in systematic reviews.
 \end{description}
 
 Each chapter presents both the design rationale and the implementation, with 
