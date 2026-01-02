@@ -326,6 +326,37 @@ supports different workflows. During initial screening, reviewers often want to
 quickly mark obviously relevant papers. Later, when organizing kept papers for
 thematic analysis, they can use \texttt{T} to add themes.
 
+\subsection{LLM Decision Handling}
+\label{sec:abstract-llm-handling}
+
+When reviewing papers that have been pre-classified by an LLM (marked with
+[[LLM_UNREVIEWED]] source), any keep or discard action in this screen will
+update the review source appropriately. If the user confirms the LLM's decision,
+the paper is marked as [[LLM_REVIEWED]]. If the user changes the decision (for
+example, keeping a paper that the LLM had discarded), the paper is also marked
+as [[LLM_REVIEWED]] and flagged with [[is_example=True]] to serve as training
+data for future LLM rounds.
+
+This behavior mirrors the main review screen's handling, ensuring consistent
+behavior whether the user makes decisions from the paper list or from the
+detailed abstract view.
+
+\paragraph{Closure capture for asynchronous state.}
+The key insight is that we must capture the LLM state \emph{before} any modal
+dialogs open, since the user's selection in the modal determines the final
+decision. When working with modal dialogs in TUI frameworks like Textual, the
+callback pattern introduces a timing challenge: variables like [[was_llm]] and
+[[was_discarded]] must be captured \emph{before} the modal opens, since the
+dialog is asynchronous and the decision object might change between the modal
+opening and the callback executing.
+
+Python closures solve this elegantly. When we define a nested function like
+[[handle_themes]] inside [[action_keep_with_themes]], the function captures
+references to local variables from the enclosing scope. By reading [[was_llm]]
+and [[was_discarded]] before calling [[push_screen]], we freeze these values at
+the moment the action was initiated---exactly when we need to know whether the
+user is changing an LLM decision.
+
 \subsection{External Editor Integration}
 
 For note editing, we use [[self.app.suspend()]] which temporarily releases
@@ -479,8 +510,24 @@ class AbstractScreen(Screen[None]):
         if not self.review_mode:
             self.notify("Keep/discard disabled in notes mode", severity="warning")
             return
+
+        # Check if changing an LLM decision
+        was_llm = self.decision.source == ReviewSource.LLM_UNREVIEWED
+        was_discarded = self.decision.status == DecisionStatus.DISCARDED
+
         self.decision.status = DecisionStatus.KEPT
         self.decision.clear_tags()
+
+        # Mark as reviewed if it was an LLM decision
+        if was_llm:
+            from scholar.llm_review import mark_as_reviewed
+            mark_as_reviewed(
+                self.decision,
+                user_agrees=not was_discarded,
+                new_status=DecisionStatus.KEPT,
+                new_tags=[],
+            )
+
         self.dismiss(None)
     
     def action_keep_with_themes(self) -> None:
@@ -488,13 +535,28 @@ class AbstractScreen(Screen[None]):
         if not self.review_mode:
             self.notify("Keep/discard disabled in notes mode", severity="warning")
             return
-        
+
+        # Capture LLM state before modal opens
+        was_llm = self.decision.source == ReviewSource.LLM_UNREVIEWED
+        was_discarded = self.decision.status == DecisionStatus.DISCARDED
+
         def handle_themes(result: list[str] | None) -> None:
             if result is not None:  # None means cancelled
                 self.decision.status = DecisionStatus.KEPT
                 self.decision.tags = result
+
+                # Mark as reviewed if it was an LLM decision
+                if was_llm:
+                    from scholar.llm_review import mark_as_reviewed
+                    mark_as_reviewed(
+                        self.decision,
+                        user_agrees=not was_discarded,
+                        new_status=DecisionStatus.KEPT,
+                        new_tags=result,
+                    )
+
                 self.dismiss(None)
-        
+
         self.app.push_screen(
             TagSelectionModal(
                 title=f"Themes: {self.decision.paper.title[:50]}...",
@@ -505,19 +567,34 @@ class AbstractScreen(Screen[None]):
             ),
             handle_themes,
         )
-    
+
     def action_discard(self) -> None:
         """Open motivation selection modal."""
         if not self.review_mode:
             self.notify("Keep/discard disabled in notes mode", severity="warning")
             return
-        
+
+        # Capture LLM state before modal opens
+        was_llm = self.decision.source == ReviewSource.LLM_UNREVIEWED
+        was_kept = self.decision.status == DecisionStatus.KEPT
+
         def handle_discard(result: list[str] | None) -> None:
             if result is not None:  # None means cancelled
                 self.decision.status = DecisionStatus.DISCARDED
                 self.decision.tags = result
+
+                # Mark as reviewed if it was an LLM decision
+                if was_llm:
+                    from scholar.llm_review import mark_as_reviewed
+                    mark_as_reviewed(
+                        self.decision,
+                        user_agrees=not was_kept,
+                        new_status=DecisionStatus.DISCARDED,
+                        new_tags=result,
+                    )
+
                 self.dismiss(None)
-        
+
         self.app.push_screen(
             TagSelectionModal(
                 title=f"Motivations: {self.decision.paper.title[:50]}...",
