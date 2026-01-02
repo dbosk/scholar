@@ -36,6 +36,7 @@ The TUI supports:
 - **Note-taking** with your preferred editor
 - **PDF viewing** with automatic download and caching
 - **Abstract enrichment** for papers missing abstracts
+- **LLM-assisted classification** to help review large result sets
 - **Sorting and filtering** by various criteria
 
 ### Output Formats
@@ -188,9 +189,43 @@ scholar pdf clear
 | `n` | Edit notes |
 | `p` | Open PDF |
 | `e` | Enrich (fetch abstract) |
+| `L` | LLM-assisted classification |
 | `s` | Sort papers |
 | `f` | Filter by status |
 | `q` | Quit |
+
+## LLM-Assisted Review
+
+For large result sets, Scholar can use LLMs to assist with paper classification:
+
+```bash
+# In the TUI, press 'L' to invoke LLM classification
+# Or use the CLI command directly
+scholar llm-review "session-name" --count 10
+```
+
+### How It Works
+
+1. **Tag some papers manually** - The LLM needs examples to learn from. Review at least 5 papers with tags (themes for kept, motivations for discarded).
+
+2. **Set research context** (optional) - Describe your review's focus to help the LLM understand relevance criteria.
+
+3. **Invoke LLM classification** - The LLM classifies pending papers based on your examples, returning confidence scores.
+
+4. **Review LLM decisions** - Prioritize low-confidence classifications. Accept correct ones, correct wrong ones.
+
+5. **Iterate** - Corrections become training examples for the next round.
+
+### Requirements
+
+Install the `llm` package and configure a model:
+
+```bash
+pip install llm
+llm keys set openai  # Or configure another provider
+```
+
+The LLM module supports any model available through Simon Willison's `llm` package (OpenAI, Anthropic, local models, etc.).
 
 ## Documentation
 
