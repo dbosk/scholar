@@ -275,8 +275,28 @@ def get_example_decisions(
     kept_examples.sort(key=sort_key)
     discarded_examples.sort(key=sort_key)
 
-    # Limit to max
-    return kept_examples[:max_kept], discarded_examples[:max_discarded]
+    # Limit to max and log selected examples
+    kept_result = kept_examples[:max_kept]
+    discarded_result = discarded_examples[:max_discarded]
+
+    # Log info about selected examples
+    if kept_result or discarded_result:
+        logger.info(
+            f"Selected {len(kept_result)} kept and "
+            f"{len(discarded_result)} discarded examples for LLM"
+        )
+        for example in kept_result:
+            logger.info(
+                f"  KEPT example: {example.paper.title[:60]}... "
+                f"[tags: {', '.join(example.tags)}]"
+            )
+        for example in discarded_result:
+            logger.info(
+                f"  DISCARDED example: {example.paper.title[:60]}... "
+                f"[tags: {', '.join(example.tags)}]"
+            )
+
+    return kept_result, discarded_result
 @
 
 
@@ -1064,6 +1084,14 @@ def classify_papers_with_llm(
     model = llm.get_model(model_id) if model_id else llm.get_model()
     logger.info(f"Classifying {len(to_classify)} papers with {model.model_id}")
 
+    # Log papers being sent for classification
+    logger.info("Papers to classify:")
+    for i, decision in enumerate(to_classify):
+        abstract_status = "with abstract" if decision.paper.abstract else "NO ABSTRACT"
+        logger.info(
+            f"  [{i}] {decision.paper.title[:50]}... ({abstract_status})"
+        )
+
     response = model.prompt(prompt)
     response_text = response.text()
 
@@ -1229,6 +1257,8 @@ def apply_llm_decisions(
     # Build lookup for efficient paper_id matching
     paper_id_lookup = _build_paper_id_lookup(session)
 
+    logger.info(f"Applying LLM decisions for {len(batch_result.decisions)} papers")
+
     for llm_decision in batch_result.decisions:
         if llm_decision.paper_id not in paper_id_lookup:
             logger.warning(
@@ -1254,6 +1284,20 @@ def apply_llm_decisions(
         decision.source = ReviewSource.LLM_UNREVIEWED
         decision.llm_confidence = llm_decision.confidence
         decision.is_example = False  # Not an example until user reviews
+
+        # Log info about each paper's review outcome
+        status_str = "KEPT" if llm_decision.status == "kept" else "DISCARDED"
+        logger.info(
+            f"  {status_str} (conf={llm_decision.confidence:.2f}): "
+            f"{decision.paper.title[:50]}..."
+        )
+        logger.info(
+            f"    Tags: {', '.join(llm_decision.tags)}"
+        )
+        if llm_decision.reasoning:
+            logger.info(
+                f"    Reason: {llm_decision.reasoning[:80]}..."
+            )
 
         updated.append(decision)
 
