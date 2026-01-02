@@ -1468,7 +1468,9 @@ the filter never loses data; it simply changes what is currently visible.
 
 When a filter is active, the status bar displays the current filter name and 
 the count of matching papers, providing clear feedback about what subset is 
-being viewed.
+being viewed. The status bar also shows a session identifier: the session name
+if one was provided, \enquote{N queries} if multiple query-provider pairs exist,
+or the query string for simple single-query sessions.
 
 <<tui main app>>=
 class PaperReviewApp(App):
@@ -1639,10 +1641,18 @@ class PaperReviewApp(App):
         if self.current_filter != "all":
             filter_text = f" | [yellow]Filter: {self.current_filter} ({filtered_count})[/yellow]"
         
+        # Build session identifier for status bar
+        if self.session.name:
+            session_id = self.session.name
+        elif len(self.session.query_provider_pairs) > 1:
+            session_id = f"{len(self.session.query_provider_pairs)} queries"
+        else:
+            session_id = self.session.query
+        
         status = self.query_one("#status-bar", Static)
         if self.review_mode:
             status.update(
-                f"Query: {self.session.query} | "
+                f"Session: {session_id} | "
                 f"[green]Kept: {kept}[/green] | "
                 f"[red]Discarded: {discarded}[/red] | "
                 f"Pending: {pending} | "

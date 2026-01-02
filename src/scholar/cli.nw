@@ -1370,7 +1370,8 @@ The [[sessions]] command provides access to saved review sessions without
 launching the full TUI. Users can:
 \begin{description}
 \item[sessions list] View all saved review sessions with their statistics
-\item[sessions show] Display details of a specific session
+\item[sessions show] Display details of a specific session, including
+query-provider pairs when multiple queries were used
 \item[sessions export] Generate reports (CSV, \LaTeX{}) from a saved session
 \item[sessions resume] Continue reviewing a saved session in the TUI
 \end{description}
@@ -1475,6 +1476,7 @@ def sessions_show(
         output = {
             "query": session.query,
             "providers": session.providers,
+            "query_provider_pairs": session.query_provider_pairs,
             "timestamp": session.timestamp.isoformat(),
             "decisions": [
                 {
@@ -1500,7 +1502,14 @@ def sessions_show(
         
         render_console.print(f"[bold]Session: {session.query}[/bold]")
         render_console.print(f"[dim]Date: {session.timestamp.strftime('%Y-%m-%d %H:%M')}[/dim]")
-        render_console.print(f"[dim]Providers: {', '.join(session.providers)}[/dim]")
+        
+        # Show query-provider pairs if multiple, else simple providers list
+        if len(session.query_provider_pairs) > 1:
+            render_console.print("[dim]Queries by provider:[/dim]")
+            for query, provider in session.query_provider_pairs:
+                render_console.print(f"[dim]  {provider}: {query}[/dim]")
+        else:
+            render_console.print(f"[dim]Providers: {', '.join(session.providers)}[/dim]")
         render_console.print()
 
         # Show kept papers
