@@ -2079,6 +2079,7 @@ class WebOfScienceProvider:
     <<wos search>>
     <<wos convert starter hit>>
     <<wos safe get nested>>
+    <<wos ensure list>>
     <<wos convert expanded hit>>
     <<wos extended methods>>
 @
@@ -2523,6 +2524,37 @@ def _safe_get_nested(obj: Any, *keys: str, default: Any = None) -> Any:
     return obj
 @
 
+\subsubsection{Normalizing API response types}
+
+The WoS API (like many XML-to-JSON APIs) inconsistently returns fields that
+should be lists.
+When a field contains multiple items, it returns a list of dicts.
+When it contains a single item, it may return just that dict (not wrapped in a
+list).
+Sometimes it returns a string instead of a structured object.
+
+This causes problems when we iterate over these fields: iterating over a string
+yields individual characters, and calling [[.get()]] on a character raises
+[[AttributeError]].
+
+This helper normalizes values to lists for safe iteration:
+\begin{description}
+\item[List] returned as-is
+\item[Dict] wrapped in a single-element list
+\item[String or other] returns empty list (skip gracefully)
+\end{description}
+
+<<wos ensure list>>=
+@staticmethod
+def _ensure_list(value: Any) -> list:
+    """Normalize a value to a list for safe iteration."""
+    if isinstance(value, list):
+        return value
+    if isinstance(value, dict):
+        return [value]
+    return []
+@
+
 \subsubsection{Converting Expanded API response}
 
 The WoS Expanded API returns documents with a deeply nested structure that
@@ -2537,7 +2569,9 @@ def _convert_expanded_hit(self, rec: dict) -> Paper:
 
     # Extract title (look for type="item")
     title = ""
-    titles = self._safe_get_nested(summary, "titles", "title", default=[])
+    titles = self._ensure_list(
+        self._safe_get_nested(summary, "titles", "title", default=[])
+    )
     for t in titles:
         if t.get("type") == "item":
             title = t.get("content", "")
@@ -2556,7 +2590,9 @@ def _convert_expanded_hit(self, rec: dict) -> Paper:
 
     # Extract authors
     authors = []
-    names = self._safe_get_nested(summary, "names", "name", default=[])
+    names = self._ensure_list(
+        self._safe_get_nested(summary, "names", "name", default=[])
+    )
     for author in names:
         if author.get("role") == "author":
             name = author.get("display_name") or author.get("full_name")
@@ -2567,7 +2603,9 @@ def _convert_expanded_hit(self, rec: dict) -> Paper:
     doi = None
     dynamic_data = rec.get("dynamic_data", {})
     cluster = dynamic_data.get("cluster_related", {})
-    identifiers = self._safe_get_nested(cluster, "identifiers", "identifier", default=[])
+    identifiers = self._ensure_list(
+        self._safe_get_nested(cluster, "identifiers", "identifier", default=[])
+    )
     for ident in identifiers:
         if ident.get("type") == "doi":
             doi = ident.get("value")
