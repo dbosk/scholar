@@ -472,11 +472,18 @@ class ReviewSession:
     <<query-provider pair methods>>
 @
 
-We provide helper methods for managing query-provider pairs. The
+Different providers often require different query syntaxes. OpenAlex works well
+with natural language queries like \enquote{llm programming education}, while
+Web of Science requires Boolean syntax like \enquote{llm AND programming AND
+education}. When building a review session across multiple providers, we need to
+track which query was used with which provider so that reports accurately
+reflect the search methodology.
+
+We provide helper methods for managing these pairs. The
 [[add_query_provider_pair]] method adds a pair only if it doesn't already exist,
 preventing duplicates when appending results to an existing session. The
 [[queries_for_provider]] method retrieves all queries used with a specific
-provider, useful for displaying in reports and the UI.
+provider.
 
 <<query-provider pair methods>>=
 def add_query_provider_pair(self, query: str, provider: str) -> None:
@@ -498,6 +505,59 @@ def queries_for_provider(self, provider: str) -> list[str]:
     Returns a list of queries that were used to search the given provider.
     """
     return [q for q, p in self.query_provider_pairs if p == provider]
+@
+
+We verify that pairs are added correctly and that duplicates are prevented:
+
+<<test functions>>=
+class TestQueryProviderPairs:
+    """Tests for query-provider pair tracking."""
+
+    def test_add_query_provider_pair(self):
+        """Adding pairs associates queries with their providers."""
+        session = ReviewSession(
+            query="test",
+            providers=["openalex", "wos"],
+            timestamp=datetime.now(),
+        )
+        session.add_query_provider_pair("llm programming education", "openalex")
+        session.add_query_provider_pair("llm AND programming AND education", "wos")
+        
+        assert len(session.query_provider_pairs) == 2
+        assert ("llm programming education", "openalex") in session.query_provider_pairs
+        assert ("llm AND programming AND education", "wos") in session.query_provider_pairs
+
+    def test_add_query_provider_pair_no_duplicates(self):
+        """Duplicate pairs are silently ignored."""
+        session = ReviewSession(
+            query="test",
+            providers=["openalex"],
+            timestamp=datetime.now(),
+        )
+        session.add_query_provider_pair("test query", "openalex")
+        session.add_query_provider_pair("test query", "openalex")  # duplicate
+        
+        assert len(session.query_provider_pairs) == 1
+
+    def test_queries_for_provider(self):
+        """Can retrieve all queries used with a specific provider."""
+        session = ReviewSession(
+            query="test",
+            providers=["openalex", "wos"],
+            timestamp=datetime.now(),
+        )
+        session.add_query_provider_pair("natural language query", "openalex")
+        session.add_query_provider_pair("another query", "openalex")
+        session.add_query_provider_pair("boolean AND query", "wos")
+        
+        openalex_queries = session.queries_for_provider("openalex")
+        wos_queries = session.queries_for_provider("wos")
+        
+        assert len(openalex_queries) == 2
+        assert "natural language query" in openalex_queries
+        assert "another query" in openalex_queries
+        assert len(wos_queries) == 1
+        assert "boolean AND query" in wos_queries
 @
 
 \subsection{Testing ReviewSession}
@@ -712,52 +772,6 @@ class TestReviewSession:
             research_context="Focus on privacy-preserving machine learning",
         )
         assert session.research_context == "Focus on privacy-preserving machine learning"
-
-    def test_add_query_provider_pair(self):
-        """Test adding query-provider pairs."""
-        session = ReviewSession(
-            query="test",
-            providers=["openalex", "wos"],
-            timestamp=datetime.now(),
-        )
-        session.add_query_provider_pair("llm programming education", "openalex")
-        session.add_query_provider_pair("llm AND programming AND education", "wos")
-        
-        assert len(session.query_provider_pairs) == 2
-        assert ("llm programming education", "openalex") in session.query_provider_pairs
-        assert ("llm AND programming AND education", "wos") in session.query_provider_pairs
-
-    def test_add_query_provider_pair_no_duplicates(self):
-        """Test that duplicate pairs are not added."""
-        session = ReviewSession(
-            query="test",
-            providers=["openalex"],
-            timestamp=datetime.now(),
-        )
-        session.add_query_provider_pair("test query", "openalex")
-        session.add_query_provider_pair("test query", "openalex")  # duplicate
-        
-        assert len(session.query_provider_pairs) == 1
-
-    def test_queries_for_provider(self):
-        """Test retrieving queries for a specific provider."""
-        session = ReviewSession(
-            query="test",
-            providers=["openalex", "wos"],
-            timestamp=datetime.now(),
-        )
-        session.add_query_provider_pair("natural language query", "openalex")
-        session.add_query_provider_pair("another query", "openalex")
-        session.add_query_provider_pair("boolean AND query", "wos")
-        
-        openalex_queries = session.queries_for_provider("openalex")
-        wos_queries = session.queries_for_provider("wos")
-        
-        assert len(openalex_queries) == 2
-        assert "natural language query" in openalex_queries
-        assert "another query" in openalex_queries
-        assert len(wos_queries) == 1
-        assert "boolean AND query" in wos_queries
 @
 
 
@@ -1121,8 +1135,79 @@ def load_session(name_or_query: str) -> ReviewSession | None:
     except (json.JSONDecodeError, KeyError, OSError) as e:
         logger.warning("Failed to load session %s: %s", name_or_query, e)
         return None
+@
 
+\subsubsection{Persisting Query-Provider Pairs}
 
+Query-provider pairs are serialized to JSON along with the rest of the session
+data. We verify that pairs survive a round-trip through [[save_session]] and
+[[load_session]]:
+
+<<test functions>>=
+class TestQueryProviderPairsPersistence:
+    """Tests for query-provider pair persistence."""
+
+    def test_save_and_load_query_provider_pairs(self, tmp_path, monkeypatch):
+        """Query-provider pairs are saved and loaded correctly."""
+        monkeypatch.setenv("SCHOLAR_DATA_DIR", str(tmp_path))
+        
+        session = ReviewSession(
+            query="test query",
+            providers=["openalex", "wos"],
+            timestamp=datetime.now(),
+            name="pairs-session",
+        )
+        session.add_query_provider_pair("natural language", "openalex")
+        session.add_query_provider_pair("boolean AND query", "wos")
+        
+        save_session(session)
+        loaded = load_session("pairs-session")
+        
+        assert loaded is not None
+        assert len(loaded.query_provider_pairs) == 2
+        assert ("natural language", "openalex") in loaded.query_provider_pairs
+        assert ("boolean AND query", "wos") in loaded.query_provider_pairs
+@
+
+\paragraph{Backward Compatibility}
+
+Users may have sessions saved before we added query-provider pairs. These old
+session files lack the [[query_provider_pairs]] field entirely. Rather than
+failing to load or losing information, we reconstruct reasonable pairs from the
+existing [[query]] and [[providers]] fields. This assumes the same query was
+used for all providers---which was true before this feature existed---and
+preserves session usability without requiring manual migration.
+
+<<test functions>>=
+def test_load_session_backward_compatibility(tmp_path, monkeypatch):
+    """Old sessions without query_provider_pairs get pairs reconstructed."""
+    monkeypatch.setenv("SCHOLAR_DATA_DIR", str(tmp_path))
+    
+    # Create session file in old format (no query_provider_pairs)
+    sessions_dir = tmp_path / "review_sessions"
+    sessions_dir.mkdir(parents=True)
+    old_session_data = {
+        "query": "old query",
+        "name": "old-session",
+        "providers": ["openalex", "wos"],
+        "timestamp": datetime.now().isoformat(),
+        "research_context": None,
+        "decisions": [],
+    }
+    session_file = sessions_dir / "old-session.json"
+    with open(session_file, "w") as f:
+        json.dump(old_session_data, f)
+    
+    loaded = load_session("old-session")
+    
+    assert loaded is not None
+    # Backward compat: pairs should be reconstructed from query + providers
+    assert len(loaded.query_provider_pairs) == 2
+    assert ("old query", "openalex") in loaded.query_provider_pairs
+    assert ("old query", "wos") in loaded.query_provider_pairs
+@
+
+<<review session functions>>=
 def list_sessions() -> list[dict[str, Any]]:
     """
     List all saved review sessions.
@@ -1280,54 +1365,6 @@ class TestSessionFunctions:
         
         sessions = list_sessions()
         assert len(sessions) == 2
-
-    def test_save_and_load_query_provider_pairs(self, tmp_path, monkeypatch):
-        """Query-provider pairs are saved and loaded correctly."""
-        monkeypatch.setenv("SCHOLAR_DATA_DIR", str(tmp_path))
-        
-        session = ReviewSession(
-            query="test query",
-            providers=["openalex", "wos"],
-            timestamp=datetime.now(),
-            name="pairs-session",
-        )
-        session.add_query_provider_pair("natural language", "openalex")
-        session.add_query_provider_pair("boolean AND query", "wos")
-        
-        save_session(session)
-        loaded = load_session("pairs-session")
-        
-        assert loaded is not None
-        assert len(loaded.query_provider_pairs) == 2
-        assert ("natural language", "openalex") in loaded.query_provider_pairs
-        assert ("boolean AND query", "wos") in loaded.query_provider_pairs
-
-    def test_load_session_backward_compatibility(self, tmp_path, monkeypatch):
-        """Old sessions without query_provider_pairs get pairs reconstructed."""
-        monkeypatch.setenv("SCHOLAR_DATA_DIR", str(tmp_path))
-        
-        # Create session file in old format (no query_provider_pairs)
-        sessions_dir = tmp_path / "review_sessions"
-        sessions_dir.mkdir(parents=True)
-        old_session_data = {
-            "query": "old query",
-            "name": "old-session",
-            "providers": ["openalex", "wos"],
-            "timestamp": datetime.now().isoformat(),
-            "research_context": None,
-            "decisions": [],
-        }
-        session_file = sessions_dir / "old-session.json"
-        with open(session_file, "w") as f:
-            json.dump(old_session_data, f)
-        
-        loaded = load_session("old-session")
-        
-        assert loaded is not None
-        # Backward compat: pairs should be reconstructed from query + providers
-        assert len(loaded.query_provider_pairs) == 2
-        assert ("old query", "openalex") in loaded.query_provider_pairs
-        assert ("old query", "wos") in loaded.query_provider_pairs
 @
 
 
