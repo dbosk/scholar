@@ -162,14 +162,18 @@ class PaperNote:
 class ReviewDecisionRecord:
     """
     A single review decision for a paper within a search.
-    
+
     Stores the status (keep/discard/pending), tags (themes for kept papers,
     motivations for discarded), and paper details needed for reconstruction
     when merging sessions.
-    
+
     The [[tags]] field replaces the older [[motivation]] field. For backward
     compatibility, [[motivation]] is kept as a property that accesses the
     first tag.
+
+    LLM-related fields track whether the decision was made by human or LLM,
+    whether this paper is a training example for future LLM rounds, and the
+    LLM's confidence score (if applicable).
     """
     status: str  # "kept", "discarded", "pending"
     tags: list[str] = field(default_factory=list)
@@ -183,6 +187,10 @@ class ReviewDecisionRecord:
     url: str | None = None
     pdf_url: str | None = None
     provider: str = ""
+    # LLM-related fields
+    source: str = "human"  # "human", "llm", "llm_reviewed"
+    is_example: bool = False  # True if user corrected an LLM decision
+    llm_confidence: float | None = None  # 0.0-1.0 if LLM decided
     
     @property
     def motivation(self) -> str:
@@ -214,6 +222,9 @@ class ReviewDecisionRecord:
             "url": self.url,
             "pdf_url": self.pdf_url,
             "provider": self.provider,
+            "source": self.source,
+            "is_example": self.is_example,
+            "llm_confidence": self.llm_confidence,
         }
     
     @classmethod
@@ -223,7 +234,7 @@ class ReviewDecisionRecord:
         tags = data.get("tags", [])
         if not tags and data.get("motivation"):
             tags = [data["motivation"]]
-        
+
         return cls(
             status=data.get("status", "pending"),
             tags=tags,
@@ -236,6 +247,9 @@ class ReviewDecisionRecord:
             url=data.get("url"),
             pdf_url=data.get("pdf_url"),
             provider=data.get("provider", ""),
+            source=data.get("source", "human"),
+            is_example=data.get("is_example", False),
+            llm_confidence=data.get("llm_confidence"),
         )
 
 
@@ -945,17 +959,90 @@ class TestSearchDecisions:
     def test_clear_all_decisions(self, tmp_path, monkeypatch):
         """Can clear all decisions."""
         monkeypatch.setenv("SCHOLAR_DATA_DIR", str(tmp_path))
-        
+
         # Create some decisions
         save_search_decisions("query1", {})
         save_search_decisions("query2", {})
-        
+
         decisions_dir = get_decisions_dir()
         assert len(list(decisions_dir.glob("*.json"))) == 2
-        
+
         count = clear_all_decisions()
         assert count == 2
         assert len(list(decisions_dir.glob("*.json"))) == 0
+
+    def test_save_and_load_llm_fields(self, tmp_path, monkeypatch):
+        """LLM-related fields are saved and loaded correctly."""
+        monkeypatch.setenv("SCHOLAR_DATA_DIR", str(tmp_path))
+
+        query = "llm test query"
+        decisions = {
+            "doi:10.1234/llm1": ReviewDecisionRecord(
+                status="kept",
+                tags=["relevant"],
+                source="llm",
+                is_example=False,
+                llm_confidence=0.85,
+            ),
+            "doi:10.1234/llm2": ReviewDecisionRecord(
+                status="discarded",
+                tags=["off-topic"],
+                source="llm_reviewed",
+                is_example=True,
+                llm_confidence=0.45,
+            ),
+        }
+
+        save_search_decisions(query, decisions)
+
+        loaded = load_search_decisions(query)
+        assert loaded is not None
+
+        # Check first record (LLM unreviewed)
+        record1 = loaded.decisions["doi:10.1234/llm1"]
+        assert record1.source == "llm"
+        assert record1.is_example is False
+        assert record1.llm_confidence == 0.85
+
+        # Check second record (LLM reviewed, marked as example)
+        record2 = loaded.decisions["doi:10.1234/llm2"]
+        assert record2.source == "llm_reviewed"
+        assert record2.is_example is True
+        assert record2.llm_confidence == 0.45
+
+    def test_load_old_format_without_llm_fields(self, tmp_path, monkeypatch):
+        """Old format without LLM fields loads with sensible defaults."""
+        monkeypatch.setenv("SCHOLAR_DATA_DIR", str(tmp_path))
+
+        # Simulate old format file (no LLM fields)
+        old_format = {
+            "query": "old llm query",
+            "query_hash": get_query_hash("old llm query"),
+            "decisions": {
+                "doi:10.1234/old_llm": {
+                    "status": "kept",
+                    "tags": ["good paper"],
+                    "title": "Old Paper",
+                    "authors": ["Author"],
+                }
+            },
+            "timestamp": "2024-01-01",
+        }
+
+        decisions_file = (
+            get_decisions_dir() / f"{get_query_hash('old llm query')}.json"
+        )
+        with open(decisions_file, "w") as f:
+            json.dump(old_format, f)
+
+        loaded = load_search_decisions("old llm query")
+        assert loaded is not None
+        record = loaded.decisions["doi:10.1234/old_llm"]
+
+        # Verify defaults for missing LLM fields
+        assert record.source == "human"
+        assert record.is_example is False
+        assert record.llm_confidence is None
 @
 
 

@@ -114,6 +114,27 @@ class DecisionStatus(Enum):
     DISCARDED = "discarded"
 @
 
+\subsection{Review Source}
+
+When using LLM-assisted review, we track where each decision originated.
+This enables:
+\begin{description}
+\item[Learning from corrections] When a user corrects an LLM decision, that
+  paper becomes a training example for future LLM rounds.
+\item[Progress tracking] Users can see how many papers were reviewed by humans
+  versus the LLM, and how many LLM decisions are pending review.
+\item[Confidence prioritization] LLM decisions with low confidence can be
+  prioritized for human review.
+\end{description}
+
+<<review data structures>>=
+class ReviewSource(Enum):
+    """Source of a review decision."""
+    HUMAN = "human"              # User decided directly
+    LLM_UNREVIEWED = "llm"       # LLM decided, not yet reviewed by user
+    LLM_REVIEWED = "llm_reviewed"  # LLM decided, user confirmed or changed
+@
+
 \subsection{Review Decision}
 
 A [[ReviewDecision]] captures the review state of a single paper, including
@@ -124,20 +145,26 @@ its status and associated tags.
 class ReviewDecision:
     """
     A review decision for a single paper.
-    
+
     Tracks whether the paper was kept or discarded during review,
     along with tags (themes for kept, motivations for discarded).
-    
+
     Attributes:
         paper: The Paper being reviewed.
         provider: Which search provider returned this paper.
         status: Current decision status (pending/kept/discarded).
         tags: List of tags (themes for kept, motivations for discarded).
+        source: Where the decision came from (human or LLM).
+        is_example: True if this paper is a training example for LLM.
+        llm_confidence: Confidence score from LLM (0.0-1.0), if applicable.
     """
     paper: Paper
     provider: str
     status: DecisionStatus = DecisionStatus.PENDING
     tags: list[str] = field(default_factory=list)
+    source: ReviewSource = ReviewSource.HUMAN
+    is_example: bool = False
+    llm_confidence: float | None = None
     
     @property
     def is_decided(self) -> bool:
@@ -245,14 +272,45 @@ class TestReviewDecision:
         """motivation property works for backward compatibility."""
         paper = Paper(title="Test", authors=["Author"], year=2024)
         decision = ReviewDecision(paper=paper, provider="test")
-        
+
         decision.motivation = "Not relevant"
         assert decision.tags == ["Not relevant"]
         assert decision.motivation == "Not relevant"
-        
+
         decision.motivation = ""
         assert decision.tags == []
         assert decision.motivation == ""
+
+    def test_default_source_is_human(self):
+        """New decisions default to human source."""
+        paper = Paper(title="Test", authors=["Author"], year=2024)
+        decision = ReviewDecision(paper=paper, provider="test")
+        assert decision.source == ReviewSource.HUMAN
+        assert not decision.is_example
+        assert decision.llm_confidence is None
+
+    def test_llm_source_tracking(self):
+        """Can track LLM source and confidence."""
+        paper = Paper(title="Test", authors=["Author"], year=2024)
+        decision = ReviewDecision(
+            paper=paper,
+            provider="test",
+            status=DecisionStatus.KEPT,
+            source=ReviewSource.LLM_UNREVIEWED,
+            llm_confidence=0.85,
+        )
+        assert decision.source == ReviewSource.LLM_UNREVIEWED
+        assert decision.llm_confidence == 0.85
+
+    def test_example_flag(self):
+        """Can mark a decision as a training example."""
+        paper = Paper(title="Test", authors=["Author"], year=2024)
+        decision = ReviewDecision(
+            paper=paper,
+            provider="test",
+            is_example=True,
+        )
+        assert decision.is_example
 @
 
 
@@ -262,19 +320,24 @@ A [[ReviewSession]] contains all decisions for a review, along with metadata
 about the search and analysis methods.
 
 <<review data structures>>=
-@dataclass 
+@dataclass
 class ReviewSession:
     """
     A complete review session with all papers and decisions.
-    
+
     Maintains the search parameters and all review decisions,
     supporting sorting, filtering, and analysis operations.
+
+    The [[research_context]] field stores a description of the research goals,
+    which is used by the LLM to understand what types of papers to keep or
+    discard. This context is reused across LLM classification rounds.
     """
     query: str
     providers: list[str]
     timestamp: datetime
     decisions: list[ReviewDecision] = field(default_factory=list)
     name: str | None = None  # Optional session name for persistence
+    research_context: str | None = None  # Research goals for LLM review
     
     @property
     def kept_papers(self) -> list[ReviewDecision]:
@@ -342,6 +405,62 @@ class ReviewSession:
             )
         elif key == "provider":
             self.decisions.sort(key=lambda d: d.provider.lower(), reverse=reverse)
+
+    def llm_unreviewed_papers(self) -> list[ReviewDecision]:
+        """Get papers decided by LLM but not yet reviewed by user."""
+        return [
+            d for d in self.decisions
+            if d.source == ReviewSource.LLM_UNREVIEWED
+        ]
+
+    def example_papers(self) -> list[ReviewDecision]:
+        """
+        Get papers that serve as training examples for LLM.
+
+        This includes:
+        - Human decisions that have tags (themes or motivations)
+        - User corrections of LLM decisions (is_example=True)
+        """
+        return [
+            d for d in self.decisions
+            if d.is_decided and d.tags and (
+                d.source == ReviewSource.HUMAN or d.is_example
+            )
+        ]
+
+    def llm_review_statistics(self) -> dict[str, int]:
+        """
+        Get statistics about LLM review progress.
+
+        Returns dict with counts:
+        - human: Human-only decisions
+        - llm_unreviewed: LLM decisions pending review
+        - llm_reviewed: LLM decisions confirmed by user
+        - examples: Training examples for LLM
+        - pending: Papers not yet decided
+        """
+        human = sum(
+            1 for d in self.decisions
+            if d.source == ReviewSource.HUMAN and d.is_decided
+        )
+        llm_unreviewed = sum(
+            1 for d in self.decisions
+            if d.source == ReviewSource.LLM_UNREVIEWED
+        )
+        llm_reviewed = sum(
+            1 for d in self.decisions
+            if d.source == ReviewSource.LLM_REVIEWED
+        )
+        examples = len(self.example_papers())
+        pending = len(self.pending_papers)
+
+        return {
+            "human": human,
+            "llm_unreviewed": llm_unreviewed,
+            "llm_reviewed": llm_reviewed,
+            "examples": examples,
+            "pending": pending,
+        }
 @
 
 \subsection{Testing ReviewSession}
@@ -422,6 +541,140 @@ class TestReviewSession:
         sample_session.sort_by("year", reverse=True)
         years = [d.paper.year for d in sample_session.decisions]
         assert years == [2022, 2021, 2020]
+
+    def test_llm_unreviewed_papers(self):
+        """Test getting LLM unreviewed papers."""
+        session = ReviewSession(
+            query="test",
+            providers=["test"],
+            timestamp=datetime.now(),
+        )
+        papers = [
+            Paper(title="Human", authors=["A"], year=2024),
+            Paper(title="LLM Unreviewed", authors=["B"], year=2024),
+            Paper(title="LLM Reviewed", authors=["C"], year=2024),
+        ]
+        session.decisions = [
+            ReviewDecision(
+                paper=papers[0], provider="test",
+                status=DecisionStatus.KEPT,
+                source=ReviewSource.HUMAN,
+            ),
+            ReviewDecision(
+                paper=papers[1], provider="test",
+                status=DecisionStatus.KEPT,
+                source=ReviewSource.LLM_UNREVIEWED,
+            ),
+            ReviewDecision(
+                paper=papers[2], provider="test",
+                status=DecisionStatus.KEPT,
+                source=ReviewSource.LLM_REVIEWED,
+            ),
+        ]
+        unreviewed = session.llm_unreviewed_papers()
+        assert len(unreviewed) == 1
+        assert unreviewed[0].paper.title == "LLM Unreviewed"
+
+    def test_example_papers(self):
+        """Test getting training example papers."""
+        session = ReviewSession(
+            query="test",
+            providers=["test"],
+            timestamp=datetime.now(),
+        )
+        papers = [
+            Paper(title="Human with tags", authors=["A"], year=2024),
+            Paper(title="Human without tags", authors=["B"], year=2024),
+            Paper(title="LLM corrected", authors=["C"], year=2024),
+            Paper(title="LLM not example", authors=["D"], year=2024),
+        ]
+        session.decisions = [
+            ReviewDecision(
+                paper=papers[0], provider="test",
+                status=DecisionStatus.KEPT,
+                tags=["ml"],
+                source=ReviewSource.HUMAN,
+            ),
+            ReviewDecision(
+                paper=papers[1], provider="test",
+                status=DecisionStatus.KEPT,
+                source=ReviewSource.HUMAN,
+            ),
+            ReviewDecision(
+                paper=papers[2], provider="test",
+                status=DecisionStatus.KEPT,
+                tags=["corrected"],
+                source=ReviewSource.LLM_REVIEWED,
+                is_example=True,
+            ),
+            ReviewDecision(
+                paper=papers[3], provider="test",
+                status=DecisionStatus.KEPT,
+                tags=["ml"],
+                source=ReviewSource.LLM_REVIEWED,
+                is_example=False,
+            ),
+        ]
+        examples = session.example_papers()
+        assert len(examples) == 2
+        titles = {e.paper.title for e in examples}
+        assert "Human with tags" in titles
+        assert "LLM corrected" in titles
+
+    def test_llm_review_statistics(self):
+        """Test LLM review statistics."""
+        session = ReviewSession(
+            query="test",
+            providers=["test"],
+            timestamp=datetime.now(),
+        )
+        papers = [
+            Paper(title=f"Paper {i}", authors=["A"], year=2024)
+            for i in range(5)
+        ]
+        session.decisions = [
+            ReviewDecision(
+                paper=papers[0], provider="test",
+                status=DecisionStatus.KEPT, tags=["ml"],
+                source=ReviewSource.HUMAN,
+            ),
+            ReviewDecision(
+                paper=papers[1], provider="test",
+                status=DecisionStatus.KEPT,
+                source=ReviewSource.LLM_UNREVIEWED,
+            ),
+            ReviewDecision(
+                paper=papers[2], provider="test",
+                status=DecisionStatus.DISCARDED, tags=["off-topic"],
+                source=ReviewSource.LLM_REVIEWED,
+            ),
+            ReviewDecision(
+                paper=papers[3], provider="test",
+                status=DecisionStatus.PENDING,
+            ),
+            ReviewDecision(
+                paper=papers[4], provider="test",
+                status=DecisionStatus.KEPT, tags=["corrected"],
+                source=ReviewSource.LLM_REVIEWED,
+                is_example=True,
+            ),
+        ]
+        stats = session.llm_review_statistics()
+        assert stats["human"] == 1
+        assert stats["llm_unreviewed"] == 1
+        assert stats["llm_reviewed"] == 2
+        assert stats["examples"] == 2  # Human with tags + corrected
+        assert stats["pending"] == 1
+
+    def test_research_context(self):
+        """Test research context field."""
+        session = ReviewSession(
+            query="test",
+            providers=["test"],
+            timestamp=datetime.now(),
+            research_context="Focus on privacy-preserving machine learning",
+        )
+        assert session.research_context == "Focus on privacy-preserving machine learning"
 @
 
 
@@ -641,12 +894,16 @@ def save_session(session: ReviewSession) -> Path:
         "name": session.name,
         "providers": session.providers,
         "timestamp": session.timestamp.isoformat(),
+        "research_context": session.research_context,
         "decisions": [
             {
                 "paper_id": get_paper_id(d.paper),
                 "provider": d.provider,
                 "status": d.status.value,
                 "tags": d.tags,
+                "source": d.source.value,
+                "is_example": d.is_example,
+                "llm_confidence": d.llm_confidence,
                 "paper": {
                     "title": d.paper.title,
                     "authors": list(d.paper.authors),
@@ -705,8 +962,9 @@ def load_session(name_or_query: str) -> ReviewSession | None:
             providers=data["providers"],
             timestamp=datetime.fromisoformat(data["timestamp"]),
             name=data.get("name"),
+            research_context=data.get("research_context"),
         )
-        
+
         for dec_data in data["decisions"]:
             paper_data = dec_data["paper"]
             paper = Paper(
@@ -722,13 +980,25 @@ def load_session(name_or_query: str) -> ReviewSession | None:
             )
             status = DecisionStatus(dec_data["status"])
             tags = dec_data.get("tags", [])
-            
+
+            # Load LLM-related fields with backward compatibility
+            source_str = dec_data.get("source", "human")
+            try:
+                source = ReviewSource(source_str)
+            except ValueError:
+                source = ReviewSource.HUMAN
+            is_example = dec_data.get("is_example", False)
+            llm_confidence = dec_data.get("llm_confidence")
+
             session.decisions.append(
                 ReviewDecision(
                     paper=paper,
                     provider=dec_data["provider"],
                     status=status,
                     tags=tags,
+                    source=source,
+                    is_example=is_example,
+                    llm_confidence=llm_confidence,
                 )
             )
         
