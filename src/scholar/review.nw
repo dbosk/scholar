@@ -1,24 +1,39 @@
 \chapter{Review Session Management}
 \label{review-module}
 
-\section{Introduction}
+The heart of a systematic review is the screening process: examining each
+paper and deciding whether it belongs in the final corpus.
+This is not merely a binary keep/discard choice---every decision needs
+justification.
+Why was this paper excluded?
+What themes connect the kept papers?
+Answers to these questions form the methodological narrative that makes
+a review reproducible and defensible.
 
-This module provides the core data structures and functions for managing
-systematic literature review sessions. It separates the domain logic from
-the TUI, enabling programmatic review workflows.
+This chapter implements the \emph{review session}: a named container that
+accumulates papers from searches, tracks decisions with their justifications,
+and generates reports documenting the entire process.
+Sessions support the interrupted, iterative nature of real reviews---a
+researcher might screen fifty papers today, add new search results tomorrow,
+and resume screening next week.
+
+The module is deliberately independent of the TUI (\cref{tui-module}).
+While most users interact with reviews through the interactive interface,
+the underlying logic is accessible programmatically, enabling automation
+and integration with other tools.
 
 \subsection{Design Goals}
 
-The review module is designed with these goals:
 \begin{description}
-\item[TUI Independence] All review functionality should be usable from Python
-  code without any TUI dependencies.
-\item[Tag-Based Decisions] Decisions support multiple tags (themes for kept
-  papers, motivations for discarded papers) rather than single strings.
-\item[Session Persistence] Review sessions can be saved and loaded, supporting
-  interrupted workflows.
-\item[Programmatic Access] Enable automation of review decisions based on
-  paper content, keywords, or other criteria.
+\item[Session persistence] Reviews can span days or weeks; progress must
+  survive program restarts.
+\item[Tag-based organization] Both kept papers (organized by themes) and
+  discarded papers (annotated with exclusion reasons) use a unified tagging
+  system.
+\item[Report generation] Sessions export to \LaTeX{} with BibTeX for inclusion
+  in papers, and CSV for spreadsheet analysis.
+\item[TUI independence] All functionality works from Python code, enabling
+  scripting and batch processing.
 \end{description}
 
 \subsection{Tags: Themes and Motivations}

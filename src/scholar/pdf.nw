@@ -1,12 +1,23 @@
 \chapter{PDF Management}
 \label{pdf-module}
 
-\section{Introduction}
+Sometimes the abstract is not enough.
+A paper's methodology section may reveal fatal flaws invisible from the
+summary; figures may clarify (or contradict) textual claims; the reference
+list may expose missing citations to foundational work.
+Systematic reviewers need access to full papers, not just metadata.
 
-When reviewing papers, researchers often need to view the full PDF, especially
-when the abstract is missing or insufficient. This module provides PDF
-download and caching functionality that can be used both programmatically
-and through the TUI.
+This chapter implements PDF downloading and caching, bridging the gap between
+search results (which provide URLs) and the researcher's PDF viewer.
+The module operates independently of the TUI, enabling both interactive
+viewing and batch downloading for offline review.
+
+The key design challenge is performance.
+PDFs are large (megabytes versus kilobytes for metadata), downloads are slow
+(seconds versus milliseconds for API calls), and the same paper may appear
+across multiple searches.
+We address this with a content-addressed cache that persists independently of
+search results, providing automatic deduplication and surviving cache clears.
 
 \subsection{Design Goals}
 

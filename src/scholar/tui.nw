@@ -1,20 +1,36 @@
 \chapter{Interactive Review Interface}
 \label{tui-module}
 
-\section{Introduction}
+Paper review is fundamentally an interactive process.
+A researcher scans titles, reads abstracts, makes quick judgments, occasionally
+digs deeper into full PDFs, and gradually develops intuition for what belongs
+in the corpus.
+This rhythm---scan, evaluate, decide, move on---demands an interface that keeps
+pace with human thought, not one that forces context switches between terminal
+and browser.
 
-This module provides an interactive terminal user interface (TUI) for reviewing 
-academic papers returned from search results. The TUI allows researchers to:
+This chapter implements the \emph{terminal user interface} (TUI): an interactive
+application that runs entirely in the terminal, providing vim-style navigation
+through paper lists, abstract viewing, decision recording, and note-taking.
+The TUI is where most screening happens; the CLI (\cref{cli-module}) handles
+batch operations, but the TUI handles the cognitive work of evaluation.
+
+The interface provides:
 \begin{description}
-\item[Browse] Navigate papers with vim-style keybindings
-\item[View] Read paper abstracts and metadata
-\item[Decide] Keep or discard papers with mandatory motivations for discards
-\item[Annotate] Add and edit notes for papers (persisted globally)
-\item[Sort] Order papers by various criteria
-\item[Report] Generate \LaTeX\ reports of the review session
+\item[Fast navigation] Vim-style keybindings ([[j]]/[[k]]) for moving through
+  papers without reaching for the mouse.
+\item[Abstract viewing] Full abstracts and metadata displayed in a readable
+  format, with PDF access one keypress away.
+\item[Decision recording] Keep ([[K]]) or discard ([[d]]) with mandatory
+  motivations for discards, creating an audit trail.
+\item[Note-taking] Persistent notes attached to papers, editable in your
+  preferred [[EDITOR]].
+\item[LLM review support] Filter and confirm LLM decisions ([[l]]/[[L]] for
+  filtering, [[c]] to confirm), integrating with LLM-assisted classification
+  from the CLI.
 \end{description}
 
-The TUI supports two modes:
+The TUI supports two operational modes:
 \begin{description}
 \item[Review mode] Used when reviewing search results, with keep/discard 
   functionality enabled and decisions saved per-query.

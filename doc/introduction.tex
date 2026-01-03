@@ -1,10 +1,27 @@
 \chapter{Introduction}
 \label{ch:introduction}
 
-Scholar is a command-line tool for conducting structured literature searches 
+Scholar is a command-line tool for conducting structured literature searches
 across multiple academic databases.
-It is designed to support systematic literature reviews by providing a unified 
+It is designed to support systematic literature reviews by providing a unified
 interface for searching, reviewing, and documenting the search process.
+
+At its core, Scholar embodies a simple insight: systematic literature reviews
+are fundamentally about \emph{traceable decision-making}.
+Every paper must be found, evaluated, and either kept or discarded---and each
+decision must be justified and reproducible.
+Scholar automates the mechanical aspects of this process (searching,
+deduplicating, exporting) while preserving human judgment for what matters
+most: evaluating relevance.
+
+The tool follows the Unix philosophy of small, composable components.
+The command-line interface supports scripting and integration with other tools.
+The interactive terminal interface provides efficient navigation for
+hands-on review.
+And the LLM-assisted classification system extends human judgment without
+replacing it---learning from your decisions to suggest (not dictate)
+classifications for remaining papers.
+
 
 \section{Motivation}
 
@@ -221,15 +238,23 @@ This document is a literate program combining documentation and implementation.
 It is organized as follows:
 
 \begin{description}
-\item[Part I: Core Functionality] The data models, search abstraction, caching 
-  system, and provider implementations.
-\item[Part II: User Interface] The command-line interface and interactive 
-  terminal UI for paper review.
-\item[Part III: LLM-Assisted Review] The module for using large language models 
-  to assist with paper classification in systematic reviews.
+\item[Part I: Core Functionality] The foundation of Scholar: data models for
+  papers and search results (\cref{scholar-module}), the caching system that
+  avoids redundant API calls (\cref{cache-module}), provider implementations
+  for each database (\cref{providers-module}), abstract enrichment from
+  secondary sources (\cref{enrich-module}), and PDF downloading and viewing
+  (\cref{pdf-module}).
+\item[Part II: Review System] The systematic review workflow: persistent notes
+  attached to papers (\cref{notes-module}), the review session model that
+  tracks decisions and exports reports (\cref{review-module}), and the
+  LLM-assisted classification system (\cref{llm-review-module}).
+\item[Part III: User Interface] How users interact with Scholar: the
+  command-line interface for scripting and quick operations
+  (\cref{cli-module}), and the terminal-based user interface for interactive
+  paper review (\cref{tui-module}).
 \end{description}
 
-Each chapter presents both the design rationale and the implementation, with 
+Each chapter presents both the design rationale and the implementation, with
 tests appearing alongside the code they verify.
-The source files are generated (\enquote{tangled}) from this document using 
-noweb.
+The source files are generated (\enquote{tangled}) from this document using
+noweb, and can be regenerated at any time from this single source of truth.

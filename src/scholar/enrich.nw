@@ -1,26 +1,33 @@
 \chapter{Paper Enrichment}
 \label{enrich-module}
 
-\section{Introduction}
+Abstracts are essential for systematic review screening---you cannot evaluate
+a paper's relevance from title alone.
+Yet not all databases provide them.
+DBLP, despite its excellent computer science coverage, returns only
+bibliographic metadata.
+Web of Science's Starter API omits abstracts entirely.
+A search returning hundreds of papers without abstracts is nearly useless for
+review purposes.
 
-When searching for papers across multiple providers, we often encounter
-incomplete metadata.
-For example, DBLP provides excellent bibliographic coverage but doesn't include
-abstracts.
-Web of Science's Starter API similarly omits abstracts.
+This chapter implements \emph{paper enrichment}: using DOIs to fetch missing
+metadata from providers with better coverage.
+The key insight is that the same paper often appears in multiple databases.
+A paper found in DBLP likely exists in Semantic Scholar or OpenAlex, where we
+can retrieve its abstract.
+The DOI serves as the universal identifier linking these representations.
 
-Paper enrichment fills in these gaps by looking up papers in providers with
-better coverage.
-If we have a paper's DOI, we can query Semantic Scholar or OpenAlex to fetch
-the missing abstract.
-
-This module provides two levels of enrichment:
+Enrichment operates at two levels:
 \begin{description}
-\item[Single paper enrichment] Fetch missing fields for one paper, useful in
-  the TUI when viewing a paper's details.
-\item[Batch enrichment] Enrich multiple papers, useful after a search to fill
-  in abstracts for all results.
+\item[Single-paper enrichment] Fetch missing fields on demand, triggered when
+  a user views a paper's details in the TUI.
+  This provides immediate feedback without pre-processing all results.
+\item[Batch enrichment] Enrich all papers in a search session, useful before
+  LLM-assisted review where every paper needs an abstract for classification.
 \end{description}
+
+We prioritize Semantic Scholar (good abstract coverage, fast API) with
+OpenAlex as fallback (broader coverage, always free).
 
 \section{Module structure}
 
