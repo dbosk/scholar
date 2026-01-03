@@ -28,8 +28,9 @@ We define three core abstractions:
 \end{description}
 
 The chapter proceeds as follows: we first establish the data model
-(\cref{sec:data-model}), then implement the search coordination logic, and
-finally provide utility functions for filtering and deduplication.
+(\cref{sec:data-model})---including [[SearchFilters]] for constraining
+queries---then implement the [[Search]] class that coordinates queries across
+providers.
 
 
 \section{Overall design}

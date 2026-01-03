@@ -22,10 +22,10 @@ The CLI exposes every major Scholar capability as a subcommand:
 \item[[scholar llm-review]] Run LLM-assisted classification.
 \end{description}
 
-This chapter presents the implementation of each command, organized by
-functionality rather than alphabetically.
-We start with the core search command, then cover session management, and
-finish with utility commands.
+This chapter presents the implementation of each command.
+We start with the core search command, then cover utility commands (enrich,
+providers, cache, pdf, notes), session management, and finally LLM-assisted
+review.
 
 
 \section{Design decisions}

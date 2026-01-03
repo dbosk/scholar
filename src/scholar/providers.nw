@@ -2,9 +2,9 @@
 \label{providers-module}
 
 Every academic database speaks its own language.
-Semantic Scholar returns JSON with [[paperId]] fields; DBLP uses XML with
-[[@key]] attributes; Web of Science demands a completely different query
-syntax.
+Semantic Scholar returns JSON with [[paperId]] fields; DBLP returns JSON with
+[[@key]] identifiers in a different structure; Web of Science demands XML
+responses and a completely different query syntax.
 Yet from a user's perspective, these are all just sources of papers.
 The challenge is hiding this heterogeneity behind a uniform interface.
 
@@ -31,7 +31,7 @@ The chapter covers five providers:
 \item[OpenAlex] Open catalog of 250M+ works.
   Uses the [[pyalex]] client library.
 \item[DBLP] Computer science bibliography.
-  Direct REST API with XML responses.
+  Direct REST API with JSON responses.
 \item[Web of Science] Comprehensive citation index.
   REST API requiring authentication.
 \item[IEEE Xplore] IEEE technical literature.
