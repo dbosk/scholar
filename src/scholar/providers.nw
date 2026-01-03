@@ -763,7 +763,7 @@ def _convert_paper(self, paper_data: dict) -> Paper:
         venue=paper_data.get("venue"),
         url=paper_data.get("url"),
         pdf_url=pdf_url,
-        source=self.name,
+        sources=[self.name],
     )
 @
 
@@ -836,7 +836,7 @@ class TestSemanticScholarProvider:
             assert paper.title == "Test Paper"
             assert paper.year == 2024
             assert paper.doi == "10.1234/test"
-            assert paper.source == "s2"
+            assert paper.sources == ["s2"]
             assert "Alice" in paper.authors
             assert "Bob" in paper.authors
             assert paper.pdf_url == "https://arxiv.org/pdf/1234.5678.pdf"
@@ -918,7 +918,7 @@ class TestSemanticScholarGetPaperByDoi:
             assert paper.title == "Test Paper"
             assert paper.abstract == "This is the abstract"
             assert paper.doi == "10.1234/test"
-            assert paper.source == "s2"
+            assert paper.sources == ["s2"]
 
     def test_get_paper_by_doi_returns_none_on_404(self):
         """get_paper_by_doi() returns None when paper not found."""
@@ -1066,7 +1066,7 @@ class TestSemanticScholarIntegration:
             paper = papers[0]
             assert isinstance(paper, Paper)
             assert paper.title
-            assert paper.source == "s2"
+            assert paper.sources == ["s2"]
         except Exception as e:
             pytest.skip(f"Semantic Scholar API unavailable: {e}")
 @
@@ -1291,7 +1291,7 @@ def _convert_work(self, work: dict) -> Paper:
         venue=venue,
         url=work.get("id"),
         pdf_url=pdf_url,
-        source=self.name,
+        sources=[self.name],
     )
 @
 
@@ -1408,7 +1408,7 @@ class TestOpenAlexProvider:
             assert paper.year == 2024
             assert paper.doi == "10.1234/test"
             assert paper.venue == "Test Journal"
-            assert paper.source == "openalex"
+            assert paper.sources == ["openalex"]
 
     def test_search_handles_empty_results(self):
         """search() returns empty list when no results."""
@@ -1482,7 +1482,7 @@ class TestOpenAlexGetPaperByDoi:
             assert paper.title == "Test Paper"
             assert paper.abstract == "This is the abstract"
             assert paper.doi == "10.1234/test"
-            assert paper.source == "openalex"
+            assert paper.sources == ["openalex"]
 
     def test_get_paper_by_doi_returns_none_when_not_found(self):
         """get_paper_by_doi() returns None when paper not found."""
@@ -1549,7 +1549,7 @@ class TestOpenAlexIntegration:
             paper = papers[0]
             assert isinstance(paper, Paper)
             assert paper.title
-            assert paper.source == "openalex"
+            assert paper.sources == ["openalex"]
         except Exception as e:
             pytest.skip(f"OpenAlex API unavailable: {e}")
 @
@@ -1785,7 +1785,7 @@ def _convert_hit(self, hit: dict) -> Paper:
         abstract=None,  # DBLP doesn't provide abstracts
         venue=info.get("venue"),
         url=info.get("url") or info.get("ee"),
-        source=self.name,
+        sources=[self.name],
     )
 @
 
@@ -1862,7 +1862,7 @@ class TestDBLPProvider:
             assert paper.year == 2024
             assert paper.doi == "10.1234/test"
             assert paper.venue == "ICSE"
-            assert paper.source == "dblp"
+            assert paper.sources == ["dblp"]
 
     def test_search_handles_single_author(self):
         """search() handles single author as dict instead of list."""
@@ -2041,7 +2041,7 @@ class TestDBLPIntegration:
             paper = papers[0]
             assert isinstance(paper, Paper)
             assert paper.title
-            assert paper.source == "dblp"
+            assert paper.sources == ["dblp"]
         except Exception as e:
             pytest.skip(f"DBLP API unavailable: {e}")
 @
@@ -2521,7 +2521,7 @@ def _convert_starter_hit(self, hit: dict) -> Paper:
         abstract=None,  # Not available in Starter API
         venue=source.get("sourceTitle"),
         url=url,
-        source=self.name,
+        sources=[self.name],
     )
 @
 
@@ -2657,7 +2657,7 @@ def _convert_expanded_hit(self, rec: dict) -> Paper:
         abstract=abstract,
         venue=venue,
         url=url,
-        source=self.name,
+        sources=[self.name],
     )
 @
 
@@ -3054,7 +3054,7 @@ class TestWebOfScienceStarterAPI:
             assert paper.doi == "10.1234/test"
             assert paper.venue == "Nature"
             assert paper.abstract is None  # Starter API has no abstracts
-            assert paper.source == "wos"
+            assert paper.sources == ["wos"]
 
     def test_search_handles_empty_results(self):
         """search() returns empty list when no results."""
@@ -3294,7 +3294,7 @@ class TestWebOfScienceExpandedAPI:
             assert paper.doi == "10.1234/test"
             assert paper.venue == "Nature"
             assert paper.abstract == "This is the abstract."
-            assert paper.source == "wos"
+            assert paper.sources == ["wos"]
 
     def test_handles_malformed_nested_fields(self):
         """search() handles cases where nested fields are strings instead of dicts."""
@@ -3346,7 +3346,7 @@ class TestWebOfScienceExpandedAPI:
             assert paper.year is None
             assert paper.doi is None
             assert paper.abstract is None
-            assert paper.source == "wos"
+            assert paper.sources == ["wos"]
 
     def test_fetches_multiple_pages(self):
         """Expanded API fetches multiple pages when limit exceeds page size."""
@@ -3740,7 +3740,7 @@ class TestWebOfScienceIntegration:
             paper = papers[0]
             assert isinstance(paper, Paper)
             assert paper.title
-            assert paper.source == "wos"
+            assert paper.sources == ["wos"]
         except Exception as e:
             pytest.skip(f"Web of Science API unavailable: {e}")
 @
@@ -4023,7 +4023,7 @@ def _convert_article(self, article: dict) -> Paper:
         abstract=article.get("abstract"),
         venue=article.get("publication_title"),
         url=url,
-        source=self.name,
+        sources=[self.name],
     )
 @
 
@@ -4107,7 +4107,7 @@ class TestIEEEXploreProvider:
             assert paper.doi == "10.1109/TNN.2024.1234567"
             assert paper.abstract == "This paper presents..."
             assert paper.venue == "IEEE Trans. Neural Networks"
-            assert paper.source == "ieee"
+            assert paper.sources == ["ieee"]
 
     def test_search_handles_empty_results(self):
         """search() returns empty list when no results."""
@@ -4324,7 +4324,7 @@ class TestIEEEXploreIntegration:
             paper = papers[0]
             assert isinstance(paper, Paper)
             assert paper.title
-            assert paper.source == "ieee"
+            assert paper.sources == ["ieee"]
         except Exception as e:
             pytest.skip(f"IEEE Xplore API unavailable: {e}")
 @
