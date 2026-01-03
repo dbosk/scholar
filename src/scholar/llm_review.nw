@@ -1,26 +1,46 @@
 \chapter{LLM-Assisted Paper Review}
 \label{llm-review-module}
 
-\section{Introduction}
+Screening hundreds of papers is exhausting.
+A comprehensive search on \enquote{privacy-preserving machine learning} might
+return a thousand results; reviewing each abstract takes thirty seconds;
+the arithmetic is discouraging.
+Yet systematic reviews demand exactly this thoroughness---missing a relevant
+paper undermines the entire methodology.
 
-This module provides LLM-assisted paper classification for systematic
-literature reviews. Rather than replacing human judgment, the LLM learns
-from human-tagged examples and applies similar classifications to pending
-papers in a round-based workflow.
+Large language models offer a way to scale human judgment without replacing
+it.
+The key insight is that after reviewing a few dozen papers, a researcher has
+implicitly defined relevance criteria through their decisions.
+An LLM can learn these criteria from examples and apply them to remaining
+papers, dramatically reducing the screening burden while preserving human
+oversight.
+
+This chapter implements \emph{LLM-assisted classification}: a round-based
+workflow where the LLM suggests decisions based on human-tagged examples,
+and the researcher reviews (and corrects) these suggestions.
+Each correction refines the training set for the next round, creating a
+feedback loop that improves accuracy over time.
+
+The design prioritizes transparency.
+Every LLM decision includes a confidence score (0.0--1.0), enabling reviewers
+to prioritize uncertain classifications.
+Decisions track their source (human, LLM-unreviewed, LLM-reviewed), ensuring
+the audit trail distinguishes machine suggestions from human judgments.
 
 \subsection{Design Goals}
 
 \begin{description}
-\item[Interface Independence] All functions are usable from Python code,
-  CLI, and TUI without coupling to any specific interface.
-\item[Round-Based Learning] LLM decisions are reviewed by humans;
-  corrections become training examples for future rounds.
-\item[Source Tracking] Decisions track whether they are human, LLM-unreviewed,
-  or LLM-reviewed, enabling progress monitoring and confidence prioritization.
-\item[Example Requirements] Only tagged papers count as training examples;
-  a minimum of 5 total examples (at least 1 kept, 1 discarded) are required.
-\item[Automatic Enrichment] Papers without abstracts are automatically
-  enriched before classification, ensuring the LLM has sufficient context.
+\item[Round-based learning] LLM decisions are reviewed by humans; corrections
+  become training examples for future rounds.
+\item[Confidence-based prioritization] Reviewers focus on uncertain
+  classifications first, maximizing impact of limited human attention.
+\item[Source tracking] Decisions record whether they are human-made,
+  LLM-suggested, or LLM-suggested-and-reviewed.
+\item[Automatic enrichment] Papers without abstracts are enriched before
+  classification, ensuring the LLM has sufficient context.
+\item[Model flexibility] Uses Simon Willison's [[llm]] package, supporting
+  OpenAI, Anthropic, local models, and other providers.
 \end{description}
 
 \subsection{Workflow Overview}
