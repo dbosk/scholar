@@ -10,14 +10,27 @@
 \maketitle
 
 \begin{abstract}
-Scholar is a command-line tool for conducting structured literature searches
-across multiple academic databases. It provides a unified interface for
-searching Semantic Scholar, OpenAlex, DBLP, Web of Science, and IEEE Xplore,
-with caching to manage API rate limits and an interactive TUI for reviewing
-results.
+Systematic literature reviews are fundamental to rigorous scholarship, yet
+conducting them remains tedious and error-prone.
+Researchers must search multiple databases with different interfaces, merge
+and deduplicate results, and meticulously document their screening decisions.
+Scholar addresses these challenges through a command-line tool that unifies
+access to five major academic databases---Semantic Scholar, OpenAlex, DBLP,
+Web of Science, and IEEE Xplore---while automating the bookkeeping that
+systematic reviews demand.
 
-This document is the complete literate source of Scholar, combining
-documentation and implementation in a single narrative.
+The tool centers on a terminal-based review interface where researchers
+navigate papers, read abstracts, record keep/discard decisions with
+justifications, and organize findings with themes and notes.
+For large result sets, an LLM-assisted classification system learns from
+user decisions to suggest classifications for pending papers, dramatically
+reducing manual screening effort while maintaining human oversight.
+Intelligent caching, automatic deduplication, and PDF management round out
+the workflow support.
+
+This document is the complete literate source of Scholar, weaving together
+the design rationale, implementation, and tests into a unified narrative.
+The code is extracted (``tangled'') from this document using noweb.
 \end{abstract}
 \vfill
 \inputminted[linenos=false]{text}{../LICENSE}
