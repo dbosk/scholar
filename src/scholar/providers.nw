@@ -1,19 +1,41 @@
 \chapter{Search Providers}
 \label{providers-module}
 
-\section{Introduction}
+Every academic database speaks its own language.
+Semantic Scholar returns JSON with [[paperId]] fields; DBLP uses XML with
+[[@key]] attributes; Web of Science demands a completely different query
+syntax.
+Yet from a user's perspective, these are all just sources of papers.
+The challenge is hiding this heterogeneity behind a uniform interface.
 
-This module implements search providers---adapters that connect Scholar to
-various bibliographic databases.
-Each provider knows how to query a specific database and convert results to
-our common [[Paper]] type.
+This chapter implements \emph{search providers}---adapters that translate
+between Scholar's internal [[Paper]] representation and each database's
+native API.
+A provider handles three responsibilities:
+\begin{enumerate}
+\item Constructing valid API requests from a query string.
+\item Parsing the response format into [[Paper]] objects.
+\item Managing authentication (API keys) where required.
+\end{enumerate}
 
-The provider abstraction allows us to:
+We use Python's [[Protocol]] type for structural typing: any object with the
+right shape is a valid provider, no inheritance required.
+This enables clean testing (mock objects just work), future extensibility
+(third-party providers need not depend on Scholar), and explicit contracts
+that static type checkers can verify.
+
+The chapter covers five providers:
 \begin{description}
-\item[Add new databases] without modifying the core search logic.
-\item[Test in isolation] by mocking individual providers.
-\item[Configure per-provider] settings like API keys and rate limits.
-\item[Cache results] to avoid redundant API calls and respect rate limits.
+\item[Semantic Scholar] AI-powered research database with 200M+ papers.
+  Uses the official [[semanticscholar]] client library.
+\item[OpenAlex] Open catalog of 250M+ works.
+  Uses the [[pyalex]] client library.
+\item[DBLP] Computer science bibliography.
+  Direct REST API with XML responses.
+\item[Web of Science] Comprehensive citation index.
+  REST API requiring authentication.
+\item[IEEE Xplore] IEEE technical literature.
+  REST API requiring authentication.
 \end{description}
 
 \section{Caching}
