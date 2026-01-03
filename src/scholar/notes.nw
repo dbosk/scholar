@@ -1,19 +1,28 @@
 \chapter{Paper Notes and Decision Persistence}
 \label{notes-module}
 
-\section{Introduction}
+A systematic review is not a single session's work.
+Researchers return to the same papers over days or weeks, building up
+understanding through repeated reading.
+They jot down methodological concerns, note connections to other papers,
+and record why certain studies were excluded.
+This accumulated knowledge must survive session boundaries---closing the
+terminal should not erase hours of careful annotation.
 
-When conducting systematic literature reviews, researchers need to:
-\begin{itemize}
-\item Take notes on individual papers that persist across sessions
-\item Remember previous keep/discard decisions when re-running the same search
-\item Include notes in generated reports
-\end{itemize}
+This chapter implements persistent storage for user-generated content:
+notes attached to individual papers and keep/discard decisions from review
+sessions.
+Unlike the search cache (which stores API results and may be cleared for
+fresh data), this module stores \emph{researcher work product} that must
+never be automatically deleted.
 
-This module provides persistent storage for paper notes (global, per-paper) and
-search decisions (per-query). Unlike the search cache which stores API results,
-this module stores user-generated content that should never be automatically
-cleared.
+The key design challenge is paper identity.
+The same paper appears across multiple searches, possibly from different
+providers with different metadata.
+We need a stable identifier so that notes attached in one session remain
+attached when the paper reappears later.
+DOIs provide this when available; otherwise we hash the title and first
+author to create a synthetic identifier.
 
 \subsection{Design overview}
 
