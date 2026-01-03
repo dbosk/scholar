@@ -1,20 +1,34 @@
 \chapter{Caching}
 \label{cache-module}
 
-\section{Introduction}
+Academic database APIs present a fundamental tension: we need fresh results to
+discover new research, but we also need stable results for reproducible
+reviews.
+Worse, most APIs impose rate limits that make repeated queries impractical
+during iterative workflow refinement.
 
-When conducting systematic literature reviews, researchers often run the same
-search multiple times---refining queries, re-running reports, or continuing
-work across sessions.
-Each search hits external APIs that impose rate limits and add latency.
-Caching search results provides two key benefits:
+This chapter implements a caching layer that sits between providers and the
+network, transparently storing and retrieving search results.
+The cache is invisible during normal operation---searches just work faster---but
+users can inspect and clear it when they need fresh data.
+
+Caching provides two distinct benefits:
 \begin{description}
-\item[API rate limit management] Many academic databases impose strict rate
-  limits. Caching avoids redundant requests when refining searches or
-  re-running reports.
-\item[Reproducibility] Cached results ensure that re-running a search produces
-  identical results, supporting systematic review methodology.
+\item[Rate limit management] Semantic Scholar allows roughly one request per
+  second without an API key; Web of Science is even stricter.
+  Caching lets users refine queries, regenerate reports, and resume sessions
+  without hitting these limits.
+\item[Reproducibility] A systematic review must document exactly which papers
+  were found.
+  Cached results ensure that re-running a search weeks later produces identical
+  output, supporting methodological rigor.
 \end{description}
+
+We deliberately avoid cache expiration.
+Fresh results require explicit action ([[scholar cache clear]]), because
+implicit staleness would undermine reproducibility---users would not know
+whether differences stem from new publications or cache invalidation.
+
 
 \section{Design overview}
 
