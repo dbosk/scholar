@@ -1,22 +1,36 @@
 \chapter{The Core Module}
 \label{scholar-module}
 
-\section{Introduction}
+This chapter establishes the foundational abstractions upon which all of
+Scholar is built.
+Before we can search databases, cache results, or review papers, we need a
+common vocabulary: what \emph{is} a paper?
+What does a search result contain?
+How do we represent queries in a way that works across databases with
+different capabilities?
 
-Systematic literature reviews and structured searches are essential for
-rigorous academic research.
-However, searching across multiple databases---such as Web of Science,
-IEEE~Xplore, Semantic~Scholar, and OpenAlex---is tedious and error-prone.
-Each database has its own query syntax, interface, and export format.
-Reproducing a search requires careful documentation of queries, filters, and
-timestamps.
+The answers to these questions shape every subsequent chapter.
+A paper from Semantic Scholar must be comparable to one from DBLP for
+deduplication to work.
+A search result must capture enough metadata for reproducible reporting.
+Get these abstractions wrong, and complexity propagates throughout the system;
+get them right, and the rest follows naturally.
 
-This program, \emph{Scholar}, provides a unified interface for structured
-searches across multiple bibliographic databases.
-It produces reproducible reports documenting the search process: the queries
-used, filters applied, timestamps, and resulting papers.
-This supports the transparency required for systematic reviews while reducing
-manual effort.
+We define three core abstractions:
+\begin{description}
+\item[Paper] The fundamental unit of scholarly output---a title, authors, year,
+  and optional metadata like abstract, DOI, and venue.
+  Papers from different sources are unified through this common representation.
+\item[SearchResult] A timestamped collection of papers from a single provider,
+  preserving the provenance needed for reproducible documentation.
+\item[Search] The orchestrator that coordinates queries across multiple
+  providers, merges results, and applies filters.
+\end{description}
+
+The chapter proceeds as follows: we first establish the data model
+(\cref{sec:data-model}), then implement the search coordination logic, and
+finally provide utility functions for filtering and deduplication.
+
 
 \section{Overall design}
 
