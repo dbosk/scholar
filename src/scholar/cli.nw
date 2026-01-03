@@ -1,19 +1,31 @@
 \chapter{Command-Line Interface}
 \label{cli-module}
 
-\section{Introduction}
+The command line is Scholar's primary interface for non-interactive use.
+While the TUI (\cref{tui-module}) provides an interactive review experience,
+the CLI serves complementary purposes: quick searches, scripted workflows,
+and pipeline integration.
+A researcher might use the CLI to run a search, pipe the results to [[jq]] for
+filtering, then export to BibTeX---all without leaving the shell.
 
-This document describes the command-line interface for Scholar.
-While the core library (\texttt{scholar.py}) provides the data model and search
-functionality, users need a convenient way to invoke searches from the terminal.
-
-The CLI serves several purposes:
+The CLI exposes every major Scholar capability as a subcommand:
 \begin{description}
-\item[Direct invocation] Users can run searches without writing Python code.
-\item[Scripting] The CLI supports output formats suitable for shell pipelines.
-\item[Extensibility] The subcommand structure allows adding new functionality
-  (like snowball searching) without modifying the core interface.
+\item[[scholar search]] Query multiple databases, with options for output
+  format and interactive review.
+\item[[scholar sessions]] Manage saved review sessions: list, resume, export.
+\item[[scholar providers]] Show available search providers and their
+  configuration status.
+\item[[scholar cache]] Inspect and clear the search result cache.
+\item[[scholar pdf]] Download and manage paper PDFs.
+\item[[scholar notes]] Access the notes database.
+\item[[scholar enrich]] Fetch missing abstracts for papers.
+\item[[scholar llm-review]] Run LLM-assisted classification.
 \end{description}
+
+This chapter presents the implementation of each command, organized by
+functionality rather than alphabetically.
+We start with the core search command, then cover session management, and
+finish with utility commands.
 
 
 \section{Design decisions}
