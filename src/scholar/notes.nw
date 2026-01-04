@@ -24,7 +24,7 @@ attached when the paper reappears later.
 DOIs provide this when available; otherwise we hash the title and first
 author to create a synthetic identifier.
 
-\subsection{Design overview}
+\section{Design overview}
 
 We store data in the user's data directory (not cache directory):
 \begin{description}
@@ -39,7 +39,7 @@ Paper identity uses DOI when available, otherwise a hash of the lowercase title
 combined with the first author's last name. This provides better disambiguation
 than title alone.
 
-\subsection{Module structure}
+\section{Module structure}
 
 <<[[notes.py]]>>=
 """
