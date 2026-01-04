@@ -22,7 +22,7 @@ While most users interact with reviews through the interactive interface,
 the underlying logic is accessible programmatically, enabling automation
 and integration with other tools.
 
-\subsection{Design Goals}
+\section{Design Goals}
 
 \begin{description}
 \item[Session persistence] Reviews can span days or weeks; progress must
@@ -36,7 +36,7 @@ and integration with other tools.
   scripting and batch processing.
 \end{description}
 
-\subsection{Tags: Themes and Motivations}
+\section{Tags: Themes and Motivations}
 
 The module uses a unified \enquote{tags} concept for both:
 \begin{description}
