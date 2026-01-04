@@ -28,7 +28,7 @@ to prioritize uncertain classifications.
 Decisions track their source (human, LLM-unreviewed, LLM-reviewed), ensuring
 the audit trail distinguishes machine suggestions from human judgments.
 
-\subsection{Design Goals}
+\section{Design Goals}
 
 \begin{description}
 \item[Round-based learning] LLM decisions are reviewed by humans; corrections
@@ -43,7 +43,7 @@ the audit trail distinguishes machine suggestions from human judgments.
   OpenAI, Anthropic, local models, and other providers.
 \end{description}
 
-\subsection{Workflow Overview}
+\section{Workflow Overview}
 
 The typical LLM-assisted review workflow:
 \begin{enumerate}

@@ -22,7 +22,7 @@ While most users interact with reviews through the interactive interface,
 the underlying logic is accessible programmatically, enabling automation
 and integration with other tools.
 
-\subsection{Design Goals}
+\section{Design Goals}
 
 \begin{description}
 \item[Session persistence] Reviews can span days or weeks; progress must
@@ -36,7 +36,7 @@ and integration with other tools.
   scripting and batch processing.
 \end{description}
 
-\subsection{Tags: Themes and Motivations}
+\section{Tags: Themes and Motivations}
 
 The module uses a unified \enquote{tags} concept for both:
 \begin{description}
@@ -1145,7 +1145,7 @@ def save_session(session: ReviewSession) -> Path:
                     "venue": d.paper.venue,
                     "url": d.paper.url,
                     "pdf_url": d.paper.pdf_url,
-                    "source": d.paper.source,
+                    "sources": d.paper.sources,
                 },
             }
             for d in session.decisions
@@ -1218,7 +1218,10 @@ def load_session(name_or_query: str) -> ReviewSession | None:
                 venue=paper_data.get("venue"),
                 url=paper_data.get("url"),
                 pdf_url=paper_data.get("pdf_url"),
-                source=paper_data.get("source", "session"),
+                sources=paper_data.get("sources") or (
+                    [s.strip() for s in paper_data["source"].split(",")]
+                    if paper_data.get("source") else []
+                ),
             )
             status = DecisionStatus(dec_data["status"])
             tags = dec_data.get("tags", [])

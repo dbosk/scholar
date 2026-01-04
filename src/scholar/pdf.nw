@@ -19,7 +19,7 @@ across multiple searches.
 We address this with a content-addressed cache that persists independently of
 search results, providing automatic deduplication and surviving cache clears.
 
-\subsection{Design Goals}
+\section{Design Goals}
 
 The PDF management module is designed with these goals:
 \begin{description}
@@ -32,7 +32,7 @@ The PDF management module is designed with these goals:
 \item[Platform independence] Works on Linux, macOS, and Windows.
 \end{description}
 
-\subsection{Why a Separate PDF Cache?}
+\section{Why a Separate PDF Cache?}
 
 PDFs are cached separately from search results for several reasons:
 \begin{description}

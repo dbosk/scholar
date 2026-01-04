@@ -147,14 +147,14 @@ class Paper:
     venue: str | None = None
     url: str | None = None
     pdf_url: str | None = None
-    source: str | None = None
+    sources: list[str] = field(default_factory=list)
 
     <<paper methods>>
 @
 
 We use a dataclass for simplicity.
-The [[source]] field tracks which database returned this paper, useful for
-provenance in reports.
+The [[sources]] field tracks which databases returned this paper, useful for
+provenance in reports when merging results from multiple providers.
 
 \subsubsection{Paper identity and deduplication}
 
@@ -191,6 +191,8 @@ The [[merge_with]] method combines two equal papers (same DOI or title),
 keeping non-[[None]] values from either source.
 We prefer [[self]]'s values when both have data, since the caller controls
 the order of merging.
+The [[sources]] lists are combined as a union, preserving the order with
+[[self]]'s sources first.
 
 <<paper methods>>=
 def merge_with(self, other: "Paper") -> "Paper":
@@ -198,7 +200,7 @@ def merge_with(self, other: "Paper") -> "Paper":
     Create a consolidated paper from two equal papers.
 
     Keeps non-None values, preferring self when both have values.
-    Combines sources if different.
+    Combines sources lists (union, preserving order).
 
     Raises:
         ValueError: If papers are not equal (different DOI/title).
@@ -206,12 +208,11 @@ def merge_with(self, other: "Paper") -> "Paper":
     if self != other:
         raise ValueError("Can only merge equal papers")
 
-    # Combine sources for provenance tracking
-    sources = []
-    if self.source:
-        sources.append(self.source)
-    if other.source and other.source not in sources:
-        sources.append(other.source)
+    # Combine sources for provenance tracking (union, preserving order)
+    combined_sources = list(self.sources)
+    for src in other.sources:
+        if src not in combined_sources:
+            combined_sources.append(src)
 
     return Paper(
         title=self.title or other.title,
@@ -222,7 +223,7 @@ def merge_with(self, other: "Paper") -> "Paper":
         venue=self.venue or other.venue,
         url=self.url or other.url,
         pdf_url=self.pdf_url or other.pdf_url,
-        source=", ".join(sources) if sources else None,
+        sources=combined_sources,
     )
 @
 
@@ -264,10 +265,10 @@ class TestPaperMergeWith:
 
     def test_merge_keeps_abstract_from_other(self):
         """Merging keeps abstract from paper that has it."""
-        p1 = Paper(title="Test", authors=["A"], doi="10.1/test", source="dblp")
+        p1 = Paper(title="Test", authors=["A"], doi="10.1/test", sources=["dblp"])
         p2 = Paper(
             title="Test", authors=["A"], doi="10.1/test",
-            abstract="This is the abstract", source="s2"
+            abstract="This is the abstract", sources=["s2"]
         )
         merged = p1.merge_with(p2)
         assert merged.abstract == "This is the abstract"
@@ -276,22 +277,22 @@ class TestPaperMergeWith:
         """When both have a value, prefer self."""
         p1 = Paper(
             title="Test", authors=["A"], doi="10.1/test",
-            venue="Conference A", source="provider1"
+            venue="Conference A", sources=["provider1"]
         )
         p2 = Paper(
             title="Test", authors=["A"], doi="10.1/test",
-            venue="Conference B", source="provider2"
+            venue="Conference B", sources=["provider2"]
         )
         merged = p1.merge_with(p2)
         assert merged.venue == "Conference A"
 
     def test_merge_combines_sources(self):
         """Merging combines sources from both papers."""
-        p1 = Paper(title="Test", authors=["A"], source="dblp")
-        p2 = Paper(title="test", authors=["B"], source="s2")
+        p1 = Paper(title="Test", authors=["A"], sources=["dblp"])
+        p2 = Paper(title="test", authors=["B"], sources=["s2"])
         merged = p1.merge_with(p2)
-        assert "dblp" in merged.source
-        assert "s2" in merged.source
+        assert "dblp" in merged.sources
+        assert "s2" in merged.sources
 
     def test_merge_raises_for_unequal_papers(self):
         """Cannot merge papers that aren't equal."""
@@ -304,12 +305,12 @@ class TestPaperMergeWith:
         """Merging fills in all missing fields from other."""
         p1 = Paper(
             title="Test", authors=["A"], doi="10.1/test",
-            year=2024, source="provider1"
+            year=2024, sources=["provider1"]
         )
         p2 = Paper(
             title="Test", authors=["A"], doi="10.1/test",
             abstract="Abstract", venue="Venue", url="http://example.com",
-            pdf_url="http://example.com/pdf", source="provider2"
+            pdf_url="http://example.com/pdf", sources=["provider2"]
         )
         merged = p1.merge_with(p2)
         assert merged.year == 2024  # From p1
@@ -815,12 +816,12 @@ class TestSearchResult:
         # DBLP paper without abstract
         p1 = Paper(
             title="Paper A", authors=["Author"], doi="10.1/a",
-            source="dblp"
+            sources=["dblp"]
         )
         # Semantic Scholar paper with abstract
         p2 = Paper(
             title="Paper A", authors=["Author"], doi="10.1/a",
-            abstract="This is the abstract", source="s2"
+            abstract="This is the abstract", sources=["s2"]
         )
 
         r1 = SearchResult(
@@ -837,8 +838,8 @@ class TestSearchResult:
         # Consolidated paper should have the abstract
         assert merged.papers[0].abstract == "This is the abstract"
         # And combined sources
-        assert "dblp" in merged.papers[0].source
-        assert "s2" in merged.papers[0].source
+        assert "dblp" in merged.papers[0].sources
+        assert "s2" in merged.papers[0].sources
 @
 
 
@@ -1008,7 +1009,7 @@ class TestSearch:
 We collect the imports used throughout the module:
 
 <<imports>>=
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import datetime
 import logging
 
