@@ -149,6 +149,8 @@ class Paper:
     pdf_url: str | None = None
     citation_count: int | None = None
     sources: list[str] = field(default_factory=list)
+    references: list["Paper"] | None = None
+    citations: list["Paper"] | None = None
 
     <<paper methods>>
 @
@@ -237,6 +239,8 @@ def merge_with(self, other: "Paper") -> "Paper":
         pdf_url=self.pdf_url or other.pdf_url,
         citation_count=merged_citation_count,
         sources=combined_sources,
+        references=self.references if self.references is not None else other.references,
+        citations=self.citations if self.citations is not None else other.citations,
     )
 @
 

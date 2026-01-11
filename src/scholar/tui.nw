@@ -393,8 +393,6 @@ class AbstractScreen(Screen[None]):
         Binding("p", "open_pdf", "Open PDF"),
         Binding("n", "edit_notes", "Notes"),
         Binding("e", "enrich", "Enrich"),
-        Binding("r", "toggle_references", "Refs"),
-        Binding("c", "toggle_citations", "Cites"),
         Binding("C", "confirm_llm", "Confirm"),
         Binding("a", "add_references", "+Refs"),
         Binding("A", "add_citations", "+Cites"),
@@ -408,8 +406,6 @@ class AbstractScreen(Screen[None]):
         self.session = session
         self.review_mode = review_mode
         self.pdf_status: str = ""
-        self.show_references: bool = False
-        self.show_citations: bool = False
     
     def compose(self) -> ComposeResult:
         paper = self.decision.paper
@@ -464,18 +460,18 @@ class AbstractScreen(Screen[None]):
                 tags_text = ", ".join(self.decision.tags)
                 yield Static(tags_text)
             
-            # Show references if toggled on
-            if self.show_references and self.decision.cached_references:
+            # Show references if paper has them
+            if paper.references:
                 yield Static("")
-                yield Static(f"[bold blue]─── References ({len(self.decision.cached_references)}) ───[/bold blue]")
-                for ref_paper in self.decision.cached_references:
+                yield Static(f"[bold blue]─── References ({len(paper.references)}) ───[/bold blue]")
+                for ref_paper in paper.references:
                     yield self._render_paper_entry(ref_paper)
             
-            # Show citations if toggled on
-            if self.show_citations and self.decision.cached_citations:
+            # Show citations if paper has them
+            if paper.citations:
                 yield Static("")
-                yield Static(f"[bold magenta]─── Citing Papers ({len(self.decision.cached_citations)}) ───[/bold magenta]")
-                for cite_paper in self.decision.cached_citations:
+                yield Static(f"[bold magenta]─── Citing Papers ({len(paper.citations)}) ───[/bold magenta]")
+                for cite_paper in paper.citations:
                     yield self._render_paper_entry(cite_paper)
             
             yield Static("", id="pdf-status")
@@ -490,20 +486,17 @@ class AbstractScreen(Screen[None]):
         self.refresh(recompose=True)
     
     def action_enrich(self) -> None:
-        """Fetch missing abstract and PDF URL from Semantic Scholar or OpenAlex."""
+        """Fetch missing metadata, references, and citations."""
         paper = self.decision.paper
         
         if not paper.doi:
             self.notify("No DOI available for enrichment", severity="warning")
             return
         
-        if not needs_enrichment(paper, ["abstract", "pdf_url"]):
-            self.notify("Paper already complete", severity="information")
-            return
+        self.notify("Enriching paper (metadata, refs, cites)...", severity="information")
         
-        self.notify("Enriching paper...", severity="information")
-        
-        enriched = enrich_paper(paper)
+        from scholar.enrich import enrich_paper
+        enriched = enrich_paper(paper, fetch_refs_cites=True)
         
         # Check what was enriched
         enriched_fields = []
@@ -511,13 +504,17 @@ class AbstractScreen(Screen[None]):
             enriched_fields.append("abstract")
         if enriched.pdf_url and enriched.pdf_url != paper.pdf_url:
             enriched_fields.append("PDF URL")
+        if enriched.references is not None and paper.references is None:
+            enriched_fields.append(f"{len(enriched.references)} refs")
+        if enriched.citations is not None and paper.citations is None:
+            enriched_fields.append(f"{len(enriched.citations)} cites")
         
         if enriched_fields:
             self.decision.paper = enriched
             self.notify(f"Enriched: {', '.join(enriched_fields)}", severity="information")
             self.refresh(recompose=True)
         else:
-            self.notify("Could not enrich from any provider", severity="warning")
+            self.notify("Paper already fully enriched", severity="information")
     
     def action_open_pdf(self) -> None:
         """Download and open the PDF."""
@@ -570,66 +567,12 @@ class AbstractScreen(Screen[None]):
             f"    [dim]{authors}[/dim] {citations}"
         )
 
-    def action_toggle_references(self) -> None:
-        """Show references, fetching if not already cached."""
-        paper = self.decision.paper
-
-        if self.decision.cached_references is None:
-            # Fetch references
-            if not paper.doi:
-                self.notify("No DOI available", severity="warning")
-                return
-
-            self.notify("Fetching references from all providers...", severity="information")
-            from scholar.providers import fetch_references
-            from scholar.enrich import enrich_papers
-
-            try:
-                refs = fetch_references(paper.doi)
-                # Enrich papers that may have incomplete metadata
-                refs = enrich_papers(refs)
-                self.decision.cached_references = refs
-                self.notify(f"Found {len(refs)} references")
-            except Exception as e:
-                self.notify(f"Error: {e}", severity="error")
-                return
-
-        self.show_references = True
-        self.refresh(recompose=True)
-
-    def action_toggle_citations(self) -> None:
-        """Show citations, fetching if not already cached."""
-        paper = self.decision.paper
-
-        if self.decision.cached_citations is None:
-            # Fetch citations
-            if not paper.doi:
-                self.notify("No DOI available", severity="warning")
-                return
-
-            self.notify("Fetching citations from all providers...", severity="information")
-            from scholar.providers import fetch_citations
-            from scholar.enrich import enrich_papers
-
-            try:
-                cites = fetch_citations(paper.doi)
-                # Enrich papers that may have incomplete metadata
-                cites = enrich_papers(cites)
-                self.decision.cached_citations = cites
-                self.notify(f"Found {len(cites)} citing papers")
-            except Exception as e:
-                self.notify(f"Error: {e}", severity="error")
-                return
-
-        self.show_citations = True
-        self.refresh(recompose=True)
-
     def action_add_references(self) -> None:
         """Add references of this paper to the session for review."""
         paper = self.decision.paper
 
-        # Ensure we have cached references
-        if self.decision.cached_references is None:
+        # Ensure we have references on the paper
+        if paper.references is None:
             if not paper.doi:
                 self.notify("No DOI available", severity="warning")
                 return
@@ -641,12 +584,27 @@ class AbstractScreen(Screen[None]):
             try:
                 refs = fetch_references(paper.doi)
                 refs = enrich_papers(refs)
-                self.decision.cached_references = refs
+                # Store on the paper object
+                self.decision.paper = Paper(
+                    title=paper.title,
+                    authors=paper.authors,
+                    year=paper.year,
+                    doi=paper.doi,
+                    abstract=paper.abstract,
+                    venue=paper.venue,
+                    url=paper.url,
+                    pdf_url=paper.pdf_url,
+                    citation_count=paper.citation_count,
+                    sources=paper.sources,
+                    references=refs,
+                    citations=paper.citations,
+                )
+                paper = self.decision.paper
             except Exception as e:
                 self.notify(f"Error: {e}", severity="error")
                 return
 
-        if not self.decision.cached_references:
+        if not paper.references:
             self.notify("No references found", severity="warning")
             return
 
@@ -655,7 +613,7 @@ class AbstractScreen(Screen[None]):
 
         source_id = get_paper_id(paper)
         added = self.session.add_papers_from_snowball(
-            papers=self.decision.cached_references,
+            papers=paper.references,
             source_paper_ids=[source_id],
             direction="references",
         )
@@ -665,8 +623,8 @@ class AbstractScreen(Screen[None]):
         """Add citing papers of this paper to the session for review."""
         paper = self.decision.paper
 
-        # Ensure we have cached citations
-        if self.decision.cached_citations is None:
+        # Ensure we have citations on the paper
+        if paper.citations is None:
             if not paper.doi:
                 self.notify("No DOI available", severity="warning")
                 return
@@ -678,12 +636,27 @@ class AbstractScreen(Screen[None]):
             try:
                 cites = fetch_citations(paper.doi)
                 cites = enrich_papers(cites)
-                self.decision.cached_citations = cites
+                # Store on the paper object
+                self.decision.paper = Paper(
+                    title=paper.title,
+                    authors=paper.authors,
+                    year=paper.year,
+                    doi=paper.doi,
+                    abstract=paper.abstract,
+                    venue=paper.venue,
+                    url=paper.url,
+                    pdf_url=paper.pdf_url,
+                    citation_count=paper.citation_count,
+                    sources=paper.sources,
+                    references=paper.references,
+                    citations=cites,
+                )
+                paper = self.decision.paper
             except Exception as e:
                 self.notify(f"Error: {e}", severity="error")
                 return
 
-        if not self.decision.cached_citations:
+        if not paper.citations:
             self.notify("No citing papers found", severity="warning")
             return
 
@@ -692,7 +665,7 @@ class AbstractScreen(Screen[None]):
 
         source_id = get_paper_id(paper)
         added = self.session.add_papers_from_snowball(
-            papers=self.decision.cached_citations,
+            papers=paper.citations,
             source_paper_ids=[source_id],
             direction="citations",
         )

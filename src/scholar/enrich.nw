@@ -105,6 +105,7 @@ ENRICHABLE_FIELDS = ["title", "authors", "abstract", "year", "venue", "pdf_url"]
 def enrich_paper(
     paper: Paper,
     fields: list[str] | None = None,
+    fetch_refs_cites: bool = False,
 ) -> Paper:
     """
     Enrich a paper by fetching missing fields from other providers.
@@ -115,10 +116,15 @@ def enrich_paper(
     - Papers from snowballing that may only have a DOI
     - Any paper missing title, authors, abstract, year, venue, or pdf_url
 
+    When [[fetch_refs_cites]] is True, also fetches references and citations
+    if they are not already present on the paper. The refs/cites are stored
+    directly on the Paper object, so they persist with any caching.
+
     Args:
         paper: The paper to enrich.
         fields: Fields to check and enrich. If None, checks all enrichable
             fields (title, authors, abstract, year, venue, pdf_url).
+        fetch_refs_cites: If True, also fetch references and citations.
 
     Returns:
         A new Paper with enriched fields, or the original if enrichment
@@ -127,44 +133,114 @@ def enrich_paper(
     if fields is None:
         fields = ENRICHABLE_FIELDS
 
-    # Check if enrichment is needed
-    if not needs_enrichment(paper, fields):
+    result = paper
+
+    # Check if metadata enrichment is needed
+    if needs_enrichment(paper, fields):
+        # Need DOI for lookup
+        if not paper.doi:
+            title_preview = _title_preview(paper)
+            logger.debug(f"Paper '{title_preview}' has no DOI, cannot enrich")
+        else:
+            title_preview = _title_preview(paper)
+            logger.debug(f"Enriching paper '{title_preview}' (DOI: {paper.doi})")
+
+            # Try each enrichment provider in order
+            for provider_name in ENRICHMENT_PROVIDERS:
+                provider = get_provider(provider_name)
+                if provider is None:
+                    continue
+
+                if not hasattr(provider, "get_paper_by_doi"):
+                    continue
+
+                logger.debug(f"Trying to enrich from {provider_name}")
+                enriched = provider.get_paper_by_doi(paper.doi)
+                if enriched is None:
+                    logger.debug(f"{provider_name} returned no data for DOI {paper.doi}")
+                    continue
+
+                # Merge the enriched data into our paper
+                # We want to keep our paper's existing data and fill in gaps
+                logger.info(f"Successfully enriched paper from {provider_name}")
+                result = paper.merge_with(enriched)
+                break
+    else:
         title_preview = _title_preview(paper)
-        logger.debug(f"Paper '{title_preview}' doesn't need enrichment")
-        return paper
+        logger.debug(f"Paper '{title_preview}' doesn't need metadata enrichment")
 
-    # Need DOI for lookup
-    if not paper.doi:
-        title_preview = _title_preview(paper)
-        logger.debug(f"Paper '{title_preview}' has no DOI, cannot enrich")
-        return paper
+    # Fetch references and citations if requested
+    if fetch_refs_cites and result.doi:
+        result = _fetch_refs_cites(result)
 
-    title_preview = _title_preview(paper)
-    logger.debug(f"Enriching paper '{title_preview}' (DOI: {paper.doi})")
+    return result
 
-    # Try each enrichment provider in order
-    for provider_name in ENRICHMENT_PROVIDERS:
-        provider = get_provider(provider_name)
-        if provider is None:
-            continue
 
-        if not hasattr(provider, "get_paper_by_doi"):
-            continue
+def _fetch_refs_cites(paper: Paper) -> Paper:
+    """
+    Fetch references and citations for a paper if not already present.
 
-        logger.debug(f"Trying to enrich from {provider_name}")
-        enriched = provider.get_paper_by_doi(paper.doi)
-        if enriched is None:
-            logger.debug(f"{provider_name} returned no data for DOI {paper.doi}")
-            continue
+    Args:
+        paper: The paper to fetch refs/cites for (must have DOI).
 
-        # Merge the enriched data into our paper
-        # We want to keep our paper's existing data and fill in gaps
-        logger.info(f"Successfully enriched paper from {provider_name}")
-        return paper.merge_with(enriched)
+    Returns:
+        A new Paper with references and citations populated.
+    """
+    from scholar.providers import fetch_references, fetch_citations
 
-    # No provider could enrich the paper
-    logger.debug(f"No provider could enrich paper with DOI {paper.doi}")
-    return paper
+    result = paper
+
+    # Fetch references if needed
+    if result.references is None:
+        logger.info(f"Fetching references for {_title_preview(result)}")
+        try:
+            refs = fetch_references(result.doi)
+            # Enrich the references too (metadata only, no recursive refs/cites)
+            refs = [enrich_paper(r, fetch_refs_cites=False) for r in refs]
+            result = Paper(
+                title=result.title,
+                authors=result.authors,
+                year=result.year,
+                doi=result.doi,
+                abstract=result.abstract,
+                venue=result.venue,
+                url=result.url,
+                pdf_url=result.pdf_url,
+                citation_count=result.citation_count,
+                sources=result.sources,
+                references=refs,
+                citations=result.citations,
+            )
+            logger.info(f"Found {len(refs)} references")
+        except Exception as e:
+            logger.warning(f"Failed to fetch references: {e}")
+
+    # Fetch citations if needed
+    if result.citations is None:
+        logger.info(f"Fetching citations for {_title_preview(result)}")
+        try:
+            cites = fetch_citations(result.doi)
+            # Enrich the citations too (metadata only, no recursive refs/cites)
+            cites = [enrich_paper(c, fetch_refs_cites=False) for c in cites]
+            result = Paper(
+                title=result.title,
+                authors=result.authors,
+                year=result.year,
+                doi=result.doi,
+                abstract=result.abstract,
+                venue=result.venue,
+                url=result.url,
+                pdf_url=result.pdf_url,
+                citation_count=result.citation_count,
+                sources=result.sources,
+                references=result.references,
+                citations=cites,
+            )
+            logger.info(f"Found {len(cites)} citations")
+        except Exception as e:
+            logger.warning(f"Failed to fetch citations: {e}")
+
+    return result
 @
 
 \subsection{Title preview helper}

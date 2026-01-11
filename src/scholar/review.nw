@@ -172,8 +172,6 @@ class ReviewDecision:
         source: Where the decision came from (human or LLM).
         is_example: True if this paper is a training example for LLM.
         llm_confidence: Confidence score from LLM (0.0-1.0), if applicable.
-        cached_references: Cached references for this paper (for TUI).
-        cached_citations: Cached citations for this paper (for TUI).
     """
     paper: Paper
     provider: str
@@ -182,8 +180,6 @@ class ReviewDecision:
     source: ReviewSource = ReviewSource.HUMAN
     is_example: bool = False
     llm_confidence: float | None = None
-    cached_references: list[Paper] | None = None
-    cached_citations: list[Paper] | None = None
     
     @property
     def is_decided(self) -> bool:
