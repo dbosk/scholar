@@ -401,7 +401,121 @@ class TestEnrichPapers:
 @
 
 
-\section{Dependencies}
+\section{Snowball Paper Enrichment}
+
+When fetching references or citations from providers like WOS, we often get
+incomplete metadata---particularly missing titles. This function enriches
+snowball papers by looking up their DOIs in other providers.
+
+Unlike regular enrichment (which assumes we have a title and want the abstract),
+snowball enrichment focuses on papers that may lack basic metadata like titles.
+We try to resolve as much as possible using the DOI.
+
+<<enrichment functions>>=
+def enrich_snowball_papers(
+    papers: list[Paper],
+    progress_callback: Callable[[int, int], None] | None = None,
+) -> list[Paper]:
+    """
+    Enrich papers from snowballing (refs/cites) that may lack titles.
+
+    This function is specifically designed for papers returned by citation
+    or reference lookups, which often have incomplete metadata. It attempts
+    to resolve missing titles and other fields using DOI lookups.
+
+    Papers without DOIs or that cannot be enriched are returned as-is.
+    Papers without titles after enrichment are filtered out.
+
+    Args:
+        papers: List of papers to enrich (typically from refs/cites lookup).
+        progress_callback: Called with (current, total) after each paper.
+
+    Returns:
+        List of enriched papers. Papers without titles are excluded.
+    """
+    logger.info(f"Enriching {len(papers)} snowball papers")
+
+    result = []
+    total = len(papers)
+
+    for i, paper in enumerate(papers):
+        enriched = paper
+
+        # If paper lacks a title but has a DOI, try to enrich it
+        if (not paper.title or paper.title.strip() == "") and paper.doi:
+            enriched = enrich_paper(paper, fields=["title", "abstract", "authors"])
+
+        # Only include papers that have titles after enrichment
+        if enriched.title and enriched.title.strip():
+            result.append(enriched)
+        else:
+            logger.debug(f"Skipping paper without title (DOI: {paper.doi})")
+
+        if progress_callback:
+            progress_callback(i + 1, total)
+
+    logger.info(f"Snowball enrichment: {len(result)}/{total} papers have titles")
+    return result
+@
+
+\subsection{Testing snowball enrichment}
+
+<<test functions>>=
+class TestEnrichSnowballPapers:
+    """Tests for enrich_snowball_papers function."""
+
+    def test_enriches_papers_without_titles(self):
+        """Papers without titles get enriched via DOI lookup."""
+        papers = [
+            Paper(title="", authors=[], doi="10.1/missing"),
+            Paper(title="Has Title", authors=[], doi="10.1/complete"),
+        ]
+
+        mock_provider = MagicMock()
+        mock_provider.get_paper_by_doi.return_value = Paper(
+            title="Resolved Title",
+            authors=["Author"],
+            doi="10.1/missing",
+            abstract="Abstract",
+            sources=["s2"]
+        )
+
+        with patch("scholar.enrich.get_provider", return_value=mock_provider):
+            result = enrich_snowball_papers(papers)
+
+        assert len(result) == 2
+        assert result[0].title == "Resolved Title"
+        assert result[1].title == "Has Title"
+
+    def test_filters_out_papers_without_titles(self):
+        """Papers that still lack titles after enrichment are excluded."""
+        papers = [
+            Paper(title="", authors=[], doi="10.1/unresolvable"),
+            Paper(title="Has Title", authors=[]),
+        ]
+
+        mock_provider = MagicMock()
+        mock_provider.get_paper_by_doi.return_value = None  # Can't resolve
+
+        with patch("scholar.enrich.get_provider", return_value=mock_provider):
+            result = enrich_snowball_papers(papers)
+
+        # Only the paper with title remains
+        assert len(result) == 1
+        assert result[0].title == "Has Title"
+
+    def test_handles_papers_without_dois(self):
+        """Papers without DOIs are kept if they have titles."""
+        papers = [
+            Paper(title="No DOI", authors=[]),
+            Paper(title="", authors=[]),  # No DOI, no title - excluded
+        ]
+
+        result = enrich_snowball_papers(papers)
+
+        assert len(result) == 1
+        assert result[0].title == "No DOI"
+@
 
 <<imports>>=
 import logging

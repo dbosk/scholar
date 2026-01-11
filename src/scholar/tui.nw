@@ -580,11 +580,14 @@ class AbstractScreen(Screen[None]):
 
             self.notify("Fetching references...", severity="information")
             from scholar.providers import get_snowball_provider
+            from scholar.enrich import enrich_snowball_papers
 
             provider = get_snowball_provider()
             if provider:
                 try:
                     refs = provider.get_paper_references(paper.doi)
+                    # Enrich papers that lack titles
+                    refs = enrich_snowball_papers(refs)
                     self.decision.cached_references = refs
                     self.notify(f"Found {len(refs)} references")
                 except NotImplementedError:
@@ -614,11 +617,14 @@ class AbstractScreen(Screen[None]):
 
             self.notify("Fetching citing papers...", severity="information")
             from scholar.providers import get_snowball_provider
+            from scholar.enrich import enrich_snowball_papers
 
             provider = get_snowball_provider()
             if provider:
                 try:
                     cits = provider.get_paper_citations(paper.doi)
+                    # Enrich papers that lack titles
+                    cits = enrich_snowball_papers(cits)
                     self.decision.cached_citations = cits
                     self.notify(f"Found {len(cits)} citing papers")
                 except NotImplementedError:
