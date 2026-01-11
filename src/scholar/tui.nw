@@ -578,28 +578,18 @@ class AbstractScreen(Screen[None]):
                 self.notify("No DOI available", severity="warning")
                 return
 
-            self.notify("Fetching references...", severity="information")
-            from scholar.providers import get_snowball_provider
-            from scholar.enrich import enrich_snowball_papers
+            self.notify("Fetching references from all providers...", severity="information")
+            from scholar.providers import fetch_references
+            from scholar.enrich import enrich_papers
 
-            provider = get_snowball_provider()
-            if provider:
-                try:
-                    refs = provider.get_paper_references(paper.doi)
-                    # Enrich papers that lack titles
-                    refs = enrich_snowball_papers(refs)
-                    self.decision.cached_references = refs
-                    self.notify(f"Found {len(refs)} references")
-                except NotImplementedError:
-                    self.notify(
-                        "Provider doesn't support references", severity="error"
-                    )
-                    return
-                except Exception as e:
-                    self.notify(f"Error: {e}", severity="error")
-                    return
-            else:
-                self.notify("No provider available", severity="error")
+            try:
+                refs = fetch_references(paper.doi)
+                # Enrich papers that may have incomplete metadata
+                refs = enrich_papers(refs)
+                self.decision.cached_references = refs
+                self.notify(f"Found {len(refs)} references")
+            except Exception as e:
+                self.notify(f"Error: {e}", severity="error")
                 return
 
         self.show_references = not self.show_references
@@ -615,28 +605,18 @@ class AbstractScreen(Screen[None]):
                 self.notify("No DOI available", severity="warning")
                 return
 
-            self.notify("Fetching citing papers...", severity="information")
-            from scholar.providers import get_snowball_provider
-            from scholar.enrich import enrich_snowball_papers
+            self.notify("Fetching citations from all providers...", severity="information")
+            from scholar.providers import fetch_citations
+            from scholar.enrich import enrich_papers
 
-            provider = get_snowball_provider()
-            if provider:
-                try:
-                    cits = provider.get_paper_citations(paper.doi)
-                    # Enrich papers that lack titles
-                    cits = enrich_snowball_papers(cits)
-                    self.decision.cached_citations = cits
-                    self.notify(f"Found {len(cits)} citing papers")
-                except NotImplementedError:
-                    self.notify(
-                        "Provider doesn't support citations", severity="error"
-                    )
-                    return
-                except Exception as e:
-                    self.notify(f"Error: {e}", severity="error")
-                    return
-            else:
-                self.notify("No provider available", severity="error")
+            try:
+                cites = fetch_citations(paper.doi)
+                # Enrich papers that may have incomplete metadata
+                cites = enrich_papers(cites)
+                self.decision.cached_citations = cites
+                self.notify(f"Found {len(cites)} citing papers")
+            except Exception as e:
+                self.notify(f"Error: {e}", severity="error")
                 return
 
         self.show_citations = not self.show_citations
@@ -653,23 +633,15 @@ class AbstractScreen(Screen[None]):
                 return
 
             self.notify("Fetching references...", severity="information")
-            from scholar.providers import get_snowball_provider
+            from scholar.providers import fetch_references
+            from scholar.enrich import enrich_papers
 
-            provider = get_snowball_provider()
-            if provider:
-                try:
-                    refs = provider.get_paper_references(paper.doi)
-                    self.decision.cached_references = refs
-                except NotImplementedError:
-                    self.notify(
-                        "Provider doesn't support references", severity="error"
-                    )
-                    return
-                except Exception as e:
-                    self.notify(f"Error: {e}", severity="error")
-                    return
-            else:
-                self.notify("No provider available", severity="error")
+            try:
+                refs = fetch_references(paper.doi)
+                refs = enrich_papers(refs)
+                self.decision.cached_references = refs
+            except Exception as e:
+                self.notify(f"Error: {e}", severity="error")
                 return
 
         if not self.decision.cached_references:
@@ -698,23 +670,15 @@ class AbstractScreen(Screen[None]):
                 return
 
             self.notify("Fetching citing papers...", severity="information")
-            from scholar.providers import get_snowball_provider
+            from scholar.providers import fetch_citations
+            from scholar.enrich import enrich_papers
 
-            provider = get_snowball_provider()
-            if provider:
-                try:
-                    cits = provider.get_paper_citations(paper.doi)
-                    self.decision.cached_citations = cits
-                except NotImplementedError:
-                    self.notify(
-                        "Provider doesn't support citations", severity="error"
-                    )
-                    return
-                except Exception as e:
-                    self.notify(f"Error: {e}", severity="error")
-                    return
-            else:
-                self.notify("No provider available", severity="error")
+            try:
+                cites = fetch_citations(paper.doi)
+                cites = enrich_papers(cites)
+                self.decision.cached_citations = cites
+            except Exception as e:
+                self.notify(f"Error: {e}", severity="error")
                 return
 
         if not self.decision.cached_citations:
@@ -2112,13 +2076,9 @@ class PaperReviewApp(App):
             self.notify("No kept papers have DOIs", severity="warning")
             return
 
-        from scholar.providers import get_snowball_provider
+        from scholar.providers import fetch_references
+        from scholar.enrich import enrich_papers
         from scholar.review import get_paper_id
-
-        provider = get_snowball_provider()
-        if not provider:
-            self.notify("No provider available", severity="error")
-            return
 
         self.notify(
             f"Fetching references from {len(papers_with_doi)} papers...",
@@ -2135,7 +2095,8 @@ class PaperReviewApp(App):
                 if decision.cached_references is not None:
                     refs = decision.cached_references
                 else:
-                    refs = provider.get_paper_references(paper.doi)
+                    refs = fetch_references(paper.doi)
+                    refs = enrich_papers(refs)
                     decision.cached_references = refs
                 
                 all_refs.extend(refs)
@@ -2176,13 +2137,9 @@ class PaperReviewApp(App):
             self.notify("No kept papers have DOIs", severity="warning")
             return
 
-        from scholar.providers import get_snowball_provider
+        from scholar.providers import fetch_citations
+        from scholar.enrich import enrich_papers
         from scholar.review import get_paper_id
-
-        provider = get_snowball_provider()
-        if not provider:
-            self.notify("No provider available", severity="error")
-            return
 
         self.notify(
             f"Fetching citations from {len(papers_with_doi)} papers...",
@@ -2199,7 +2156,8 @@ class PaperReviewApp(App):
                 if decision.cached_citations is not None:
                     cites = decision.cached_citations
                 else:
-                    cites = provider.get_paper_citations(paper.doi)
+                    cites = fetch_citations(paper.doi)
+                    cites = enrich_papers(cites)
                     decision.cached_citations = cites
                 
                 all_cites.extend(cites)

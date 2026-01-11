@@ -246,20 +246,19 @@ def get_all_providers() -> list[SearchProvider]:
     return list(PROVIDERS.values())
 
 
-def get_snowball_provider() -> SearchProvider | None:
+def get_snowball_providers() -> list[SearchProvider]:
     """
-    Get the best available provider for citation/reference fetching.
+    Get all available providers that support citation/reference fetching.
 
-    Returns the first available provider that supports citation retrieval
-    using DOIs, in priority order: WOS (Expanded API), Semantic Scholar,
-    OpenAlex.
+    Returns providers in priority order: S2, OpenAlex, WOS (if expanded).
+    Only returns providers that are available and have citation methods.
 
     Returns:
-        A provider with citation support, or None if none available.
+        List of providers with citation support.
     """
     # Priority order for DOI-based snowballing
-    # S2 is preferred as it has better API reliability
     priority = ["s2", "openalex", "wos"]
+    result = []
 
     for name in priority:
         provider = PROVIDERS.get(name)
@@ -278,9 +277,120 @@ def get_snowball_provider() -> SearchProvider | None:
         if name == "wos" and getattr(provider, "_api_tier", None) != "expanded":
             continue
 
-        return provider
+        result.append(provider)
 
-    return None
+    return result
+
+
+def get_snowball_provider() -> SearchProvider | None:
+    """
+    Get the best available provider for citation/reference fetching.
+
+    Returns the first available provider that supports citation retrieval.
+    For fetching from multiple providers, use get_snowball_providers() instead.
+
+    Returns:
+        A provider with citation support, or None if none available.
+    """
+    providers = get_snowball_providers()
+    return providers[0] if providers else None
+
+
+def fetch_references(doi: str, limit: int = 100) -> list[Paper]:
+    """
+    Fetch references for a paper from all available providers.
+
+    Tries each provider in priority order and merges results. Papers are
+    deduplicated by DOI, with data merged from multiple sources.
+
+    Args:
+        doi: DOI of the paper to fetch references for.
+        limit: Maximum number of references to return per provider.
+
+    Returns:
+        List of referenced papers, deduplicated and merged.
+    """
+    providers = get_snowball_providers()
+    if not providers:
+        return []
+
+    all_papers: dict[str, Paper] = {}  # DOI -> Paper
+    papers_without_doi: list[Paper] = []
+
+    for provider in providers:
+        try:
+            refs = provider.get_paper_references(doi, limit)
+            logger.info(f"{provider.name}: found {len(refs)} references")
+
+            for paper in refs:
+                if paper.doi:
+                    # Merge with existing paper if we have it
+                    if paper.doi in all_papers:
+                        all_papers[paper.doi] = all_papers[paper.doi].merge_with(paper)
+                    else:
+                        all_papers[paper.doi] = paper
+                elif paper.title:
+                    # No DOI - check if we can match by title
+                    # For now, just add to the list (may have duplicates)
+                    papers_without_doi.append(paper)
+
+        except NotImplementedError:
+            logger.debug(f"{provider.name}: references not supported")
+        except Exception as e:
+            logger.warning(f"{provider.name}: error fetching references: {e}")
+
+    # Combine papers with DOIs and those without
+    result = list(all_papers.values()) + papers_without_doi
+    logger.info(f"Total unique references: {len(result)}")
+    return result
+
+
+def fetch_citations(doi: str, limit: int = 100) -> list[Paper]:
+    """
+    Fetch citing papers for a paper from all available providers.
+
+    Tries each provider in priority order and merges results. Papers are
+    deduplicated by DOI, with data merged from multiple sources.
+
+    Args:
+        doi: DOI of the paper to fetch citations for.
+        limit: Maximum number of citing papers to return per provider.
+
+    Returns:
+        List of citing papers, deduplicated and merged.
+    """
+    providers = get_snowball_providers()
+    if not providers:
+        return []
+
+    all_papers: dict[str, Paper] = {}  # DOI -> Paper
+    papers_without_doi: list[Paper] = []
+
+    for provider in providers:
+        try:
+            cites = provider.get_paper_citations(doi, limit)
+            logger.info(f"{provider.name}: found {len(cites)} citations")
+
+            for paper in cites:
+                if paper.doi:
+                    # Merge with existing paper if we have it
+                    if paper.doi in all_papers:
+                        all_papers[paper.doi] = all_papers[paper.doi].merge_with(paper)
+                    else:
+                        all_papers[paper.doi] = paper
+                elif paper.title:
+                    # No DOI - check if we can match by title
+                    papers_without_doi.append(paper)
+
+        except NotImplementedError:
+            logger.debug(f"{provider.name}: citations not supported")
+        except Exception as e:
+            logger.warning(f"{provider.name}: error fetching citations: {e}")
+
+    # Combine papers with DOIs and those without
+    result = list(all_papers.values()) + papers_without_doi
+    logger.info(f"Total unique citations: {len(result)}")
+    return result
 @
 
 \subsection{Testing the registry}

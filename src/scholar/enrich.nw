@@ -1,34 +1,33 @@
 \chapter{Paper Enrichment}
 \label{enrich-module}
 
-Abstracts are essential for systematic review screening---you cannot evaluate
-a paper's relevance from title alone.
-Yet not all databases provide them.
-DBLP, despite its excellent computer science coverage, returns only
-bibliographic metadata.
+Paper metadata from different sources varies widely in completeness.
+DBLP provides excellent bibliographic data but no abstracts.
 Web of Science's Starter API omits abstracts entirely.
-A search returning hundreds of papers without abstracts is nearly useless for
+Snowballing via citation lookups often returns papers with only a DOI.
+A search returning papers without abstracts or titles is nearly useless for
 review purposes.
-Similarly, PDF URLs are often missing, making it harder to access full texts.
 
 This chapter implements \emph{paper enrichment}: using DOIs to fetch missing
 metadata from providers with better coverage.
 The key insight is that the same paper often appears in multiple databases.
 A paper found in DBLP likely exists in Semantic Scholar or OpenAlex, where we
-can retrieve its abstract and PDF URL.
+can retrieve its abstract, title, authors, and PDF URL.
 The DOI serves as the universal identifier linking these representations.
 
-Enrichment operates at two levels:
+The enrichment function is general-purpose: it fills in \emph{any} missing
+fields on a paper, making it useful for multiple scenarios:
 \begin{description}
-\item[Single-paper enrichment] Fetch missing fields on demand, triggered when
-  a user views a paper's details in the TUI.
-  This provides immediate feedback without pre-processing all results.
-\item[Batch enrichment] Enrich all papers in a search session, useful before
-  LLM-assisted review where every paper needs an abstract for classification.
+\item[Screening enrichment] Papers from DBLP or WOS need abstracts for
+  systematic review screening.
+\item[Snowball enrichment] Papers from citation lookups may lack titles,
+  authors, and abstracts---enrichment resolves these using the DOI.
+\item[Display enrichment] On-demand enrichment when viewing paper details in
+  the TUI.
 \end{description}
 
-We prioritize Semantic Scholar (good abstract coverage, fast API) with
-OpenAlex as fallback (broader coverage, always free).
+We prioritize Semantic Scholar (good coverage, fast API) with OpenAlex as
+fallback (broader coverage, always free).
 
 \section{Module structure}
 
@@ -89,11 +88,20 @@ ENRICHMENT_PROVIDERS = ["s2", "openalex"]
 
 \section{Single Paper Enrichment}
 
-The core enrichment function takes a paper and returns an enriched version.
+The core enrichment function takes a paper and returns an enriched version
+with any missing fields filled in from other providers.
 If the paper already has all fields or lacks a DOI (making lookup impossible),
 we return the original paper unchanged.
 
+The function is general-purpose: by default it enriches all common fields
+(title, authors, abstract, year, venue, pdf\_url), but callers can specify a
+subset of fields if they only care about specific ones.
+
 <<enrichment functions>>=
+# All fields that can be enriched via DOI lookup
+ENRICHABLE_FIELDS = ["title", "authors", "abstract", "year", "venue", "pdf_url"]
+
+
 def enrich_paper(
     paper: Paper,
     fields: list[str] | None = None,
@@ -101,30 +109,37 @@ def enrich_paper(
     """
     Enrich a paper by fetching missing fields from other providers.
 
+    This function fills in any missing metadata by looking up the paper's DOI
+    in providers with better coverage. It's useful for:
+    - Papers from DBLP/WOS that lack abstracts
+    - Papers from snowballing that may only have a DOI
+    - Any paper missing title, authors, abstract, year, venue, or pdf_url
+
     Args:
         paper: The paper to enrich.
-        fields: Fields to enrich. If None, enriches 'abstract' and 'pdf_url'.
+        fields: Fields to check and enrich. If None, checks all enrichable
+            fields (title, authors, abstract, year, venue, pdf_url).
 
     Returns:
         A new Paper with enriched fields, or the original if enrichment
         fails or isn't needed.
     """
     if fields is None:
-        fields = ["abstract", "pdf_url"]
+        fields = ENRICHABLE_FIELDS
 
     # Check if enrichment is needed
     if not needs_enrichment(paper, fields):
-        title_preview = paper.title[:50] + ('...' if len(paper.title) > 50 else '')
+        title_preview = _title_preview(paper)
         logger.debug(f"Paper '{title_preview}' doesn't need enrichment")
         return paper
 
     # Need DOI for lookup
     if not paper.doi:
-        title_preview = paper.title[:50] + ('...' if len(paper.title) > 50 else '')
+        title_preview = _title_preview(paper)
         logger.debug(f"Paper '{title_preview}' has no DOI, cannot enrich")
         return paper
 
-    title_preview = paper.title[:50] + ('...' if len(paper.title) > 50 else '')
+    title_preview = _title_preview(paper)
     logger.debug(f"Enriching paper '{title_preview}' (DOI: {paper.doi})")
 
     # Try each enrichment provider in order
@@ -152,17 +167,55 @@ def enrich_paper(
     return paper
 @
 
+\subsection{Title preview helper}
+
+For logging, we often want to show a truncated version of the paper title.
+If the paper has no title, we show the DOI instead.
+
+<<enrichment functions>>=
+def _title_preview(paper: Paper) -> str:
+    """Return a short preview of the paper for logging."""
+    if paper.title and paper.title.strip():
+        title = paper.title[:50]
+        if len(paper.title) > 50:
+            title += "..."
+        return title
+    elif paper.doi:
+        return f"DOI:{paper.doi}"
+    else:
+        return "(unknown paper)"
+@
+
 \subsection{Checking if enrichment is needed}
 
 We only enrich papers that have missing fields.
 This avoids unnecessary API calls for papers that already have all data.
 
+A field is considered missing if it is [[None]], an empty string, or (for list
+fields like authors) an empty list.
+
 <<enrichment functions>>=
-def needs_enrichment(paper: Paper, fields: list[str]) -> bool:
-    """Check if a paper needs enrichment for the specified fields."""
+def needs_enrichment(paper: Paper, fields: list[str] | None = None) -> bool:
+    """
+    Check if a paper needs enrichment for the specified fields.
+
+    Args:
+        paper: The paper to check.
+        fields: Fields to check. If None, checks all enrichable fields.
+
+    Returns:
+        True if any of the specified fields are missing or empty.
+    """
+    if fields is None:
+        fields = ENRICHABLE_FIELDS
+
     for field in fields:
         value = getattr(paper, field, None)
-        if value is None or value == "":
+        if value is None:
+            return True
+        if isinstance(value, str) and value.strip() == "":
+            return True
+        if isinstance(value, list) and len(value) == 0:
             return True
     return False
 @
@@ -212,6 +265,8 @@ class TestEnrichPaper:
             title="Test Paper",
             authors=["Author"],
             doi="10.1234/test",
+            year=2024,
+            venue="Conference",
             abstract="Already has abstract",
             pdf_url="https://example.com/paper.pdf"
         )
@@ -278,18 +333,48 @@ class TestNeedsEnrichment:
 
     def test_needs_enrichment_missing_abstract(self):
         """Paper with missing abstract needs enrichment."""
-        paper = Paper(title="Test", authors=[], abstract=None)
+        paper = Paper(title="Test", authors=["Author"], abstract=None)
         assert needs_enrichment(paper, ["abstract"]) is True
 
     def test_needs_enrichment_empty_abstract(self):
         """Paper with empty abstract needs enrichment."""
-        paper = Paper(title="Test", authors=[], abstract="")
+        paper = Paper(title="Test", authors=["Author"], abstract="")
         assert needs_enrichment(paper, ["abstract"]) is True
+
+    def test_needs_enrichment_empty_authors(self):
+        """Paper with empty authors list needs enrichment."""
+        paper = Paper(title="Test", authors=[], abstract="Has abstract")
+        assert needs_enrichment(paper, ["authors"]) is True
 
     def test_no_enrichment_if_complete(self):
         """Paper with filled fields doesn't need enrichment."""
-        paper = Paper(title="Test", authors=[], abstract="Has abstract")
+        paper = Paper(title="Test", authors=["Author"], abstract="Has abstract")
         assert needs_enrichment(paper, ["abstract"]) is False
+
+    def test_uses_all_fields_by_default(self):
+        """needs_enrichment checks all enrichable fields when none specified."""
+        # Paper missing abstract but has everything else
+        paper = Paper(
+            title="Test",
+            authors=["Author"],
+            year=2024,
+            venue="Conference",
+            pdf_url="https://example.com/paper.pdf",
+            abstract=None  # Missing
+        )
+        assert needs_enrichment(paper) is True
+
+    def test_complete_paper_needs_no_enrichment(self):
+        """Paper with all fields filled doesn't need enrichment."""
+        paper = Paper(
+            title="Test",
+            authors=["Author"],
+            year=2024,
+            venue="Conference",
+            pdf_url="https://example.com/paper.pdf",
+            abstract="Has abstract"
+        )
+        assert needs_enrichment(paper) is False
 @
 
 
@@ -398,123 +483,6 @@ class TestEnrichPapers:
         assert result[0].title == "First"
         assert result[1].title == "Second"
         assert result[2].title == "Third"
-@
-
-
-\section{Snowball Paper Enrichment}
-
-When fetching references or citations from providers like WOS, we often get
-incomplete metadata---particularly missing titles. This function enriches
-snowball papers by looking up their DOIs in other providers.
-
-Unlike regular enrichment (which assumes we have a title and want the abstract),
-snowball enrichment focuses on papers that may lack basic metadata like titles.
-We try to resolve as much as possible using the DOI.
-
-<<enrichment functions>>=
-def enrich_snowball_papers(
-    papers: list[Paper],
-    progress_callback: Callable[[int, int], None] | None = None,
-) -> list[Paper]:
-    """
-    Enrich papers from snowballing (refs/cites) that may lack titles.
-
-    This function is specifically designed for papers returned by citation
-    or reference lookups, which often have incomplete metadata. It attempts
-    to resolve missing titles and other fields using DOI lookups.
-
-    Papers without DOIs or that cannot be enriched are returned as-is.
-    Papers without titles after enrichment are filtered out.
-
-    Args:
-        papers: List of papers to enrich (typically from refs/cites lookup).
-        progress_callback: Called with (current, total) after each paper.
-
-    Returns:
-        List of enriched papers. Papers without titles are excluded.
-    """
-    logger.info(f"Enriching {len(papers)} snowball papers")
-
-    result = []
-    total = len(papers)
-
-    for i, paper in enumerate(papers):
-        enriched = paper
-
-        # If paper lacks a title but has a DOI, try to enrich it
-        if (not paper.title or paper.title.strip() == "") and paper.doi:
-            enriched = enrich_paper(paper, fields=["title", "abstract", "authors"])
-
-        # Only include papers that have titles after enrichment
-        if enriched.title and enriched.title.strip():
-            result.append(enriched)
-        else:
-            logger.debug(f"Skipping paper without title (DOI: {paper.doi})")
-
-        if progress_callback:
-            progress_callback(i + 1, total)
-
-    logger.info(f"Snowball enrichment: {len(result)}/{total} papers have titles")
-    return result
-@
-
-\subsection{Testing snowball enrichment}
-
-<<test functions>>=
-class TestEnrichSnowballPapers:
-    """Tests for enrich_snowball_papers function."""
-
-    def test_enriches_papers_without_titles(self):
-        """Papers without titles get enriched via DOI lookup."""
-        papers = [
-            Paper(title="", authors=[], doi="10.1/missing"),
-            Paper(title="Has Title", authors=[], doi="10.1/complete"),
-        ]
-
-        mock_provider = MagicMock()
-        mock_provider.get_paper_by_doi.return_value = Paper(
-            title="Resolved Title",
-            authors=["Author"],
-            doi="10.1/missing",
-            abstract="Abstract",
-            sources=["s2"]
-        )
-
-        with patch("scholar.enrich.get_provider", return_value=mock_provider):
-            result = enrich_snowball_papers(papers)
-
-        assert len(result) == 2
-        assert result[0].title == "Resolved Title"
-        assert result[1].title == "Has Title"
-
-    def test_filters_out_papers_without_titles(self):
-        """Papers that still lack titles after enrichment are excluded."""
-        papers = [
-            Paper(title="", authors=[], doi="10.1/unresolvable"),
-            Paper(title="Has Title", authors=[]),
-        ]
-
-        mock_provider = MagicMock()
-        mock_provider.get_paper_by_doi.return_value = None  # Can't resolve
-
-        with patch("scholar.enrich.get_provider", return_value=mock_provider):
-            result = enrich_snowball_papers(papers)
-
-        # Only the paper with title remains
-        assert len(result) == 1
-        assert result[0].title == "Has Title"
-
-    def test_handles_papers_without_dois(self):
-        """Papers without DOIs are kept if they have titles."""
-        papers = [
-            Paper(title="No DOI", authors=[]),
-            Paper(title="", authors=[]),  # No DOI, no title - excluded
-        ]
-
-        result = enrich_snowball_papers(papers)
-
-        assert len(result) == 1
-        assert result[0].title == "No DOI"
 @
 
 <<imports>>=
