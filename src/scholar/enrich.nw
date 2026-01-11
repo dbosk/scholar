@@ -176,6 +176,17 @@ def enrich_paper(
     return result
 
 
+@
+
+\subsection{Fetching references and citations}
+
+When enriching a paper, we also fetch its references and citations if requested.
+We enrich each reference and citation paper with basic metadata (title, authors,
+abstract) so they display properly in the TUI and are useful for snowballing.
+This enrichment uses [[fetch_refs_cites=False]] to avoid infinite recursion---we
+only need one level of metadata, not the refs/cites of refs/cites.
+
+<<enrichment functions>>=
 def _fetch_refs_cites(paper: Paper) -> Paper:
     """
     Fetch references and citations for a paper if not already present.

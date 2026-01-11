@@ -3102,7 +3102,9 @@ def get_citing_articles(self, uid: str, limit: int = 10) -> list[Paper]:
         response.raise_for_status()
         data = response.json()
 
-        records = (
+        # Use _ensure_list because the API may return a single dict instead of
+        # a list when there's only one citing article.
+        records = self._ensure_list(
             data.get("Data", {})
             .get("Records", {})
             .get("records", {})
@@ -3163,8 +3165,10 @@ def get_cited_references(self, uid: str, limit: int = 10) -> list[dict]:
         response.raise_for_status()
         data = response.json()
 
-        # References have a different structure than regular records
-        references = data.get("Data", [])
+        # References have a different structure than regular records.
+        # Use _ensure_list because the API may return a single dict or string
+        # instead of a list when there's only one reference.
+        references = self._ensure_list(data.get("Data", []))
         result = [
             {
                 "uid": ref.get("UID"),

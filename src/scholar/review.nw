@@ -1270,6 +1270,54 @@ def _get_sessions_dir() -> Path:
     path = get_data_dir() / SESSIONS_DIR
     path.mkdir(parents=True, exist_ok=True)
     return path
+@
+
+Papers store references and citations as lists of [[Paper]] objects, but JSON
+cannot directly serialize these nested objects.
+We convert [[Paper]] lists to plain dictionaries for storage and back to
+[[Paper]] objects when loading.
+This ensures enriched references and citations persist across session restarts,
+avoiding expensive re-fetching from APIs.
+
+<<review session functions>>=
+def _serialize_paper_list(papers: list[Paper] | None) -> list[dict] | None:
+    """Serialize a list of Paper objects to JSON-compatible dicts."""
+    if papers is None:
+        return None
+    return [
+        {
+            "title": p.title,
+            "authors": list(p.authors),
+            "year": p.year,
+            "doi": p.doi,
+            "abstract": p.abstract,
+            "venue": p.venue,
+            "url": p.url,
+            "pdf_url": p.pdf_url,
+            "sources": p.sources,
+        }
+        for p in papers
+    ]
+
+
+def _deserialize_paper_list(data: list[dict] | None) -> list[Paper] | None:
+    """Deserialize a list of dicts to Paper objects."""
+    if data is None:
+        return None
+    return [
+        Paper(
+            title=p.get("title", ""),
+            authors=p.get("authors", []),
+            year=p.get("year"),
+            doi=p.get("doi"),
+            abstract=p.get("abstract"),
+            venue=p.get("venue"),
+            url=p.get("url"),
+            pdf_url=p.get("pdf_url"),
+            sources=p.get("sources", []),
+        )
+        for p in data
+    ]
 
 
 def save_session(session: ReviewSession) -> Path:
@@ -1327,6 +1375,8 @@ def save_session(session: ReviewSession) -> Path:
                     "url": d.paper.url,
                     "pdf_url": d.paper.pdf_url,
                     "sources": d.paper.sources,
+                    "references": _serialize_paper_list(d.paper.references),
+                    "citations": _serialize_paper_list(d.paper.citations),
                 },
             }
             for d in session.decisions
@@ -1413,6 +1463,8 @@ def load_session(name_or_query: str) -> ReviewSession | None:
                     [s.strip() for s in paper_data["source"].split(",")]
                     if paper_data.get("source") else []
                 ),
+                references=_deserialize_paper_list(paper_data.get("references")),
+                citations=_deserialize_paper_list(paper_data.get("citations")),
             )
             status = DecisionStatus(dec_data["status"])
             tags = dec_data.get("tags", [])
@@ -1475,6 +1527,98 @@ class TestQueryProviderPairsPersistence:
         assert len(loaded.query_provider_pairs) == 2
         assert ("natural language", "openalex") in loaded.query_provider_pairs
         assert ("boolean AND query", "wos") in loaded.query_provider_pairs
+
+    def test_save_and_load_references_citations(self, tmp_path, monkeypatch):
+        """References and citations are persisted with the session."""
+        monkeypatch.setenv("SCHOLAR_DATA_DIR", str(tmp_path))
+
+        # Create paper with refs and cites
+        ref = Paper(title="Reference Paper", authors=["Ref Author"], year=2020,
+                    doi="10.1000/ref")
+        cite = Paper(title="Citing Paper", authors=["Cite Author"], year=2024,
+                     doi="10.1000/cite")
+        paper = Paper(
+            title="Main Paper", authors=["Main Author"], year=2022,
+            doi="10.1000/main",
+            references=[ref],
+            citations=[cite],
+        )
+
+        session = ReviewSession(
+            query="test",
+            providers=["s2"],
+            timestamp=datetime.now(),
+            name="refs-cites-session",
+        )
+        session.decisions.append(ReviewDecision(paper=paper, provider="s2"))
+
+        save_session(session)
+        loaded = load_session("refs-cites-session")
+
+        assert loaded is not None
+        assert len(loaded.decisions) == 1
+        loaded_paper = loaded.decisions[0].paper
+
+        # Check refs were persisted
+        assert loaded_paper.references is not None
+        assert len(loaded_paper.references) == 1
+        assert loaded_paper.references[0].title == "Reference Paper"
+        assert loaded_paper.references[0].doi == "10.1000/ref"
+
+        # Check cites were persisted
+        assert loaded_paper.citations is not None
+        assert len(loaded_paper.citations) == 1
+        assert loaded_paper.citations[0].title == "Citing Paper"
+        assert loaded_paper.citations[0].doi == "10.1000/cite"
+
+    def test_load_session_without_refs_cites(self, tmp_path, monkeypatch):
+        """Old sessions without refs/cites load correctly with None values."""
+        monkeypatch.setenv("SCHOLAR_DATA_DIR", str(tmp_path))
+
+        # Create session file without refs/cites fields
+        sessions_dir = tmp_path / "review_sessions"
+        sessions_dir.mkdir(parents=True)
+        old_session_data = {
+            "query": "test",
+            "name": "old-format",
+            "providers": ["s2"],
+            "timestamp": datetime.now().isoformat(),
+            "research_context": None,
+            "query_provider_pairs": [],
+            "snowball_rounds": [],
+            "decisions": [{
+                "paper_id": "doi:10.1000/test",
+                "provider": "s2",
+                "status": "pending",
+                "tags": [],
+                "source": "human",
+                "is_example": False,
+                "llm_confidence": None,
+                "paper": {
+                    "title": "Test Paper",
+                    "authors": ["Author"],
+                    "year": 2024,
+                    "doi": "10.1000/test",
+                    "abstract": None,
+                    "venue": None,
+                    "url": None,
+                    "pdf_url": None,
+                    "sources": ["s2"],
+                    # No references or citations fields
+                },
+            }],
+        }
+        session_file = sessions_dir / "old-format.json"
+        with open(session_file, "w") as f:
+            json.dump(old_session_data, f)
+
+        loaded = load_session("old-format")
+
+        assert loaded is not None
+        assert len(loaded.decisions) == 1
+        # Should have None for refs/cites (not fetched yet)
+        assert loaded.decisions[0].paper.references is None
+        assert loaded.decisions[0].paper.citations is None
 @
 
 \paragraph{Backward Compatibility}
