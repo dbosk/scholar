@@ -398,6 +398,8 @@ class AbstractScreen(Screen[None]):
         Binding("C", "confirm_llm", "Confirm"),
         Binding("a", "add_references", "+Refs"),
         Binding("A", "add_citations", "+Cites"),
+        Binding("j", "scroll_down", "Down", show=False),
+        Binding("k", "scroll_up", "Up", show=False),
     ]
     
     def __init__(self, decision: ReviewDecision, session: ReviewSession, review_mode: bool = True) -> None:
@@ -811,6 +813,16 @@ class AbstractScreen(Screen[None]):
         mark_as_reviewed(self.decision, user_agrees=True)
         self.notify(f"Confirmed LLM decision: {self.decision.status.value}")
         self.dismiss(None)
+
+    def action_scroll_down(self) -> None:
+        """Scroll the abstract view down."""
+        scroll = self.query_one(VerticalScroll)
+        scroll.scroll_down()
+
+    def action_scroll_up(self) -> None:
+        """Scroll the abstract view up."""
+        scroll = self.query_one(VerticalScroll)
+        scroll.scroll_up()
 @
 
 \section{Tag Selection Modal}
