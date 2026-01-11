@@ -992,6 +992,14 @@ def _get_related_papers(
     if "/" in paper_id and not paper_id.startswith("DOI:"):
         paper_id = f"DOI:{paper_id}"
 
+    # Check cache first
+    cache_key = (relation, paper_id, limit)
+    if cache_key in self._cache:
+        logger.info(f"s2: Cache hit for {relation} of {paper_id}")
+        return self._cache[cache_key]
+
+    logger.info(f"s2: Cache miss for {relation} of {paper_id}, fetching from API")
+
     all_papers: list[Paper] = []
     offset = 0
     page_size = min(limit, 100)
@@ -1056,6 +1064,9 @@ def _get_related_papers(
         logger.warning("s2: %s fetch failed: %s", relation, e)
 
     logger.info("s2: Found %d %s for %s", len(all_papers), relation, paper_id)
+    
+    # Cache the result
+    self._cache[cache_key] = all_papers
     return all_papers
 @
 
@@ -3068,6 +3079,14 @@ def get_citing_articles(self, uid: str, limit: int = 10) -> list[Paper]:
     """
     self._require_expanded_api("get_citing_articles")
 
+    # Check cache first
+    cache_key = ("citing", uid, limit)
+    if cache_key in self._cache:
+        logger.info(f"wos: Cache hit for citing articles of {uid}")
+        return self._cache[cache_key]
+
+    logger.info(f"wos: Cache miss for citing articles of {uid}, fetching from API")
+
     try:
         response = requests.get(
             f"{WOS_EXPANDED_API_URL}/citing",
@@ -3089,7 +3108,9 @@ def get_citing_articles(self, uid: str, limit: int = 10) -> list[Paper]:
             .get("records", {})
             .get("REC", [])
         )
-        return [self._convert_expanded_hit(rec) for rec in records]
+        result = [self._convert_expanded_hit(rec) for rec in records]
+        self._cache[cache_key] = result
+        return result
     except NotImplementedError:
         raise
     except Exception as e:
@@ -3098,7 +3119,7 @@ def get_citing_articles(self, uid: str, limit: int = 10) -> list[Paper]:
 
 def get_cited_references(self, uid: str, limit: int = 10) -> list[dict]:
     """
-    Find references cited by the given paper.
+    Get references (bibliography) from a given paper.
 
     Args:
         uid: Web of Science unique identifier (e.g., "WOS:000270372400005")
@@ -3106,7 +3127,7 @@ def get_cited_references(self, uid: str, limit: int = 10) -> list[dict]:
 
     Returns:
         List of reference dictionaries with fields:
-        - uid: WoS identifier (if available)
+        - uid: WOS UID of cited paper (if available)
         - citedAuthor: Author name
         - citedTitle: Title of cited work
         - citedWork: Source/journal name
@@ -3118,6 +3139,14 @@ def get_cited_references(self, uid: str, limit: int = 10) -> list[dict]:
         NotImplementedError: If Expanded API is not configured
     """
     self._require_expanded_api("get_cited_references")
+
+    # Check cache first
+    cache_key = ("references", uid, limit)
+    if cache_key in self._cache:
+        logger.info(f"wos: Cache hit for references of {uid}")
+        return self._cache[cache_key]
+
+    logger.info(f"wos: Cache miss for references of {uid}, fetching from API")
 
     try:
         response = requests.get(
@@ -3136,7 +3165,7 @@ def get_cited_references(self, uid: str, limit: int = 10) -> list[dict]:
 
         # References have a different structure than regular records
         references = data.get("Data", [])
-        return [
+        result = [
             {
                 "uid": ref.get("UID"),
                 "citedAuthor": ref.get("citedAuthor"),
@@ -3148,6 +3177,8 @@ def get_cited_references(self, uid: str, limit: int = 10) -> list[dict]:
             }
             for ref in references
         ]
+        self._cache[cache_key] = result
+        return result
     except NotImplementedError:
         raise
     except Exception as e:

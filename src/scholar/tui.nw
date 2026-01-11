@@ -569,7 +569,7 @@ class AbstractScreen(Screen[None]):
         )
 
     def action_toggle_references(self) -> None:
-        """Toggle references section visibility, fetching if needed."""
+        """Show references, fetching if not already cached."""
         paper = self.decision.paper
 
         if self.decision.cached_references is None:
@@ -592,11 +592,11 @@ class AbstractScreen(Screen[None]):
                 self.notify(f"Error: {e}", severity="error")
                 return
 
-        self.show_references = not self.show_references
+        self.show_references = True
         self.refresh(recompose=True)
 
     def action_toggle_citations(self) -> None:
-        """Toggle citations section visibility, fetching if needed."""
+        """Show citations, fetching if not already cached."""
         paper = self.decision.paper
 
         if self.decision.cached_citations is None:
@@ -619,7 +619,7 @@ class AbstractScreen(Screen[None]):
                 self.notify(f"Error: {e}", severity="error")
                 return
 
-        self.show_citations = not self.show_citations
+        self.show_citations = True
         self.refresh(recompose=True)
 
     def action_add_references(self) -> None:
