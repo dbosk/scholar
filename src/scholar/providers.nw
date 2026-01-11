@@ -2706,12 +2706,12 @@ def _search_expanded(
             data = response.json()
 
             # Navigate the nested structure to get records
-            records = (
-                data.get("Data", {})
-                .get("Records", {})
-                .get("records", {})
-                .get("REC", [])
+            # Use _safe_get_nested to handle cases where intermediate fields are strings.
+            records = self._safe_get_nested(
+                data, "Data", "Records", "records", "REC", default=[]
             )
+            if not isinstance(records, list):
+                records = [records] if isinstance(records, dict) else []
 
             if not records:
                 # No more results available
@@ -3059,13 +3059,13 @@ def get_related_records(self, uid: str, limit: int = 10) -> list[Paper]:
         response.raise_for_status()
         data = response.json()
 
-        records = (
-            data.get("Data", {})
-            .get("Records", {})
-            .get("records", {})
-            .get("REC", [])
+        # Use _safe_get_nested to handle cases where intermediate fields are strings.
+        records = self._safe_get_nested(
+            data, "Data", "Records", "records", "REC", default=[]
         )
-        return [self._convert_expanded_hit(rec) for rec in records]
+        if not isinstance(records, list):
+            records = [records] if isinstance(records, dict) else []
+        return [self._convert_expanded_hit(rec) for rec in records if isinstance(rec, dict)]
     except NotImplementedError:
         raise
     except Exception as e:
@@ -3113,11 +3113,9 @@ def get_citing_articles(self, uid: str, limit: int = 10) -> list[Paper]:
 
         # Use _ensure_list because the API may return a single dict instead of
         # a list when there's only one citing article. Skip non-dict items.
+        # Use _safe_get_nested to handle cases where intermediate fields are strings.
         records = self._ensure_list(
-            data.get("Data", {})
-            .get("Records", {})
-            .get("records", {})
-            .get("REC", [])
+            self._safe_get_nested(data, "Data", "Records", "records", "REC", default=[])
         )
         result = [self._convert_expanded_hit(rec) for rec in records if isinstance(rec, dict)]
         self._cache[cache_key] = result
@@ -3338,13 +3336,13 @@ def _get_uid_for_doi(self, doi: str) -> str | None:
             response.raise_for_status()
             data = response.json()
 
-            records = (
-                data.get("Data", {})
-                .get("Records", {})
-                .get("records", {})
-                .get("REC", [])
+            # Use _safe_get_nested to handle cases where intermediate fields are strings.
+            records = self._safe_get_nested(
+                data, "Data", "Records", "records", "REC", default=[]
             )
-            if records and len(records) > 0:
+            if not isinstance(records, list):
+                records = [records] if isinstance(records, dict) else []
+            if records and len(records) > 0 and isinstance(records[0], dict):
                 return records[0].get("UID")
         else:
             # Starter API - search and extract UID from response
