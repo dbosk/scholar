@@ -26,7 +26,7 @@ The interface provides:
 \item[Note-taking] Persistent notes attached to papers, editable in your
   preferred [[EDITOR]].
 \item[LLM review support] Filter and confirm LLM decisions ([[l]]/[[L]] for
-  filtering, [[c]] to confirm), integrating with LLM-assisted classification
+  filtering, [[C]] to confirm), integrating with LLM-assisted classification
   from the CLI.
 \end{description}
 
@@ -393,8 +393,8 @@ class AbstractScreen(Screen[None]):
         Binding("p", "open_pdf", "Open PDF"),
         Binding("n", "edit_notes", "Notes"),
         Binding("e", "enrich", "Enrich"),
-        Binding("a", "add_references", "Add Refs"),
-        Binding("A", "add_citations", "Add Cites"),
+        Binding("r", "add_references", "Refs"),
+        Binding("c", "add_citations", "Cites"),
     ]
     
     def __init__(self, decision: ReviewDecision, session: ReviewSession, review_mode: bool = True) -> None:
@@ -469,29 +469,34 @@ class AbstractScreen(Screen[None]):
         self.refresh(recompose=True)
     
     def action_enrich(self) -> None:
-        """Fetch missing abstract from Semantic Scholar or OpenAlex."""
+        """Fetch missing abstract and PDF URL from Semantic Scholar or OpenAlex."""
         paper = self.decision.paper
         
         if not paper.doi:
             self.notify("No DOI available for enrichment", severity="warning")
             return
         
-        if not needs_enrichment(paper, ["abstract"]):
-            self.notify("Paper already has an abstract", severity="information")
+        if not needs_enrichment(paper, ["abstract", "pdf_url"]):
+            self.notify("Paper already complete", severity="information")
             return
         
-        self.notify("Fetching abstract...", severity="information")
+        self.notify("Enriching paper...", severity="information")
         
         enriched = enrich_paper(paper)
         
+        # Check what was enriched
+        enriched_fields = []
         if enriched.abstract and enriched.abstract != paper.abstract:
-            # Update the paper in the decision
+            enriched_fields.append("abstract")
+        if enriched.pdf_url and enriched.pdf_url != paper.pdf_url:
+            enriched_fields.append("PDF URL")
+        
+        if enriched_fields:
             self.decision.paper = enriched
-            self.notify("Abstract fetched successfully", severity="information")
-            # Refresh to show the new abstract
+            self.notify(f"Enriched: {', '.join(enriched_fields)}", severity="information")
             self.refresh(recompose=True)
         else:
-            self.notify("Could not find abstract in any provider", severity="warning")
+            self.notify("Could not enrich from any provider", severity="warning")
     
     def action_open_pdf(self) -> None:
         """Download and open the PDF."""
@@ -1726,13 +1731,13 @@ class PaperReviewApp(App):
         Binding("K", "keep", "Keep"),
         Binding("T", "keep_with_themes", "Themes"),
         Binding("d", "discard", "Discard"),
-        Binding("c", "confirm_llm", "Confirm"),
+        Binding("C", "confirm_llm", "Confirm"),
         Binding("s", "sort", "Sort"),
         Binding("f", "filter", "Filter"),
         Binding("F", "search_filters", "Search"),
         Binding("n", "edit_notes", "Notes"),
-        Binding("a", "add_all_references", "Add Refs"),
-        Binding("A", "add_all_citations", "Add Cites"),
+        Binding("r", "add_all_references", "Refs"),
+        Binding("c", "add_all_citations", "Cites"),
     ]
     
     def __init__(self, session: ReviewSession, review_mode: bool = True,
