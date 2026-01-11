@@ -496,40 +496,45 @@ class AbstractScreen(Screen[None]):
         self.notify("Enriching paper (metadata, refs, cites)...", severity="information")
         self._do_enrich()
     
-    @work(thread=True)
     def _do_enrich(self) -> None:
-        """Worker thread to fetch enrichment data without blocking UI."""
-        paper = self.decision.paper
+        """Start enrichment in a background thread.
         
-        from scholar.enrich import enrich_paper
-        enriched = enrich_paper(paper, fetch_refs_cites=True)
+        Uses a plain thread instead of @work so the enrichment continues
+        even if the screen is dismissed before it completes.
+        """
+        import threading
         
-        # Check what was enriched
-        enriched_fields = []
-        if enriched.abstract and enriched.abstract != paper.abstract:
-            enriched_fields.append("abstract")
-        if enriched.pdf_url and enriched.pdf_url != paper.pdf_url:
-            enriched_fields.append("PDF URL")
-        if enriched.references is not None and paper.references is None:
-            enriched_fields.append(f"{len(enriched.references)} refs")
-        if enriched.citations is not None and paper.citations is None:
-            enriched_fields.append(f"{len(enriched.citations)} cites")
+        decision = self.decision  # Capture reference
+        app = self.app  # Capture app reference
+        paper = decision.paper
         
-        # Update UI from main thread
-        self.app.call_from_thread(self._finish_enrich, enriched, enriched_fields)
-    
-    def _finish_enrich(self, enriched: Paper, enriched_fields: list[str]) -> None:
-        """Called from main thread after enrichment completes."""
-        if enriched_fields:
-            # Update the decision's paper - this modifies the object in the session
-            self.decision.paper = enriched
-            # Notify via app so it shows even if this screen was dismissed
-            self.app.notify(f"Enriched: {', '.join(enriched_fields)}", severity="information")
-            # Only refresh if screen is still mounted
-            if self.is_mounted:
-                self.refresh(recompose=True)
-        else:
-            self.app.notify("Paper already fully enriched", severity="information")
+        def enrich_thread():
+            from scholar.enrich import enrich_paper
+            enriched = enrich_paper(paper, fetch_refs_cites=True)
+            
+            # Check what was enriched
+            enriched_fields = []
+            if enriched.abstract and enriched.abstract != paper.abstract:
+                enriched_fields.append("abstract")
+            if enriched.pdf_url and enriched.pdf_url != paper.pdf_url:
+                enriched_fields.append("PDF URL")
+            if enriched.references is not None and paper.references is None:
+                enriched_fields.append(f"{len(enriched.references)} refs")
+            if enriched.citations is not None and paper.citations is None:
+                enriched_fields.append(f"{len(enriched.citations)} cites")
+            
+            # Update decision and notify from main thread
+            def finish():
+                if enriched_fields:
+                    decision.paper = enriched
+                    app.notify(f"Enriched: {', '.join(enriched_fields)}", severity="information")
+                else:
+                    app.notify("Paper already fully enriched", severity="information")
+            
+            app.call_from_thread(finish)
+        
+        thread = threading.Thread(target=enrich_thread, daemon=True)
+        thread.start()
     
     def action_open_pdf(self) -> None:
         """Download and open the PDF."""
