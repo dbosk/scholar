@@ -406,6 +406,8 @@ class AbstractScreen(Screen[None]):
         self.session = session
         self.review_mode = review_mode
         self.pdf_status: str = ""
+        self.show_references: bool = False
+        self.show_citations: bool = False
     
     def compose(self) -> ComposeResult:
         paper = self.decision.paper
@@ -459,6 +461,24 @@ class AbstractScreen(Screen[None]):
                     yield Static("[bold yellow]─── Tags ───[/bold yellow]")
                 tags_text = ", ".join(self.decision.tags)
                 yield Static(tags_text)
+            
+            # Show references if toggled on
+            if self.show_references and self.decision.cached_references:
+                yield Static("")
+                yield Static(f"[bold blue]─── References ({len(self.decision.cached_references)}) ───[/bold blue]")
+                for ref_paper in self.decision.cached_references[:20]:
+                    yield self._render_paper_entry(ref_paper)
+                if len(self.decision.cached_references) > 20:
+                    yield Static(f"  [dim]... and {len(self.decision.cached_references) - 20} more[/dim]")
+            
+            # Show citations if toggled on
+            if self.show_citations and self.decision.cached_citations:
+                yield Static("")
+                yield Static(f"[bold magenta]─── Citing Papers ({len(self.decision.cached_citations)}) ───[/bold magenta]")
+                for cite_paper in self.decision.cached_citations[:20]:
+                    yield self._render_paper_entry(cite_paper)
+                if len(self.decision.cached_citations) > 20:
+                    yield Static(f"  [dim]... and {len(self.decision.cached_citations) - 20} more[/dim]")
             
             yield Static("", id="pdf-status")
         yield Footer()
