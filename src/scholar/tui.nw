@@ -494,6 +494,12 @@ class AbstractScreen(Screen[None]):
             return
         
         self.notify("Enriching paper (metadata, refs, cites)...", severity="information")
+        self._do_enrich()
+    
+    @work(thread=True)
+    def _do_enrich(self) -> None:
+        """Worker thread to fetch enrichment data without blocking UI."""
+        paper = self.decision.paper
         
         from scholar.enrich import enrich_paper
         enriched = enrich_paper(paper, fetch_refs_cites=True)
@@ -509,6 +515,11 @@ class AbstractScreen(Screen[None]):
         if enriched.citations is not None and paper.citations is None:
             enriched_fields.append(f"{len(enriched.citations)} cites")
         
+        # Update UI from main thread
+        self.app.call_from_thread(self._finish_enrich, enriched, enriched_fields)
+    
+    def _finish_enrich(self, enriched: Paper, enriched_fields: list[str]) -> None:
+        """Called from main thread after enrichment completes."""
         if enriched_fields:
             self.decision.paper = enriched
             self.notify(f"Enriched: {', '.join(enriched_fields)}", severity="information")
