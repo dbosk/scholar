@@ -393,8 +393,9 @@ class AbstractScreen(Screen[None]):
         Binding("p", "open_pdf", "Open PDF"),
         Binding("n", "edit_notes", "Notes"),
         Binding("e", "enrich", "Enrich"),
-        Binding("c", "toggle_references", "Refs"),
-        Binding("C", "toggle_citations", "Cites"),
+        Binding("r", "toggle_references", "Refs"),
+        Binding("c", "toggle_citations", "Cites"),
+        Binding("C", "confirm_llm", "Confirm"),
         Binding("a", "add_references", "+Refs"),
         Binding("A", "add_citations", "+Cites"),
     ]
@@ -805,6 +806,21 @@ class AbstractScreen(Screen[None]):
             ),
             handle_discard,
         )
+
+    def action_confirm_llm(self) -> None:
+        """Confirm current LLM decision as correct (mark as reviewed)."""
+        if not self.review_mode:
+            self.notify("Keep/discard disabled in notes mode", severity="warning")
+            return
+        if self.decision.source != ReviewSource.LLM_UNREVIEWED:
+            self.notify("Not an unreviewed LLM decision", severity="warning")
+            return
+
+        # Mark as reviewed without changing the decision
+        from scholar.llm_review import mark_as_reviewed
+        mark_as_reviewed(self.decision, user_agrees=True)
+        self.notify(f"Confirmed LLM decision: {self.decision.status.value}")
+        self.dismiss(None)
 @
 
 \section{Tag Selection Modal}
