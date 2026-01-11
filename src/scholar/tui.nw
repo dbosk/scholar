@@ -463,14 +463,14 @@ class AbstractScreen(Screen[None]):
             # Show references if paper has them
             if paper.references:
                 yield Static("")
-                yield Static(f"[bold blue]─── References ({len(paper.references)}) ───[/bold blue]")
+                yield Static(f"[bold blue]─── References ({len(paper.references)}) ───[/bold blue] [dim]Press [bold yellow]a[/bold yellow] to add to session.[/dim]")
                 for ref_paper in paper.references:
                     yield self._render_paper_entry(ref_paper)
             
             # Show citations if paper has them
             if paper.citations:
                 yield Static("")
-                yield Static(f"[bold magenta]─── Citing Papers ({len(paper.citations)}) ───[/bold magenta]")
+                yield Static(f"[bold magenta]─── Citing Papers ({len(paper.citations)}) ───[/bold magenta] [dim]Press [bold yellow]A[/bold yellow] to add to session.[/dim]")
                 for cite_paper in paper.citations:
                     yield self._render_paper_entry(cite_paper)
             
