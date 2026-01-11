@@ -9,12 +9,13 @@ bibliographic metadata.
 Web of Science's Starter API omits abstracts entirely.
 A search returning hundreds of papers without abstracts is nearly useless for
 review purposes.
+Similarly, PDF URLs are often missing, making it harder to access full texts.
 
 This chapter implements \emph{paper enrichment}: using DOIs to fetch missing
 metadata from providers with better coverage.
 The key insight is that the same paper often appears in multiple databases.
 A paper found in DBLP likely exists in Semantic Scholar or OpenAlex, where we
-can retrieve its abstract.
+can retrieve its abstract and PDF URL.
 The DOI serves as the universal identifier linking these representations.
 
 Enrichment operates at two levels:
@@ -37,7 +38,7 @@ The enrichment module exports the main enrichment functions:
 """
 Paper enrichment using DOI lookups.
 
-Fetches missing paper metadata (especially abstracts) from providers
+Fetches missing paper metadata (especially abstracts and PDF URLs) from providers
 with better coverage like Semantic Scholar and OpenAlex.
 """
 
@@ -102,14 +103,14 @@ def enrich_paper(
 
     Args:
         paper: The paper to enrich.
-        fields: Fields to enrich. If None, enriches 'abstract' only.
+        fields: Fields to enrich. If None, enriches 'abstract' and 'pdf_url'.
 
     Returns:
         A new Paper with enriched fields, or the original if enrichment
         fails or isn't needed.
     """
     if fields is None:
-        fields = ["abstract"]
+        fields = ["abstract", "pdf_url"]
 
     # Check if enrichment is needed
     if not needs_enrichment(paper, fields):
@@ -211,7 +212,8 @@ class TestEnrichPaper:
             title="Test Paper",
             authors=["Author"],
             doi="10.1234/test",
-            abstract="Already has abstract"
+            abstract="Already has abstract",
+            pdf_url="https://example.com/paper.pdf"
         )
 
         mock_provider = MagicMock()
@@ -307,14 +309,14 @@ def enrich_papers(
 
     Args:
         papers: List of papers to enrich.
-        fields: Fields to enrich. If None, enriches 'abstract' only.
+        fields: Fields to enrich. If None, enriches 'abstract' and 'pdf_url'.
         progress_callback: Called with (current, total) after each paper.
 
     Returns:
         List of enriched papers in the same order.
     """
     if fields is None:
-        fields = ["abstract"]
+        fields = ["abstract", "pdf_url"]
 
     logger.info(f"Starting batch enrichment of {len(papers)} papers")
     
