@@ -1736,6 +1736,7 @@ class PaperReviewApp(App):
     def __init__(self, session: ReviewSession, review_mode: bool = True,
                  search_filters: SearchFilters | None = None) -> None:
         super().__init__()
+        self.theme = "textual-light"
         self.session = session
         self.review_mode = review_mode
         self.current_index = 0
