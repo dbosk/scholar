@@ -556,9 +556,9 @@ class AbstractScreen(Screen[None]):
                 return
 
             self.notify("Fetching references...", severity="information")
-            from scholar.providers import get_provider
+            from scholar.providers import get_snowball_provider
 
-            provider = get_provider("s2") or get_provider("openalex")
+            provider = get_snowball_provider()
             if provider:
                 try:
                     refs = provider.get_paper_references(paper.doi)
@@ -590,9 +590,9 @@ class AbstractScreen(Screen[None]):
                 return
 
             self.notify("Fetching citing papers...", severity="information")
-            from scholar.providers import get_provider
+            from scholar.providers import get_snowball_provider
 
-            provider = get_provider("s2") or get_provider("openalex")
+            provider = get_snowball_provider()
             if provider:
                 try:
                     cits = provider.get_paper_citations(paper.doi)
@@ -624,9 +624,9 @@ class AbstractScreen(Screen[None]):
                 return
 
             self.notify("Fetching references...", severity="information")
-            from scholar.providers import get_provider
+            from scholar.providers import get_snowball_provider
 
-            provider = get_provider("s2") or get_provider("openalex")
+            provider = get_snowball_provider()
             if provider:
                 try:
                     refs = provider.get_paper_references(paper.doi)
@@ -653,7 +653,7 @@ class AbstractScreen(Screen[None]):
         source_id = get_paper_id(paper)
         added = self.session.add_papers_from_snowball(
             papers=self.decision.cached_references,
-            source_papers=[source_id],
+            source_paper_ids=[source_id],
             direction="references",
         )
         self.notify(f"Added {added} new papers from references", severity="information")
@@ -669,9 +669,9 @@ class AbstractScreen(Screen[None]):
                 return
 
             self.notify("Fetching citing papers...", severity="information")
-            from scholar.providers import get_provider
+            from scholar.providers import get_snowball_provider
 
-            provider = get_provider("s2") or get_provider("openalex")
+            provider = get_snowball_provider()
             if provider:
                 try:
                     cits = provider.get_paper_citations(paper.doi)
@@ -698,7 +698,7 @@ class AbstractScreen(Screen[None]):
         source_id = get_paper_id(paper)
         added = self.session.add_papers_from_snowball(
             papers=self.decision.cached_citations,
-            source_papers=[source_id],
+            source_paper_ids=[source_id],
             direction="citations",
         )
         self.notify(f"Added {added} new papers from citations", severity="information")
@@ -2068,10 +2068,10 @@ class PaperReviewApp(App):
             self.notify("No kept papers have DOIs", severity="warning")
             return
 
-        from scholar.providers import get_provider
+        from scholar.providers import get_snowball_provider
         from scholar.review import get_paper_id
 
-        provider = get_provider("s2") or get_provider("openalex")
+        provider = get_snowball_provider()
         if not provider:
             self.notify("No provider available", severity="error")
             return
@@ -2103,7 +2103,7 @@ class PaperReviewApp(App):
         if all_refs:
             added = self.session.add_papers_from_snowball(
                 papers=all_refs,
-                source_papers=source_ids,
+                source_paper_ids=source_ids,
                 direction="references",
             )
             self.notify(
@@ -2115,7 +2115,7 @@ class PaperReviewApp(App):
         else:
             self.notify("No references found", severity="warning")
 
-    async def action_add_all_citations(self) -> None:
+    async     def action_add_all_citations(self) -> None:
         """Add citing papers from all kept papers to session for review."""
         if not self.review_mode:
             self.notify("Snowballing disabled in notes mode", severity="warning")
@@ -2132,10 +2132,10 @@ class PaperReviewApp(App):
             self.notify("No kept papers have DOIs", severity="warning")
             return
 
-        from scholar.providers import get_provider
+        from scholar.providers import get_snowball_provider
         from scholar.review import get_paper_id
 
-        provider = get_provider("s2") or get_provider("openalex")
+        provider = get_snowball_provider()
         if not provider:
             self.notify("No provider available", severity="error")
             return
@@ -2167,7 +2167,7 @@ class PaperReviewApp(App):
         if all_cites:
             added = self.session.add_papers_from_snowball(
                 papers=all_cites,
-                source_papers=source_ids,
+                source_paper_ids=source_ids,
                 direction="citations",
             )
             self.notify(

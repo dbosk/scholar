@@ -244,6 +244,42 @@ def get_provider(name: str) -> SearchProvider | None:
 def get_all_providers() -> list[SearchProvider]:
     """Get all registered providers."""
     return list(PROVIDERS.values())
+
+
+def get_snowball_provider() -> SearchProvider | None:
+    """
+    Get the best available provider for citation/reference fetching.
+
+    Returns the first available provider that supports citation retrieval
+    using DOIs, in priority order: WOS (Expanded API), Semantic Scholar,
+    OpenAlex.
+
+    Returns:
+        A provider with citation support, or None if none available.
+    """
+    # Priority order for DOI-based snowballing
+    priority = ["wos", "s2", "openalex"]
+
+    for name in priority:
+        provider = PROVIDERS.get(name)
+        if provider is None:
+            continue
+
+        # Check if provider is available
+        if not provider.is_available():
+            continue
+
+        # Check if provider has citation methods
+        if not hasattr(provider, "get_paper_citations"):
+            continue
+
+        # For WOS, only use if Expanded API is available (required for citations)
+        if name == "wos" and getattr(provider, "_api_tier", None) != "expanded":
+            continue
+
+        return provider
+
+    return None
 @
 
 \subsection{Testing the registry}
@@ -490,6 +526,7 @@ class SemanticScholarProvider:
     <<semantic scholar rate limiting>>
     <<semantic scholar search method>>
     <<semantic scholar get paper by doi>>
+    <<semantic scholar get citations and references>>
     <<convert semantic scholar paper>>
 @
 
@@ -766,6 +803,143 @@ def get_paper_by_doi(self, doi: str) -> Paper | None:
     except Exception as e:
         logger.warning("s2: DOI lookup failed: %s", e)
         return None
+@
+
+\subsubsection{Citations and references}
+
+The Semantic Scholar API provides endpoints to retrieve papers that cite a given
+paper (citations) and papers that a given paper references (references).
+These are essential for \emph{snowballing}---the practice of finding related
+work by following citation chains.
+
+The API endpoints are:
+\begin{description}
+\item[Citations] [[/paper/{paper_id}/citations]] returns papers citing this one
+\item[References] [[/paper/{paper_id}/references]] returns papers this one cites
+\end{description}
+
+Both endpoints return a list of objects with a [[citingPaper]] or
+[[citedPaper]] field containing the paper data.
+We request the same fields as the search API for consistency.
+
+<<semantic scholar get citations and references>>=
+def get_paper_citations(
+    self,
+    paper_id: str,
+    limit: int = 100,
+) -> list[Paper]:
+    """
+    Get papers that cite the given paper.
+
+    Args:
+        paper_id: DOI or Semantic Scholar paper ID.
+        limit: Maximum number of citing papers to return.
+
+    Returns:
+        List of Paper objects that cite this paper.
+    """
+    return self._get_related_papers(paper_id, "citations", limit)
+
+def get_paper_references(
+    self,
+    paper_id: str,
+    limit: int = 100,
+) -> list[Paper]:
+    """
+    Get papers referenced by the given paper.
+
+    Args:
+        paper_id: DOI or Semantic Scholar paper ID.
+        limit: Maximum number of referenced papers to return.
+
+    Returns:
+        List of Paper objects referenced by this paper.
+    """
+    return self._get_related_papers(paper_id, "references", limit)
+
+def _get_related_papers(
+    self,
+    paper_id: str,
+    relation: str,
+    limit: int,
+) -> list[Paper]:
+    """
+    Fetch related papers (citations or references) for a given paper.
+
+    Args:
+        paper_id: DOI or Semantic Scholar paper ID.
+        relation: Either "citations" or "references".
+        limit: Maximum number of papers to return.
+
+    Returns:
+        List of related Paper objects.
+    """
+    if not paper_id:
+        return []
+
+    # Use DOI: prefix if it looks like a DOI
+    if "/" in paper_id and not paper_id.startswith("DOI:"):
+        paper_id = f"DOI:{paper_id}"
+
+    all_papers: list[Paper] = []
+    offset = 0
+    page_size = min(limit, 100)
+
+    try:
+        while len(all_papers) < limit:
+            self._wait_for_rate_limit()
+
+            headers = {}
+            if self.api_key:
+                headers["x-api-key"] = self.api_key
+
+            url = f"https://api.semanticscholar.org/graph/v1/paper/{paper_id}/{relation}"
+            response = self._session.get(
+                url,
+                params={
+                    "fields": "title,authors,year,abstract,venue,externalIds,url,openAccessPdf",
+                    "limit": page_size,
+                    "offset": offset,
+                },
+                headers=headers,
+                timeout=30,
+            )
+
+            if response.status_code == 404:
+                logger.warning("s2: Paper not found: %s", paper_id)
+                break
+
+            if response.status_code == 429:
+                logger.warning("s2: Rate limited during %s fetch", relation)
+                break
+
+            response.raise_for_status()
+            data = response.json()
+
+            items = data.get("data", [])
+            if not items:
+                break
+
+            # Extract papers from the response
+            # Citations have "citingPaper", references have "citedPaper"
+            paper_key = "citingPaper" if relation == "citations" else "citedPaper"
+            for item in items:
+                paper_data = item.get(paper_key, {})
+                if paper_data and paper_data.get("title"):
+                    all_papers.append(self._convert_paper(paper_data))
+
+            if len(items) < page_size:
+                break
+
+            offset += page_size
+
+    except requests.exceptions.HTTPError as e:
+        logger.warning("s2: %s fetch error: %s", relation, e)
+    except Exception as e:
+        logger.warning("s2: %s fetch failed: %s", relation, e)
+
+    logger.info("s2: Found %d %s for %s", len(all_papers), relation, paper_id)
+    return all_papers
 @
 
 \subsubsection{Converting paper format}
@@ -2935,6 +3109,204 @@ def search_for_citation_report(
     except Exception as e:
         logger.warning("wos: search_for_citation_report failed: %s", e)
         return None
+
+def get_paper_by_doi(self, doi: str) -> Paper | None:
+    """
+    Look up a paper by its DOI and return it with WOS metadata.
+
+    This method searches WOS for the given DOI and returns the paper
+    with its WOS UID stored, which is needed for citation operations.
+
+    Args:
+        doi: The DOI to look up (e.g., "10.1145/1234567.1234568").
+
+    Returns:
+        Paper if found, None otherwise. The paper will have WOS UID
+        in its metadata if found via the Expanded API.
+    """
+    if not doi or not self._api_key:
+        return None
+
+    # Search by DOI using the DO= field tag
+    query = f"DO={doi}"
+
+    try:
+        if self._api_tier == "expanded":
+            papers = self._search_expanded(query, limit=1, filters=None)
+        else:
+            papers = self._search_starter(query, limit=1, filters=None)
+
+        if papers:
+            return papers[0]
+        return None
+    except Exception as e:
+        logger.warning("wos: DOI lookup failed for %s: %s", doi, e)
+        return None
+
+def _get_uid_for_doi(self, doi: str) -> str | None:
+    """
+    Get the WOS UID for a paper given its DOI.
+
+    Args:
+        doi: The DOI to look up.
+
+    Returns:
+        WOS UID string (e.g., "WOS:000123456789") or None if not found.
+    """
+    if not doi or not self._api_key:
+        return None
+
+    # Search by DOI using the DO= field tag
+    query = f"DO={doi}"
+
+    try:
+        if self._api_tier == "expanded":
+            response = requests.get(
+                WOS_EXPANDED_API_URL,
+                params={
+                    "databaseId": "WOS",
+                    "usrQuery": query,
+                    "count": 1,
+                    "firstRecord": 1,
+                },
+                headers={"X-ApiKey": self._api_key},
+                timeout=30,
+            )
+            response.raise_for_status()
+            data = response.json()
+
+            records = (
+                data.get("Data", {})
+                .get("Records", {})
+                .get("records", {})
+                .get("REC", [])
+            )
+            if records and len(records) > 0:
+                return records[0].get("UID")
+        else:
+            # Starter API - search and extract UID from response
+            response = requests.get(
+                WOS_STARTER_API_URL,
+                params={
+                    "q": query,
+                    "limit": 1,
+                    "page": 1,
+                },
+                headers={"X-ApiKey": self._api_key},
+                timeout=30,
+            )
+            response.raise_for_status()
+            data = response.json()
+
+            hits = data.get("hits", [])
+            if hits and len(hits) > 0:
+                return hits[0].get("uid")
+
+        return None
+    except Exception as e:
+        logger.warning("wos: UID lookup failed for DOI %s: %s", doi, e)
+        return None
+
+def get_paper_citations(
+    self,
+    paper_id: str,
+    limit: int = 100,
+) -> list[Paper]:
+    """
+    Get papers that cite the given paper.
+
+    This method accepts either a WOS UID or a DOI. If a DOI is provided,
+    it first looks up the WOS UID, then fetches citations.
+
+    Args:
+        paper_id: DOI or WOS UID (e.g., "10.1000/xyz" or "WOS:000123456").
+        limit: Maximum number of citing papers to return.
+
+    Returns:
+        List of Paper objects that cite this paper.
+
+    Raises:
+        NotImplementedError: If Expanded API is not configured.
+    """
+    self._require_expanded_api("get_paper_citations")
+
+    # Determine if this is a DOI or WOS UID
+    if paper_id.startswith("WOS:"):
+        uid = paper_id
+    else:
+        # Assume it's a DOI - look up the UID
+        uid = self._get_uid_for_doi(paper_id)
+        if not uid:
+            logger.warning("wos: Could not find WOS UID for DOI %s", paper_id)
+            return []
+
+    return self.get_citing_articles(uid, limit)
+
+def get_paper_references(
+    self,
+    paper_id: str,
+    limit: int = 100,
+) -> list[Paper]:
+    """
+    Get papers referenced by the given paper.
+
+    This method accepts either a WOS UID or a DOI. If a DOI is provided,
+    it first looks up the WOS UID, then fetches references.
+
+    Note: The WOS API returns reference metadata as dictionaries, not full
+    Paper objects. We convert them to Paper objects with limited metadata.
+
+    Args:
+        paper_id: DOI or WOS UID (e.g., "10.1000/xyz" or "WOS:000123456").
+        limit: Maximum number of referenced papers to return.
+
+    Returns:
+        List of Paper objects referenced by this paper.
+
+    Raises:
+        NotImplementedError: If Expanded API is not configured.
+    """
+    self._require_expanded_api("get_paper_references")
+
+    # Determine if this is a DOI or WOS UID
+    if paper_id.startswith("WOS:"):
+        uid = paper_id
+    else:
+        # Assume it's a DOI - look up the UID
+        uid = self._get_uid_for_doi(paper_id)
+        if not uid:
+            logger.warning("wos: Could not find WOS UID for DOI %s", paper_id)
+            return []
+
+    # Get references as dicts and convert to Papers
+    ref_dicts = self.get_cited_references(uid, limit)
+
+    papers = []
+    for ref in ref_dicts:
+        # Convert reference dict to Paper
+        # Parse author - may be "LastName, FirstName" format
+        author = ref.get("citedAuthor", "")
+        authors = [author] if author else []
+
+        # Parse year
+        year = None
+        year_str = ref.get("year")
+        if year_str:
+            try:
+                year = int(year_str)
+            except (ValueError, TypeError):
+                pass
+
+        papers.append(Paper(
+            title=ref.get("citedTitle") or "",
+            authors=authors,
+            year=year,
+            doi=ref.get("doi"),
+            venue=ref.get("citedWork"),
+            sources=[self.name],
+        ))
+
+    return papers
 @
 
 \subsection{Auto-registration}
