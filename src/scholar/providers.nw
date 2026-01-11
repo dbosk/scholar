@@ -2834,6 +2834,8 @@ The WoS Starter API returns documents with a relatively flat structure:
 def _convert_starter_hit(self, hit: dict) -> Paper:
     """Convert a WoS Starter API hit to our Paper type."""
     source = hit.get("source", {})
+    if not isinstance(source, dict):
+        source = {}
     year = None
     pub_year = source.get("publishYear")
     if pub_year:
@@ -2844,15 +2846,22 @@ def _convert_starter_hit(self, hit: dict) -> Paper:
 
     authors = []
     names = hit.get("names", {})
+    if not isinstance(names, dict):
+        names = {}
     for author in names.get("authors", []):
-        name = author.get("displayName")
-        if name:
-            authors.append(name)
+        if isinstance(author, dict):
+            name = author.get("displayName")
+            if name:
+                authors.append(name)
 
     identifiers = hit.get("identifiers", {})
+    if not isinstance(identifiers, dict):
+        identifiers = {}
     doi = identifiers.get("doi")
 
     links = hit.get("links", {})
+    if not isinstance(links, dict):
+        links = {}
     url = links.get("record")
 
     return Paper(
@@ -2937,7 +2946,7 @@ def _convert_expanded_hit(self, rec: dict) -> Paper:
         self._safe_get_nested(summary, "titles", "title", default=[])
     )
     for t in titles:
-        if t.get("type") == "item":
+        if isinstance(t, dict) and t.get("type") == "item":
             title = t.get("content", "")
             break
     if not title and titles:
@@ -2958,7 +2967,7 @@ def _convert_expanded_hit(self, rec: dict) -> Paper:
         self._safe_get_nested(summary, "names", "name", default=[])
     )
     for author in names:
-        if author.get("role") == "author":
+        if isinstance(author, dict) and author.get("role") == "author":
             name = author.get("display_name") or author.get("full_name")
             if name:
                 authors.append(name)
@@ -2971,7 +2980,7 @@ def _convert_expanded_hit(self, rec: dict) -> Paper:
         self._safe_get_nested(cluster, "identifiers", "identifier", default=[])
     )
     for ident in identifiers:
-        if ident.get("type") == "doi":
+        if isinstance(ident, dict) and ident.get("type") == "doi":
             doi = ident.get("value")
             break
 
@@ -2983,7 +2992,7 @@ def _convert_expanded_hit(self, rec: dict) -> Paper:
     # Extract venue (source title)
     venue = None
     for t in titles:
-        if t.get("type") == "source":
+        if isinstance(t, dict) and t.get("type") == "source":
             venue = t.get("content")
             break
 
@@ -3103,14 +3112,14 @@ def get_citing_articles(self, uid: str, limit: int = 10) -> list[Paper]:
         data = response.json()
 
         # Use _ensure_list because the API may return a single dict instead of
-        # a list when there's only one citing article.
+        # a list when there's only one citing article. Skip non-dict items.
         records = self._ensure_list(
             data.get("Data", {})
             .get("Records", {})
             .get("records", {})
             .get("REC", [])
         )
-        result = [self._convert_expanded_hit(rec) for rec in records]
+        result = [self._convert_expanded_hit(rec) for rec in records if isinstance(rec, dict)]
         self._cache[cache_key] = result
         return result
     except NotImplementedError:
@@ -3167,7 +3176,8 @@ def get_cited_references(self, uid: str, limit: int = 10) -> list[dict]:
 
         # References have a different structure than regular records.
         # Use _ensure_list because the API may return a single dict or string
-        # instead of a list when there's only one reference.
+        # instead of a list when there's only one reference. We also skip any
+        # non-dict items in the list (the API sometimes returns strings).
         references = self._ensure_list(data.get("Data", []))
         result = [
             {
@@ -3180,6 +3190,7 @@ def get_cited_references(self, uid: str, limit: int = 10) -> list[dict]:
                 "timesCited": ref.get("timesCited"),
             }
             for ref in references
+            if isinstance(ref, dict)
         ]
         self._cache[cache_key] = result
         return result
@@ -3435,6 +3446,9 @@ def get_paper_references(
 
     papers = []
     for ref in ref_dicts:
+        # Skip non-dict items (defensive check)
+        if not isinstance(ref, dict):
+            continue
         # Skip references without titles
         title = ref.get("citedTitle")
         if not title:
