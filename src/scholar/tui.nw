@@ -493,7 +493,12 @@ class AbstractScreen(Screen[None]):
             self.notify("No DOI available for enrichment", severity="warning")
             return
         
-        self.notify("Enriching paper (metadata, refs, cites)...", severity="information")
+        # Brief title preview for notifications
+        title_preview = (paper.title or "")[:30]
+        if len(paper.title or "") > 30:
+            title_preview += "..."
+        
+        self.notify(f"Enriching '{title_preview}'...", severity="information")
         self._do_enrich()
     
     def _do_enrich(self) -> None:
@@ -507,6 +512,11 @@ class AbstractScreen(Screen[None]):
         decision = self.decision  # Capture reference
         app = self.app  # Capture app reference
         paper = decision.paper
+        
+        # Brief title preview for notifications
+        title_preview = (paper.title or "")[:30]
+        if len(paper.title or "") > 30:
+            title_preview += "..."
         
         def enrich_thread():
             from scholar.enrich import enrich_paper
@@ -527,9 +537,9 @@ class AbstractScreen(Screen[None]):
             def finish():
                 if enriched_fields:
                     decision.paper = enriched
-                    app.notify(f"Enriched: {', '.join(enriched_fields)}", severity="information")
+                    app.notify(f"'{title_preview}': {', '.join(enriched_fields)}", severity="information")
                 else:
-                    app.notify("Paper already fully enriched", severity="information")
+                    app.notify(f"'{title_preview}' already enriched", severity="information")
             
             app.call_from_thread(finish)
         
