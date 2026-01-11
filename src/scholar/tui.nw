@@ -498,7 +498,7 @@ class AbstractScreen(Screen[None]):
         if len(paper.title or "") > 30:
             title_preview += "..."
         
-        self.notify(f"Enriching '{title_preview}'...", severity="information")
+        self.notify(f"Enriching '{title_preview}'", severity="information")
         self._do_enrich()
     
     def _do_enrich(self) -> None:
