@@ -521,11 +521,15 @@ class AbstractScreen(Screen[None]):
     def _finish_enrich(self, enriched: Paper, enriched_fields: list[str]) -> None:
         """Called from main thread after enrichment completes."""
         if enriched_fields:
+            # Update the decision's paper - this modifies the object in the session
             self.decision.paper = enriched
-            self.notify(f"Enriched: {', '.join(enriched_fields)}", severity="information")
-            self.refresh(recompose=True)
+            # Notify via app so it shows even if this screen was dismissed
+            self.app.notify(f"Enriched: {', '.join(enriched_fields)}", severity="information")
+            # Only refresh if screen is still mounted
+            if self.is_mounted:
+                self.refresh(recompose=True)
         else:
-            self.notify("Paper already fully enriched", severity="information")
+            self.app.notify("Paper already fully enriched", severity="information")
     
     def action_open_pdf(self) -> None:
         """Download and open the PDF."""
