@@ -258,7 +258,8 @@ def get_snowball_provider() -> SearchProvider | None:
         A provider with citation support, or None if none available.
     """
     # Priority order for DOI-based snowballing
-    priority = ["wos", "s2", "openalex"]
+    # S2 is preferred as it has better API reliability
+    priority = ["s2", "openalex", "wos"]
 
     for name in priority:
         provider = PROVIDERS.get(name)
