@@ -393,8 +393,10 @@ class AbstractScreen(Screen[None]):
         Binding("p", "open_pdf", "Open PDF"),
         Binding("n", "edit_notes", "Notes"),
         Binding("e", "enrich", "Enrich"),
-        Binding("r", "add_references", "Refs"),
-        Binding("c", "add_citations", "Cites"),
+        Binding("c", "toggle_references", "Refs"),
+        Binding("C", "toggle_citations", "Cites"),
+        Binding("a", "add_references", "+Refs"),
+        Binding("A", "add_citations", "+Cites"),
     ]
     
     def __init__(self, decision: ReviewDecision, session: ReviewSession, review_mode: bool = True) -> None:
@@ -1736,8 +1738,8 @@ class PaperReviewApp(App):
         Binding("f", "filter", "Filter"),
         Binding("F", "search_filters", "Search"),
         Binding("n", "edit_notes", "Notes"),
-        Binding("r", "add_all_references", "Refs"),
-        Binding("c", "add_all_citations", "Cites"),
+        Binding("a", "add_all_references", "+Refs"),
+        Binding("A", "add_all_citations", "+Cites"),
     ]
     
     def __init__(self, session: ReviewSession, review_mode: bool = True,
