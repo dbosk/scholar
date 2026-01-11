@@ -924,9 +924,15 @@ def _get_related_papers(
             # Citations have "citingPaper", references have "citedPaper"
             paper_key = "citingPaper" if relation == "citations" else "citedPaper"
             for item in items:
-                paper_data = item.get(paper_key, {})
-                if paper_data and paper_data.get("title"):
-                    all_papers.append(self._convert_paper(paper_data))
+                paper_data = item.get(paper_key)
+                if not paper_data:
+                    # Some items may not have the nested paper data
+                    continue
+                title = paper_data.get("title")
+                if not title:
+                    # Skip papers without titles
+                    continue
+                all_papers.append(self._convert_paper(paper_data))
 
             if len(items) < page_size:
                 break
@@ -3283,6 +3289,11 @@ def get_paper_references(
 
     papers = []
     for ref in ref_dicts:
+        # Skip references without titles
+        title = ref.get("citedTitle")
+        if not title:
+            continue
+
         # Convert reference dict to Paper
         # Parse author - may be "LastName, FirstName" format
         author = ref.get("citedAuthor", "")
@@ -3298,7 +3309,7 @@ def get_paper_references(
                 pass
 
         papers.append(Paper(
-            title=ref.get("citedTitle") or "",
+            title=title,
             authors=authors,
             year=year,
             doi=ref.get("doi"),

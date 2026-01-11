@@ -466,19 +466,15 @@ class AbstractScreen(Screen[None]):
             if self.show_references and self.decision.cached_references:
                 yield Static("")
                 yield Static(f"[bold blue]─── References ({len(self.decision.cached_references)}) ───[/bold blue]")
-                for ref_paper in self.decision.cached_references[:20]:
+                for ref_paper in self.decision.cached_references:
                     yield self._render_paper_entry(ref_paper)
-                if len(self.decision.cached_references) > 20:
-                    yield Static(f"  [dim]... and {len(self.decision.cached_references) - 20} more[/dim]")
             
             # Show citations if toggled on
             if self.show_citations and self.decision.cached_citations:
                 yield Static("")
                 yield Static(f"[bold magenta]─── Citing Papers ({len(self.decision.cached_citations)}) ───[/bold magenta]")
-                for cite_paper in self.decision.cached_citations[:20]:
+                for cite_paper in self.decision.cached_citations:
                     yield self._render_paper_entry(cite_paper)
-                if len(self.decision.cached_citations) > 20:
-                    yield Static(f"  [dim]... and {len(self.decision.cached_citations) - 20} more[/dim]")
             
             yield Static("", id="pdf-status")
         yield Footer()
@@ -553,18 +549,22 @@ class AbstractScreen(Screen[None]):
 
     def _render_paper_entry(self, paper: Paper) -> Static:
         """Render a single paper in the citation/reference list."""
+        from rich.markup import escape
+        
+        title = escape(paper.title) if paper.title else "Unknown title"
         year = f"({paper.year})" if paper.year else ""
         citations = (
-            f"[{paper.citation_count} citations]"
+            f"- {paper.citation_count} citations"
             if paper.citation_count
             else ""
         )
         authors = ", ".join(paper.authors[:3]) if paper.authors else ""
         if paper.authors and len(paper.authors) > 3:
             authors += " et al."
+        authors = escape(authors)
 
         return Static(
-            f"  [bold]{paper.title}[/bold] {year}\n"
+            f"  [bold]{title}[/bold] {year}\n"
             f"    [dim]{authors}[/dim] {citations}"
         )
 
