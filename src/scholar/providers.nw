@@ -161,6 +161,46 @@ class SearchProvider(Protocol):
             True if the provider can be used, False otherwise.
         """
         ...
+
+    def get_paper_citations(
+        self,
+        paper_id: str,
+        limit: int = 100,
+    ) -> list[Paper]:
+        """
+        Get papers that cite the given paper.
+
+        Args:
+            paper_id: The paper identifier (DOI, provider-specific ID, etc.).
+            limit: Maximum number of citing papers to return.
+
+        Returns:
+            List of Paper objects that cite this paper.
+
+        Raises:
+            NotImplementedError: If this provider doesn't support citation retrieval.
+        """
+        ...
+
+    def get_paper_references(
+        self,
+        paper_id: str,
+        limit: int = 100,
+    ) -> list[Paper]:
+        """
+        Get papers referenced by the given paper.
+
+        Args:
+            paper_id: The paper identifier (DOI, provider-specific ID, etc.).
+            limit: Maximum number of referenced papers to return.
+
+        Returns:
+            List of Paper objects referenced by this paper.
+
+        Raises:
+            NotImplementedError: If this provider doesn't support reference retrieval.
+        """
+        ...
 @
 
 

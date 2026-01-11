@@ -393,6 +393,8 @@ class AbstractScreen(Screen[None]):
         Binding("p", "open_pdf", "Open PDF"),
         Binding("n", "edit_notes", "Notes"),
         Binding("e", "enrich", "Enrich"),
+        Binding("a", "add_references", "Add Refs"),
+        Binding("A", "add_citations", "Add Cites"),
     ]
     
     def __init__(self, decision: ReviewDecision, session: ReviewSession, review_mode: bool = True) -> None:
@@ -520,7 +522,182 @@ class AbstractScreen(Screen[None]):
     async def action_dismiss_screen(self) -> None:
         """Return to the paper list."""
         self.dismiss(None)
-    
+
+    def _render_paper_entry(self, paper: Paper) -> Static:
+        """Render a single paper in the citation/reference list."""
+        year = f"({paper.year})" if paper.year else ""
+        citations = (
+            f"[{paper.citation_count} citations]"
+            if paper.citation_count
+            else ""
+        )
+        authors = ", ".join(paper.authors[:3]) if paper.authors else ""
+        if paper.authors and len(paper.authors) > 3:
+            authors += " et al."
+
+        return Static(
+            f"  [bold]{paper.title}[/bold] {year}\n"
+            f"    [dim]{authors}[/dim] {citations}"
+        )
+
+    def action_toggle_references(self) -> None:
+        """Toggle references section visibility, fetching if needed."""
+        paper = self.decision.paper
+
+        if self.decision.cached_references is None:
+            # Fetch references
+            if not paper.doi:
+                self.notify("No DOI available", severity="warning")
+                return
+
+            self.notify("Fetching references...", severity="information")
+            from scholar.providers import get_provider
+
+            provider = get_provider("s2") or get_provider("openalex")
+            if provider:
+                try:
+                    refs = provider.get_paper_references(paper.doi)
+                    self.decision.cached_references = refs
+                    self.notify(f"Found {len(refs)} references")
+                except NotImplementedError:
+                    self.notify(
+                        "Provider doesn't support references", severity="error"
+                    )
+                    return
+                except Exception as e:
+                    self.notify(f"Error: {e}", severity="error")
+                    return
+            else:
+                self.notify("No provider available", severity="error")
+                return
+
+        self.show_references = not self.show_references
+        self.refresh(recompose=True)
+
+    def action_toggle_citations(self) -> None:
+        """Toggle citations section visibility, fetching if needed."""
+        paper = self.decision.paper
+
+        if self.decision.cached_citations is None:
+            # Fetch citations
+            if not paper.doi:
+                self.notify("No DOI available", severity="warning")
+                return
+
+            self.notify("Fetching citing papers...", severity="information")
+            from scholar.providers import get_provider
+
+            provider = get_provider("s2") or get_provider("openalex")
+            if provider:
+                try:
+                    cits = provider.get_paper_citations(paper.doi)
+                    self.decision.cached_citations = cits
+                    self.notify(f"Found {len(cits)} citing papers")
+                except NotImplementedError:
+                    self.notify(
+                        "Provider doesn't support citations", severity="error"
+                    )
+                    return
+                except Exception as e:
+                    self.notify(f"Error: {e}", severity="error")
+                    return
+            else:
+                self.notify("No provider available", severity="error")
+                return
+
+        self.show_citations = not self.show_citations
+        self.refresh(recompose=True)
+
+    def action_add_references(self) -> None:
+        """Add references of this paper to the session for review."""
+        paper = self.decision.paper
+
+        # Ensure we have cached references
+        if self.decision.cached_references is None:
+            if not paper.doi:
+                self.notify("No DOI available", severity="warning")
+                return
+
+            self.notify("Fetching references...", severity="information")
+            from scholar.providers import get_provider
+
+            provider = get_provider("s2") or get_provider("openalex")
+            if provider:
+                try:
+                    refs = provider.get_paper_references(paper.doi)
+                    self.decision.cached_references = refs
+                except NotImplementedError:
+                    self.notify(
+                        "Provider doesn't support references", severity="error"
+                    )
+                    return
+                except Exception as e:
+                    self.notify(f"Error: {e}", severity="error")
+                    return
+            else:
+                self.notify("No provider available", severity="error")
+                return
+
+        if not self.decision.cached_references:
+            self.notify("No references found", severity="warning")
+            return
+
+        # Add references to session
+        from scholar.review import get_paper_id
+
+        source_id = get_paper_id(paper)
+        added = self.session.add_papers_from_snowball(
+            papers=self.decision.cached_references,
+            source_papers=[source_id],
+            direction="references",
+        )
+        self.notify(f"Added {added} new papers from references", severity="information")
+
+    def action_add_citations(self) -> None:
+        """Add citing papers of this paper to the session for review."""
+        paper = self.decision.paper
+
+        # Ensure we have cached citations
+        if self.decision.cached_citations is None:
+            if not paper.doi:
+                self.notify("No DOI available", severity="warning")
+                return
+
+            self.notify("Fetching citing papers...", severity="information")
+            from scholar.providers import get_provider
+
+            provider = get_provider("s2") or get_provider("openalex")
+            if provider:
+                try:
+                    cits = provider.get_paper_citations(paper.doi)
+                    self.decision.cached_citations = cits
+                except NotImplementedError:
+                    self.notify(
+                        "Provider doesn't support citations", severity="error"
+                    )
+                    return
+                except Exception as e:
+                    self.notify(f"Error: {e}", severity="error")
+                    return
+            else:
+                self.notify("No provider available", severity="error")
+                return
+
+        if not self.decision.cached_citations:
+            self.notify("No citing papers found", severity="warning")
+            return
+
+        # Add citations to session
+        from scholar.review import get_paper_id
+
+        source_id = get_paper_id(paper)
+        added = self.session.add_papers_from_snowball(
+            papers=self.decision.cached_citations,
+            source_papers=[source_id],
+            direction="citations",
+        )
+        self.notify(f"Added {added} new papers from citations", severity="information")
+
     def action_keep(self) -> None:
         """Quick keep---mark paper as kept without themes."""
         if not self.review_mode:
@@ -1554,6 +1731,8 @@ class PaperReviewApp(App):
         Binding("f", "filter", "Filter"),
         Binding("F", "search_filters", "Search"),
         Binding("n", "edit_notes", "Notes"),
+        Binding("a", "add_all_references", "Add Refs"),
+        Binding("A", "add_all_citations", "Add Cites"),
     ]
     
     def __init__(self, session: ReviewSession, review_mode: bool = True,
@@ -1866,6 +2045,134 @@ class PaperReviewApp(App):
         self.notify(f"Confirmed LLM decision: {decision.status.value}")
         self._refresh_list()
         self._update_status()
+
+    async def action_add_all_references(self) -> None:
+        """Add references from all kept papers to session for review."""
+        if not self.review_mode:
+            self.notify("Snowballing disabled in notes mode", severity="warning")
+            return
+
+        kept_papers = self.session.kept_papers
+        if not kept_papers:
+            self.notify("No kept papers to snowball from", severity="warning")
+            return
+
+        # Only use papers with DOIs
+        papers_with_doi = [d for d in kept_papers if d.paper.doi]
+        if not papers_with_doi:
+            self.notify("No kept papers have DOIs", severity="warning")
+            return
+
+        from scholar.providers import get_provider
+        from scholar.review import get_paper_id
+
+        provider = get_provider("s2") or get_provider("openalex")
+        if not provider:
+            self.notify("No provider available", severity="error")
+            return
+
+        self.notify(
+            f"Fetching references from {len(papers_with_doi)} papers...",
+            severity="information"
+        )
+
+        all_refs: list[Paper] = []
+        source_ids: list[str] = []
+        
+        for decision in papers_with_doi:
+            paper = decision.paper
+            try:
+                # Use cached references if available
+                if decision.cached_references is not None:
+                    refs = decision.cached_references
+                else:
+                    refs = provider.get_paper_references(paper.doi)
+                    decision.cached_references = refs
+                
+                all_refs.extend(refs)
+                source_ids.append(get_paper_id(paper))
+                self.notify(f"Found {len(refs)} refs for {paper.title[:30]}...")
+            except Exception as e:
+                self.notify(f"Error for {paper.title[:30]}: {e}", severity="warning")
+
+        if all_refs:
+            added = self.session.add_papers_from_snowball(
+                papers=all_refs,
+                source_papers=source_ids,
+                direction="references",
+            )
+            self.notify(
+                f"Added {added} new papers from {len(all_refs)} references",
+                severity="information"
+            )
+            self._refresh_list()
+            self._update_status()
+        else:
+            self.notify("No references found", severity="warning")
+
+    async def action_add_all_citations(self) -> None:
+        """Add citing papers from all kept papers to session for review."""
+        if not self.review_mode:
+            self.notify("Snowballing disabled in notes mode", severity="warning")
+            return
+
+        kept_papers = self.session.kept_papers
+        if not kept_papers:
+            self.notify("No kept papers to snowball from", severity="warning")
+            return
+
+        # Only use papers with DOIs
+        papers_with_doi = [d for d in kept_papers if d.paper.doi]
+        if not papers_with_doi:
+            self.notify("No kept papers have DOIs", severity="warning")
+            return
+
+        from scholar.providers import get_provider
+        from scholar.review import get_paper_id
+
+        provider = get_provider("s2") or get_provider("openalex")
+        if not provider:
+            self.notify("No provider available", severity="error")
+            return
+
+        self.notify(
+            f"Fetching citations from {len(papers_with_doi)} papers...",
+            severity="information"
+        )
+
+        all_cites: list[Paper] = []
+        source_ids: list[str] = []
+        
+        for decision in papers_with_doi:
+            paper = decision.paper
+            try:
+                # Use cached citations if available
+                if decision.cached_citations is not None:
+                    cites = decision.cached_citations
+                else:
+                    cites = provider.get_paper_citations(paper.doi)
+                    decision.cached_citations = cites
+                
+                all_cites.extend(cites)
+                source_ids.append(get_paper_id(paper))
+                self.notify(f"Found {len(cites)} cites for {paper.title[:30]}...")
+            except Exception as e:
+                self.notify(f"Error for {paper.title[:30]}: {e}", severity="warning")
+
+        if all_cites:
+            added = self.session.add_papers_from_snowball(
+                papers=all_cites,
+                source_papers=source_ids,
+                direction="citations",
+            )
+            self.notify(
+                f"Added {added} new papers from {len(all_cites)} citations",
+                severity="information"
+            )
+            self._refresh_list()
+            self._update_status()
+        else:
+            self.notify("No citing papers found", severity="warning")
 
     def action_sort(self) -> None:
         """Open sort modal."""

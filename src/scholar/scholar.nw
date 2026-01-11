@@ -147,12 +147,15 @@ class Paper:
     venue: str | None = None
     url: str | None = None
     pdf_url: str | None = None
+    citation_count: int | None = None
     sources: list[str] = field(default_factory=list)
 
     <<paper methods>>
 @
 
 We use a dataclass for simplicity.
+The [[citation_count]] field stores the number of citations if available from
+the provider.
 The [[sources]] field tracks which databases returned this paper, useful for
 provenance in reports when merging results from multiple providers.
 
@@ -214,6 +217,15 @@ def merge_with(self, other: "Paper") -> "Paper":
         if src not in combined_sources:
             combined_sources.append(src)
 
+    # For citation count, prefer higher value when both exist
+    merged_citation_count = None
+    if self.citation_count is not None and other.citation_count is not None:
+        merged_citation_count = max(self.citation_count, other.citation_count)
+    elif self.citation_count is not None:
+        merged_citation_count = self.citation_count
+    elif other.citation_count is not None:
+        merged_citation_count = other.citation_count
+
     return Paper(
         title=self.title or other.title,
         authors=self.authors if self.authors else other.authors,
@@ -223,6 +235,7 @@ def merge_with(self, other: "Paper") -> "Paper":
         venue=self.venue or other.venue,
         url=self.url or other.url,
         pdf_url=self.pdf_url or other.pdf_url,
+        citation_count=merged_citation_count,
         sources=combined_sources,
     )
 @
