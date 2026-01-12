@@ -1,3 +1,9 @@
 [submodule "makefiles"]
 	path = makefiles
 	url = https://github.com/dbosk/makefiles.git
+[submodule "snowball"]
+	path = snowball
+	url = https://github.com/rjglasse/snowball.git
+[submodule "tuxedo"]
+	path = tuxedo
+	url = https://github.com/rjglasse/tuxedo.git
