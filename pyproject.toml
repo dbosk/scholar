@@ -11,6 +11,7 @@ dependencies = [
     "typer>=0.21.0",
     "rich>=14.2.0",
     "pyalex>=0.19",
+    "arxiv>=2.1.0",
     "cachetools>=6.2.4",
     "platformdirs>=4.5.1",
     "textual>=6.11.0",
