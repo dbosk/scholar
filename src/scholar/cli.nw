@@ -1009,6 +1009,20 @@ console.print()
 
 console.print("[dim]Tip: When in doubt, use simple keywords without operators.[/dim]")
 console.print("[dim]All providers support basic keyword search.[/dim]")
+console.print()
+
+console.print("[bold]Documentation:[/bold]")
+console.print()
+docs = [
+    ("s2", "https://www.semanticscholar.org/product/api/tutorial"),
+    ("openalex", "https://docs.openalex.org/how-to-use-the-api/get-lists-of-entities/search-entities"),
+    ("dblp", "https://dblp.org/faq/How+to+use+the+dblp+search+API.html"),
+    ("wos", "https://webofscience.help.clarivate.com/en-us/Content/search-rules.html"),
+    ("ieee", "https://ieeexplore.ieee.org/Xplorehelp/searching-ieee-xplore/command-search"),
+    ("arxiv", "https://info.arxiv.org/help/api/user-manual.html#query_details"),
+]
+for provider, url in docs:
+    console.print(f"  [cyan]{provider:12}[/]  {url}")
 @
 
 \subsection{Testing syntax command}
@@ -1038,6 +1052,13 @@ class TestSyntaxCommand:
         assert result.exit_code == 0
         assert "AND" in result.stdout
         assert "OR" in result.stdout
+
+    def test_syntax_shows_documentation_urls(self):
+        """The syntax command shows documentation URLs."""
+        result = runner.invoke(app, ["syntax"])
+        assert result.exit_code == 0
+        assert "Documentation" in result.stdout
+        assert "https://" in result.stdout
 @
 
 
