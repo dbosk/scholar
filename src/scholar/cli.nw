@@ -2439,6 +2439,53 @@ class TestCLI:
         assert result.exit_code == 0
         assert "search" in result.stdout
 
+
+class TestSubcommandRegistration:
+    """Tests for subcommand registration from snowball and tuxedo."""
+
+    @pytest.fixture(autouse=True)
+    def register_submodules(self):
+        """Ensure submodules are registered before each test."""
+        from scholar.cli import register_submodules
+
+        register_submodules()
+
+    def test_snowball_subcommand_registered(self):
+        """Snowball subcommand is registered and shows help."""
+        result = runner.invoke(app, ["snowball", "--help"])
+        assert result.exit_code == 0
+        # Should show snowball help
+        assert "snowball" in result.stdout.lower() or "usage" in result.stdout.lower()
+
+    def test_tuxedo_subcommand_registered(self):
+        """Tuxedo subcommand is registered and shows help."""
+        result = runner.invoke(app, ["tuxedo", "--help"])
+        assert result.exit_code == 0
+        # Should show tuxedo help
+        assert "tuxedo" in result.stdout.lower() or "usage" in result.stdout.lower()
+
+    def test_subcommands_appear_in_main_help(self):
+        """Snowball and tuxedo appear in main help output."""
+        result = runner.invoke(app, ["--help"])
+        assert result.exit_code == 0
+        # Both should be listed as subcommands
+        assert "snowball" in result.stdout.lower()
+        assert "tuxedo" in result.stdout.lower()
+
+    def test_snowball_register_commands_function_exists(self):
+        """Snowball module has register_commands function."""
+        import snowball
+
+        assert hasattr(snowball, "register_commands")
+        assert callable(snowball.register_commands)
+
+    def test_tuxedo_register_commands_function_exists(self):
+        """Tuxedo module has register_commands function."""
+        import tuxedo
+
+        assert hasattr(tuxedo, "register_commands")
+        assert callable(tuxedo.register_commands)
+
 @
 
 
