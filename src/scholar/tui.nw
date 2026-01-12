@@ -511,6 +511,7 @@ class AbstractScreen(Screen[None]):
         
         decision = self.decision  # Capture reference
         app = self.app  # Capture app reference
+        screen = self  # Capture screen reference for refresh
         paper = decision.paper
         
         # Brief title preview for notifications
@@ -538,6 +539,9 @@ class AbstractScreen(Screen[None]):
                 if enriched_fields:
                     decision.paper = enriched
                     app.notify(f"'{title_preview}': {', '.join(enriched_fields)}", severity="information")
+                    # Refresh screen if still mounted
+                    if screen.is_mounted:
+                        screen.refresh(recompose=True)
                 else:
                     app.notify(f"'{title_preview}' already enriched", severity="information")
             
