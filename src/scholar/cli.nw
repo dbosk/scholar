@@ -125,7 +125,8 @@ app = typer.Typer(
 
 
 @app.callback(
-    epilog="Copyright (c) 2025--2026 Daniel Bosk. MIT License.\n"
+    epilog="Copyright (c) 2025--2026 Daniel Bosk, Ric Glassey.\n"
+           "MIT License.\n"
            "Web: https://github.com/dbosk/scholar",
 )
 def callback(
@@ -2376,7 +2377,10 @@ for submodules to register their commands with the main application.
 
 Each submodule should provide a [[register_commands(app)]] function that adds
 its commands to the Typer app.
-We attempt to import each known submodule and call this function if it exists:
+We attempt to import each known submodule and call this function if it exists.
+We try both [[scholar.<name>]] (for nested packages) and [[<name>]] (for
+sibling packages installed separately) to support different installation
+configurations:
 
 <<submodule registration>>=
 SUBMODULES = ["snowball", "tuxedo"]
@@ -2386,17 +2390,31 @@ def register_submodules() -> None:
     """
     Dynamically register subcommand modules if available.
 
-    This allows snowball and tuxedo to be added as git submodules
+    This allows snowball and tuxedo to be added as submodules
     without modifying this file. Each submodule should provide a
     `register_commands(app)` function.
+
+    Tries both `scholar.<name>` and `<name>` import paths to support
+    different installation configurations.
     """
     for name in SUBMODULES:
+        module = None
+
+        # Try scholar.<name> first (for nested packages)
         try:
             module = __import__(f"scholar.{name}", fromlist=["register_commands"])
-            if hasattr(module, "register_commands"):
-                module.register_commands(app)
         except ImportError:
-            pass  # Submodule not installed
+            pass
+
+        # Fall back to top-level <name> (for sibling packages)
+        if module is None:
+            try:
+                module = __import__(name, fromlist=["register_commands"])
+            except ImportError:
+                pass
+
+        if module is not None and hasattr(module, "register_commands"):
+            module.register_commands(app)
 @
 
 
@@ -2438,6 +2456,67 @@ class TestCLI:
         result = runner.invoke(app, ["--help"])
         assert result.exit_code == 0
         assert "search" in result.stdout
+@
+
+\subsection{Testing subcommand registration}
+
+Since submodules like snowball and tuxedo are dynamically registered via
+[[register_submodules]], we need to verify that the registration mechanism
+works correctly.
+These tests ensure that:
+\begin{enumerate}
+\item The [[register_commands]] function exists in each submodule.
+\item Subcommands are properly registered with the main app.
+\item Subcommands appear in help output.
+\end{enumerate}
+
+<<test functions>>=
+
+class TestSubcommandRegistration:
+    """Tests for subcommand registration from snowball and tuxedo."""
+
+    @pytest.fixture(autouse=True)
+    def register_submodules(self):
+        """Ensure submodules are registered before each test."""
+        from scholar.cli import register_submodules
+
+        register_submodules()
+
+    def test_snowball_subcommand_registered(self):
+        """Snowball subcommand is registered and shows help."""
+        result = runner.invoke(app, ["snowball", "--help"])
+        assert result.exit_code == 0
+        # Should show snowball help
+        assert "snowball" in result.stdout.lower() or "usage" in result.stdout.lower()
+
+    def test_tuxedo_subcommand_registered(self):
+        """Tuxedo subcommand is registered and shows help."""
+        result = runner.invoke(app, ["tuxedo", "--help"])
+        assert result.exit_code == 0
+        # Should show tuxedo help
+        assert "tuxedo" in result.stdout.lower() or "usage" in result.stdout.lower()
+
+    def test_subcommands_appear_in_main_help(self):
+        """Snowball and tuxedo appear in main help output."""
+        result = runner.invoke(app, ["--help"])
+        assert result.exit_code == 0
+        # Both should be listed as subcommands
+        assert "snowball" in result.stdout.lower()
+        assert "tuxedo" in result.stdout.lower()
+
+    def test_snowball_register_commands_function_exists(self):
+        """Snowball module has register_commands function."""
+        import snowball
+
+        assert hasattr(snowball, "register_commands")
+        assert callable(snowball.register_commands)
+
+    def test_tuxedo_register_commands_function_exists(self):
+        """Tuxedo module has register_commands function."""
+        import tuxedo
+
+        assert hasattr(tuxedo, "register_commands")
+        assert callable(tuxedo.register_commands)
 
 @
 

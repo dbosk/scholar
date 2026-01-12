@@ -1,8 +1,9 @@
 [project]
-name = "scholar"
-version = "0.1.0"
+name = "scholarcli"
+version = "1.0"
 description = "A tool for structured literature searches across bibliographic databases"
-authors = [{ name = "Daniel Bosk", email = "dbosk@kth.se" }]
+authors = [{ name = "Daniel Bosk", email = "dbosk@kth.se" },
+           { name = "Ric Glassey", email = "glassey@kth.se" }]
 readme = "README.md"
 license = "MIT"
 requires-python = ">= 3.12"
@@ -23,6 +24,31 @@ dependencies = [
     "llm-azure>=2.1",
     "llm-anthropic>=0.23",
     "llm-gemini>=0.28.2",
+]
+
+[project.optional-dependencies]
+# Snowball dependencies (for scholar snowball subcommand)
+snowball = [
+    "pypdfium2>=4.26.0",
+    "bibtexparser>=1.4.0",
+    "pandas>=2.0.0",
+    "pydantic>=2.0.0",
+    "python-dotenv>=1.0.0",
+    "httpx>=0.25.0",
+    "grobid-client-python>=0.1.0",
+    "scholarly>=1.7.0",
+]
+# Tuxedo dependencies (for scholar tuxedo subcommand)
+tuxedo = [
+    "httpx>=0.27.0",
+    "openai>=1.0.0",
+    "pydantic>=2.0.0",
+    "pyyaml>=6.0",
+]
+# All subcommand dependencies
+all = [
+    "scholar[snowball]",
+    "scholar[tuxedo]",
 ]
 
 [project.scripts]
