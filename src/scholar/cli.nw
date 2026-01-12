@@ -124,7 +124,10 @@ app = typer.Typer(
 )
 
 
-@app.callback()
+@app.callback(
+    epilog="Copyright (c) 2025--2026 Daniel Bosk. MIT License.\n"
+           "Web: https://github.com/dbosk/scholar",
+)
 def callback(
     verbose: Annotated[
         int,
