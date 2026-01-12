@@ -2377,7 +2377,10 @@ for submodules to register their commands with the main application.
 
 Each submodule should provide a [[register_commands(app)]] function that adds
 its commands to the Typer app.
-We attempt to import each known submodule and call this function if it exists:
+We attempt to import each known submodule and call this function if it exists.
+We try both [[scholar.<name>]] (for nested packages) and [[<name>]] (for
+sibling packages installed separately) to support different installation
+configurations:
 
 <<submodule registration>>=
 SUBMODULES = ["snowball", "tuxedo"]
@@ -2387,17 +2390,31 @@ def register_submodules() -> None:
     """
     Dynamically register subcommand modules if available.
 
-    This allows snowball and tuxedo to be added as git submodules
+    This allows snowball and tuxedo to be added as submodules
     without modifying this file. Each submodule should provide a
     `register_commands(app)` function.
+
+    Tries both `scholar.<name>` and `<name>` import paths to support
+    different installation configurations.
     """
     for name in SUBMODULES:
+        module = None
+
+        # Try scholar.<name> first (for nested packages)
         try:
             module = __import__(f"scholar.{name}", fromlist=["register_commands"])
-            if hasattr(module, "register_commands"):
-                module.register_commands(app)
         except ImportError:
-            pass  # Submodule not installed
+            pass
+
+        # Fall back to top-level <name> (for sibling packages)
+        if module is None:
+            try:
+                module = __import__(name, fromlist=["register_commands"])
+            except ImportError:
+                pass
+
+        if module is not None and hasattr(module, "register_commands"):
+            module.register_commands(app)
 @
 
 
@@ -2439,7 +2456,21 @@ class TestCLI:
         result = runner.invoke(app, ["--help"])
         assert result.exit_code == 0
         assert "search" in result.stdout
+@
 
+\subsection{Testing subcommand registration}
+
+Since submodules like snowball and tuxedo are dynamically registered via
+[[register_submodules]], we need to verify that the registration mechanism
+works correctly.
+These tests ensure that:
+\begin{enumerate}
+\item The [[register_commands]] function exists in each submodule.
+\item Subcommands are properly registered with the main app.
+\item Subcommands appear in help output.
+\end{enumerate}
+
+<<test functions>>=
 
 class TestSubcommandRegistration:
     """Tests for subcommand registration from snowball and tuxedo."""
