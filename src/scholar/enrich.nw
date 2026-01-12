@@ -60,6 +60,12 @@ from unittest.mock import Mock, patch, MagicMock
 
 from scholar import Paper
 from scholar.enrich import *
+from scholar.enrich import (
+    _save_cached_enrichment,
+    _load_cached_enrichment,
+    _fetch_refs_cites,
+    _get_enrichment_cache_dir,
+)
 
 
 <<test functions>>
@@ -83,6 +89,10 @@ We define which providers to use for enrichment and in what order:
 <<constants>>=
 # Providers that support DOI lookup and provide abstracts
 ENRICHMENT_PROVIDERS = ["s2", "openalex"]
+
+# Global cache for enriched paper data (refs/cites)
+# Stored in data dir (not cache dir) since fetching refs/cites is expensive
+ENRICHMENT_CACHE_DIR = "enrichment_cache"
 @
 
 
@@ -178,6 +188,141 @@ def enrich_paper(
 
 @
 
+\subsection{Global enrichment cache}
+
+Fetching references and citations is expensive---it requires API calls that count
+against rate limits. When the same paper appears in different searches or sessions,
+we don't want to re-fetch its refs/cites. This section implements a global cache
+that persists enrichment data across sessions.
+
+The cache stores refs/cites keyed by paper ID (using the same [[get_paper_id]]
+function from the notes module). We store in the user's data directory (not cache
+directory) because this data represents work done and is expensive to regenerate.
+
+<<enrichment functions>>=
+def _get_enrichment_cache_dir() -> Path:
+    """
+    Return the directory for storing enriched paper data.
+    
+    Uses SCHOLAR_DATA_DIR if set, otherwise platform-appropriate data dir.
+    Creates the directory if it doesn't exist.
+    """
+    data_dir = os.environ.get("SCHOLAR_DATA_DIR")
+    if data_dir:
+        path = Path(data_dir) / ENRICHMENT_CACHE_DIR
+    else:
+        path = Path(platformdirs.user_data_dir("scholar")) / ENRICHMENT_CACHE_DIR
+    path.mkdir(parents=True, exist_ok=True)
+    return path
+
+
+def _serialize_paper(paper: Paper) -> dict:
+    """Serialize a Paper to a JSON-compatible dict."""
+    return {
+        "title": paper.title,
+        "authors": paper.authors,
+        "year": paper.year,
+        "doi": paper.doi,
+        "abstract": paper.abstract,
+        "venue": paper.venue,
+        "url": paper.url,
+        "pdf_url": paper.pdf_url,
+        "citation_count": paper.citation_count,
+        "sources": paper.sources,
+        # We don't serialize refs/cites of refs/cites (only one level deep)
+    }
+
+
+def _deserialize_paper(data: dict) -> Paper:
+    """Deserialize a Paper from a JSON dict."""
+    return Paper(
+        title=data.get("title"),
+        authors=data.get("authors", []),
+        year=data.get("year"),
+        doi=data.get("doi"),
+        abstract=data.get("abstract"),
+        venue=data.get("venue"),
+        url=data.get("url"),
+        pdf_url=data.get("pdf_url"),
+        citation_count=data.get("citation_count"),
+        sources=data.get("sources", []),
+    )
+
+
+def _load_cached_enrichment(paper: Paper) -> tuple[list[Paper] | None, list[Paper] | None]:
+    """
+    Load cached references and citations for a paper.
+    
+    Args:
+        paper: The paper to load enrichment for.
+    
+    Returns:
+        Tuple of (references, citations), each may be None if not cached.
+    """
+    paper_id = get_paper_id(paper)
+    # Make a safe filename from paper_id
+    safe_id = paper_id.replace(":", "_").replace("/", "_")
+    cache_file = _get_enrichment_cache_dir() / f"{safe_id}.json"
+    
+    if not cache_file.exists():
+        return None, None
+    
+    try:
+        with open(cache_file, "r", encoding="utf-8") as f:
+            data = json.load(f)
+        
+        refs = None
+        if "references" in data and data["references"] is not None:
+            refs = [_deserialize_paper(p) for p in data["references"]]
+        
+        cites = None
+        if "citations" in data and data["citations"] is not None:
+            cites = [_deserialize_paper(p) for p in data["citations"]]
+        
+        logger.debug(f"Loaded cached enrichment for {_title_preview(paper)}")
+        return refs, cites
+    except (json.JSONDecodeError, OSError, KeyError) as e:
+        logger.debug(f"Failed to load cached enrichment: {e}")
+        return None, None
+
+
+def _save_cached_enrichment(
+    paper: Paper,
+    references: list[Paper] | None,
+    citations: list[Paper] | None,
+) -> None:
+    """
+    Save references and citations to the global cache.
+    
+    Args:
+        paper: The paper these refs/cites belong to.
+        references: List of reference papers, or None.
+        citations: List of citing papers, or None.
+    """
+    paper_id = get_paper_id(paper)
+    safe_id = paper_id.replace(":", "_").replace("/", "_")
+    cache_file = _get_enrichment_cache_dir() / f"{safe_id}.json"
+    
+    data = {
+        "paper_id": paper_id,
+        "title": paper.title,  # For debugging/inspection
+        "doi": paper.doi,
+    }
+    
+    if references is not None:
+        data["references"] = [_serialize_paper(p) for p in references]
+    
+    if citations is not None:
+        data["citations"] = [_serialize_paper(p) for p in citations]
+    
+    try:
+        with open(cache_file, "w", encoding="utf-8") as f:
+            json.dump(data, f, indent=2, ensure_ascii=False)
+        logger.debug(f"Saved enrichment cache for {_title_preview(paper)}")
+    except OSError as e:
+        logger.warning(f"Failed to save enrichment cache: {e}")
+@
+
 \subsection{Fetching references and citations}
 
 When enriching a paper, we also fetch its references and citations if requested.
@@ -186,10 +331,17 @@ abstract) so they display properly in the TUI and are useful for snowballing.
 This enrichment uses [[fetch_refs_cites=False]] to avoid infinite recursion---we
 only need one level of metadata, not the refs/cites of refs/cites.
 
+Before fetching from the API, we check the global cache. If refs/cites are
+cached, we use them directly. After fetching from the API, we save to the cache
+so future requests for the same paper are instant.
+
 <<enrichment functions>>=
 def _fetch_refs_cites(paper: Paper) -> Paper:
     """
     Fetch references and citations for a paper if not already present.
+
+    Checks the global enrichment cache first. If not cached, fetches from
+    the API and saves to the cache for future use.
 
     Args:
         paper: The paper to fetch refs/cites for (must have DOI).
@@ -200,14 +352,18 @@ def _fetch_refs_cites(paper: Paper) -> Paper:
     from scholar.providers import fetch_references, fetch_citations
 
     result = paper
+    
+    # Check global cache first
+    cached_refs, cached_cites = _load_cached_enrichment(paper)
+    
+    # Track what we fetched (for saving to cache)
+    fetched_refs = None
+    fetched_cites = None
 
-    # Fetch references if needed
+    # Use cached refs if available, otherwise fetch
     if result.references is None:
-        logger.info(f"Fetching references for {_title_preview(result)}")
-        try:
-            refs = fetch_references(result.doi)
-            # Enrich the references too (metadata only, no recursive refs/cites)
-            refs = [enrich_paper(r, fetch_refs_cites=False) for r in refs]
+        if cached_refs is not None:
+            logger.info(f"Using cached references for {_title_preview(result)}")
             result = Paper(
                 title=result.title,
                 authors=result.authors,
@@ -219,20 +375,38 @@ def _fetch_refs_cites(paper: Paper) -> Paper:
                 pdf_url=result.pdf_url,
                 citation_count=result.citation_count,
                 sources=result.sources,
-                references=refs,
+                references=cached_refs,
                 citations=result.citations,
             )
-            logger.info(f"Found {len(refs)} references")
-        except Exception as e:
-            logger.warning(f"Failed to fetch references: {e}")
+        else:
+            logger.info(f"Fetching references for {_title_preview(result)}")
+            try:
+                refs = fetch_references(result.doi)
+                # Enrich the references too (metadata only, no recursive refs/cites)
+                refs = [enrich_paper(r, fetch_refs_cites=False) for r in refs]
+                fetched_refs = refs  # Track for caching
+                result = Paper(
+                    title=result.title,
+                    authors=result.authors,
+                    year=result.year,
+                    doi=result.doi,
+                    abstract=result.abstract,
+                    venue=result.venue,
+                    url=result.url,
+                    pdf_url=result.pdf_url,
+                    citation_count=result.citation_count,
+                    sources=result.sources,
+                    references=refs,
+                    citations=result.citations,
+                )
+                logger.info(f"Found {len(refs)} references")
+            except Exception as e:
+                logger.warning(f"Failed to fetch references: {e}")
 
-    # Fetch citations if needed
+    # Use cached cites if available, otherwise fetch
     if result.citations is None:
-        logger.info(f"Fetching citations for {_title_preview(result)}")
-        try:
-            cites = fetch_citations(result.doi)
-            # Enrich the citations too (metadata only, no recursive refs/cites)
-            cites = [enrich_paper(c, fetch_refs_cites=False) for c in cites]
+        if cached_cites is not None:
+            logger.info(f"Using cached citations for {_title_preview(result)}")
             result = Paper(
                 title=result.title,
                 authors=result.authors,
@@ -245,11 +419,40 @@ def _fetch_refs_cites(paper: Paper) -> Paper:
                 citation_count=result.citation_count,
                 sources=result.sources,
                 references=result.references,
-                citations=cites,
+                citations=cached_cites,
             )
-            logger.info(f"Found {len(cites)} citations")
-        except Exception as e:
-            logger.warning(f"Failed to fetch citations: {e}")
+        else:
+            logger.info(f"Fetching citations for {_title_preview(result)}")
+            try:
+                cites = fetch_citations(result.doi)
+                # Enrich the citations too (metadata only, no recursive refs/cites)
+                cites = [enrich_paper(c, fetch_refs_cites=False) for c in cites]
+                fetched_cites = cites  # Track for caching
+                result = Paper(
+                    title=result.title,
+                    authors=result.authors,
+                    year=result.year,
+                    doi=result.doi,
+                    abstract=result.abstract,
+                    venue=result.venue,
+                    url=result.url,
+                    pdf_url=result.pdf_url,
+                    citation_count=result.citation_count,
+                    sources=result.sources,
+                    references=result.references,
+                    citations=cites,
+                )
+                logger.info(f"Found {len(cites)} citations")
+            except Exception as e:
+                logger.warning(f"Failed to fetch citations: {e}")
+
+    # Save newly fetched data to cache
+    if fetched_refs is not None or fetched_cites is not None:
+        # Load existing cache to merge (in case we only fetched one of refs/cites)
+        existing_refs, existing_cites = _load_cached_enrichment(paper)
+        save_refs = fetched_refs if fetched_refs is not None else existing_refs
+        save_cites = fetched_cites if fetched_cites is not None else existing_cites
+        _save_cached_enrichment(paper, save_refs, save_cites)
 
     return result
 @
@@ -570,14 +773,174 @@ class TestEnrichPapers:
         assert result[0].title == "First"
         assert result[1].title == "Second"
         assert result[2].title == "Third"
+
+
+class TestEnrichmentCache:
+    """Tests for global enrichment cache."""
+
+    def test_save_and_load_cached_enrichment(self, tmp_path, monkeypatch):
+        """Can save and load refs/cites from cache."""
+        monkeypatch.setenv("SCHOLAR_DATA_DIR", str(tmp_path))
+
+        paper = Paper(
+            title="Test Paper",
+            authors=["Author"],
+            doi="10.1234/test",
+        )
+
+        refs = [
+            Paper(title="Reference 1", authors=["Ref Author"], doi="10.1/ref1"),
+            Paper(title="Reference 2", authors=["Ref Author 2"], doi="10.1/ref2"),
+        ]
+        cites = [
+            Paper(title="Citing Paper", authors=["Cite Author"], doi="10.1/cite1"),
+        ]
+
+        _save_cached_enrichment(paper, refs, cites)
+
+        loaded_refs, loaded_cites = _load_cached_enrichment(paper)
+
+        assert loaded_refs is not None
+        assert len(loaded_refs) == 2
+        assert loaded_refs[0].title == "Reference 1"
+        assert loaded_refs[1].doi == "10.1/ref2"
+
+        assert loaded_cites is not None
+        assert len(loaded_cites) == 1
+        assert loaded_cites[0].title == "Citing Paper"
+
+    def test_load_nonexistent_returns_none(self, tmp_path, monkeypatch):
+        """Loading from empty cache returns None, None."""
+        monkeypatch.setenv("SCHOLAR_DATA_DIR", str(tmp_path))
+
+        paper = Paper(
+            title="Unknown Paper",
+            authors=["Author"],
+            doi="10.1234/unknown",
+        )
+
+        refs, cites = _load_cached_enrichment(paper)
+        assert refs is None
+        assert cites is None
+
+    def test_fetch_refs_cites_uses_cache(self, tmp_path, monkeypatch):
+        """_fetch_refs_cites returns cached data instead of fetching."""
+        monkeypatch.setenv("SCHOLAR_DATA_DIR", str(tmp_path))
+
+        paper = Paper(
+            title="Cached Paper",
+            authors=["Author"],
+            doi="10.1234/cached",
+        )
+
+        # Pre-populate cache
+        cached_refs = [Paper(title="Cached Ref", authors=[], doi="10.1/cached_ref")]
+        cached_cites = [Paper(title="Cached Cite", authors=[], doi="10.1/cached_cite")]
+        _save_cached_enrichment(paper, cached_refs, cached_cites)
+
+        # Mock fetch functions to ensure they're not called
+        with patch("scholar.providers.fetch_references") as mock_fetch_refs, \
+             patch("scholar.providers.fetch_citations") as mock_fetch_cites:
+            result = _fetch_refs_cites(paper)
+
+        # Should NOT have called the fetch functions
+        mock_fetch_refs.assert_not_called()
+        mock_fetch_cites.assert_not_called()
+
+        # Should have used cached data
+        assert result.references is not None
+        assert len(result.references) == 1
+        assert result.references[0].title == "Cached Ref"
+        assert result.citations is not None
+        assert len(result.citations) == 1
+        assert result.citations[0].title == "Cached Cite"
+
+    def test_fetch_refs_cites_saves_to_cache(self, tmp_path, monkeypatch):
+        """_fetch_refs_cites saves fetched data to cache."""
+        monkeypatch.setenv("SCHOLAR_DATA_DIR", str(tmp_path))
+
+        paper = Paper(
+            title="New Paper",
+            authors=["Author"],
+            doi="10.1234/new",
+        )
+
+        fetched_refs = [Paper(title="Fetched Ref", authors=[], doi="10.1/fetched")]
+        fetched_cites = [Paper(title="Fetched Cite", authors=[], doi="10.1/cite")]
+
+        with patch("scholar.providers.fetch_references", return_value=fetched_refs), \
+             patch("scholar.providers.fetch_citations", return_value=fetched_cites):
+            result = _fetch_refs_cites(paper)
+
+        # Verify data was returned
+        assert result.references is not None
+        assert result.citations is not None
+
+        # Verify data was cached
+        cached_refs, cached_cites = _load_cached_enrichment(paper)
+        assert cached_refs is not None
+        assert len(cached_refs) == 1
+        assert cached_refs[0].title == "Fetched Ref"
+        assert cached_cites is not None
+        assert len(cached_cites) == 1
+        assert cached_cites[0].title == "Fetched Cite"
+
+    def test_cache_persists_across_sessions(self, tmp_path, monkeypatch):
+        """Cached enrichment persists when simulating new session."""
+        monkeypatch.setenv("SCHOLAR_DATA_DIR", str(tmp_path))
+
+        paper = Paper(
+            title="Persistent Paper",
+            authors=["Author"],
+            doi="10.1234/persist",
+        )
+
+        refs = [Paper(title="Persistent Ref", authors=[], doi="10.1/pref")]
+        _save_cached_enrichment(paper, refs, None)
+
+        # Simulate new session by creating new Paper object with same DOI
+        paper2 = Paper(
+            title="Persistent Paper",
+            authors=["Author"],
+            doi="10.1234/persist",
+        )
+
+        loaded_refs, loaded_cites = _load_cached_enrichment(paper2)
+        assert loaded_refs is not None
+        assert loaded_refs[0].title == "Persistent Ref"
+        assert loaded_cites is None
+
+    def test_partial_cache_only_refs(self, tmp_path, monkeypatch):
+        """Can cache only refs without cites."""
+        monkeypatch.setenv("SCHOLAR_DATA_DIR", str(tmp_path))
+
+        paper = Paper(
+            title="Partial Paper",
+            authors=["Author"],
+            doi="10.1234/partial",
+        )
+
+        refs = [Paper(title="Only Ref", authors=[], doi="10.1/only")]
+        _save_cached_enrichment(paper, refs, None)
+
+        loaded_refs, loaded_cites = _load_cached_enrichment(paper)
+        assert loaded_refs is not None
+        assert len(loaded_refs) == 1
+        assert loaded_cites is None
 @
 
 <<imports>>=
+import json
 import logging
+import os
+from pathlib import Path
 from typing import Callable
+
+import platformdirs
 
 from scholar import Paper
 from scholar.providers import get_provider
+from scholar.notes import get_paper_id
 
 logger = logging.getLogger(__name__)
 @
