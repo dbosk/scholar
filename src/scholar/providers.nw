@@ -2445,8 +2445,6 @@ class WebOfScienceProvider:
     <<wos is available>>
     <<wos search>>
     <<wos convert starter hit>>
-    <<wos safe get nested>>
-    <<wos ensure list>>
     <<wos convert expanded hit>>
     <<wos extended methods>>
 @
@@ -2709,8 +2707,8 @@ def _search_expanded(
             data = response.json()
 
             # Navigate the nested structure to get records
-            # Use _safe_get_nested to handle cases where intermediate fields are strings.
-            records = self._safe_get_nested(
+            # Use safe_get_nested to handle cases where intermediate fields are strings.
+            records = safe_get_nested(
                 data, "Data", "Records", "records", "REC", default=[]
             )
             if not isinstance(records, list):
@@ -2879,58 +2877,6 @@ def _convert_starter_hit(self, hit: dict) -> Paper:
     )
 @
 
-\subsubsection{Safe nested dictionary access}
-
-The WoS Expanded API can return unexpected types for nested fields.
-When data is missing or malformed, the API may return strings instead of
-dictionaries, causing [[AttributeError]] when we attempt to call [[.get()]]
-on non-dict values.
-
-This helper safely navigates nested dictionaries, returning a default value
-if any level in the chain is not a dictionary.
-
-<<wos safe get nested>>=
-@staticmethod
-def _safe_get_nested(obj: Any, *keys: str, default: Any = None) -> Any:
-    """Safely navigate nested dicts, returning default if any level is not a dict."""
-    for key in keys:
-        if not isinstance(obj, dict):
-            return default
-        obj = obj.get(key, default)
-    return obj
-@
-
-\subsubsection{Normalizing API response types}
-
-The WoS API (like many XML-to-JSON APIs) inconsistently returns fields that
-should be lists.
-When a field contains multiple items, it returns a list of dicts.
-When it contains a single item, it may return just that dict (not wrapped in a
-list).
-Sometimes it returns a string instead of a structured object.
-
-This causes problems when we iterate over these fields: iterating over a string
-yields individual characters, and calling [[.get()]] on a character raises
-[[AttributeError]].
-
-This helper normalizes values to lists for safe iteration:
-\begin{description}
-\item[List] returned as-is
-\item[Dict] wrapped in a single-element list
-\item[String or other] returns empty list (skip gracefully)
-\end{description}
-
-<<wos ensure list>>=
-@staticmethod
-def _ensure_list(value: Any) -> list:
-    """Normalize a value to a list for safe iteration."""
-    if isinstance(value, list):
-        return value
-    if isinstance(value, dict):
-        return [value]
-    return []
-@
-
 \subsubsection{Converting Expanded API response}
 
 The WoS Expanded API returns documents with a deeply nested structure that
@@ -2945,8 +2891,8 @@ def _convert_expanded_hit(self, rec: dict) -> Paper:
 
     # Extract title (look for type="item")
     title = ""
-    titles = self._ensure_list(
-        self._safe_get_nested(summary, "titles", "title", default=[])
+    titles = ensure_list(
+        safe_get_nested(summary, "titles", "title", default=[])
     )
     for t in titles:
         if isinstance(t, dict) and t.get("type") == "item":
@@ -2957,7 +2903,7 @@ def _convert_expanded_hit(self, rec: dict) -> Paper:
 
     # Extract publication year
     year = None
-    pub_year = self._safe_get_nested(summary, "pub_info", "pubyear", default=None)
+    pub_year = safe_get_nested(summary, "pub_info", "pubyear", default=None)
     if pub_year:
         try:
             year = int(pub_year)
@@ -2966,8 +2912,8 @@ def _convert_expanded_hit(self, rec: dict) -> Paper:
 
     # Extract authors
     authors = []
-    names = self._ensure_list(
-        self._safe_get_nested(summary, "names", "name", default=[])
+    names = ensure_list(
+        safe_get_nested(summary, "names", "name", default=[])
     )
     for author in names:
         if isinstance(author, dict) and author.get("role") == "author":
@@ -2979,8 +2925,8 @@ def _convert_expanded_hit(self, rec: dict) -> Paper:
     doi = None
     dynamic_data = rec.get("dynamic_data", {})
     cluster = dynamic_data.get("cluster_related", {})
-    identifiers = self._ensure_list(
-        self._safe_get_nested(cluster, "identifiers", "identifier", default=[])
+    identifiers = ensure_list(
+        safe_get_nested(cluster, "identifiers", "identifier", default=[])
     )
     for ident in identifiers:
         if isinstance(ident, dict) and ident.get("type") == "doi":
@@ -2988,7 +2934,7 @@ def _convert_expanded_hit(self, rec: dict) -> Paper:
             break
 
     # Extract abstract
-    abstract = self._safe_get_nested(
+    abstract = safe_get_nested(
         fullrecord, "abstracts", "abstract", "abstract_text", "p", default=None
     )
 
@@ -3062,8 +3008,8 @@ def get_related_records(self, uid: str, limit: int = 10) -> list[Paper]:
         response.raise_for_status()
         data = response.json()
 
-        # Use _safe_get_nested to handle cases where intermediate fields are strings.
-        records = self._safe_get_nested(
+        # Use safe_get_nested to handle cases where intermediate fields are strings.
+        records = safe_get_nested(
             data, "Data", "Records", "records", "REC", default=[]
         )
         if not isinstance(records, list):
@@ -3114,11 +3060,11 @@ def get_citing_articles(self, uid: str, limit: int = 10) -> list[Paper]:
         response.raise_for_status()
         data = response.json()
 
-        # Use _ensure_list because the API may return a single dict instead of
+        # Use ensure_list because the API may return a single dict instead of
         # a list when there's only one citing article. Skip non-dict items.
-        # Use _safe_get_nested to handle cases where intermediate fields are strings.
-        records = self._ensure_list(
-            self._safe_get_nested(data, "Data", "Records", "records", "REC", default=[])
+        # Use safe_get_nested to handle cases where intermediate fields are strings.
+        records = ensure_list(
+            safe_get_nested(data, "Data", "Records", "records", "REC", default=[])
         )
         result = [self._convert_expanded_hit(rec) for rec in records if isinstance(rec, dict)]
         self._cache[cache_key] = result
@@ -3176,10 +3122,10 @@ def get_cited_references(self, uid: str, limit: int = 10) -> list[dict]:
         data = response.json()
 
         # References have a different structure than regular records.
-        # Use _ensure_list because the API may return a single dict or string
+        # Use ensure_list because the API may return a single dict or string
         # instead of a list when there's only one reference. We also skip any
         # non-dict items in the list (the API sometimes returns strings).
-        references = self._ensure_list(data.get("Data", []))
+        references = ensure_list(data.get("Data", []))
         result = [
             {
                 "uid": ref.get("UID"),
@@ -3339,8 +3285,8 @@ def _get_uid_for_doi(self, doi: str) -> str | None:
             response.raise_for_status()
             data = response.json()
 
-            # Use _safe_get_nested to handle cases where intermediate fields are strings.
-            records = self._safe_get_nested(
+            # Use safe_get_nested to handle cases where intermediate fields are strings.
+            records = safe_get_nested(
                 data, "Data", "Records", "records", "REC", default=[]
             )
             if not isinstance(records, list):
@@ -3498,6 +3444,8 @@ tags like [[TS=]] or [[TI=]]).
 import re
 import requests
 from typing import Any
+
+from scholar.utils import safe_get_nested, ensure_list
 @
 
 We also define the API URL constants for both tiers, plus a sentinel value

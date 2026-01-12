@@ -1274,52 +1274,14 @@ def _get_sessions_dir() -> Path:
 
 Papers store references and citations as lists of [[Paper]] objects, but JSON
 cannot directly serialize these nested objects.
-We convert [[Paper]] lists to plain dictionaries for storage and back to
-[[Paper]] objects when loading.
+The [[Paper]] class provides [[to_dict()]] and [[from_dict()]] methods for
+serialization: [[to_dict(include_refs_cites=True)]] serializes the paper with
+its refs/cites (one level deep), and [[from_dict()]] reconstructs the paper
+including any nested refs/cites.
 This ensures enriched references and citations persist across session restarts,
 avoiding expensive re-fetching from APIs.
 
 <<review session functions>>=
-def _serialize_paper_list(papers: list[Paper] | None) -> list[dict] | None:
-    """Serialize a list of Paper objects to JSON-compatible dicts."""
-    if papers is None:
-        return None
-    return [
-        {
-            "title": p.title,
-            "authors": list(p.authors),
-            "year": p.year,
-            "doi": p.doi,
-            "abstract": p.abstract,
-            "venue": p.venue,
-            "url": p.url,
-            "pdf_url": p.pdf_url,
-            "sources": p.sources,
-        }
-        for p in papers
-    ]
-
-
-def _deserialize_paper_list(data: list[dict] | None) -> list[Paper] | None:
-    """Deserialize a list of dicts to Paper objects."""
-    if data is None:
-        return None
-    return [
-        Paper(
-            title=p.get("title", ""),
-            authors=p.get("authors", []),
-            year=p.get("year"),
-            doi=p.get("doi"),
-            abstract=p.get("abstract"),
-            venue=p.get("venue"),
-            url=p.get("url"),
-            pdf_url=p.get("pdf_url"),
-            sources=p.get("sources", []),
-        )
-        for p in data
-    ]
-
-
 def save_session(session: ReviewSession) -> Path:
     """
     Save a review session to disk.
@@ -1365,19 +1327,7 @@ def save_session(session: ReviewSession) -> Path:
                 "source": d.source.value,
                 "is_example": d.is_example,
                 "llm_confidence": d.llm_confidence,
-                "paper": {
-                    "title": d.paper.title,
-                    "authors": list(d.paper.authors),
-                    "year": d.paper.year,
-                    "doi": d.paper.doi,
-                    "abstract": d.paper.abstract,
-                    "venue": d.paper.venue,
-                    "url": d.paper.url,
-                    "pdf_url": d.paper.pdf_url,
-                    "sources": d.paper.sources,
-                    "references": _serialize_paper_list(d.paper.references),
-                    "citations": _serialize_paper_list(d.paper.citations),
-                },
+                "paper": d.paper.to_dict(include_refs_cites=True),
             }
             for d in session.decisions
         ],
@@ -1450,22 +1400,12 @@ def load_session(name_or_query: str) -> ReviewSession | None:
 
         for dec_data in data["decisions"]:
             paper_data = dec_data["paper"]
-            paper = Paper(
-                title=paper_data["title"],
-                authors=paper_data.get("authors", []),
-                year=paper_data.get("year"),
-                doi=paper_data.get("doi"),
-                abstract=paper_data.get("abstract"),
-                venue=paper_data.get("venue"),
-                url=paper_data.get("url"),
-                pdf_url=paper_data.get("pdf_url"),
-                sources=paper_data.get("sources") or (
-                    [s.strip() for s in paper_data["source"].split(",")]
-                    if paper_data.get("source") else []
-                ),
-                references=_deserialize_paper_list(paper_data.get("references")),
-                citations=_deserialize_paper_list(paper_data.get("citations")),
-            )
+            # Handle legacy format where "source" was a comma-separated string
+            if "sources" not in paper_data and "source" in paper_data:
+                paper_data["sources"] = [
+                    s.strip() for s in paper_data["source"].split(",")
+                ] if paper_data["source"] else []
+            paper = Paper.from_dict(paper_data)
             status = DecisionStatus(dec_data["status"])
             tags = dec_data.get("tags", [])
 

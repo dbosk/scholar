@@ -1,5 +1,6 @@
 MODULES+=	__init__.py
 MODULES+=	scholar.py
+MODULES+=	utils.py
 MODULES+=	providers.py
 MODULES+=	cache.py
 MODULES+=	enrich.py
@@ -12,6 +13,7 @@ MODULES+=	llm_review.py
 MODULES+=	__main__.py
 
 DOC+=		scholar.tex
+DOC+=		utils.tex
 DOC+=		providers.tex
 DOC+=		cache.tex
 DOC+=		enrich.tex

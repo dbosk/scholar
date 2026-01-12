@@ -75,6 +75,7 @@ Scholar package for structured literature searches.
 
 from .scholar import Search, SearchResult, Paper, SearchFilters
 from .scholar import search, filter_papers
+from .utils import safe_get_nested, ensure_list
 
 __all__ = [
     "Search",
@@ -83,6 +84,8 @@ __all__ = [
     "SearchFilters",
     "search",
     "filter_papers",
+    "safe_get_nested",
+    "ensure_list",
 ]
 @
 
@@ -184,6 +187,125 @@ def __hash__(self) -> int:
 @
 
 This allows us to use papers in sets for automatic deduplication.
+
+\subsubsection{Serialization and deserialization}
+
+For caching enrichment data (references and citations), we need to serialize
+papers to dictionaries and deserialize them back.
+The [[to_dict]] method converts a paper to a dictionary suitable for JSON
+serialization or pickle storage.
+
+By default, we exclude references and citations to avoid infinite recursion
+when papers reference each other.
+When [[include_refs_cites=True]], we serialize them one level deep (the
+referenced papers themselves have their refs/cites excluded).
+
+<<paper methods>>=
+def to_dict(self, include_refs_cites: bool = False) -> dict:
+    """
+    Convert paper to a dictionary for serialization.
+
+    Args:
+        include_refs_cites: If True, include references and citations
+            (serialized one level deep, without their own refs/cites).
+
+    Returns:
+        Dictionary representation of the paper.
+    """
+    result = {
+        "title": self.title,
+        "authors": self.authors,
+        "year": self.year,
+        "doi": self.doi,
+        "abstract": self.abstract,
+        "venue": self.venue,
+        "url": self.url,
+        "pdf_url": self.pdf_url,
+        "citation_count": self.citation_count,
+        "sources": self.sources,
+    }
+
+    if include_refs_cites:
+        result["references"] = (
+            [p.to_dict(include_refs_cites=False) for p in self.references]
+            if self.references else None
+        )
+        result["citations"] = (
+            [p.to_dict(include_refs_cites=False) for p in self.citations]
+            if self.citations else None
+        )
+
+    return result
+@
+
+The [[from_dict]] class method reconstructs a Paper from a dictionary.
+It handles both the old format (without refs/cites) and the new format
+(with refs/cites as nested dictionaries).
+
+<<paper methods>>=
+@classmethod
+def from_dict(cls, data: dict) -> "Paper":
+    """
+    Create a Paper from a dictionary.
+
+    Handles both legacy format (no refs/cites) and new format
+    (refs/cites as list of dicts).
+
+    Args:
+        data: Dictionary with paper fields.
+
+    Returns:
+        Paper instance.
+    """
+    # Parse references if present
+    references = None
+    if "references" in data and data["references"] is not None:
+        references = [cls.from_dict(ref) for ref in data["references"]]
+
+    # Parse citations if present
+    citations = None
+    if "citations" in data and data["citations"] is not None:
+        citations = [cls.from_dict(cit) for cit in data["citations"]]
+
+    return cls(
+        title=data.get("title", ""),
+        authors=data.get("authors", []),
+        year=data.get("year"),
+        doi=data.get("doi"),
+        abstract=data.get("abstract"),
+        venue=data.get("venue"),
+        url=data.get("url"),
+        pdf_url=data.get("pdf_url"),
+        citation_count=data.get("citation_count"),
+        sources=data.get("sources", []),
+        references=references,
+        citations=citations,
+    )
+@
+
+\subsubsection{Title preview for display}
+
+When displaying papers in logs or UI elements with limited space, we need
+a truncated title.
+The [[title_preview]] method provides this, falling back to the DOI if no
+title is available.
+
+<<paper methods>>=
+def title_preview(self, max_length: int = 50) -> str:
+    """
+    Return a truncated title for display in logs or UI.
+
+    Args:
+        max_length: Maximum length of the returned string.
+
+    Returns:
+        Truncated title, or DOI if no title, or "Unknown" as fallback.
+    """
+    text = self.title or self.doi or "Unknown"
+    if len(text) <= max_length:
+        return text
+    return text[:max_length - 3] + "..."
+@
 
 \subsubsection{Consolidating data from multiple sources}
 
@@ -335,6 +457,183 @@ class TestPaperMergeWith:
         assert merged.venue == "Venue"  # From p2
         assert merged.url == "http://example.com"  # From p2
         assert merged.pdf_url == "http://example.com/pdf"  # From p2
+
+
+class TestPaperSerialization:
+    """Tests for Paper.to_dict() and Paper.from_dict()."""
+
+    def test_to_dict_basic_fields(self):
+        """to_dict includes all basic fields."""
+        paper = Paper(
+            title="Test Paper",
+            authors=["Author A", "Author B"],
+            year=2024,
+            doi="10.1234/test",
+            abstract="An abstract",
+            venue="Conference",
+            url="http://example.com",
+            pdf_url="http://example.com/pdf",
+            citation_count=42,
+            sources=["s2", "dblp"],
+        )
+        d = paper.to_dict()
+        assert d["title"] == "Test Paper"
+        assert d["authors"] == ["Author A", "Author B"]
+        assert d["year"] == 2024
+        assert d["doi"] == "10.1234/test"
+        assert d["abstract"] == "An abstract"
+        assert d["venue"] == "Conference"
+        assert d["url"] == "http://example.com"
+        assert d["pdf_url"] == "http://example.com/pdf"
+        assert d["citation_count"] == 42
+        assert d["sources"] == ["s2", "dblp"]
+
+    def test_to_dict_excludes_refs_cites_by_default(self):
+        """to_dict excludes references/citations by default."""
+        paper = Paper(
+            title="Test",
+            authors=[],
+            references=[Paper(title="Ref", authors=[])],
+            citations=[Paper(title="Cit", authors=[])],
+        )
+        d = paper.to_dict()
+        assert "references" not in d
+        assert "citations" not in d
+
+    def test_to_dict_includes_refs_cites_when_requested(self):
+        """to_dict includes refs/cites when include_refs_cites=True."""
+        ref = Paper(title="Reference Paper", authors=["R"], year=2020)
+        cit = Paper(title="Citing Paper", authors=["C"], year=2025)
+        paper = Paper(title="Test", authors=[], references=[ref], citations=[cit])
+
+        d = paper.to_dict(include_refs_cites=True)
+        assert d["references"] is not None
+        assert len(d["references"]) == 1
+        assert d["references"][0]["title"] == "Reference Paper"
+        assert d["citations"] is not None
+        assert len(d["citations"]) == 1
+        assert d["citations"][0]["title"] == "Citing Paper"
+
+    def test_to_dict_refs_cites_one_level_deep(self):
+        """Nested refs/cites are serialized without their own refs/cites."""
+        nested_ref = Paper(
+            title="Nested",
+            authors=[],
+            references=[Paper(title="Deep", authors=[])],
+        )
+        paper = Paper(title="Test", authors=[], references=[nested_ref])
+
+        d = paper.to_dict(include_refs_cites=True)
+        # The nested reference is serialized...
+        assert d["references"][0]["title"] == "Nested"
+        # ...but without its own references
+        assert "references" not in d["references"][0]
+
+    def test_from_dict_basic_fields(self):
+        """from_dict reconstructs a paper from a dictionary."""
+        d = {
+            "title": "Test Paper",
+            "authors": ["Author A"],
+            "year": 2024,
+            "doi": "10.1234/test",
+            "abstract": "Abstract",
+            "venue": "Venue",
+            "url": "http://example.com",
+            "pdf_url": "http://example.com/pdf",
+            "citation_count": 10,
+            "sources": ["s2"],
+        }
+        paper = Paper.from_dict(d)
+        assert paper.title == "Test Paper"
+        assert paper.authors == ["Author A"]
+        assert paper.year == 2024
+        assert paper.doi == "10.1234/test"
+        assert paper.abstract == "Abstract"
+        assert paper.venue == "Venue"
+        assert paper.url == "http://example.com"
+        assert paper.pdf_url == "http://example.com/pdf"
+        assert paper.citation_count == 10
+        assert paper.sources == ["s2"]
+
+    def test_from_dict_with_refs_cites(self):
+        """from_dict reconstructs nested references and citations."""
+        d = {
+            "title": "Test",
+            "authors": [],
+            "references": [{"title": "Ref Paper", "authors": ["R"], "year": 2020}],
+            "citations": [{"title": "Cit Paper", "authors": ["C"], "year": 2025}],
+        }
+        paper = Paper.from_dict(d)
+        assert paper.references is not None
+        assert len(paper.references) == 1
+        assert paper.references[0].title == "Ref Paper"
+        assert paper.citations is not None
+        assert len(paper.citations) == 1
+        assert paper.citations[0].title == "Cit Paper"
+
+    def test_from_dict_legacy_format(self):
+        """from_dict handles legacy format without refs/cites."""
+        d = {"title": "Old Paper", "authors": ["A"]}
+        paper = Paper.from_dict(d)
+        assert paper.title == "Old Paper"
+        assert paper.references is None
+        assert paper.citations is None
+
+    def test_roundtrip_serialization(self):
+        """Serializing and deserializing preserves paper data."""
+        original = Paper(
+            title="Test",
+            authors=["A", "B"],
+            year=2024,
+            doi="10.1/test",
+            abstract="Abstract",
+            venue="Venue",
+            sources=["s2"],
+            references=[Paper(title="Ref", authors=["R"], year=2020)],
+        )
+        d = original.to_dict(include_refs_cites=True)
+        restored = Paper.from_dict(d)
+
+        assert restored.title == original.title
+        assert restored.authors == original.authors
+        assert restored.year == original.year
+        assert restored.doi == original.doi
+        assert restored.references is not None
+        assert len(restored.references) == 1
+        assert restored.references[0].title == "Ref"
+
+
+class TestPaperTitlePreview:
+    """Tests for Paper.title_preview()."""
+
+    def test_short_title_unchanged(self):
+        """Short titles are returned unchanged."""
+        paper = Paper(title="Short Title", authors=[])
+        assert paper.title_preview(50) == "Short Title"
+
+    def test_long_title_truncated(self):
+        """Long titles are truncated with ellipsis."""
+        paper = Paper(title="A" * 100, authors=[])
+        preview = paper.title_preview(50)
+        assert len(preview) == 50
+        assert preview.endswith("...")
+
+    def test_fallback_to_doi(self):
+        """Falls back to DOI when no title."""
+        paper = Paper(title="", authors=[], doi="10.1234/test")
+        assert paper.title_preview() == "10.1234/test"
+
+    def test_fallback_to_unknown(self):
+        """Falls back to 'Unknown' when no title or DOI."""
+        paper = Paper(title="", authors=[])
+        assert paper.title_preview() == "Unknown"
+
+    def test_custom_max_length(self):
+        """Respects custom max_length parameter."""
+        paper = Paper(title="A" * 50, authors=[])
+        preview = paper.title_preview(20)
+        assert len(preview) == 20
+        assert preview.endswith("...")
 @
 
 

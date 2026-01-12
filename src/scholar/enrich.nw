@@ -65,6 +65,7 @@ from scholar.enrich import (
     _load_cached_enrichment,
     _fetch_refs_cites,
     _get_enrichment_cache_dir,
+    _safe_cache_filename,
 )
 
 
@@ -149,11 +150,9 @@ def enrich_paper(
     if needs_enrichment(paper, fields):
         # Need DOI for lookup
         if not paper.doi:
-            title_preview = _title_preview(paper)
-            logger.debug(f"Paper '{title_preview}' has no DOI, cannot enrich")
+            logger.debug(f"Paper '{paper.title_preview()}' has no DOI, cannot enrich")
         else:
-            title_preview = _title_preview(paper)
-            logger.debug(f"Enriching paper '{title_preview}' (DOI: {paper.doi})")
+            logger.debug(f"Enriching paper '{paper.title_preview()}' (DOI: {paper.doi})")
 
             # Try each enrichment provider in order
             for provider_name in ENRICHMENT_PROVIDERS:
@@ -176,8 +175,7 @@ def enrich_paper(
                 result = paper.merge_with(enriched)
                 break
     else:
-        title_preview = _title_preview(paper)
-        logger.debug(f"Paper '{title_preview}' doesn't need metadata enrichment")
+        logger.debug(f"Paper '{paper.title_preview()}' doesn't need metadata enrichment")
 
     # Fetch references and citations if requested
     if fetch_refs_cites and result.doi:
@@ -235,38 +233,9 @@ creating deeply nested structures and keeps cache files manageable. The cache
 stores enough information to display papers in the TUI without additional API
 calls.
 
-<<enrichment functions>>=
-def _serialize_paper(paper: Paper) -> dict:
-    """Serialize a Paper to a JSON-compatible dict."""
-    return {
-        "title": paper.title,
-        "authors": paper.authors,
-        "year": paper.year,
-        "doi": paper.doi,
-        "abstract": paper.abstract,
-        "venue": paper.venue,
-        "url": paper.url,
-        "pdf_url": paper.pdf_url,
-        "citation_count": paper.citation_count,
-        "sources": paper.sources,
-    }
-
-
-def _deserialize_paper(data: dict) -> Paper:
-    """Deserialize a Paper from a JSON dict."""
-    return Paper(
-        title=data.get("title"),
-        authors=data.get("authors", []),
-        year=data.get("year"),
-        doi=data.get("doi"),
-        abstract=data.get("abstract"),
-        venue=data.get("venue"),
-        url=data.get("url"),
-        pdf_url=data.get("pdf_url"),
-        citation_count=data.get("citation_count"),
-        sources=data.get("sources", []),
-    )
-@
+The [[Paper]] class provides [[to_dict()]] and [[from_dict()]] methods for
+serialization. We use [[to_dict(include_refs_cites=False)]] to avoid storing
+nested refs/cites, keeping cache files small and avoiding infinite recursion.
 
 Paper IDs derived from DOIs contain characters that are invalid in filenames on
 most filesystems. DOIs use forward slashes (e.g., [[10.1234/example]]) and our
@@ -300,13 +269,13 @@ def _load_cached_enrichment(paper: Paper) -> tuple[list[Paper] | None, list[Pape
         
         refs = None
         if "references" in data and data["references"] is not None:
-            refs = [_deserialize_paper(p) for p in data["references"]]
+            refs = [Paper.from_dict(p) for p in data["references"]]
         
         cites = None
         if "citations" in data and data["citations"] is not None:
-            cites = [_deserialize_paper(p) for p in data["citations"]]
+            cites = [Paper.from_dict(p) for p in data["citations"]]
         
-        logger.debug(f"Loaded cached enrichment for {_title_preview(paper)}")
+        logger.debug(f"Loaded cached enrichment for {paper.title_preview()}")
         return refs, cites
     except (json.JSONDecodeError, OSError, KeyError) as e:
         logger.debug(f"Failed to load cached enrichment: {e}")
@@ -336,15 +305,15 @@ def _save_cached_enrichment(
     }
     
     if references is not None:
-        data["references"] = [_serialize_paper(p) for p in references]
+        data["references"] = [p.to_dict() for p in references]
     
     if citations is not None:
-        data["citations"] = [_serialize_paper(p) for p in citations]
+        data["citations"] = [p.to_dict() for p in citations]
     
     try:
         with open(cache_file, "w", encoding="utf-8") as f:
             json.dump(data, f, indent=2, ensure_ascii=False)
-        logger.debug(f"Saved enrichment cache for {_title_preview(paper)}")
+        logger.debug(f"Saved enrichment cache for {paper.title_preview()}")
     except OSError as e:
         logger.warning(f"Failed to save enrichment cache: {e}")
 @
@@ -554,10 +523,10 @@ def _fetch_refs_cites(paper: Paper) -> Paper:
     # Use cached refs if available, otherwise fetch
     if result.references is None:
         if cached_refs is not None:
-            logger.info(f"Using cached references for {_title_preview(result)}")
+            logger.info(f"Using cached references for {result.title_preview()}")
             result = replace(result, references=cached_refs)
         else:
-            logger.info(f"Fetching references for {_title_preview(result)}")
+            logger.info(f"Fetching references for {result.title_preview()}")
             try:
                 refs = fetch_references(result.doi)
                 # Enrich the references too (metadata only, no recursive refs/cites)
@@ -571,10 +540,10 @@ def _fetch_refs_cites(paper: Paper) -> Paper:
     # Use cached cites if available, otherwise fetch
     if result.citations is None:
         if cached_cites is not None:
-            logger.info(f"Using cached citations for {_title_preview(result)}")
+            logger.info(f"Using cached citations for {result.title_preview()}")
             result = replace(result, citations=cached_cites)
         else:
-            logger.info(f"Fetching citations for {_title_preview(result)}")
+            logger.info(f"Fetching citations for {result.title_preview()}")
             try:
                 cites = fetch_citations(result.doi)
                 # Enrich the citations too (metadata only, no recursive refs/cites)
@@ -594,25 +563,6 @@ def _fetch_refs_cites(paper: Paper) -> Paper:
         _save_cached_enrichment(paper, save_refs, save_cites)
 
     return result
-@
-
-\subsection{Title preview helper}
-
-For logging, we often want to show a truncated version of the paper title.
-If the paper has no title, we show the DOI instead.
-
-<<enrichment functions>>=
-def _title_preview(paper: Paper) -> str:
-    """Return a short preview of the paper for logging."""
-    if paper.title and paper.title.strip():
-        title = paper.title[:50]
-        if len(paper.title) > 50:
-            title += "..."
-        return title
-    elif paper.doi:
-        return f"DOI:{paper.doi}"
-    else:
-        return "(unknown paper)"
 @
 
 \subsection{Checking if enrichment is needed}

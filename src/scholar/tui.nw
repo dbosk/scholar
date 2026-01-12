@@ -2121,9 +2121,9 @@ class PaperReviewApp(App):
                 
                 all_refs.extend(refs)
                 source_ids.append(get_paper_id(paper))
-                self.notify(f"Found {len(refs)} refs for {paper.title[:30]}...")
+                self.notify(f"Found {len(refs)} refs for {paper.title_preview(30)}")
             except Exception as e:
-                self.notify(f"Error for {paper.title[:30]}: {e}", severity="warning")
+                self.notify(f"Error for {paper.title_preview(30)}: {e}", severity="warning")
 
         if all_refs:
             added = self.session.add_papers_from_snowball(
@@ -2182,9 +2182,9 @@ class PaperReviewApp(App):
                 
                 all_cites.extend(cites)
                 source_ids.append(get_paper_id(paper))
-                self.notify(f"Found {len(cites)} cites for {paper.title[:30]}...")
+                self.notify(f"Found {len(cites)} cites for {paper.title_preview(30)}")
             except Exception as e:
-                self.notify(f"Error for {paper.title[:30]}: {e}", severity="warning")
+                self.notify(f"Error for {paper.title_preview(30)}: {e}", severity="warning")
 
         if all_cites:
             added = self.session.add_papers_from_snowball(
