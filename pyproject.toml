@@ -24,11 +24,7 @@ dependencies = [
     "llm-azure>=2.1",
     "llm-anthropic>=0.23",
     "llm-gemini>=0.28.2",
-]
-
-[project.optional-dependencies]
-# Snowball dependencies (for scholar snowball subcommand)
-snowball = [
+    # Snowball dependencies
     "pypdfium2>=4.26.0",
     "bibtexparser>=1.4.0",
     "pandas>=2.0.0",
@@ -37,18 +33,9 @@ snowball = [
     "httpx>=0.25.0",
     "grobid-client-python>=0.1.0",
     "scholarly>=1.7.0",
-]
-# Tuxedo dependencies (for scholar tuxedo subcommand)
-tuxedo = [
-    "httpx>=0.27.0",
+    # Tuxedo dependencies (httpx, pydantic already above)
     "openai>=1.0.0",
-    "pydantic>=2.0.0",
     "pyyaml>=6.0",
-]
-# All subcommand dependencies
-all = [
-    "scholar[snowball]",
-    "scholar[tuxedo]",
 ]
 
 [project.scripts]
