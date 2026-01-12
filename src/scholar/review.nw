@@ -329,6 +329,28 @@ class TestReviewDecision:
 @
 
 
+\subsection{Snowball Round}
+
+When performing manual snowballing (adding references or citing papers to the
+session), we track each round for documentation in the final report. This
+allows systematic literature reviews to document their snowballing methodology.
+
+<<review data structures>>=
+@dataclass
+class SnowballRound:
+    """
+    Record of a snowballing round.
+
+    Tracks when snowballing was performed, which papers were used as sources,
+    the direction (references or citations), and how many new papers were added.
+    """
+    timestamp: datetime
+    source_papers: list[str]  # Paper IDs that were snowballed from
+    direction: str  # "references" or "citations"
+    papers_added: int  # Count of new papers added (excluding duplicates)
+@
+
+
 \subsection{Review Session}
 
 A [[ReviewSession]] contains all decisions for a review, along with metadata
@@ -339,6 +361,9 @@ The session tracks which query was used with which provider through the
 different providers---for example, natural language queries for OpenAlex and
 Boolean syntax for Web of Science. The [[query]] and [[providers]] fields are
 retained for backward compatibility with older session files.
+
+The [[snowball_rounds]] field tracks manual snowballing operations, recording
+which papers were used as sources and how many new papers were discovered.
 
 <<review data structures>>=
 @dataclass
@@ -360,6 +385,7 @@ class ReviewSession:
     name: str | None = None  # Optional session name for persistence
     research_context: str | None = None  # Research goals for LLM review
     query_provider_pairs: list[tuple[str, str]] = field(default_factory=list)
+    snowball_rounds: list[SnowballRound] = field(default_factory=list)
     
     @property
     def kept_papers(self) -> list[ReviewDecision]:
@@ -485,6 +511,7 @@ class ReviewSession:
         }
 
     <<query-provider pair methods>>
+    <<snowball methods>>
 @
 
 Different providers often require different query syntaxes. OpenAlex works well
@@ -520,6 +547,151 @@ def queries_for_provider(self, provider: str) -> list[str]:
     Returns a list of queries that were used to search the given provider.
     """
     return [q for q, p in self.query_provider_pairs if p == provider]
+@
+
+\subsubsection{Snowballing Methods}
+
+Manual snowballing allows users to expand their search by following references
+(backward snowballing) or citations (forward snowballing) from papers already in
+the session. These methods track which papers were used as sources and record
+each round for documentation in the final report.
+
+The [[add_papers_from_snowball]] method adds new papers to the session, tagging
+them to indicate they came from snowballing. It returns the count of papers
+actually added (excluding duplicates already in the session).
+
+<<snowball methods>>=
+def add_papers_from_snowball(
+    self,
+    papers: list[Paper],
+    direction: str,
+    source_paper_ids: list[str],
+) -> int:
+    """
+    Add papers from snowballing to the session.
+
+    Papers are tagged with 'snowball-refs' or 'snowball-cites' to indicate
+    their origin. Duplicate papers (already in session) are skipped.
+
+    Args:
+        papers: Papers to add (references or citations).
+        direction: Either "references" or "citations".
+        source_paper_ids: IDs of papers that were snowballed from.
+
+    Returns:
+        Count of new papers added (excluding duplicates).
+    """
+    # Build set of existing paper IDs for deduplication
+    existing_ids = {get_paper_id(d.paper) for d in self.decisions}
+
+    # Tag papers by snowball direction
+    if direction == "references":
+        tag = "snowball-refs"
+    else:
+        tag = "snowball-cite"
+    added_count = 0
+
+    for paper in papers:
+        paper_id = get_paper_id(paper)
+        if paper_id not in existing_ids:
+            decision = ReviewDecision(
+                paper=paper,
+                provider="snowball",
+                status=DecisionStatus.PENDING,
+                tags=[tag],
+            )
+            self.decisions.append(decision)
+            existing_ids.add(paper_id)
+            added_count += 1
+
+    # Record the snowball round
+    if added_count > 0 or source_paper_ids:
+        self.snowball_rounds.append(SnowballRound(
+            timestamp=datetime.now(),
+            source_papers=source_paper_ids,
+            direction=direction,
+            papers_added=added_count,
+        ))
+
+    return added_count
+@
+
+We verify that papers are added correctly and duplicates are handled:
+
+<<test functions>>=
+class TestSnowballing:
+    """Tests for snowballing functionality."""
+
+    def test_add_papers_from_snowball_adds_new_papers(self):
+        """New papers are added with snowball tag."""
+        session = ReviewSession(
+            query="test",
+            providers=["s2"],
+            timestamp=datetime.now(),
+        )
+        papers = [
+            Paper(title="Reference 1", authors=["Author A"], year=2020,
+                  doi="10.1000/ref1"),
+            Paper(title="Reference 2", authors=["Author B"], year=2021,
+                  doi="10.1000/ref2"),
+        ]
+
+        count = session.add_papers_from_snowball(
+            papers, "references", ["doi:10.1000/source"]
+        )
+
+        assert count == 2
+        assert len(session.decisions) == 2
+        assert all(d.provider == "snowball" for d in session.decisions)
+        assert all("snowball-refs" in d.tags for d in session.decisions)
+
+    def test_add_papers_from_snowball_skips_duplicates(self):
+        """Existing papers are not duplicated."""
+        session = ReviewSession(
+            query="test",
+            providers=["s2"],
+            timestamp=datetime.now(),
+        )
+        existing = Paper(title="Existing", authors=["Author"], year=2020,
+                        doi="10.1000/existing")
+        session.decisions.append(ReviewDecision(
+            paper=existing, provider="s2"
+        ))
+
+        papers = [
+            existing,  # Duplicate
+            Paper(title="New Paper", authors=["Author B"], year=2021,
+                  doi="10.1000/new"),
+        ]
+
+        count = session.add_papers_from_snowball(
+            papers, "citations", ["doi:10.1000/source"]
+        )
+
+        assert count == 1
+        assert len(session.decisions) == 2
+
+    def test_snowball_round_recorded(self):
+        """Snowball rounds are tracked for reporting."""
+        session = ReviewSession(
+            query="test",
+            providers=["s2"],
+            timestamp=datetime.now(),
+        )
+        papers = [
+            Paper(title="Citation 1", authors=["Author"], year=2022,
+                  doi="10.1000/cit1"),
+        ]
+
+        session.add_papers_from_snowball(
+            papers, "citations", ["doi:10.1000/paper1", "doi:10.1000/paper2"]
+        )
+
+        assert len(session.snowball_rounds) == 1
+        round_info = session.snowball_rounds[0]
+        assert round_info.direction == "citations"
+        assert round_info.papers_added == 1
+        assert len(round_info.source_papers) == 2
 @
 
 We verify that pairs are added correctly and that duplicates are prevented:
@@ -1098,8 +1270,18 @@ def _get_sessions_dir() -> Path:
     path = get_data_dir() / SESSIONS_DIR
     path.mkdir(parents=True, exist_ok=True)
     return path
+@
 
+Papers store references and citations as lists of [[Paper]] objects, but JSON
+cannot directly serialize these nested objects.
+The [[Paper]] class provides [[to_dict()]] and [[from_dict()]] methods for
+serialization: [[to_dict(include_refs_cites=True)]] serializes the paper with
+its refs/cites (one level deep), and [[from_dict()]] reconstructs the paper
+including any nested refs/cites.
+This ensures enriched references and citations persist across session restarts,
+avoiding expensive re-fetching from APIs.
 
+<<review session functions>>=
 def save_session(session: ReviewSession) -> Path:
     """
     Save a review session to disk.
@@ -1127,6 +1309,15 @@ def save_session(session: ReviewSession) -> Path:
         "timestamp": session.timestamp.isoformat(),
         "research_context": session.research_context,
         "query_provider_pairs": session.query_provider_pairs,
+        "snowball_rounds": [
+            {
+                "timestamp": r.timestamp.isoformat(),
+                "source_papers": r.source_papers,
+                "direction": r.direction,
+                "papers_added": r.papers_added,
+            }
+            for r in session.snowball_rounds
+        ],
         "decisions": [
             {
                 "paper_id": get_paper_id(d.paper),
@@ -1136,17 +1327,7 @@ def save_session(session: ReviewSession) -> Path:
                 "source": d.source.value,
                 "is_example": d.is_example,
                 "llm_confidence": d.llm_confidence,
-                "paper": {
-                    "title": d.paper.title,
-                    "authors": list(d.paper.authors),
-                    "year": d.paper.year,
-                    "doi": d.paper.doi,
-                    "abstract": d.paper.abstract,
-                    "venue": d.paper.venue,
-                    "url": d.paper.url,
-                    "pdf_url": d.paper.pdf_url,
-                    "sources": d.paper.sources,
-                },
+                "paper": d.paper.to_dict(include_refs_cites=True),
             }
             for d in session.decisions
         ],
@@ -1207,22 +1388,24 @@ def load_session(name_or_query: str) -> ReviewSession | None:
             for provider in data["providers"]:
                 session.add_query_provider_pair(data["query"], provider)
 
+        # Load snowball_rounds with backward compatibility
+        if "snowball_rounds" in data:
+            for round_data in data["snowball_rounds"]:
+                session.snowball_rounds.append(SnowballRound(
+                    timestamp=datetime.fromisoformat(round_data["timestamp"]),
+                    source_papers=round_data["source_papers"],
+                    direction=round_data["direction"],
+                    papers_added=round_data["papers_added"],
+                ))
+
         for dec_data in data["decisions"]:
             paper_data = dec_data["paper"]
-            paper = Paper(
-                title=paper_data["title"],
-                authors=paper_data.get("authors", []),
-                year=paper_data.get("year"),
-                doi=paper_data.get("doi"),
-                abstract=paper_data.get("abstract"),
-                venue=paper_data.get("venue"),
-                url=paper_data.get("url"),
-                pdf_url=paper_data.get("pdf_url"),
-                sources=paper_data.get("sources") or (
-                    [s.strip() for s in paper_data["source"].split(",")]
-                    if paper_data.get("source") else []
-                ),
-            )
+            # Handle legacy format where "source" was a comma-separated string
+            if "sources" not in paper_data and "source" in paper_data:
+                paper_data["sources"] = [
+                    s.strip() for s in paper_data["source"].split(",")
+                ] if paper_data["source"] else []
+            paper = Paper.from_dict(paper_data)
             status = DecisionStatus(dec_data["status"])
             tags = dec_data.get("tags", [])
 
@@ -1284,6 +1467,98 @@ class TestQueryProviderPairsPersistence:
         assert len(loaded.query_provider_pairs) == 2
         assert ("natural language", "openalex") in loaded.query_provider_pairs
         assert ("boolean AND query", "wos") in loaded.query_provider_pairs
+
+    def test_save_and_load_references_citations(self, tmp_path, monkeypatch):
+        """References and citations are persisted with the session."""
+        monkeypatch.setenv("SCHOLAR_DATA_DIR", str(tmp_path))
+
+        # Create paper with refs and cites
+        ref = Paper(title="Reference Paper", authors=["Ref Author"], year=2020,
+                    doi="10.1000/ref")
+        cite = Paper(title="Citing Paper", authors=["Cite Author"], year=2024,
+                     doi="10.1000/cite")
+        paper = Paper(
+            title="Main Paper", authors=["Main Author"], year=2022,
+            doi="10.1000/main",
+            references=[ref],
+            citations=[cite],
+        )
+
+        session = ReviewSession(
+            query="test",
+            providers=["s2"],
+            timestamp=datetime.now(),
+            name="refs-cites-session",
+        )
+        session.decisions.append(ReviewDecision(paper=paper, provider="s2"))
+
+        save_session(session)
+        loaded = load_session("refs-cites-session")
+
+        assert loaded is not None
+        assert len(loaded.decisions) == 1
+        loaded_paper = loaded.decisions[0].paper
+
+        # Check refs were persisted
+        assert loaded_paper.references is not None
+        assert len(loaded_paper.references) == 1
+        assert loaded_paper.references[0].title == "Reference Paper"
+        assert loaded_paper.references[0].doi == "10.1000/ref"
+
+        # Check cites were persisted
+        assert loaded_paper.citations is not None
+        assert len(loaded_paper.citations) == 1
+        assert loaded_paper.citations[0].title == "Citing Paper"
+        assert loaded_paper.citations[0].doi == "10.1000/cite"
+
+    def test_load_session_without_refs_cites(self, tmp_path, monkeypatch):
+        """Old sessions without refs/cites load correctly with None values."""
+        monkeypatch.setenv("SCHOLAR_DATA_DIR", str(tmp_path))
+
+        # Create session file without refs/cites fields
+        sessions_dir = tmp_path / "review_sessions"
+        sessions_dir.mkdir(parents=True)
+        old_session_data = {
+            "query": "test",
+            "name": "old-format",
+            "providers": ["s2"],
+            "timestamp": datetime.now().isoformat(),
+            "research_context": None,
+            "query_provider_pairs": [],
+            "snowball_rounds": [],
+            "decisions": [{
+                "paper_id": "doi:10.1000/test",
+                "provider": "s2",
+                "status": "pending",
+                "tags": [],
+                "source": "human",
+                "is_example": False,
+                "llm_confidence": None,
+                "paper": {
+                    "title": "Test Paper",
+                    "authors": ["Author"],
+                    "year": 2024,
+                    "doi": "10.1000/test",
+                    "abstract": None,
+                    "venue": None,
+                    "url": None,
+                    "pdf_url": None,
+                    "sources": ["s2"],
+                    # No references or citations fields
+                },
+            }],
+        }
+        session_file = sessions_dir / "old-format.json"
+        with open(session_file, "w") as f:
+            json.dump(old_session_data, f)
+
+        loaded = load_session("old-format")
+
+        assert loaded is not None
+        assert len(loaded.decisions) == 1
+        # Should have None for refs/cites (not fetched yet)
+        assert loaded.decisions[0].paper.references is None
+        assert loaded.decisions[0].paper.citations is None
 @
 
 \paragraph{Backward Compatibility}
@@ -2000,6 +2275,53 @@ def generate_latex_report(session: ReviewSession, output_path: Path) -> None:
         r"\end{description}",
         r"",
     ])
+
+    # Snowballing section (if any rounds were performed)
+    if session.snowball_rounds:
+        lines.extend([
+            r"\section{Snowballing}",
+            r"",
+            r"Manual snowballing was performed to discover additional papers",
+            r"through citations and references of kept papers.",
+            r"",
+            r"\begin{longtable}{llcl}",
+            r"\toprule",
+            r"Round & Direction & Papers Added & Source Papers \\",
+            r"\midrule",
+        ])
+        for i, round_info in enumerate(session.snowball_rounds, 1):
+            direction = "References" if round_info.direction == "references" else "Citations"
+            source_count = len(round_info.source_papers)
+            source_label = f"{source_count} paper{'s' if source_count != 1 else ''}"
+            lines.append(
+                f"{i} & {direction} & {round_info.papers_added} & {source_label} \\\\"
+            )
+        lines.extend([
+            r"\bottomrule",
+            r"\end{longtable}",
+            r"",
+        ])
+
+        # Summary of snowball-tagged papers
+        snowball_refs = [d for d in session.kept_papers if d.has_tag("snowball-refs")]
+        snowball_cite = [d for d in session.kept_papers if d.has_tag("snowball-cite")]
+        if snowball_refs or snowball_cite:
+            lines.extend([
+                r"\subsection{Papers Added via Snowballing}",
+                r"\begin{description}",
+            ])
+            if snowball_refs:
+                lines.append(
+                    f"\\item[From references] {len(snowball_refs)} papers"
+                )
+            if snowball_cite:
+                lines.append(
+                    f"\\item[From citations] {len(snowball_cite)} papers"
+                )
+            lines.extend([
+                r"\end{description}",
+                r"",
+            ])
 
     # Summary Tables section
     if session.kept_papers or session.discarded_papers:

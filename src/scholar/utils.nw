@@ -1,0 +1,221 @@
+\chapter{Utility Functions}
+\label{utils-module}
+
+This chapter provides general-purpose utility functions used throughout Scholar.
+These functions solve common problems that arise when working with external APIs
+and data structures, particularly handling inconsistent JSON responses.
+
+\section{Module structure}
+
+<<[[utils.py]]>>=
+"""
+Utility functions for Scholar.
+
+Provides general-purpose helpers for working with nested data structures
+and normalizing API responses.
+"""
+
+<<utils functions>>
+@
+
+
+\section{Testing}
+
+<<test [[utils.py]]>>=
+"""Tests for the utils module."""
+import pytest
+
+from scholar.utils import *
+
+
+<<test functions>>
+@
+
+
+\section{Navigating nested data structures}
+
+When working with external APIs, responses often contain deeply nested
+dictionaries. Accessing these safely requires checking each level exists and is
+the correct type. The naive approach leads to verbose, error-prone code:
+
+\begin{verbatim}
+# Verbose and repetitive
+value = None
+if isinstance(data, dict):
+    level1 = data.get("key1")
+    if isinstance(level1, dict):
+        level2 = level1.get("key2")
+        if isinstance(level2, dict):
+            value = level2.get("key3")
+\end{verbatim}
+
+The [[safe_get_nested]] function provides a cleaner alternative that safely
+navigates nested dictionaries, returning a default value if any level is missing
+or not a dictionary:
+
+<<utils functions>>=
+from typing import Any
+
+
+def safe_get_nested(obj: Any, *keys: str, default: Any = None) -> Any:
+    """
+    Safely navigate nested dictionaries.
+
+    Traverses a nested dictionary structure following the given keys.
+    Returns the default value if any intermediate level is not a dictionary
+    or if any key is missing.
+
+    Args:
+        obj: The object to navigate (typically a dict).
+        *keys: The sequence of keys to follow.
+        default: Value to return if navigation fails.
+
+    Returns:
+        The value at the nested path, or default if not found.
+
+    Examples:
+        >>> data = {"a": {"b": {"c": 42}}}
+        >>> safe_get_nested(data, "a", "b", "c")
+        42
+        >>> safe_get_nested(data, "a", "x", "c", default="missing")
+        'missing'
+        >>> safe_get_nested(data, "a", "b", "c", "d", default=None)
+        None
+    """
+    for key in keys:
+        if not isinstance(obj, dict):
+            return default
+        obj = obj.get(key, default)
+    return obj
+@
+
+\subsection{Testing safe\_get\_nested}
+
+<<test functions>>=
+class TestSafeGetNested:
+    """Tests for safe_get_nested function."""
+
+    def test_navigates_nested_dict(self):
+        """Successfully navigates nested dictionaries."""
+        data = {"a": {"b": {"c": 42}}}
+        assert safe_get_nested(data, "a", "b", "c") == 42
+
+    def test_returns_default_for_missing_key(self):
+        """Returns default when key doesn't exist."""
+        data = {"a": {"b": 1}}
+        assert safe_get_nested(data, "a", "x", default="missing") == "missing"
+
+    def test_returns_default_for_non_dict(self):
+        """Returns default when intermediate value is not a dict."""
+        data = {"a": "not a dict"}
+        assert safe_get_nested(data, "a", "b", default=None) is None
+
+    def test_returns_default_for_none_input(self):
+        """Returns default when input is None."""
+        assert safe_get_nested(None, "a", "b", default="fallback") == "fallback"
+
+    def test_empty_keys_returns_object(self):
+        """With no keys, returns the object itself."""
+        data = {"a": 1}
+        assert safe_get_nested(data) == {"a": 1}
+
+    def test_single_key(self):
+        """Works with single key."""
+        data = {"a": 42}
+        assert safe_get_nested(data, "a") == 42
+
+    def test_default_is_none(self):
+        """Default value is None when not specified."""
+        data = {"a": 1}
+        assert safe_get_nested(data, "x") is None
+@
+
+
+\section{Normalizing API response types}
+
+Many APIs, particularly those converting XML to JSON, inconsistently return
+fields that should be lists. When a field contains multiple items, it returns a
+list. When it contains a single item, it may return just that item (not wrapped
+in a list). Sometimes it returns a string instead of a structured object.
+
+This inconsistency causes problems when iterating: iterating over a string
+yields individual characters, and calling [[.get()]] on a character raises
+[[AttributeError]].
+
+The [[ensure_list]] function normalizes values to lists for safe iteration:
+\begin{description}
+\item[List] returned as-is
+\item[Dict] wrapped in a single-element list
+\item[String or other] returns empty list (skip gracefully)
+\end{description}
+
+<<utils functions>>=
+def ensure_list(value: Any) -> list:
+    """
+    Normalize a value to a list for safe iteration.
+
+    Useful when an API inconsistently returns either a single item or a list
+    of items. This function ensures you always get a list to iterate over.
+
+    Args:
+        value: The value to normalize.
+
+    Returns:
+        - If value is a list: returns it unchanged
+        - If value is a dict: returns [value]
+        - Otherwise: returns [] (empty list)
+
+    Examples:
+        >>> ensure_list([1, 2, 3])
+        [1, 2, 3]
+        >>> ensure_list({"key": "value"})
+        [{'key': 'value'}]
+        >>> ensure_list("string")
+        []
+        >>> ensure_list(None)
+        []
+    """
+    if isinstance(value, list):
+        return value
+    if isinstance(value, dict):
+        return [value]
+    return []
+@
+
+\subsection{Testing ensure\_list}
+
+<<test functions>>=
+class TestEnsureList:
+    """Tests for ensure_list function."""
+
+    def test_list_unchanged(self):
+        """Lists are returned as-is."""
+        data = [1, 2, 3]
+        assert ensure_list(data) == [1, 2, 3]
+
+    def test_empty_list_unchanged(self):
+        """Empty lists are returned as-is."""
+        assert ensure_list([]) == []
+
+    def test_dict_wrapped(self):
+        """Dicts are wrapped in a list."""
+        data = {"key": "value"}
+        assert ensure_list(data) == [{"key": "value"}]
+
+    def test_string_returns_empty(self):
+        """Strings return empty list (not iterated as chars)."""
+        assert ensure_list("hello") == []
+
+    def test_none_returns_empty(self):
+        """None returns empty list."""
+        assert ensure_list(None) == []
+
+    def test_int_returns_empty(self):
+        """Integers return empty list."""
+        assert ensure_list(42) == []
+
+    def test_nested_list_unchanged(self):
+        """Nested lists are returned as-is."""
+        data = [[1, 2], [3, 4]]
+        assert ensure_list(data) == [[1, 2], [3, 4]]
+@

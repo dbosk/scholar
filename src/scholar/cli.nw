@@ -62,6 +62,7 @@ across bibliographic databases.
 <<search command>>
 <<enrich command>>
 <<providers command>>
+<<syntax command>>
 <<cache command>>
 <<pdf command>>
 <<notes command>>
@@ -289,6 +290,9 @@ def search(
     Queries all available providers when no -p option is given. A provider is
     available if it doesn't require an API key, or has its API key configured.
     Use 'scholar providers' to see which providers are currently available.
+
+    Query syntax varies by provider. Use 'scholar syntax' to see supported
+    operators (AND, OR, NOT), wildcards, and phrase search for each provider.
 
     Examples:
         scholar search "machine learning privacy"
@@ -907,6 +911,154 @@ class TestProvidersCommand:
         assert "S2_API_KEY" in result.stdout
         assert "WOS_EXPANDED_API_KEY" in result.stdout
         assert "IEEE_API_KEY" in result.stdout
+@
+
+
+\section{Query Syntax Reference}
+\label{ch:syntax-cli}
+
+Different providers support different query syntax features.
+The [[syntax]] command displays a reference showing what each provider supports.
+
+<<syntax command>>=
+@app.command()
+def syntax() -> None:
+    """
+    Show query syntax supported by each provider.
+
+    Different providers support different features like boolean operators,
+    wildcards, and phrase search. Use this command to see what's available.
+    """
+    <<display syntax reference>>
+@
+
+We display the information in a table for easy comparison:
+
+<<display syntax reference>>=
+console = Console()
+
+console.print()
+console.print("[bold]Query Syntax Reference[/bold]")
+console.print()
+console.print("Different providers support different query syntax. This reference")
+console.print("shows what features are available for each provider.")
+console.print()
+
+# Boolean operators table
+table = Table(title="Boolean Operators", box=box.HORIZONTALS)
+table.add_column("Provider", style="cyan")
+table.add_column("AND", style="green")
+table.add_column("OR", style="green")
+table.add_column("NOT", style="green")
+table.add_column("Grouping", style="green")
+table.add_column("Notes", style="dim")
+
+table.add_row("s2", "[green]✓[/]", "[green]✓[/]", "[green]✓[/]", "[green]✓[/]",
+              "Use + for AND, | for OR in bulk API")
+table.add_row("openalex", "[green]✓[/]", "[green]✓[/]", "[green]✓[/]", "[green]✓[/]",
+              "Must be UPPERCASE")
+table.add_row("dblp", "[dim]implicit[/]", "[red]✗[/]", "[red]✗[/]", "[red]✗[/]",
+              "Space = AND, NOT disabled")
+table.add_row("wos", "[green]✓[/]", "[green]✓[/]", "[green]✓[/]", "[green]✓[/]",
+              "Must be UPPERCASE, supports NEAR/SAME")
+table.add_row("ieee", "[green]✓[/]", "[green]✓[/]", "[green]✓[/]", "[green]✓[/]",
+              "Must be UPPERCASE, supports ONEAR")
+table.add_row("arxiv", "[green]✓[/]", "[green]✓[/]", "[green]✓[/]", "[green]✓[/]",
+              "Use ANDNOT instead of NOT")
+
+console.print(table)
+console.print()
+
+# Other features table
+table2 = Table(title="Other Features", box=box.HORIZONTALS)
+table2.add_column("Provider", style="cyan")
+table2.add_column("Wildcards", style="green")
+table2.add_column("Phrase", style="green")
+table2.add_column("Field Search", style="green")
+table2.add_column("Notes", style="dim")
+
+table2.add_row("s2", "[red]✗[/]", '[green]✓[/] "..."', "[red]✗[/]",
+               "Simple keyword search")
+table2.add_row("openalex", "[red]✗[/]", '[green]✓[/] "..."', "[red]✗[/]",
+               "Stemming enabled")
+table2.add_row("dblp", "[green]✓[/] prefix*", '[red]✗[/] disabled', "[green]✓[/] author:",
+               "author:Name, year:YYYY")
+table2.add_row("wos", "[green]✓[/] * $ ?", '[green]✓[/] "..."', "[green]✓[/] TS= TI= AU=",
+               "TS=topic, TI=title, AU=author")
+table2.add_row("ieee", "[green]✓[/] *", '[green]✓[/] "..."', "[green]✓[/]",
+               "Max 5 wildcards per search")
+table2.add_row("arxiv", "[red]✗[/]", '[green]✓[/] "..."', "[green]✓[/] ti: au: cat:",
+               "ti:title, au:author, cat:category")
+
+console.print(table2)
+console.print()
+
+# Examples
+console.print("[bold]Examples:[/bold]")
+console.print()
+examples = [
+    ("s2/openalex", '"machine learning" AND privacy'),
+    ("dblp", "machine learning privacy  [space = AND]"),
+    ("wos", 'TS=("machine learning" AND privacy)'),
+    ("ieee", '"machine learning" AND privacy NOT survey'),
+    ("arxiv", 'ti:"machine learning" AND cat:cs.AI'),
+]
+for provider, example in examples:
+    console.print(f"  [cyan]{provider:12}[/]  {example}")
+console.print()
+
+console.print("[dim]Tip: When in doubt, use simple keywords without operators.[/dim]")
+console.print("[dim]All providers support basic keyword search.[/dim]")
+console.print()
+
+console.print("[bold]Documentation:[/bold]")
+console.print()
+docs = [
+    ("s2", "https://www.semanticscholar.org/product/api/tutorial"),
+    ("openalex", "https://docs.openalex.org/how-to-use-the-api/get-lists-of-entities/search-entities"),
+    ("dblp", "https://dblp.org/faq/How+to+use+the+dblp+search+API.html"),
+    ("wos", "https://webofscience.help.clarivate.com/en-us/Content/search-rules.html"),
+    ("ieee", "https://ieeexplore.ieee.org/Xplorehelp/searching-ieee-xplore/command-search"),
+    ("arxiv", "https://info.arxiv.org/help/api/user-manual.html#query_details"),
+]
+for provider, url in docs:
+    console.print(f"  [cyan]{provider:12}[/]  {url}")
+@
+
+\subsection{Testing syntax command}
+
+<<test functions>>=
+class TestSyntaxCommand:
+    """Tests for the syntax command."""
+
+    def test_syntax_command_exists(self):
+        """The syntax command is registered."""
+        result = runner.invoke(app, ["syntax", "--help"])
+        assert result.exit_code == 0
+        assert "query syntax" in result.stdout.lower()
+
+    def test_syntax_shows_providers(self):
+        """The syntax command shows all providers."""
+        result = runner.invoke(app, ["syntax"])
+        assert result.exit_code == 0
+        assert "s2" in result.stdout
+        assert "openalex" in result.stdout
+        assert "dblp" in result.stdout
+        assert "arxiv" in result.stdout
+
+    def test_syntax_shows_operators(self):
+        """The syntax command shows boolean operators."""
+        result = runner.invoke(app, ["syntax"])
+        assert result.exit_code == 0
+        assert "AND" in result.stdout
+        assert "OR" in result.stdout
+
+    def test_syntax_shows_documentation_urls(self):
+        """The syntax command shows documentation URLs."""
+        result = runner.invoke(app, ["syntax"])
+        assert result.exit_code == 0
+        assert "Documentation" in result.stdout
+        assert "https://" in result.stdout
 @
 
 

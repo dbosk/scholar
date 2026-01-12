@@ -8,6 +8,7 @@ TESTS+=		test_review.py
 TESTS+=		test_notes.py
 TESTS+=		test_llm_review.py
 TESTS+=		test_pdf.py
+TESTS+=		test_utils.py
 
 CONFIG+=	conftest.py
 
@@ -44,6 +45,9 @@ test_llm_review.py: ../src/scholar/llm_review.nw
 
 test_pdf.py: ../src/scholar/pdf.nw
 	notangle -R"test [[pdf.py]]" $< | cpif $@
+
+test_utils.py: ../src/scholar/utils.nw
+	notangle -R"test [[utils.py]]" $< | cpif $@
 
 conftest.py: ../src/scholar/cache.nw
 	notangle -R"[[conftest.py]]" $< | cpif $@

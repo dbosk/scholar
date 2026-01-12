@@ -75,6 +75,8 @@ Scholar package for structured literature searches.
 
 from .scholar import Search, SearchResult, Paper, SearchFilters
 from .scholar import search, filter_papers
+from .scholar import get_registry, isolated_registry
+from .utils import safe_get_nested, ensure_list
 
 __all__ = [
     "Search",
@@ -83,6 +85,10 @@ __all__ = [
     "SearchFilters",
     "search",
     "filter_papers",
+    "get_registry",
+    "isolated_registry",
+    "safe_get_nested",
+    "ensure_list",
 ]
 @
 
@@ -128,6 +134,316 @@ classes because:
 \item[Serializability] Works with [[asdict()]] for easy JSON/dict conversion.
 \end{description}
 
+\subsection{Paper registry}
+\label{sec:paper-registry}
+
+A critical challenge when working with papers across different subsystems
+(search results, review sessions, enrichment cache, notes) is that the same
+paper can exist as multiple different Python objects.
+When we enrich a paper with references in one place, copies elsewhere don't get
+updated.
+This leads to stale data and inconsistent state.
+
+The \emph{Paper Registry} solves this by ensuring each unique paper exists as a
+single object in memory.
+When deserializing papers from cache or creating papers from API responses, we
+look up existing papers in the registry first.
+
+\subsubsection{Registry design}
+
+We use a module-level registry (singleton pattern) for simplicity.
+For testing, we provide a context manager that temporarily replaces the
+registry with an isolated instance, preventing test pollution.
+
+<<classes>>=
+class PaperRegistry:
+    """
+    Central registry ensuring each unique paper exists as a single object.
+
+    Papers are keyed by their stable identifier (DOI or title+author hash).
+    When deserializing or creating papers, use get_or_create() to either
+    retrieve an existing paper or register a new one.
+    """
+
+    def __init__(self):
+        self._papers: dict[str, "Paper"] = {}
+
+    <<paper registry methods>>
+@
+
+The registry provides three core operations:
+\begin{description}
+\item[get] Retrieve a paper by its ID, returning [[None]] if not found.
+\item[get\_or\_create] The primary interface: given paper data, return an
+  existing paper if one with the same ID exists, otherwise create and register
+  a new paper.
+\item[register] Explicitly add a paper to the registry (used internally by
+  [[get_or_create]]).
+\end{description}
+
+<<paper registry methods>>=
+def get(self, paper_id: str) -> "Paper | None":
+    """
+    Retrieve a paper by its stable identifier.
+
+    Args:
+        paper_id: The paper's stable ID (from Paper.id property).
+
+    Returns:
+        The Paper if found, None otherwise.
+    """
+    return self._papers.get(paper_id)
+
+def register(self, paper: "Paper") -> "Paper":
+    """
+    Register a paper in the registry.
+
+    If a paper with the same ID already exists, returns the existing paper
+    (the new paper is discarded). Otherwise, adds the paper to the registry.
+
+    Args:
+        paper: The Paper to register.
+
+    Returns:
+        The registered paper (may be different from input if duplicate).
+    """
+    paper_id = paper.id
+    if paper_id in self._papers:
+        return self._papers[paper_id]
+    self._papers[paper_id] = paper
+    return paper
+
+def get_or_create(self, data: dict) -> "Paper":
+    """
+    Get an existing paper or create and register a new one.
+
+    This is the primary interface for obtaining Paper objects. It ensures
+    that papers with the same identity (DOI or title+author) are represented
+    by a single object.
+
+    Args:
+        data: Dictionary with paper fields (as from Paper.to_dict()).
+
+    Returns:
+        Either an existing Paper from the registry, or a newly created
+        and registered Paper.
+    """
+    # Create a temporary paper to compute its ID
+    paper = Paper._from_dict_without_registry(data)
+    paper_id = paper.id
+
+    if paper_id in self._papers:
+        existing = self._papers[paper_id]
+        # Optionally merge new data into existing paper
+        # For now, just return existing
+        return existing
+
+    self._papers[paper_id] = paper
+    return paper
+@
+
+We also need methods to inspect and clear the registry:
+
+<<paper registry methods>>=
+def __len__(self) -> int:
+    """Return the number of papers in the registry."""
+    return len(self._papers)
+
+def __contains__(self, paper: "Paper") -> bool:
+    """Check if a paper is in the registry."""
+    return paper.id in self._papers
+
+def clear(self) -> None:
+    """Remove all papers from the registry."""
+    self._papers.clear()
+
+def all_papers(self) -> list["Paper"]:
+    """Return all papers in the registry."""
+    return list(self._papers.values())
+@
+
+\subsubsection{Module-level registry access}
+
+We provide a module-level function to access the global registry.
+This keeps the registry as an implementation detail while providing a clean
+interface.
+
+<<functions>>=
+# Module-level registry instance
+_registry: PaperRegistry | None = None
+
+
+def get_registry() -> PaperRegistry:
+    """
+    Get the global paper registry.
+
+    The registry is created lazily on first access.
+
+    Returns:
+        The global PaperRegistry instance.
+    """
+    global _registry
+    if _registry is None:
+        _registry = PaperRegistry()
+    return _registry
+@
+
+\subsubsection{Test isolation with context manager}
+
+Tests need isolated registries to avoid interference between test cases.
+The [[isolated_registry]] context manager temporarily replaces the global
+registry with a fresh instance:
+
+<<functions>>=
+@contextmanager
+def isolated_registry():
+    """
+    Context manager providing an isolated paper registry for testing.
+
+    Within the context, a fresh registry is used. The original registry
+    is restored when the context exits, preventing test pollution.
+
+    Example:
+        with isolated_registry():
+            paper = Paper.from_dict({"title": "Test", "authors": []})
+            assert len(get_registry()) == 1
+        # Original registry restored here
+
+    Yields:
+        The isolated PaperRegistry instance.
+    """
+    global _registry
+    original = _registry
+    _registry = PaperRegistry()
+    try:
+        yield _registry
+    finally:
+        _registry = original
+@
+
+\subsubsection{Testing the paper registry}
+
+Let's verify the registry works correctly:
+
+<<test functions>>=
+class TestPaperRegistry:
+    """Tests for the PaperRegistry class."""
+
+    def test_register_new_paper(self):
+        """Registering a new paper adds it to the registry."""
+        with isolated_registry() as registry:
+            paper = Paper(title="Test Paper", authors=["Author A"])
+            result = registry.register(paper)
+            assert result is paper
+            assert len(registry) == 1
+            assert paper in registry
+
+    def test_register_duplicate_returns_existing(self):
+        """Registering a duplicate returns the existing paper."""
+        with isolated_registry() as registry:
+            paper1 = Paper(title="Test Paper", authors=["Author A"])
+            paper2 = Paper(title="Test Paper", authors=["Author A"])
+            registry.register(paper1)
+            result = registry.register(paper2)
+            assert result is paper1
+            assert len(registry) == 1
+
+    def test_get_existing_paper(self):
+        """Can retrieve a registered paper by ID."""
+        with isolated_registry() as registry:
+            paper = Paper(title="Test Paper", authors=["Author A"])
+            registry.register(paper)
+            retrieved = registry.get(paper.id)
+            assert retrieved is paper
+
+    def test_get_nonexistent_returns_none(self):
+        """Getting a non-existent paper returns None."""
+        with isolated_registry() as registry:
+            result = registry.get("nonexistent-id")
+            assert result is None
+
+    def test_get_or_create_new(self):
+        """get_or_create creates and registers new papers."""
+        with isolated_registry() as registry:
+            paper = registry.get_or_create({
+                "title": "New Paper",
+                "authors": ["Author"],
+            })
+            assert paper.title == "New Paper"
+            assert len(registry) == 1
+
+    def test_get_or_create_existing(self):
+        """get_or_create returns existing paper for duplicates."""
+        with isolated_registry() as registry:
+            paper1 = registry.get_or_create({
+                "title": "Test Paper",
+                "authors": ["Author A"],
+            })
+            paper2 = registry.get_or_create({
+                "title": "Test Paper",
+                "authors": ["Author A"],
+            })
+            assert paper1 is paper2
+            assert len(registry) == 1
+
+    def test_clear_removes_all_papers(self):
+        """clear() removes all papers from the registry."""
+        with isolated_registry() as registry:
+            registry.register(Paper(title="A", authors=[]))
+            registry.register(Paper(title="B", authors=[]))
+            assert len(registry) == 2
+            registry.clear()
+            assert len(registry) == 0
+
+    def test_all_papers(self):
+        """all_papers() returns list of all registered papers."""
+        with isolated_registry() as registry:
+            p1 = Paper(title="A", authors=["X"])
+            p2 = Paper(title="B", authors=["Y"])
+            registry.register(p1)
+            registry.register(p2)
+            papers = registry.all_papers()
+            assert len(papers) == 2
+            assert p1 in papers
+            assert p2 in papers
+
+
+class TestIsolatedRegistry:
+    """Tests for the isolated_registry context manager."""
+
+    def test_isolated_registry_is_empty(self):
+        """Isolated registry starts empty."""
+        with isolated_registry() as registry:
+            assert len(registry) == 0
+
+    def test_isolated_registry_does_not_affect_global(self):
+        """Changes in isolated registry don't affect global."""
+        # Add a paper to global registry
+        global_registry = get_registry()
+        initial_count = len(global_registry)
+
+        with isolated_registry() as registry:
+            registry.register(Paper(title="Isolated", authors=[]))
+            assert len(registry) == 1
+
+        # Global registry unchanged
+        assert len(get_registry()) == initial_count
+
+    def test_nested_isolated_registries(self):
+        """Nested isolated registries work correctly."""
+        with isolated_registry() as outer:
+            outer.register(Paper(title="Outer", authors=[]))
+            assert len(outer) == 1
+
+            with isolated_registry() as inner:
+                assert len(inner) == 0
+                inner.register(Paper(title="Inner", authors=[]))
+                assert len(inner) == 1
+
+            # Outer registry preserved
+            assert len(outer) == 1
+@
+
 \subsection{Representing papers}
 
 A paper has bibliographic metadata that we need for deduplication and export.
@@ -147,12 +463,17 @@ class Paper:
     venue: str | None = None
     url: str | None = None
     pdf_url: str | None = None
+    citation_count: int | None = None
     sources: list[str] = field(default_factory=list)
+    references: list["Paper"] | None = None
+    citations: list["Paper"] | None = None
 
     <<paper methods>>
 @
 
 We use a dataclass for simplicity.
+The [[citation_count]] field stores the number of citations if available from
+the provider.
 The [[sources]] field tracks which databases returned this paper, useful for
 provenance in reports when merging results from multiple providers.
 
@@ -160,25 +481,212 @@ provenance in reports when merging results from multiple providers.
 
 When merging results from multiple databases, we need to identify duplicate
 papers.
-The DOI is the most reliable identifier when available:
+We use a two-tier identity system:
+\begin{enumerate}
+\item If both papers have a DOI, compare DOIs (case-insensitive).
+\item Otherwise, compare normalized title combined with the first author's
+  last name.
+\end{enumerate}
+
+This matches the identity used by the Paper Registry, ensuring that
+[[paper1 == paper2]] if and only if they would map to the same registry entry.
+
+The [[id]] property returns a stable string identifier for a paper.
+This is used as the key in the Paper Registry and for persistent storage.
 
 <<paper methods>>=
+@property
+def id(self) -> str:
+    """
+    Generate a stable identifier for this paper.
+
+    Uses DOI if available, otherwise SHA256 hash of normalized
+    title + first author's last name.
+
+    Returns:
+        A string identifier unique to this paper's identity.
+    """
+    if self.doi:
+        return f"doi:{self.doi.lower()}"
+
+    # Normalize title
+    title_normalized = self.title.lower().strip()
+
+    # Get first author's last name if available
+    author_part = ""
+    if self.authors:
+        first_author = self.authors[0]
+        # Extract last name (last word of author name)
+        last_name = first_author.split()[-1].lower() if first_author else ""
+        author_part = last_name
+
+    # Create hash
+    content = f"{title_normalized}|{author_part}"
+    hash_value = hashlib.sha256(content.encode()).hexdigest()[:16]
+    return f"hash:{hash_value}"
+
 def __eq__(self, other: object) -> bool:
-    """Check equality based on DOI if available, else title."""
+    """
+    Check equality based on stable paper identity.
+
+    Two papers are equal if they have the same DOI (case-insensitive),
+    or if they have the same normalized title and first author's last name.
+    """
     if not isinstance(other, Paper):
         return NotImplemented
-    if self.doi and other.doi:
-        return self.doi.lower() == other.doi.lower()
-    return self.title.lower() == other.title.lower()
+    return self.id == other.id
 
 def __hash__(self) -> int:
-    """Hash based on DOI if available, else title."""
-    if self.doi:
-        return hash(self.doi.lower())
-    return hash(self.title.lower())
+    """Hash based on stable paper identity."""
+    return hash(self.id)
 @
 
 This allows us to use papers in sets for automatic deduplication.
+
+\subsubsection{Serialization and deserialization}
+
+For caching enrichment data (references and citations), we need to serialize
+papers to dictionaries and deserialize them back.
+The [[to_dict]] method converts a paper to a dictionary suitable for JSON
+serialization or pickle storage.
+
+By default, we exclude references and citations to avoid infinite recursion
+when papers reference each other.
+When [[include_refs_cites=True]], we serialize them one level deep (the
+referenced papers themselves have their refs/cites excluded).
+
+<<paper methods>>=
+def to_dict(self, include_refs_cites: bool = False) -> dict:
+    """
+    Convert paper to a dictionary for serialization.
+
+    Args:
+        include_refs_cites: If True, include references and citations
+            (serialized one level deep, without their own refs/cites).
+
+    Returns:
+        Dictionary representation of the paper.
+    """
+    result = {
+        "title": self.title,
+        "authors": self.authors,
+        "year": self.year,
+        "doi": self.doi,
+        "abstract": self.abstract,
+        "venue": self.venue,
+        "url": self.url,
+        "pdf_url": self.pdf_url,
+        "citation_count": self.citation_count,
+        "sources": self.sources,
+    }
+
+    if include_refs_cites:
+        result["references"] = (
+            [p.to_dict(include_refs_cites=False) for p in self.references]
+            if self.references else None
+        )
+        result["citations"] = (
+            [p.to_dict(include_refs_cites=False) for p in self.citations]
+            if self.citations else None
+        )
+
+    return result
+@
+
+The [[from_dict]] class method reconstructs a Paper from a dictionary.
+It handles both the old format (without refs/cites) and the new format
+(with refs/cites as nested dictionaries).
+
+By default, [[from_dict]] uses the Paper Registry to ensure each unique paper
+is represented by a single object.
+The [[use_registry]] parameter can disable this for special cases (like
+creating temporary papers for comparison).
+
+<<paper methods>>=
+@classmethod
+def from_dict(cls, data: dict, use_registry: bool = True) -> "Paper":
+    """
+    Create a Paper from a dictionary, using the registry for deduplication.
+
+    Handles both legacy format (no refs/cites) and new format
+    (refs/cites as list of dicts).
+
+    Args:
+        data: Dictionary with paper fields.
+        use_registry: If True (default), use the Paper Registry to ensure
+            each unique paper is represented by a single object.
+
+    Returns:
+        Paper instance (may be an existing paper from the registry).
+    """
+    if use_registry:
+        return get_registry().get_or_create(data)
+    return cls._from_dict_without_registry(data)
+
+@classmethod
+def _from_dict_without_registry(cls, data: dict) -> "Paper":
+    """
+    Create a Paper from a dictionary without using the registry.
+
+    This is used internally by the registry's get_or_create method,
+    and for cases where registry use should be bypassed.
+
+    Args:
+        data: Dictionary with paper fields.
+
+    Returns:
+        New Paper instance.
+    """
+    # Parse references if present (recursively, but without registry
+    # to avoid infinite loops during get_or_create)
+    references = None
+    if "references" in data and data["references"] is not None:
+        references = [cls._from_dict_without_registry(ref) for ref in data["references"]]
+
+    # Parse citations if present
+    citations = None
+    if "citations" in data and data["citations"] is not None:
+        citations = [cls._from_dict_without_registry(cit) for cit in data["citations"]]
+
+    return cls(
+        title=data.get("title", ""),
+        authors=data.get("authors", []),
+        year=data.get("year"),
+        doi=data.get("doi"),
+        abstract=data.get("abstract"),
+        venue=data.get("venue"),
+        url=data.get("url"),
+        pdf_url=data.get("pdf_url"),
+        citation_count=data.get("citation_count"),
+        sources=data.get("sources", []),
+        references=references,
+        citations=citations,
+    )
+@
+
+\subsubsection{Title preview for display}
+
+When displaying papers in logs or UI elements with limited space, we need
+a truncated title.
+The [[title_preview]] method provides this, falling back to the DOI if no
+title is available.
+
+<<paper methods>>=
+def title_preview(self, max_length: int = 50) -> str:
+    """
+    Return a truncated title for display in logs or UI.
+
+    Args:
+        max_length: Maximum length of the returned string.
+
+    Returns:
+        Truncated title, or DOI if no title, or "Unknown" as fallback.
+    """
+    text = self.title or self.doi or "Unknown"
+    if len(text) <= max_length:
+        return text
+    return text[:max_length - 3] + "..."
+@
 
 \subsubsection{Consolidating data from multiple sources}
 
@@ -214,6 +722,15 @@ def merge_with(self, other: "Paper") -> "Paper":
         if src not in combined_sources:
             combined_sources.append(src)
 
+    # For citation count, prefer higher value when both exist
+    merged_citation_count = None
+    if self.citation_count is not None and other.citation_count is not None:
+        merged_citation_count = max(self.citation_count, other.citation_count)
+    elif self.citation_count is not None:
+        merged_citation_count = self.citation_count
+    elif other.citation_count is not None:
+        merged_citation_count = other.citation_count
+
     return Paper(
         title=self.title or other.title,
         authors=self.authors if self.authors else other.authors,
@@ -223,41 +740,76 @@ def merge_with(self, other: "Paper") -> "Paper":
         venue=self.venue or other.venue,
         url=self.url or other.url,
         pdf_url=self.pdf_url or other.pdf_url,
+        citation_count=merged_citation_count,
         sources=combined_sources,
+        references=self.references if self.references is not None else other.references,
+        citations=self.citations if self.citations is not None else other.citations,
     )
 @
 
 \subsubsection{Testing paper equality}
 
-Let's verify that paper equality and hashing work correctly for deduplication:
+Let's verify that paper equality and hashing work correctly for deduplication.
+Note that equality is now based on DOI (if both have DOI) or title+first author:
 
 <<test functions>>=
 class TestPaper:
     """Tests for the Paper class."""
 
     def test_equality_by_doi(self):
-        """Papers with same DOI are equal."""
-        p1 = Paper(title="Paper One", authors=["A"], doi="10.1234/test")
-        p2 = Paper(title="Paper 1", authors=["B"], doi="10.1234/test")
-        assert p1 == p2
+        """Papers with same DOI are equal regardless of title/author."""
+        with isolated_registry():
+            p1 = Paper(title="Paper One", authors=["A"], doi="10.1234/test")
+            p2 = Paper(title="Paper 1", authors=["B"], doi="10.1234/test")
+            assert p1 == p2
 
-    def test_equality_by_title(self):
-        """Papers without DOI are equal by title."""
-        p1 = Paper(title="Test Paper", authors=["A"])
-        p2 = Paper(title="test paper", authors=["B"])
-        assert p1 == p2
+    def test_equality_by_title_and_author(self):
+        """Papers without DOI are equal by title + first author."""
+        with isolated_registry():
+            p1 = Paper(title="Test Paper", authors=["John Smith"])
+            p2 = Paper(title="test paper", authors=["Alice Smith"])  # Same last name
+            assert p1 == p2
 
-    def test_inequality(self):
+    def test_inequality_different_authors(self):
+        """Papers with same title but different first author are not equal."""
+        with isolated_registry():
+            p1 = Paper(title="Test Paper", authors=["Smith, John"])
+            p2 = Paper(title="Test Paper", authors=["Jones, Alice"])
+            assert p1 != p2
+
+    def test_inequality_different_titles(self):
         """Different papers are not equal."""
-        p1 = Paper(title="Paper A", authors=["A"])
-        p2 = Paper(title="Paper B", authors=["B"])
-        assert p1 != p2
+        with isolated_registry():
+            p1 = Paper(title="Paper A", authors=["A"])
+            p2 = Paper(title="Paper B", authors=["B"])
+            assert p1 != p2
 
     def test_hash_consistency(self):
         """Equal papers have the same hash."""
-        p1 = Paper(title="Test", authors=["A"], doi="10.1234/test")
-        p2 = Paper(title="Different", authors=["B"], doi="10.1234/test")
-        assert hash(p1) == hash(p2)
+        with isolated_registry():
+            p1 = Paper(title="Test", authors=["A"], doi="10.1234/test")
+            p2 = Paper(title="Different", authors=["B"], doi="10.1234/test")
+            assert hash(p1) == hash(p2)
+
+    def test_paper_id_with_doi(self):
+        """Paper ID uses DOI when available."""
+        with isolated_registry():
+            paper = Paper(title="Test", authors=["A"], doi="10.1234/TEST")
+            assert paper.id == "doi:10.1234/test"
+
+    def test_paper_id_without_doi(self):
+        """Paper ID uses hash of title+author when no DOI."""
+        with isolated_registry():
+            paper = Paper(title="Test Paper", authors=["John Smith"])
+            assert paper.id.startswith("hash:")
+            assert len(paper.id) == 5 + 16  # "hash:" + 16 hex chars
+
+    def test_paper_id_stable(self):
+        """Paper ID is stable for same paper data."""
+        with isolated_registry():
+            p1 = Paper(title="Test", authors=["Smith"])
+            p2 = Paper(title="Test", authors=["Smith"])
+            assert p1.id == p2.id
 
 
 class TestPaperMergeWith:
@@ -265,59 +817,261 @@ class TestPaperMergeWith:
 
     def test_merge_keeps_abstract_from_other(self):
         """Merging keeps abstract from paper that has it."""
-        p1 = Paper(title="Test", authors=["A"], doi="10.1/test", sources=["dblp"])
-        p2 = Paper(
-            title="Test", authors=["A"], doi="10.1/test",
-            abstract="This is the abstract", sources=["s2"]
-        )
-        merged = p1.merge_with(p2)
-        assert merged.abstract == "This is the abstract"
+        with isolated_registry():
+            p1 = Paper(title="Test", authors=["A"], doi="10.1/test", sources=["dblp"])
+            p2 = Paper(title="Test", authors=["A"], doi="10.1/test",
+                abstract="This is the abstract", sources=["s2"])
+            merged = p1.merge_with(p2)
+            assert merged.abstract == "This is the abstract"
 
     def test_merge_prefers_self_values(self):
         """When both have a value, prefer self."""
-        p1 = Paper(
-            title="Test", authors=["A"], doi="10.1/test",
-            venue="Conference A", sources=["provider1"]
-        )
-        p2 = Paper(
-            title="Test", authors=["A"], doi="10.1/test",
-            venue="Conference B", sources=["provider2"]
-        )
-        merged = p1.merge_with(p2)
-        assert merged.venue == "Conference A"
+        with isolated_registry():
+            p1 = Paper(title="Test", authors=["A"], doi="10.1/test",
+                venue="Conference A", sources=["provider1"])
+            p2 = Paper(title="Test", authors=["A"], doi="10.1/test",
+                venue="Conference B", sources=["provider2"])
+            merged = p1.merge_with(p2)
+            assert merged.venue == "Conference A"
 
     def test_merge_combines_sources(self):
         """Merging combines sources from both papers."""
-        p1 = Paper(title="Test", authors=["A"], sources=["dblp"])
-        p2 = Paper(title="test", authors=["B"], sources=["s2"])
-        merged = p1.merge_with(p2)
-        assert "dblp" in merged.sources
-        assert "s2" in merged.sources
+        with isolated_registry():
+            p1 = Paper(title="Test", authors=["A"], sources=["dblp"])
+            p2 = Paper(title="test", authors=["A"], sources=["s2"])
+            merged = p1.merge_with(p2)
+            assert "dblp" in merged.sources
+            assert "s2" in merged.sources
 
     def test_merge_raises_for_unequal_papers(self):
         """Cannot merge papers that aren't equal."""
-        p1 = Paper(title="Paper A", authors=["A"], doi="10.1/a")
-        p2 = Paper(title="Paper B", authors=["B"], doi="10.1/b")
-        with pytest.raises(ValueError, match="Can only merge equal papers"):
-            p1.merge_with(p2)
+        with isolated_registry():
+            p1 = Paper(title="Paper A", authors=["A"], doi="10.1/a")
+            p2 = Paper(title="Paper B", authors=["B"], doi="10.1/b")
+            with pytest.raises(ValueError, match="Can only merge equal papers"):
+                p1.merge_with(p2)
 
     def test_merge_consolidates_all_fields(self):
         """Merging fills in all missing fields from other."""
-        p1 = Paper(
-            title="Test", authors=["A"], doi="10.1/test",
-            year=2024, sources=["provider1"]
-        )
-        p2 = Paper(
-            title="Test", authors=["A"], doi="10.1/test",
-            abstract="Abstract", venue="Venue", url="http://example.com",
-            pdf_url="http://example.com/pdf", sources=["provider2"]
-        )
-        merged = p1.merge_with(p2)
-        assert merged.year == 2024  # From p1
-        assert merged.abstract == "Abstract"  # From p2
-        assert merged.venue == "Venue"  # From p2
-        assert merged.url == "http://example.com"  # From p2
-        assert merged.pdf_url == "http://example.com/pdf"  # From p2
+        with isolated_registry():
+            p1 = Paper(title="Test", authors=["A"], doi="10.1/test",
+                year=2024, sources=["provider1"])
+            p2 = Paper(title="Test", authors=["A"], doi="10.1/test",
+                abstract="Abstract", venue="Venue", url="http://example.com",
+                pdf_url="http://example.com/pdf", sources=["provider2"])
+            merged = p1.merge_with(p2)
+            assert merged.year == 2024  # From p1
+            assert merged.abstract == "Abstract"  # From p2
+            assert merged.venue == "Venue"  # From p2
+            assert merged.url == "http://example.com"  # From p2
+            assert merged.pdf_url == "http://example.com/pdf"  # From p2
+
+
+class TestPaperSerialization:
+    """Tests for Paper.to_dict() and Paper.from_dict()."""
+
+    def test_to_dict_basic_fields(self):
+        """to_dict includes all basic fields."""
+        with isolated_registry():
+            paper = Paper(
+                title="Test Paper",
+                authors=["Author A", "Author B"],
+                year=2024,
+                doi="10.1234/test",
+                abstract="An abstract",
+                venue="Conference",
+                url="http://example.com",
+                pdf_url="http://example.com/pdf",
+                citation_count=42,
+                sources=["s2", "dblp"],
+            )
+            d = paper.to_dict()
+            assert d["title"] == "Test Paper"
+            assert d["authors"] == ["Author A", "Author B"]
+            assert d["year"] == 2024
+            assert d["doi"] == "10.1234/test"
+            assert d["abstract"] == "An abstract"
+            assert d["venue"] == "Conference"
+            assert d["url"] == "http://example.com"
+            assert d["pdf_url"] == "http://example.com/pdf"
+            assert d["citation_count"] == 42
+            assert d["sources"] == ["s2", "dblp"]
+
+    def test_to_dict_excludes_refs_cites_by_default(self):
+        """to_dict excludes references/citations by default."""
+        with isolated_registry():
+            paper = Paper(
+                title="Test",
+                authors=[],
+                references=[Paper(title="Ref", authors=[])],
+                citations=[Paper(title="Cit", authors=[])],
+            )
+            d = paper.to_dict()
+            assert "references" not in d
+            assert "citations" not in d
+
+    def test_to_dict_includes_refs_cites_when_requested(self):
+        """to_dict includes refs/cites when include_refs_cites=True."""
+        with isolated_registry():
+            ref = Paper(title="Reference Paper", authors=["R"], year=2020)
+            cit = Paper(title="Citing Paper", authors=["C"], year=2025)
+            paper = Paper(title="Test", authors=[], references=[ref], citations=[cit])
+
+            d = paper.to_dict(include_refs_cites=True)
+            assert d["references"] is not None
+            assert len(d["references"]) == 1
+            assert d["references"][0]["title"] == "Reference Paper"
+            assert d["citations"] is not None
+            assert len(d["citations"]) == 1
+            assert d["citations"][0]["title"] == "Citing Paper"
+
+    def test_to_dict_refs_cites_one_level_deep(self):
+        """Nested refs/cites are serialized without their own refs/cites."""
+        with isolated_registry():
+            nested_ref = Paper(
+                title="Nested",
+                authors=[],
+                references=[Paper(title="Deep", authors=[])],
+            )
+            paper = Paper(title="Test", authors=[], references=[nested_ref])
+
+            d = paper.to_dict(include_refs_cites=True)
+            # The nested reference is serialized...
+            assert d["references"][0]["title"] == "Nested"
+            # ...but without its own references
+            assert "references" not in d["references"][0]
+
+    def test_from_dict_basic_fields(self):
+        """from_dict reconstructs a paper from a dictionary."""
+        with isolated_registry():
+            d = {
+                "title": "Test Paper",
+                "authors": ["Author A"],
+                "year": 2024,
+                "doi": "10.1234/test",
+                "abstract": "Abstract",
+                "venue": "Venue",
+                "url": "http://example.com",
+                "pdf_url": "http://example.com/pdf",
+                "citation_count": 10,
+                "sources": ["s2"],
+            }
+            paper = Paper.from_dict(d)
+            assert paper.title == "Test Paper"
+            assert paper.authors == ["Author A"]
+            assert paper.year == 2024
+            assert paper.doi == "10.1234/test"
+            assert paper.abstract == "Abstract"
+            assert paper.venue == "Venue"
+            assert paper.url == "http://example.com"
+            assert paper.pdf_url == "http://example.com/pdf"
+            assert paper.citation_count == 10
+            assert paper.sources == ["s2"]
+
+    def test_from_dict_with_refs_cites(self):
+        """from_dict reconstructs nested references and citations."""
+        with isolated_registry():
+            d = {
+                "title": "Test",
+                "authors": [],
+                "references": [{"title": "Ref Paper", "authors": ["R"], "year": 2020}],
+                "citations": [{"title": "Cit Paper", "authors": ["C"], "year": 2025}],
+            }
+            paper = Paper.from_dict(d)
+            assert paper.references is not None
+            assert len(paper.references) == 1
+            assert paper.references[0].title == "Ref Paper"
+            assert paper.citations is not None
+            assert len(paper.citations) == 1
+            assert paper.citations[0].title == "Cit Paper"
+
+    def test_from_dict_legacy_format(self):
+        """from_dict handles legacy format without refs/cites."""
+        with isolated_registry():
+            d = {"title": "Old Paper", "authors": ["A"]}
+            paper = Paper.from_dict(d)
+            assert paper.title == "Old Paper"
+            assert paper.references is None
+            assert paper.citations is None
+
+    def test_roundtrip_serialization(self):
+        """Serializing and deserializing preserves paper data."""
+        with isolated_registry():
+            original = Paper(
+                title="Test",
+                authors=["A", "B"],
+                year=2024,
+                doi="10.1/test",
+                abstract="Abstract",
+                venue="Venue",
+                sources=["s2"],
+                references=[Paper(title="Ref", authors=["R"], year=2020)],
+            )
+            d = original.to_dict(include_refs_cites=True)
+            restored = Paper.from_dict(d, use_registry=False)
+
+            assert restored.title == original.title
+            assert restored.authors == original.authors
+            assert restored.year == original.year
+            assert restored.doi == original.doi
+            assert restored.references is not None
+            assert len(restored.references) == 1
+            assert restored.references[0].title == "Ref"
+
+    def test_from_dict_uses_registry_by_default(self):
+        """from_dict returns same object for duplicate papers."""
+        with isolated_registry():
+            d = {"title": "Test", "authors": ["A"], "doi": "10.1/test"}
+            p1 = Paper.from_dict(d)
+            p2 = Paper.from_dict(d)
+            assert p1 is p2
+
+    def test_from_dict_without_registry(self):
+        """from_dict with use_registry=False creates new objects."""
+        with isolated_registry():
+            d = {"title": "Test", "authors": ["A"], "doi": "10.1/test"}
+            p1 = Paper.from_dict(d, use_registry=False)
+            p2 = Paper.from_dict(d, use_registry=False)
+            assert p1 is not p2
+            assert p1 == p2  # But they're equal
+
+
+class TestPaperTitlePreview:
+    """Tests for Paper.title_preview()."""
+
+    def test_short_title_unchanged(self):
+        """Short titles are returned unchanged."""
+        with isolated_registry():
+            paper = Paper(title="Short Title", authors=[])
+            assert paper.title_preview(50) == "Short Title"
+
+    def test_long_title_truncated(self):
+        """Long titles are truncated with ellipsis."""
+        with isolated_registry():
+            paper = Paper(title="A" * 100, authors=[])
+            preview = paper.title_preview(50)
+            assert len(preview) == 50
+            assert preview.endswith("...")
+
+    def test_fallback_to_doi(self):
+        """Falls back to DOI when no title."""
+        with isolated_registry():
+            paper = Paper(title="", authors=[], doi="10.1234/test")
+            assert paper.title_preview() == "10.1234/test"
+
+    def test_fallback_to_unknown(self):
+        """Falls back to 'Unknown' when no title or DOI."""
+        with isolated_registry():
+            paper = Paper(title="", authors=[])
+            assert paper.title_preview() == "Unknown"
+
+    def test_custom_max_length(self):
+        """Respects custom max_length parameter."""
+        with isolated_registry():
+            paper = Paper(title="A" * 50, authors=[])
+            preview = paper.title_preview(20)
+            assert len(preview) == 20
+            assert preview.endswith("...")
 @
 
 
@@ -649,42 +1403,48 @@ class TestSearchFilters:
 
     def test_matches_empty_filters(self):
         """Empty filters match any paper."""
-        f = SearchFilters()
-        paper = Paper(title="Test", authors=[], year=2020)
-        assert f.matches(paper) is True
+        with isolated_registry():
+            f = SearchFilters()
+            paper = Paper(title="Test", authors=[], year=2020)
+            assert f.matches(paper) is True
 
     def test_matches_year_in_range(self):
         """Paper within year range matches."""
-        f = SearchFilters(year="2018-2022")
-        assert f.matches(Paper(title="Test", authors=[], year=2020)) is True
-        assert f.matches(Paper(title="Test", authors=[], year=2018)) is True
-        assert f.matches(Paper(title="Test", authors=[], year=2022)) is True
+        with isolated_registry():
+            f = SearchFilters(year="2018-2022")
+            assert f.matches(Paper(title="Test", authors=[], year=2020)) is True
+            assert f.matches(Paper(title="Test2", authors=[], year=2018)) is True
+            assert f.matches(Paper(title="Test3", authors=[], year=2022)) is True
 
     def test_matches_year_out_of_range(self):
         """Paper outside year range doesn't match."""
-        f = SearchFilters(year="2018-2022")
-        assert f.matches(Paper(title="Test", authors=[], year=2017)) is False
-        assert f.matches(Paper(title="Test", authors=[], year=2023)) is False
+        with isolated_registry():
+            f = SearchFilters(year="2018-2022")
+            assert f.matches(Paper(title="Test", authors=[], year=2017)) is False
+            assert f.matches(Paper(title="Test2", authors=[], year=2023)) is False
 
     def test_matches_year_none(self):
         """Paper without year doesn't match year filter."""
-        f = SearchFilters(year="2020")
-        assert f.matches(Paper(title="Test", authors=[], year=None)) is False
+        with isolated_registry():
+            f = SearchFilters(year="2020")
+            assert f.matches(Paper(title="Test", authors=[], year=None)) is False
 
     def test_matches_venue(self):
         """Venue filter uses case-insensitive substring match."""
-        f = SearchFilters(venue="Nature")
-        assert f.matches(Paper(title="Test", authors=[], venue="Nature Communications")) is True
-        assert f.matches(Paper(title="Test", authors=[], venue="nature")) is True
-        assert f.matches(Paper(title="Test", authors=[], venue="Science")) is False
-        assert f.matches(Paper(title="Test", authors=[], venue=None)) is False
+        with isolated_registry():
+            f = SearchFilters(venue="Nature")
+            assert f.matches(Paper(title="Test", authors=[], venue="Nature Communications")) is True
+            assert f.matches(Paper(title="Test2", authors=[], venue="nature")) is True
+            assert f.matches(Paper(title="Test3", authors=[], venue="Science")) is False
+            assert f.matches(Paper(title="Test4", authors=[], venue=None)) is False
 
     def test_matches_multiple_filters(self):
         """All active filters must match."""
-        f = SearchFilters(year="2020-", venue="Nature")
-        assert f.matches(Paper(title="Test", authors=[], year=2021, venue="Nature")) is True
-        assert f.matches(Paper(title="Test", authors=[], year=2019, venue="Nature")) is False
-        assert f.matches(Paper(title="Test", authors=[], year=2021, venue="Science")) is False
+        with isolated_registry():
+            f = SearchFilters(year="2020-", venue="Nature")
+            assert f.matches(Paper(title="Test", authors=[], year=2021, venue="Nature")) is True
+            assert f.matches(Paper(title="Test2", authors=[], year=2019, venue="Nature")) is False
+            assert f.matches(Paper(title="Test3", authors=[], year=2021, venue="Science")) is False
 
 
 class TestFilterPapers:
@@ -692,30 +1452,33 @@ class TestFilterPapers:
 
     def test_filter_papers_empty_filters(self):
         """Empty filters return all papers."""
-        papers = [Paper(title="A", authors=[], year=2020), Paper(title="B", authors=[], year=2015)]
-        result = filter_papers(papers, SearchFilters())
-        assert result == papers
+        with isolated_registry():
+            papers = [Paper(title="A", authors=[], year=2020), Paper(title="B", authors=[], year=2015)]
+            result = filter_papers(papers, SearchFilters())
+            assert result == papers
 
     def test_filter_papers_by_year(self):
         """Filters papers by year range."""
-        papers = [
-            Paper(title="A", authors=[], year=2020),
-            Paper(title="B", authors=[], year=2015),
-            Paper(title="C", authors=[], year=2022),
-        ]
-        result = filter_papers(papers, SearchFilters(year="2018-"))
-        assert len(result) == 2
-        assert all(p.year >= 2018 for p in result)
+        with isolated_registry():
+            papers = [
+                Paper(title="A", authors=[], year=2020),
+                Paper(title="B", authors=[], year=2015),
+                Paper(title="C", authors=[], year=2022),
+            ]
+            result = filter_papers(papers, SearchFilters(year="2018-"))
+            assert len(result) == 2
+            assert all(p.year >= 2018 for p in result)
 
     def test_filter_papers_preserves_order(self):
         """Filtered list preserves original order."""
-        papers = [
-            Paper(title="A", authors=[], year=2020),
-            Paper(title="B", authors=[], year=2021),
-            Paper(title="C", authors=[], year=2022),
-        ]
-        result = filter_papers(papers, SearchFilters(year="2020-"))
-        assert [p.title for p in result] == ["A", "B", "C"]
+        with isolated_registry():
+            papers = [
+                Paper(title="A", authors=[], year=2020),
+                Paper(title="B", authors=[], year=2021),
+                Paper(title="C", authors=[], year=2022),
+            ]
+            result = filter_papers(papers, SearchFilters(year="2020-"))
+            assert [p.title for p in result] == ["A", "B", "C"]
 @
 
 
@@ -791,55 +1554,57 @@ class TestSearchResult:
 
     def test_merge_deduplicates(self):
         """Merging results deduplicates papers."""
-        p1 = Paper(title="Paper A", authors=["A"])
-        p2 = Paper(title="Paper B", authors=["B"])
-        p3 = Paper(title="Paper A", authors=["A"])  # Duplicate of p1
+        with isolated_registry():
+            p1 = Paper(title="Paper A", authors=["A"])
+            p2 = Paper(title="Paper B", authors=["B"])
+            p3 = Paper(title="Paper A", authors=["A"])  # Duplicate of p1
 
-        r1 = SearchResult(
-            query="test",
-            provider="p1",
-            timestamp="2024-01-01",
-            papers=[p1, p2],
-        )
-        r2 = SearchResult(
-            query="test",
-            provider="p2",
-            timestamp="2024-01-01",
-            papers=[p2, p3],
-        )
+            r1 = SearchResult(
+                query="test",
+                provider="p1",
+                timestamp="2024-01-01",
+                papers=[p1, p2],
+            )
+            r2 = SearchResult(
+                query="test",
+                provider="p2",
+                timestamp="2024-01-01",
+                papers=[p2, p3],
+            )
 
-        merged = r1.merge(r2)
-        assert len(merged.papers) == 2
+            merged = r1.merge(r2)
+            assert len(merged.papers) == 2
 
     def test_merge_consolidates_data(self):
         """Merging consolidates data from duplicate papers."""
-        # DBLP paper without abstract
-        p1 = Paper(
-            title="Paper A", authors=["Author"], doi="10.1/a",
-            sources=["dblp"]
-        )
-        # Semantic Scholar paper with abstract
-        p2 = Paper(
-            title="Paper A", authors=["Author"], doi="10.1/a",
-            abstract="This is the abstract", sources=["s2"]
-        )
+        with isolated_registry():
+            # DBLP paper without abstract
+            p1 = Paper(
+                title="Paper A", authors=["Author"], doi="10.1/a",
+                sources=["dblp"]
+            )
+            # Semantic Scholar paper with abstract
+            p2 = Paper(
+                title="Paper A", authors=["Author"], doi="10.1/a",
+                abstract="This is the abstract", sources=["s2"]
+            )
 
-        r1 = SearchResult(
-            query="test", provider="dblp",
-            timestamp="2024-01-01", papers=[p1]
-        )
-        r2 = SearchResult(
-            query="test", provider="s2",
-            timestamp="2024-01-01", papers=[p2]
-        )
+            r1 = SearchResult(
+                query="test", provider="dblp",
+                timestamp="2024-01-01", papers=[p1]
+            )
+            r2 = SearchResult(
+                query="test", provider="s2",
+                timestamp="2024-01-01", papers=[p2]
+            )
 
-        merged = r1.merge(r2)
-        assert len(merged.papers) == 1
-        # Consolidated paper should have the abstract
-        assert merged.papers[0].abstract == "This is the abstract"
-        # And combined sources
-        assert "dblp" in merged.papers[0].sources
-        assert "s2" in merged.papers[0].sources
+            merged = r1.merge(r2)
+            assert len(merged.papers) == 1
+            # Consolidated paper should have the abstract
+            assert merged.papers[0].abstract == "This is the abstract"
+            # And combined sources
+            assert "dblp" in merged.papers[0].sources
+            assert "s2" in merged.papers[0].sources
 @
 
 
@@ -975,32 +1740,34 @@ class TestSearch:
 
     def test_search_returns_result(self, monkeypatch):
         """search() returns a SearchResult."""
-        from scholar import providers
+        with isolated_registry():
+            from scholar import providers
 
-        mock_provider = Mock()
-        mock_provider.name = "mock"
-        mock_provider.search.return_value = [
-            Paper(title="Test", authors=["Author"])
-        ]
-        monkeypatch.setattr(providers, "PROVIDERS", {"mock": mock_provider})
+            mock_provider = Mock()
+            mock_provider.name = "mock"
+            mock_provider.search.return_value = [
+                Paper(title="Test", authors=["Author"])
+            ]
+            monkeypatch.setattr(providers, "PROVIDERS", {"mock": mock_provider})
 
-        result = search("test query")
-        assert isinstance(result, SearchResult)
-        assert result.query == "test query"
+            result = search("test query")
+            assert isinstance(result, SearchResult)
+            assert result.query == "test query"
 
     def test_search_class_execute(self, monkeypatch):
         """Search.execute() returns results when providers are specified."""
-        from scholar import providers
+        with isolated_registry():
+            from scholar import providers
 
-        mock_provider = Mock()
-        mock_provider.name = "mock"
-        mock_provider.search.return_value = []
-        monkeypatch.setattr(providers, "PROVIDERS", {"mock": mock_provider})
+            mock_provider = Mock()
+            mock_provider.name = "mock"
+            mock_provider.search.return_value = []
+            monkeypatch.setattr(providers, "PROVIDERS", {"mock": mock_provider})
 
-        s = Search("test")
-        # Explicitly specify the mock provider since "mock" is not a default
-        results = s.execute(providers=["mock"])
-        assert len(results) > 0
+            s = Search("test")
+            # Explicitly specify the mock provider since "mock" is not a default
+            results = s.execute(providers=["mock"])
+            assert len(results) > 0
 @
 
 
@@ -1009,8 +1776,10 @@ class TestSearch:
 We collect the imports used throughout the module:
 
 <<imports>>=
+from contextlib import contextmanager
 from dataclasses import dataclass, field
 from datetime import datetime
+import hashlib
 import logging
 
 logger = logging.getLogger(__name__)

@@ -26,7 +26,7 @@ The interface provides:
 \item[Note-taking] Persistent notes attached to papers, editable in your
   preferred [[EDITOR]].
 \item[LLM review support] Filter and confirm LLM decisions ([[l]]/[[L]] for
-  filtering, [[c]] to confirm), integrating with LLM-assisted classification
+  filtering, [[C]] to confirm), integrating with LLM-assisted classification
   from the CLI.
 \end{description}
 
@@ -393,6 +393,11 @@ class AbstractScreen(Screen[None]):
         Binding("p", "open_pdf", "Open PDF"),
         Binding("n", "edit_notes", "Notes"),
         Binding("e", "enrich", "Enrich"),
+        Binding("C", "confirm_llm", "Confirm"),
+        Binding("a", "add_references", "+Refs"),
+        Binding("A", "add_citations", "+Cites"),
+        Binding("j", "scroll_down", "Down", show=False),
+        Binding("k", "scroll_up", "Up", show=False),
     ]
     
     def __init__(self, decision: ReviewDecision, session: ReviewSession, review_mode: bool = True) -> None:
@@ -455,6 +460,20 @@ class AbstractScreen(Screen[None]):
                 tags_text = ", ".join(self.decision.tags)
                 yield Static(tags_text)
             
+            # Show references if paper has them
+            if paper.references:
+                yield Static("")
+                yield Static(f"[bold blue]─── References ({len(paper.references)}) ───[/bold blue] [dim]Press [bold yellow]a[/bold yellow] to add to session.[/dim]")
+                for ref_paper in paper.references:
+                    yield self._render_paper_entry(ref_paper)
+            
+            # Show citations if paper has them
+            if paper.citations:
+                yield Static("")
+                yield Static(f"[bold magenta]─── Citing Papers ({len(paper.citations)}) ───[/bold magenta] [dim]Press [bold yellow]A[/bold yellow] to add to session.[/dim]")
+                for cite_paper in paper.citations:
+                    yield self._render_paper_entry(cite_paper)
+            
             yield Static("", id="pdf-status")
         yield Footer()
     
@@ -467,29 +486,69 @@ class AbstractScreen(Screen[None]):
         self.refresh(recompose=True)
     
     def action_enrich(self) -> None:
-        """Fetch missing abstract from Semantic Scholar or OpenAlex."""
+        """Fetch missing metadata, references, and citations."""
         paper = self.decision.paper
         
         if not paper.doi:
             self.notify("No DOI available for enrichment", severity="warning")
             return
         
-        if not needs_enrichment(paper, ["abstract"]):
-            self.notify("Paper already has an abstract", severity="information")
-            return
+        # Brief title preview for notifications
+        title_preview = (paper.title or "")[:30]
+        if len(paper.title or "") > 30:
+            title_preview += "..."
         
-        self.notify("Fetching abstract...", severity="information")
+        self.notify(f"Enriching '{title_preview}'", severity="information")
+        self._do_enrich()
+    
+    def _do_enrich(self) -> None:
+        """Start enrichment in a background thread.
         
-        enriched = enrich_paper(paper)
+        Uses a plain thread instead of @work so the enrichment continues
+        even if the screen is dismissed before it completes.
+        """
+        import threading
         
-        if enriched.abstract and enriched.abstract != paper.abstract:
-            # Update the paper in the decision
-            self.decision.paper = enriched
-            self.notify("Abstract fetched successfully", severity="information")
-            # Refresh to show the new abstract
-            self.refresh(recompose=True)
-        else:
-            self.notify("Could not find abstract in any provider", severity="warning")
+        decision = self.decision  # Capture reference
+        app = self.app  # Capture app reference
+        screen = self  # Capture screen reference for refresh
+        paper = decision.paper
+        
+        # Brief title preview for notifications
+        title_preview = (paper.title or "")[:30]
+        if len(paper.title or "") > 30:
+            title_preview += "..."
+        
+        def enrich_thread():
+            from scholar.enrich import enrich_paper
+            enriched = enrich_paper(paper, fetch_refs_cites=True)
+            
+            # Check what was enriched
+            enriched_fields = []
+            if enriched.abstract and enriched.abstract != paper.abstract:
+                enriched_fields.append("abstract")
+            if enriched.pdf_url and enriched.pdf_url != paper.pdf_url:
+                enriched_fields.append("PDF URL")
+            if enriched.references is not None and paper.references is None:
+                enriched_fields.append(f"{len(enriched.references)} refs")
+            if enriched.citations is not None and paper.citations is None:
+                enriched_fields.append(f"{len(enriched.citations)} cites")
+            
+            # Update decision and notify from main thread
+            def finish():
+                if enriched_fields:
+                    decision.paper = enriched
+                    app.notify(f"'{title_preview}': {', '.join(enriched_fields)}", severity="information")
+                    # Refresh screen if still mounted
+                    if screen.is_mounted:
+                        screen.refresh(recompose=True)
+                else:
+                    app.notify(f"'{title_preview}' already enriched", severity="information")
+            
+            app.call_from_thread(finish)
+        
+        thread = threading.Thread(target=enrich_thread, daemon=True)
+        thread.start()
     
     def action_open_pdf(self) -> None:
         """Download and open the PDF."""
@@ -520,7 +579,132 @@ class AbstractScreen(Screen[None]):
     async def action_dismiss_screen(self) -> None:
         """Return to the paper list."""
         self.dismiss(None)
-    
+
+    def _render_paper_entry(self, paper: Paper) -> Static:
+        """Render a single paper in the citation/reference list."""
+        from rich.markup import escape
+        
+        title = escape(paper.title) if paper.title else "Unknown title"
+        year = f"({paper.year})" if paper.year else ""
+        citations = (
+            f"- {paper.citation_count} citations"
+            if paper.citation_count
+            else ""
+        )
+        authors = ", ".join(paper.authors[:3]) if paper.authors else ""
+        if paper.authors and len(paper.authors) > 3:
+            authors += " et al."
+        authors = escape(authors)
+
+        return Static(
+            f"  [bold]{title}[/bold] {year}\n"
+            f"    [dim]{authors}[/dim] {citations}"
+        )
+
+    def action_add_references(self) -> None:
+        """Add references of this paper to the session for review."""
+        paper = self.decision.paper
+
+        # Ensure we have references on the paper
+        if paper.references is None:
+            if not paper.doi:
+                self.notify("No DOI available", severity="warning")
+                return
+
+            self.notify("Fetching references...", severity="information")
+            from scholar.providers import fetch_references
+            from scholar.enrich import enrich_papers
+
+            try:
+                refs = fetch_references(paper.doi)
+                refs = enrich_papers(refs)
+                # Store on the paper object
+                self.decision.paper = Paper(
+                    title=paper.title,
+                    authors=paper.authors,
+                    year=paper.year,
+                    doi=paper.doi,
+                    abstract=paper.abstract,
+                    venue=paper.venue,
+                    url=paper.url,
+                    pdf_url=paper.pdf_url,
+                    citation_count=paper.citation_count,
+                    sources=paper.sources,
+                    references=refs,
+                    citations=paper.citations,
+                )
+                paper = self.decision.paper
+            except Exception as e:
+                self.notify(f"Error: {e}", severity="error")
+                return
+
+        if not paper.references:
+            self.notify("No references found", severity="warning")
+            return
+
+        # Add references to session
+        from scholar.review import get_paper_id
+
+        source_id = get_paper_id(paper)
+        added = self.session.add_papers_from_snowball(
+            papers=paper.references,
+            source_paper_ids=[source_id],
+            direction="references",
+        )
+        self.notify(f"Added {added} new papers from references", severity="information")
+
+    def action_add_citations(self) -> None:
+        """Add citing papers of this paper to the session for review."""
+        paper = self.decision.paper
+
+        # Ensure we have citations on the paper
+        if paper.citations is None:
+            if not paper.doi:
+                self.notify("No DOI available", severity="warning")
+                return
+
+            self.notify("Fetching citing papers...", severity="information")
+            from scholar.providers import fetch_citations
+            from scholar.enrich import enrich_papers
+
+            try:
+                cites = fetch_citations(paper.doi)
+                cites = enrich_papers(cites)
+                # Store on the paper object
+                self.decision.paper = Paper(
+                    title=paper.title,
+                    authors=paper.authors,
+                    year=paper.year,
+                    doi=paper.doi,
+                    abstract=paper.abstract,
+                    venue=paper.venue,
+                    url=paper.url,
+                    pdf_url=paper.pdf_url,
+                    citation_count=paper.citation_count,
+                    sources=paper.sources,
+                    references=paper.references,
+                    citations=cites,
+                )
+                paper = self.decision.paper
+            except Exception as e:
+                self.notify(f"Error: {e}", severity="error")
+                return
+
+        if not paper.citations:
+            self.notify("No citing papers found", severity="warning")
+            return
+
+        # Add citations to session
+        from scholar.review import get_paper_id
+
+        source_id = get_paper_id(paper)
+        added = self.session.add_papers_from_snowball(
+            papers=paper.citations,
+            source_paper_ids=[source_id],
+            direction="citations",
+        )
+        self.notify(f"Added {added} new papers from citations", severity="information")
+
     def action_keep(self) -> None:
         """Quick keep---mark paper as kept without themes."""
         if not self.review_mode:
@@ -621,6 +805,31 @@ class AbstractScreen(Screen[None]):
             ),
             handle_discard,
         )
+
+    def action_confirm_llm(self) -> None:
+        """Confirm current LLM decision as correct (mark as reviewed)."""
+        if not self.review_mode:
+            self.notify("Keep/discard disabled in notes mode", severity="warning")
+            return
+        if self.decision.source != ReviewSource.LLM_UNREVIEWED:
+            self.notify("Not an unreviewed LLM decision", severity="warning")
+            return
+
+        # Mark as reviewed without changing the decision
+        from scholar.llm_review import mark_as_reviewed
+        mark_as_reviewed(self.decision, user_agrees=True)
+        self.notify(f"Confirmed LLM decision: {self.decision.status.value}")
+        self.dismiss(None)
+
+    def action_scroll_down(self) -> None:
+        """Scroll the abstract view down."""
+        scroll = self.query_one(VerticalScroll)
+        scroll.scroll_down()
+
+    def action_scroll_up(self) -> None:
+        """Scroll the abstract view up."""
+        scroll = self.query_one(VerticalScroll)
+        scroll.scroll_up()
 @
 
 \section{Tag Selection Modal}
@@ -1549,16 +1758,19 @@ class PaperReviewApp(App):
         Binding("K", "keep", "Keep"),
         Binding("T", "keep_with_themes", "Themes"),
         Binding("d", "discard", "Discard"),
-        Binding("c", "confirm_llm", "Confirm"),
+        Binding("C", "confirm_llm", "Confirm"),
         Binding("s", "sort", "Sort"),
         Binding("f", "filter", "Filter"),
         Binding("F", "search_filters", "Search"),
         Binding("n", "edit_notes", "Notes"),
+        Binding("a", "add_all_references", "+Refs"),
+        Binding("A", "add_all_citations", "+Cites"),
     ]
     
     def __init__(self, session: ReviewSession, review_mode: bool = True,
                  search_filters: SearchFilters | None = None) -> None:
         super().__init__()
+        self.theme = "textual-light"
         self.session = session
         self.review_mode = review_mode
         self.current_index = 0
@@ -1866,6 +2078,128 @@ class PaperReviewApp(App):
         self.notify(f"Confirmed LLM decision: {decision.status.value}")
         self._refresh_list()
         self._update_status()
+
+    async def action_add_all_references(self) -> None:
+        """Add references from all kept papers to session for review."""
+        if not self.review_mode:
+            self.notify("Snowballing disabled in notes mode", severity="warning")
+            return
+
+        kept_papers = self.session.kept_papers
+        if not kept_papers:
+            self.notify("No kept papers to snowball from", severity="warning")
+            return
+
+        # Only use papers with DOIs
+        papers_with_doi = [d for d in kept_papers if d.paper.doi]
+        if not papers_with_doi:
+            self.notify("No kept papers have DOIs", severity="warning")
+            return
+
+        from scholar.providers import fetch_references
+        from scholar.enrich import enrich_papers
+        from scholar.review import get_paper_id
+
+        self.notify(
+            f"Fetching references from {len(papers_with_doi)} papers...",
+            severity="information"
+        )
+
+        all_refs: list[Paper] = []
+        source_ids: list[str] = []
+        
+        for decision in papers_with_doi:
+            paper = decision.paper
+            try:
+                # Use cached references if available
+                if decision.cached_references is not None:
+                    refs = decision.cached_references
+                else:
+                    refs = fetch_references(paper.doi)
+                    refs = enrich_papers(refs)
+                    decision.cached_references = refs
+                
+                all_refs.extend(refs)
+                source_ids.append(get_paper_id(paper))
+                self.notify(f"Found {len(refs)} refs for {paper.title_preview(30)}")
+            except Exception as e:
+                self.notify(f"Error for {paper.title_preview(30)}: {e}", severity="warning")
+
+        if all_refs:
+            added = self.session.add_papers_from_snowball(
+                papers=all_refs,
+                source_paper_ids=source_ids,
+                direction="references",
+            )
+            self.notify(
+                f"Added {added} new papers from {len(all_refs)} references",
+                severity="information"
+            )
+            self._refresh_list()
+            self._update_status()
+        else:
+            self.notify("No references found", severity="warning")
+
+    async     def action_add_all_citations(self) -> None:
+        """Add citing papers from all kept papers to session for review."""
+        if not self.review_mode:
+            self.notify("Snowballing disabled in notes mode", severity="warning")
+            return
+
+        kept_papers = self.session.kept_papers
+        if not kept_papers:
+            self.notify("No kept papers to snowball from", severity="warning")
+            return
+
+        # Only use papers with DOIs
+        papers_with_doi = [d for d in kept_papers if d.paper.doi]
+        if not papers_with_doi:
+            self.notify("No kept papers have DOIs", severity="warning")
+            return
+
+        from scholar.providers import fetch_citations
+        from scholar.enrich import enrich_papers
+        from scholar.review import get_paper_id
+
+        self.notify(
+            f"Fetching citations from {len(papers_with_doi)} papers...",
+            severity="information"
+        )
+
+        all_cites: list[Paper] = []
+        source_ids: list[str] = []
+        
+        for decision in papers_with_doi:
+            paper = decision.paper
+            try:
+                # Use cached citations if available
+                if decision.cached_citations is not None:
+                    cites = decision.cached_citations
+                else:
+                    cites = fetch_citations(paper.doi)
+                    cites = enrich_papers(cites)
+                    decision.cached_citations = cites
+                
+                all_cites.extend(cites)
+                source_ids.append(get_paper_id(paper))
+                self.notify(f"Found {len(cites)} cites for {paper.title_preview(30)}")
+            except Exception as e:
+                self.notify(f"Error for {paper.title_preview(30)}: {e}", severity="warning")
+
+        if all_cites:
+            added = self.session.add_papers_from_snowball(
+                papers=all_cites,
+                source_paper_ids=source_ids,
+                direction="citations",
+            )
+            self.notify(
+                f"Added {added} new papers from {len(all_cites)} citations",
+                severity="information"
+            )
+            self._refresh_list()
+            self._update_status()
+        else:
+            self.notify("No citing papers found", severity="warning")
 
     def action_sort(self) -> None:
         """Open sort modal."""

@@ -24,7 +24,7 @@ This enables clean testing (mock objects just work), future extensibility
 (third-party providers need not depend on Scholar), and explicit contracts
 that static type checkers can verify.
 
-The chapter covers five providers:
+The chapter covers six providers:
 \begin{description}
 \item[Semantic Scholar] AI-powered research database with 200M+ papers.
   Uses the official [[semanticscholar]] client library.
@@ -36,6 +36,8 @@ The chapter covers five providers:
   REST API requiring authentication.
 \item[IEEE Xplore] IEEE technical literature.
   REST API requiring authentication.
+\item[arXiv] Open-access preprint server with 2M+ papers.
+  Uses the [[arxiv]] client library.
 \end{description}
 
 \section{Caching}
@@ -69,6 +71,7 @@ itself with the provider registry on import.
 <<dblp provider>>
 <<wos provider>>
 <<ieee provider>>
+<<arxiv provider>>
 @
 
 
@@ -161,6 +164,46 @@ class SearchProvider(Protocol):
             True if the provider can be used, False otherwise.
         """
         ...
+
+    def get_paper_citations(
+        self,
+        paper_id: str,
+        limit: int = 100,
+    ) -> list[Paper]:
+        """
+        Get papers that cite the given paper.
+
+        Args:
+            paper_id: The paper identifier (DOI, provider-specific ID, etc.).
+            limit: Maximum number of citing papers to return.
+
+        Returns:
+            List of Paper objects that cite this paper.
+
+        Raises:
+            NotImplementedError: If this provider doesn't support citation retrieval.
+        """
+        ...
+
+    def get_paper_references(
+        self,
+        paper_id: str,
+        limit: int = 100,
+    ) -> list[Paper]:
+        """
+        Get papers referenced by the given paper.
+
+        Args:
+            paper_id: The paper identifier (DOI, provider-specific ID, etc.).
+            limit: Maximum number of referenced papers to return.
+
+        Returns:
+            List of Paper objects referenced by this paper.
+
+        Raises:
+            NotImplementedError: If this provider doesn't support reference retrieval.
+        """
+        ...
 @
 
 
@@ -204,6 +247,153 @@ def get_provider(name: str) -> SearchProvider | None:
 def get_all_providers() -> list[SearchProvider]:
     """Get all registered providers."""
     return list(PROVIDERS.values())
+
+
+def get_snowball_providers() -> list[SearchProvider]:
+    """
+    Get all available providers that support citation/reference fetching.
+
+    Returns providers in priority order: S2, OpenAlex, WOS (if expanded).
+    Only returns providers that are available and have citation methods.
+
+    Returns:
+        List of providers with citation support.
+    """
+    # Priority order for DOI-based snowballing
+    priority = ["s2", "openalex", "wos"]
+    result = []
+
+    for name in priority:
+        provider = PROVIDERS.get(name)
+        if provider is None:
+            continue
+
+        # Check if provider is available
+        if not provider.is_available():
+            continue
+
+        # Check if provider has citation methods
+        if not hasattr(provider, "get_paper_citations"):
+            continue
+
+        # For WOS, only use if Expanded API is available (required for citations)
+        if name == "wos" and getattr(provider, "_api_tier", None) != "expanded":
+            continue
+
+        result.append(provider)
+
+    return result
+
+
+def get_snowball_provider() -> SearchProvider | None:
+    """
+    Get the best available provider for citation/reference fetching.
+
+    Returns the first available provider that supports citation retrieval.
+    For fetching from multiple providers, use get_snowball_providers() instead.
+
+    Returns:
+        A provider with citation support, or None if none available.
+    """
+    providers = get_snowball_providers()
+    return providers[0] if providers else None
+
+
+def fetch_references(doi: str, limit: int = 100) -> list[Paper]:
+    """
+    Fetch references for a paper from all available providers.
+
+    Tries each provider in priority order and merges results. Papers are
+    deduplicated by DOI, with data merged from multiple sources.
+
+    Args:
+        doi: DOI of the paper to fetch references for.
+        limit: Maximum number of references to return per provider.
+
+    Returns:
+        List of referenced papers, deduplicated and merged.
+    """
+    providers = get_snowball_providers()
+    if not providers:
+        return []
+
+    all_papers: dict[str, Paper] = {}  # DOI -> Paper
+    papers_without_doi: list[Paper] = []
+
+    for provider in providers:
+        try:
+            refs = provider.get_paper_references(doi, limit)
+            logger.info(f"{provider.name}: found {len(refs)} references")
+
+            for paper in refs:
+                if paper.doi:
+                    # Merge with existing paper if we have it
+                    if paper.doi in all_papers:
+                        all_papers[paper.doi] = all_papers[paper.doi].merge_with(paper)
+                    else:
+                        all_papers[paper.doi] = paper
+                elif paper.title:
+                    # No DOI - check if we can match by title
+                    # For now, just add to the list (may have duplicates)
+                    papers_without_doi.append(paper)
+
+        except NotImplementedError:
+            logger.debug(f"{provider.name}: references not supported")
+        except Exception as e:
+            logger.warning(f"{provider.name}: error fetching references: {e}")
+
+    # Combine papers with DOIs and those without
+    result = list(all_papers.values()) + papers_without_doi
+    logger.info(f"Total unique references: {len(result)}")
+    return result
+
+
+def fetch_citations(doi: str, limit: int = 100) -> list[Paper]:
+    """
+    Fetch citing papers for a paper from all available providers.
+
+    Tries each provider in priority order and merges results. Papers are
+    deduplicated by DOI, with data merged from multiple sources.
+
+    Args:
+        doi: DOI of the paper to fetch citations for.
+        limit: Maximum number of citing papers to return per provider.
+
+    Returns:
+        List of citing papers, deduplicated and merged.
+    """
+    providers = get_snowball_providers()
+    if not providers:
+        return []
+
+    all_papers: dict[str, Paper] = {}  # DOI -> Paper
+    papers_without_doi: list[Paper] = []
+
+    for provider in providers:
+        try:
+            cites = provider.get_paper_citations(doi, limit)
+            logger.info(f"{provider.name}: found {len(cites)} citations")
+
+            for paper in cites:
+                if paper.doi:
+                    # Merge with existing paper if we have it
+                    if paper.doi in all_papers:
+                        all_papers[paper.doi] = all_papers[paper.doi].merge_with(paper)
+                    else:
+                        all_papers[paper.doi] = paper
+                elif paper.title:
+                    # No DOI - check if we can match by title
+                    papers_without_doi.append(paper)
+
+        except NotImplementedError:
+            logger.debug(f"{provider.name}: citations not supported")
+        except Exception as e:
+            logger.warning(f"{provider.name}: error fetching citations: {e}")
+
+    # Combine papers with DOIs and those without
+    result = list(all_papers.values()) + papers_without_doi
+    logger.info(f"Total unique citations: {len(result)}")
+    return result
 @
 
 \subsection{Testing the registry}
@@ -450,6 +640,7 @@ class SemanticScholarProvider:
     <<semantic scholar rate limiting>>
     <<semantic scholar search method>>
     <<semantic scholar get paper by doi>>
+    <<semantic scholar get citations and references>>
     <<convert semantic scholar paper>>
 @
 
@@ -726,6 +917,160 @@ def get_paper_by_doi(self, doi: str) -> Paper | None:
     except Exception as e:
         logger.warning("s2: DOI lookup failed: %s", e)
         return None
+@
+
+\subsubsection{Citations and references}
+
+The Semantic Scholar API provides endpoints to retrieve papers that cite a given
+paper (citations) and papers that a given paper references (references).
+These are essential for \emph{snowballing}---the practice of finding related
+work by following citation chains.
+
+The API endpoints are:
+\begin{description}
+\item[Citations] [[/paper/{paper_id}/citations]] returns papers citing this one
+\item[References] [[/paper/{paper_id}/references]] returns papers this one cites
+\end{description}
+
+Both endpoints return a list of objects with a [[citingPaper]] or
+[[citedPaper]] field containing the paper data.
+We request the same fields as the search API for consistency.
+
+<<semantic scholar get citations and references>>=
+def get_paper_citations(
+    self,
+    paper_id: str,
+    limit: int = 100,
+) -> list[Paper]:
+    """
+    Get papers that cite the given paper.
+
+    Args:
+        paper_id: DOI or Semantic Scholar paper ID.
+        limit: Maximum number of citing papers to return.
+
+    Returns:
+        List of Paper objects that cite this paper.
+    """
+    return self._get_related_papers(paper_id, "citations", limit)
+
+def get_paper_references(
+    self,
+    paper_id: str,
+    limit: int = 100,
+) -> list[Paper]:
+    """
+    Get papers referenced by the given paper.
+
+    Args:
+        paper_id: DOI or Semantic Scholar paper ID.
+        limit: Maximum number of referenced papers to return.
+
+    Returns:
+        List of Paper objects referenced by this paper.
+    """
+    return self._get_related_papers(paper_id, "references", limit)
+
+def _get_related_papers(
+    self,
+    paper_id: str,
+    relation: str,
+    limit: int,
+) -> list[Paper]:
+    """
+    Fetch related papers (citations or references) for a given paper.
+
+    Args:
+        paper_id: DOI or Semantic Scholar paper ID.
+        relation: Either "citations" or "references".
+        limit: Maximum number of papers to return.
+
+    Returns:
+        List of related Paper objects.
+    """
+    if not paper_id:
+        return []
+
+    # Use DOI: prefix if it looks like a DOI
+    if "/" in paper_id and not paper_id.startswith("DOI:"):
+        paper_id = f"DOI:{paper_id}"
+
+    # Check cache first
+    cache_key = (relation, paper_id, limit)
+    if cache_key in self._cache:
+        logger.info(f"s2: Cache hit for {relation} of {paper_id}")
+        return self._cache[cache_key]
+
+    logger.info(f"s2: Cache miss for {relation} of {paper_id}, fetching from API")
+
+    all_papers: list[Paper] = []
+    offset = 0
+    page_size = min(limit, 100)
+
+    try:
+        while len(all_papers) < limit:
+            self._wait_for_rate_limit()
+
+            headers = {}
+            if self.api_key:
+                headers["x-api-key"] = self.api_key
+
+            url = f"https://api.semanticscholar.org/graph/v1/paper/{paper_id}/{relation}"
+            response = self._session.get(
+                url,
+                params={
+                    "fields": "title,authors,year,abstract,venue,externalIds,url,openAccessPdf",
+                    "limit": page_size,
+                    "offset": offset,
+                },
+                headers=headers,
+                timeout=30,
+            )
+
+            if response.status_code == 404:
+                logger.warning("s2: Paper not found: %s", paper_id)
+                break
+
+            if response.status_code == 429:
+                logger.warning("s2: Rate limited during %s fetch", relation)
+                break
+
+            response.raise_for_status()
+            data = response.json()
+
+            items = data.get("data", [])
+            if not items:
+                break
+
+            # Extract papers from the response
+            # Citations have "citingPaper", references have "citedPaper"
+            paper_key = "citingPaper" if relation == "citations" else "citedPaper"
+            for item in items:
+                paper_data = item.get(paper_key)
+                if not paper_data:
+                    # Some items may not have the nested paper data
+                    continue
+                title = paper_data.get("title")
+                if not title:
+                    # Skip papers without titles
+                    continue
+                all_papers.append(self._convert_paper(paper_data))
+
+            if len(items) < page_size:
+                break
+
+            offset += page_size
+
+    except requests.exceptions.HTTPError as e:
+        logger.warning("s2: %s fetch error: %s", relation, e)
+    except Exception as e:
+        logger.warning("s2: %s fetch failed: %s", relation, e)
+
+    logger.info("s2: Found %d %s for %s", len(all_papers), relation, paper_id)
+    
+    # Cache the result
+    self._cache[cache_key] = all_papers
+    return all_papers
 @
 
 \subsubsection{Converting paper format}
@@ -2100,8 +2445,6 @@ class WebOfScienceProvider:
     <<wos is available>>
     <<wos search>>
     <<wos convert starter hit>>
-    <<wos safe get nested>>
-    <<wos ensure list>>
     <<wos convert expanded hit>>
     <<wos extended methods>>
 @
@@ -2364,12 +2707,12 @@ def _search_expanded(
             data = response.json()
 
             # Navigate the nested structure to get records
-            records = (
-                data.get("Data", {})
-                .get("Records", {})
-                .get("records", {})
-                .get("REC", [])
+            # Use safe_get_nested to handle cases where intermediate fields are strings.
+            records = safe_get_nested(
+                data, "Data", "Records", "records", "REC", default=[]
             )
+            if not isinstance(records, list):
+                records = [records] if isinstance(records, dict) else []
 
             if not records:
                 # No more results available
@@ -2492,6 +2835,8 @@ The WoS Starter API returns documents with a relatively flat structure:
 def _convert_starter_hit(self, hit: dict) -> Paper:
     """Convert a WoS Starter API hit to our Paper type."""
     source = hit.get("source", {})
+    if not isinstance(source, dict):
+        source = {}
     year = None
     pub_year = source.get("publishYear")
     if pub_year:
@@ -2502,15 +2847,22 @@ def _convert_starter_hit(self, hit: dict) -> Paper:
 
     authors = []
     names = hit.get("names", {})
+    if not isinstance(names, dict):
+        names = {}
     for author in names.get("authors", []):
-        name = author.get("displayName")
-        if name:
-            authors.append(name)
+        if isinstance(author, dict):
+            name = author.get("displayName")
+            if name:
+                authors.append(name)
 
     identifiers = hit.get("identifiers", {})
+    if not isinstance(identifiers, dict):
+        identifiers = {}
     doi = identifiers.get("doi")
 
     links = hit.get("links", {})
+    if not isinstance(links, dict):
+        links = {}
     url = links.get("record")
 
     return Paper(
@@ -2523,58 +2875,6 @@ def _convert_starter_hit(self, hit: dict) -> Paper:
         url=url,
         sources=[self.name],
     )
-@
-
-\subsubsection{Safe nested dictionary access}
-
-The WoS Expanded API can return unexpected types for nested fields.
-When data is missing or malformed, the API may return strings instead of
-dictionaries, causing [[AttributeError]] when we attempt to call [[.get()]]
-on non-dict values.
-
-This helper safely navigates nested dictionaries, returning a default value
-if any level in the chain is not a dictionary.
-
-<<wos safe get nested>>=
-@staticmethod
-def _safe_get_nested(obj: Any, *keys: str, default: Any = None) -> Any:
-    """Safely navigate nested dicts, returning default if any level is not a dict."""
-    for key in keys:
-        if not isinstance(obj, dict):
-            return default
-        obj = obj.get(key, default)
-    return obj
-@
-
-\subsubsection{Normalizing API response types}
-
-The WoS API (like many XML-to-JSON APIs) inconsistently returns fields that
-should be lists.
-When a field contains multiple items, it returns a list of dicts.
-When it contains a single item, it may return just that dict (not wrapped in a
-list).
-Sometimes it returns a string instead of a structured object.
-
-This causes problems when we iterate over these fields: iterating over a string
-yields individual characters, and calling [[.get()]] on a character raises
-[[AttributeError]].
-
-This helper normalizes values to lists for safe iteration:
-\begin{description}
-\item[List] returned as-is
-\item[Dict] wrapped in a single-element list
-\item[String or other] returns empty list (skip gracefully)
-\end{description}
-
-<<wos ensure list>>=
-@staticmethod
-def _ensure_list(value: Any) -> list:
-    """Normalize a value to a list for safe iteration."""
-    if isinstance(value, list):
-        return value
-    if isinstance(value, dict):
-        return [value]
-    return []
 @
 
 \subsubsection{Converting Expanded API response}
@@ -2591,11 +2891,11 @@ def _convert_expanded_hit(self, rec: dict) -> Paper:
 
     # Extract title (look for type="item")
     title = ""
-    titles = self._ensure_list(
-        self._safe_get_nested(summary, "titles", "title", default=[])
+    titles = ensure_list(
+        safe_get_nested(summary, "titles", "title", default=[])
     )
     for t in titles:
-        if t.get("type") == "item":
+        if isinstance(t, dict) and t.get("type") == "item":
             title = t.get("content", "")
             break
     if not title and titles:
@@ -2603,7 +2903,7 @@ def _convert_expanded_hit(self, rec: dict) -> Paper:
 
     # Extract publication year
     year = None
-    pub_year = self._safe_get_nested(summary, "pub_info", "pubyear", default=None)
+    pub_year = safe_get_nested(summary, "pub_info", "pubyear", default=None)
     if pub_year:
         try:
             year = int(pub_year)
@@ -2612,11 +2912,11 @@ def _convert_expanded_hit(self, rec: dict) -> Paper:
 
     # Extract authors
     authors = []
-    names = self._ensure_list(
-        self._safe_get_nested(summary, "names", "name", default=[])
+    names = ensure_list(
+        safe_get_nested(summary, "names", "name", default=[])
     )
     for author in names:
-        if author.get("role") == "author":
+        if isinstance(author, dict) and author.get("role") == "author":
             name = author.get("display_name") or author.get("full_name")
             if name:
                 authors.append(name)
@@ -2625,23 +2925,23 @@ def _convert_expanded_hit(self, rec: dict) -> Paper:
     doi = None
     dynamic_data = rec.get("dynamic_data", {})
     cluster = dynamic_data.get("cluster_related", {})
-    identifiers = self._ensure_list(
-        self._safe_get_nested(cluster, "identifiers", "identifier", default=[])
+    identifiers = ensure_list(
+        safe_get_nested(cluster, "identifiers", "identifier", default=[])
     )
     for ident in identifiers:
-        if ident.get("type") == "doi":
+        if isinstance(ident, dict) and ident.get("type") == "doi":
             doi = ident.get("value")
             break
 
     # Extract abstract
-    abstract = self._safe_get_nested(
+    abstract = safe_get_nested(
         fullrecord, "abstracts", "abstract", "abstract_text", "p", default=None
     )
 
     # Extract venue (source title)
     venue = None
     for t in titles:
-        if t.get("type") == "source":
+        if isinstance(t, dict) and t.get("type") == "source":
             venue = t.get("content")
             break
 
@@ -2708,13 +3008,13 @@ def get_related_records(self, uid: str, limit: int = 10) -> list[Paper]:
         response.raise_for_status()
         data = response.json()
 
-        records = (
-            data.get("Data", {})
-            .get("Records", {})
-            .get("records", {})
-            .get("REC", [])
+        # Use safe_get_nested to handle cases where intermediate fields are strings.
+        records = safe_get_nested(
+            data, "Data", "Records", "records", "REC", default=[]
         )
-        return [self._convert_expanded_hit(rec) for rec in records]
+        if not isinstance(records, list):
+            records = [records] if isinstance(records, dict) else []
+        return [self._convert_expanded_hit(rec) for rec in records if isinstance(rec, dict)]
     except NotImplementedError:
         raise
     except Exception as e:
@@ -2737,6 +3037,14 @@ def get_citing_articles(self, uid: str, limit: int = 10) -> list[Paper]:
     """
     self._require_expanded_api("get_citing_articles")
 
+    # Check cache first
+    cache_key = ("citing", uid, limit)
+    if cache_key in self._cache:
+        logger.info(f"wos: Cache hit for citing articles of {uid}")
+        return self._cache[cache_key]
+
+    logger.info(f"wos: Cache miss for citing articles of {uid}, fetching from API")
+
     try:
         response = requests.get(
             f"{WOS_EXPANDED_API_URL}/citing",
@@ -2752,13 +3060,15 @@ def get_citing_articles(self, uid: str, limit: int = 10) -> list[Paper]:
         response.raise_for_status()
         data = response.json()
 
-        records = (
-            data.get("Data", {})
-            .get("Records", {})
-            .get("records", {})
-            .get("REC", [])
+        # Use ensure_list because the API may return a single dict instead of
+        # a list when there's only one citing article. Skip non-dict items.
+        # Use safe_get_nested to handle cases where intermediate fields are strings.
+        records = ensure_list(
+            safe_get_nested(data, "Data", "Records", "records", "REC", default=[])
         )
-        return [self._convert_expanded_hit(rec) for rec in records]
+        result = [self._convert_expanded_hit(rec) for rec in records if isinstance(rec, dict)]
+        self._cache[cache_key] = result
+        return result
     except NotImplementedError:
         raise
     except Exception as e:
@@ -2767,7 +3077,7 @@ def get_citing_articles(self, uid: str, limit: int = 10) -> list[Paper]:
 
 def get_cited_references(self, uid: str, limit: int = 10) -> list[dict]:
     """
-    Find references cited by the given paper.
+    Get references (bibliography) from a given paper.
 
     Args:
         uid: Web of Science unique identifier (e.g., "WOS:000270372400005")
@@ -2775,7 +3085,7 @@ def get_cited_references(self, uid: str, limit: int = 10) -> list[dict]:
 
     Returns:
         List of reference dictionaries with fields:
-        - uid: WoS identifier (if available)
+        - uid: WOS UID of cited paper (if available)
         - citedAuthor: Author name
         - citedTitle: Title of cited work
         - citedWork: Source/journal name
@@ -2787,6 +3097,14 @@ def get_cited_references(self, uid: str, limit: int = 10) -> list[dict]:
         NotImplementedError: If Expanded API is not configured
     """
     self._require_expanded_api("get_cited_references")
+
+    # Check cache first
+    cache_key = ("references", uid, limit)
+    if cache_key in self._cache:
+        logger.info(f"wos: Cache hit for references of {uid}")
+        return self._cache[cache_key]
+
+    logger.info(f"wos: Cache miss for references of {uid}, fetching from API")
 
     try:
         response = requests.get(
@@ -2803,9 +3121,12 @@ def get_cited_references(self, uid: str, limit: int = 10) -> list[dict]:
         response.raise_for_status()
         data = response.json()
 
-        # References have a different structure than regular records
-        references = data.get("Data", [])
-        return [
+        # References have a different structure than regular records.
+        # Use ensure_list because the API may return a single dict or string
+        # instead of a list when there's only one reference. We also skip any
+        # non-dict items in the list (the API sometimes returns strings).
+        references = ensure_list(data.get("Data", []))
+        result = [
             {
                 "uid": ref.get("UID"),
                 "citedAuthor": ref.get("citedAuthor"),
@@ -2816,7 +3137,10 @@ def get_cited_references(self, uid: str, limit: int = 10) -> list[dict]:
                 "timesCited": ref.get("timesCited"),
             }
             for ref in references
+            if isinstance(ref, dict)
         ]
+        self._cache[cache_key] = result
+        return result
     except NotImplementedError:
         raise
     except Exception as e:
@@ -2895,6 +3219,212 @@ def search_for_citation_report(
     except Exception as e:
         logger.warning("wos: search_for_citation_report failed: %s", e)
         return None
+
+def get_paper_by_doi(self, doi: str) -> Paper | None:
+    """
+    Look up a paper by its DOI and return it with WOS metadata.
+
+    This method searches WOS for the given DOI and returns the paper
+    with its WOS UID stored, which is needed for citation operations.
+
+    Args:
+        doi: The DOI to look up (e.g., "10.1145/1234567.1234568").
+
+    Returns:
+        Paper if found, None otherwise. The paper will have WOS UID
+        in its metadata if found via the Expanded API.
+    """
+    if not doi or not self._api_key:
+        return None
+
+    # Search by DOI using the DO= field tag
+    query = f"DO={doi}"
+
+    try:
+        if self._api_tier == "expanded":
+            papers = self._search_expanded(query, limit=1, filters=None)
+        else:
+            papers = self._search_starter(query, limit=1, filters=None)
+
+        if papers:
+            return papers[0]
+        return None
+    except Exception as e:
+        logger.warning("wos: DOI lookup failed for %s: %s", doi, e)
+        return None
+
+def _get_uid_for_doi(self, doi: str) -> str | None:
+    """
+    Get the WOS UID for a paper given its DOI.
+
+    Args:
+        doi: The DOI to look up.
+
+    Returns:
+        WOS UID string (e.g., "WOS:000123456789") or None if not found.
+    """
+    if not doi or not self._api_key:
+        return None
+
+    # Search by DOI using the DO= field tag
+    query = f"DO={doi}"
+
+    try:
+        if self._api_tier == "expanded":
+            response = requests.get(
+                WOS_EXPANDED_API_URL,
+                params={
+                    "databaseId": "WOS",
+                    "usrQuery": query,
+                    "count": 1,
+                    "firstRecord": 1,
+                },
+                headers={"X-ApiKey": self._api_key},
+                timeout=30,
+            )
+            response.raise_for_status()
+            data = response.json()
+
+            # Use safe_get_nested to handle cases where intermediate fields are strings.
+            records = safe_get_nested(
+                data, "Data", "Records", "records", "REC", default=[]
+            )
+            if not isinstance(records, list):
+                records = [records] if isinstance(records, dict) else []
+            if records and len(records) > 0 and isinstance(records[0], dict):
+                return records[0].get("UID")
+        else:
+            # Starter API - search and extract UID from response
+            response = requests.get(
+                WOS_STARTER_API_URL,
+                params={
+                    "q": query,
+                    "limit": 1,
+                    "page": 1,
+                },
+                headers={"X-ApiKey": self._api_key},
+                timeout=30,
+            )
+            response.raise_for_status()
+            data = response.json()
+
+            hits = data.get("hits", [])
+            if hits and len(hits) > 0:
+                return hits[0].get("uid")
+
+        return None
+    except Exception as e:
+        logger.warning("wos: UID lookup failed for DOI %s: %s", doi, e)
+        return None
+
+def get_paper_citations(
+    self,
+    paper_id: str,
+    limit: int = 100,
+) -> list[Paper]:
+    """
+    Get papers that cite the given paper.
+
+    This method accepts either a WOS UID or a DOI. If a DOI is provided,
+    it first looks up the WOS UID, then fetches citations.
+
+    Args:
+        paper_id: DOI or WOS UID (e.g., "10.1000/xyz" or "WOS:000123456").
+        limit: Maximum number of citing papers to return.
+
+    Returns:
+        List of Paper objects that cite this paper.
+
+    Raises:
+        NotImplementedError: If Expanded API is not configured.
+    """
+    self._require_expanded_api("get_paper_citations")
+
+    # Determine if this is a DOI or WOS UID
+    if paper_id.startswith("WOS:"):
+        uid = paper_id
+    else:
+        # Assume it's a DOI - look up the UID
+        uid = self._get_uid_for_doi(paper_id)
+        if not uid:
+            logger.warning("wos: Could not find WOS UID for DOI %s", paper_id)
+            return []
+
+    return self.get_citing_articles(uid, limit)
+
+def get_paper_references(
+    self,
+    paper_id: str,
+    limit: int = 100,
+) -> list[Paper]:
+    """
+    Get papers referenced by the given paper.
+
+    This method accepts either a WOS UID or a DOI. If a DOI is provided,
+    it first looks up the WOS UID, then fetches references.
+
+    Note: The WOS API returns reference metadata as dictionaries, not full
+    Paper objects. We convert them to Paper objects with limited metadata.
+
+    Args:
+        paper_id: DOI or WOS UID (e.g., "10.1000/xyz" or "WOS:000123456").
+        limit: Maximum number of referenced papers to return.
+
+    Returns:
+        List of Paper objects referenced by this paper.
+
+    Raises:
+        NotImplementedError: If Expanded API is not configured.
+    """
+    self._require_expanded_api("get_paper_references")
+
+    # Determine if this is a DOI or WOS UID
+    if paper_id.startswith("WOS:"):
+        uid = paper_id
+    else:
+        # Assume it's a DOI - look up the UID
+        uid = self._get_uid_for_doi(paper_id)
+        if not uid:
+            logger.warning("wos: Could not find WOS UID for DOI %s", paper_id)
+            return []
+
+    # Get references as dicts and convert to Papers
+    ref_dicts = self.get_cited_references(uid, limit)
+
+    papers = []
+    for ref in ref_dicts:
+        # Skip non-dict items (defensive check)
+        if not isinstance(ref, dict):
+            continue
+        # Skip references without titles
+        title = ref.get("citedTitle")
+        if not title:
+            continue
+
+        # Convert reference dict to Paper
+        # Parse author - may be "LastName, FirstName" format
+        author = ref.get("citedAuthor", "")
+        authors = [author] if author else []
+
+        # Parse year
+        year = None
+        year_str = ref.get("year")
+        if year_str:
+            try:
+                year = int(year_str)
+            except (ValueError, TypeError):
+                pass
+
+        papers.append(Paper(
+            title=title,
+            authors=authors,
+            year=year,
+            doi=ref.get("doi"),
+            venue=ref.get("citedWork"),
+            sources=[self.name],
+        ))
+
+    return papers
 @
 
 \subsection{Auto-registration}
@@ -2914,6 +3444,8 @@ tags like [[TS=]] or [[TI=]]).
 import re
 import requests
 from typing import Any
+
+from scholar.utils import safe_get_nested, ensure_list
 @
 
 We also define the API URL constants for both tiers, plus a sentinel value
@@ -4330,6 +4862,522 @@ class TestIEEEXploreIntegration:
 @
 
 
+\section{arXiv Provider}
+\label{sec:arxiv}
+
+arXiv is an open-access repository of electronic preprints, primarily in
+physics, mathematics, computer science, quantitative biology, quantitative
+finance, and statistics.
+With over 2 million papers, it is the largest preprint server in the world.
+
+\subsection{Package Choice}
+
+We use the [[arxiv]] Python package, which provides a clean interface to the
+arXiv API.
+Like [[pyalex]] for OpenAlex, this package handles pagination and rate limiting
+internally, simplifying our implementation.
+
+\subsection{Authentication}
+
+No API key is required---arXiv is fully open access.
+This makes the provider always available.
+
+\subsection{Rate Limiting and Retry}
+
+arXiv's terms of use request no more than one request every three seconds.
+The [[arxiv]] package respects this limit by default with its
+[[delay_seconds]] parameter.
+
+However, the arXiv API occasionally returns HTTP 500 errors.
+We implement our own retry logic with exponential backoff to handle transient
+failures.
+Importantly, we only cache successful results---if a request fails, the cache
+is not populated, allowing the user to retry immediately.
+
+\subsection{Limitations}
+
+arXiv does not provide citation or reference data through its API.
+The [[get_paper_citations]] and [[get_paper_references]] methods raise
+[[NotImplementedError]].
+For citation data on arXiv papers, use Semantic Scholar or OpenAlex instead,
+which index arXiv papers and provide citation graphs.
+
+\subsection{Provider implementation}
+
+<<arxiv provider>>=
+class ArxivProvider:
+    """Search provider for arXiv preprint server."""
+
+    name = "arxiv"
+    MAX_LIMIT: int | None = None  # No documented maximum
+    MAX_RETRIES = 5
+    INITIAL_BACKOFF = 3.0  # seconds
+
+    def __init__(self):
+        """Initialize the arXiv provider."""
+        self._cache: dict = load_cache(self.name)
+        register_cache(self.name, self._cache)
+        # arxiv.Client handles rate limiting internally
+        # We set num_retries=0 since we implement our own retry logic
+        self._client = arxiv.Client(
+            page_size=100,
+            delay_seconds=3.0,
+            num_retries=0,
+        )
+
+    def is_available(self) -> bool:
+        """arXiv is always available (no API key required)."""
+        return True
+
+    def search(
+        self,
+        query: str,
+        limit: int = 100,
+        filters: SearchFilters | None = None,
+    ) -> list[Paper]:
+        """
+        Search arXiv for papers matching the query.
+
+        Only caches successful results. Failed requests are not cached,
+        allowing immediate retry.
+        """
+        # Check cache first
+        cache_key = (query, limit, filters.cache_key() if filters else "")
+        if cache_key in self._cache:
+            logger.debug(f"arxiv: Cache hit for '{query}'")
+            return self._cache[cache_key]
+
+        logger.debug(f"arxiv: Searching for '{query}' with limit={limit}")
+
+        # Build query with filters
+        effective_query = query
+        <<arxiv apply filters>>
+
+        search = arxiv.Search(
+            query=effective_query,
+            max_results=limit,
+            sort_by=arxiv.SortCriterion.Relevance,
+        )
+
+        # Retry with exponential backoff
+        <<arxiv search with retry>>
+
+    <<convert arxiv result>>
+    <<arxiv citation methods>>
+@
+
+\subsubsection{Retry with exponential backoff}
+
+We implement our own retry logic since the [[arxiv]] package's built-in
+retry may not handle all transient failures (especially HTTP 500 errors).
+The backoff starts at 3 seconds and doubles with each attempt.
+
+Importantly, we only cache successful results.
+If a request fails after all retries, we return an empty list without caching,
+allowing the user to retry immediately.
+
+<<arxiv search with retry>>=
+last_exception: Exception | None = None
+
+for attempt in range(self.MAX_RETRIES):
+    try:
+        all_papers: list[Paper] = []
+        for result in self._client.results(search):
+            paper = self._convert_result(result)
+            <<arxiv apply year filter>>
+            all_papers.append(paper)
+
+        logger.debug(f"arxiv: Retrieved {len(all_papers)} papers")
+
+        # Only cache successful results
+        if all_papers:
+            self._cache[cache_key] = all_papers
+
+        return all_papers
+
+    except (arxiv.HTTPError, arxiv.UnexpectedEmptyPageError) as e:
+        last_exception = e
+        if attempt < self.MAX_RETRIES - 1:
+            backoff = self.INITIAL_BACKOFF * (2 ** attempt)
+            logger.warning(
+                "arxiv: %s (attempt %d/%d, retrying in %.1fs)",
+                e, attempt + 1, self.MAX_RETRIES, backoff
+            )
+            time.sleep(backoff)
+        else:
+            logger.warning(
+                "arxiv: %s (attempt %d/%d, giving up)",
+                e, attempt + 1, self.MAX_RETRIES
+            )
+
+    except Exception as e:
+        # Non-retryable error
+        logger.warning("arxiv: %s", e)
+        return []
+
+# All retries exhausted
+return []
+@
+
+\subsubsection{Applying filters}
+
+arXiv supports category filtering via its query syntax.
+For year filtering, we apply client-side filtering since arXiv does not
+support date range queries natively.
+
+<<arxiv apply filters>>=
+if filters:
+    # Category/venue filter: use arXiv category syntax
+    if filters.venue:
+        # User may specify "cs.AI" or just "cs"
+        effective_query = f"cat:{filters.venue} AND ({query})"
+
+    # Open access filter: arXiv is always open access
+    if filters.open_access:
+        logger.debug("arxiv: All papers are open access, filter has no effect")
+
+    # Publication types: arXiv only has preprints
+    if filters.pub_types:
+        # Only proceed if "preprint" is in the requested types
+        if not any(pt.lower() == "preprint" for pt in filters.pub_types):
+            logger.warning(
+                "arxiv: Only preprints available, but requested types: %s",
+                filters.pub_types
+            )
+
+    # Minimum citations: not supported
+    if filters.min_citations is not None:
+        logger.warning("arxiv: Citation filtering not supported")
+@
+
+Year filtering is applied after fetching results since arXiv does not support
+date range queries directly:
+
+<<arxiv apply year filter>>=
+if filters and filters.year:
+    start_year, end_year = filters.year_range()
+    if paper.year:
+        if start_year and paper.year < start_year:
+            continue
+        if end_year and paper.year > end_year:
+            continue
+@
+
+\subsubsection{Converting result format}
+
+The [[arxiv]] package returns [[arxiv.Result]] objects with typed attributes.
+We extract the relevant fields and convert to our [[Paper]] type:
+
+<<convert arxiv result>>=
+def _convert_result(self, result: "arxiv.Result") -> Paper:
+    """Convert an arXiv Result to our Paper type."""
+    # Extract author names
+    authors = [author.name for author in result.authors]
+
+    # Extract year from published date
+    year = result.published.year if result.published else None
+
+    # Use provided DOI or derive from arXiv ID
+    doi = result.doi
+    if not doi and result.entry_id:
+        # entry_id is like "http://arxiv.org/abs/2306.04338v1"
+        arxiv_id = result.entry_id.split("/abs/")[-1]
+        # Remove version suffix for DOI
+        arxiv_id_base = arxiv_id.split("v")[0] if "v" in arxiv_id else arxiv_id
+        if arxiv_id_base:
+            doi = f"10.48550/arXiv.{arxiv_id_base}"
+
+    # Extract primary category as venue
+    venue = result.primary_category if result.primary_category else None
+
+    return Paper(
+        title=result.title or "",
+        authors=authors,
+        year=year,
+        doi=doi,
+        abstract=result.summary,
+        venue=venue,
+        url=result.entry_id,
+        pdf_url=result.pdf_url,
+        sources=[self.name],
+    )
+@
+
+\subsubsection{Citation methods}
+
+arXiv does not provide citation or reference data through its API.
+
+<<arxiv citation methods>>=
+def get_paper_citations(
+    self,
+    paper_id: str,
+    limit: int = 100,
+) -> list[Paper]:
+    """
+    Not supported by arXiv.
+
+    arXiv does not provide citation data. Use Semantic Scholar or
+    OpenAlex for citation information on arXiv papers.
+    """
+    raise NotImplementedError(
+        "arXiv does not provide citation data. "
+        "Use Semantic Scholar or OpenAlex instead."
+    )
+
+def get_paper_references(
+    self,
+    paper_id: str,
+    limit: int = 100,
+) -> list[Paper]:
+    """
+    Not supported by arXiv.
+
+    arXiv does not provide reference data. Use Semantic Scholar or
+    OpenAlex for reference information on arXiv papers.
+    """
+    raise NotImplementedError(
+        "arXiv does not provide reference data. "
+        "Use Semantic Scholar or OpenAlex instead."
+    )
+@
+
+\subsection{Auto-registration}
+
+<<arxiv provider>>=
+# Register the provider on module import
+register_provider(ArxivProvider())
+@
+
+\subsection{Dependencies}
+
+<<arxiv imports>>=
+import time
+
+import arxiv
+@
+
+\subsection{Testing arXiv provider}
+
+We test the arXiv provider with mocked API responses.
+First, we verify that the provider is always available since arXiv
+does not require an API key:
+
+<<test functions>>=
+class TestArxivProvider:
+    """Tests for the arXiv provider."""
+
+    def test_is_available_always_true(self):
+        """arXiv is available without API key."""
+        provider = ArxivProvider()
+        assert provider.is_available() is True
+
+    def test_search_converts_results(self):
+        """search() converts API results to Paper objects."""
+        provider = ArxivProvider()
+
+        # Create mock arxiv.Result object
+        mock_result = Mock()
+        mock_result.title = "Test Paper on Machine Learning"
+        mock_result.authors = [Mock(name="Alice Smith"), Mock(name="Bob Jones")]
+        mock_result.published = Mock(year=2024)
+        mock_result.doi = "10.48550/arXiv.2401.12345"
+        mock_result.summary = "This paper presents a novel approach..."
+        mock_result.primary_category = "cs.LG"
+        mock_result.entry_id = "http://arxiv.org/abs/2401.12345v1"
+        mock_result.pdf_url = "http://arxiv.org/pdf/2401.12345v1"
+        # Set author names correctly
+        mock_result.authors[0].name = "Alice Smith"
+        mock_result.authors[1].name = "Bob Jones"
+
+        with patch.object(provider._client, "results", return_value=iter([mock_result])):
+            results = provider.search("machine learning")
+
+            assert len(results) == 1
+            paper = results[0]
+            assert isinstance(paper, Paper)
+            assert paper.title == "Test Paper on Machine Learning"
+            assert paper.authors == ["Alice Smith", "Bob Jones"]
+            assert paper.year == 2024
+            assert paper.doi == "10.48550/arXiv.2401.12345"
+            assert paper.abstract == "This paper presents a novel approach..."
+            assert paper.venue == "cs.LG"
+            assert paper.sources == ["arxiv"]
+
+    def test_search_handles_empty_results(self):
+        """search() returns empty list when no results."""
+        provider = ArxivProvider()
+
+        with patch.object(provider._client, "results", return_value=iter([])):
+            results = provider.search("obscure query xyz123")
+            assert results == []
+
+    def test_search_handles_api_error(self):
+        """search() returns empty list on non-retryable API error."""
+        provider = ArxivProvider()
+
+        with patch.object(provider._client, "results", side_effect=Exception("API error")):
+            results = provider.search("test")
+            assert results == []
+
+    def test_retries_on_http_error(self):
+        """search() retries with exponential backoff on HTTP errors."""
+        provider = ArxivProvider()
+
+        # Create a mock that fails twice then succeeds
+        mock_result = Mock()
+        mock_result.title = "Success Paper"
+        mock_result.authors = []
+        mock_result.published = Mock(year=2024)
+        mock_result.doi = None
+        mock_result.summary = None
+        mock_result.primary_category = None
+        mock_result.entry_id = "http://arxiv.org/abs/2401.12345v1"
+        mock_result.pdf_url = None
+
+        call_count = 0
+        def mock_results(search):
+            nonlocal call_count
+            call_count += 1
+            if call_count < 3:
+                raise arxiv.HTTPError("http://example.com", 500, "Internal Server Error")
+            return iter([mock_result])
+
+        with patch.object(provider._client, "results", side_effect=mock_results):
+            with patch("time.sleep") as mock_sleep:
+                results = provider.search("test")
+
+                # Should succeed after retries
+                assert len(results) == 1
+                assert results[0].title == "Success Paper"
+                # Should have slept twice (for 2 failed attempts)
+                assert mock_sleep.call_count == 2
+
+    def test_does_not_cache_failed_results(self):
+        """search() does not cache results from failed requests."""
+        provider = ArxivProvider()
+
+        # First call fails
+        with patch.object(provider._client, "results", side_effect=Exception("API error")):
+            results1 = provider.search("test query")
+            assert results1 == []
+
+        # Create mock success result
+        mock_result = Mock()
+        mock_result.title = "Success Paper"
+        mock_result.authors = []
+        mock_result.published = Mock(year=2024)
+        mock_result.doi = None
+        mock_result.summary = None
+        mock_result.primary_category = None
+        mock_result.entry_id = "http://arxiv.org/abs/2401.12345v1"
+        mock_result.pdf_url = None
+
+        # Second call succeeds - should not be blocked by cached failure
+        with patch.object(provider._client, "results", return_value=iter([mock_result])):
+            results2 = provider.search("test query")
+            assert len(results2) == 1
+            assert results2[0].title == "Success Paper"
+
+    def test_handles_missing_fields(self):
+        """search() handles results with missing optional fields."""
+        provider = ArxivProvider()
+
+        mock_result = Mock()
+        mock_result.title = "Minimal Paper"
+        mock_result.authors = []
+        mock_result.published = None
+        mock_result.doi = None
+        mock_result.summary = None
+        mock_result.primary_category = None
+        mock_result.entry_id = None
+        mock_result.pdf_url = None
+
+        with patch.object(provider._client, "results", return_value=iter([mock_result])):
+            results = provider.search("test")
+
+            assert len(results) == 1
+            paper = results[0]
+            assert paper.title == "Minimal Paper"
+            assert paper.authors == []
+            assert paper.year is None
+            assert paper.doi is None
+
+    def test_derives_doi_from_entry_id(self):
+        """DOI is derived from arXiv ID when not provided."""
+        provider = ArxivProvider()
+
+        mock_result = Mock()
+        mock_result.title = "Test"
+        mock_result.authors = []
+        mock_result.published = Mock(year=2024)
+        mock_result.doi = None  # No DOI provided
+        mock_result.summary = None
+        mock_result.primary_category = None
+        mock_result.entry_id = "http://arxiv.org/abs/2401.12345v2"
+        mock_result.pdf_url = None
+
+        with patch.object(provider._client, "results", return_value=iter([mock_result])):
+            results = provider.search("test")
+
+            paper = results[0]
+            # DOI should be derived, without version suffix
+            assert paper.doi == "10.48550/arXiv.2401.12345"
+
+    def test_category_filter_modifies_query(self):
+        """Venue filter is converted to arXiv category syntax."""
+        provider = ArxivProvider()
+
+        with patch.object(provider._client, "results", return_value=iter([])) as mock_results:
+            with patch("arxiv.Search") as mock_search:
+                provider.search("neural networks", filters=SearchFilters(venue="cs.AI"))
+
+                # Verify the Search was created with category-filtered query
+                call_args = mock_search.call_args
+                assert "cat:cs.AI" in call_args[1]["query"]
+                assert "neural networks" in call_args[1]["query"]
+
+    def test_citations_raise_not_implemented(self):
+        """get_paper_citations raises NotImplementedError."""
+        provider = ArxivProvider()
+
+        with pytest.raises(NotImplementedError) as exc_info:
+            provider.get_paper_citations("2401.12345")
+
+        assert "arXiv does not provide citation data" in str(exc_info.value)
+
+    def test_references_raise_not_implemented(self):
+        """get_paper_references raises NotImplementedError."""
+        provider = ArxivProvider()
+
+        with pytest.raises(NotImplementedError) as exc_info:
+            provider.get_paper_references("2401.12345")
+
+        assert "arXiv does not provide reference data" in str(exc_info.value)
+
+
+class TestArxivIntegration:
+    """Integration test for the arXiv provider."""
+
+    @pytest.mark.integration
+    @pytest.mark.skip(reason="Skipped by default to avoid API calls")
+    def test_real_api_call(self):
+        """Make one real API call to verify the provider works."""
+        provider = ArxivProvider()
+
+        try:
+            papers = provider.search("machine learning", limit=1)
+
+            assert len(papers) >= 1, "Provider returned no results"
+
+            paper = papers[0]
+            assert isinstance(paper, Paper)
+            assert paper.title
+            assert paper.sources == ["arxiv"]
+        except Exception as e:
+            pytest.skip(f"arXiv API unavailable: {e}")
+@
+
+
 \section{Dependencies}
 
 We organize imports so each provider's dependencies are co-located with
@@ -4349,6 +5397,7 @@ from scholar.cache import load_cache, register_cache
 <<openalex imports>>
 <<dblp imports>>
 <<wos imports>>
+<<arxiv imports>>
 
 logger = logging.getLogger(__name__)
 @

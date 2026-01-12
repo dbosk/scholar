@@ -74,3 +74,13 @@
 }
 
 \usepackage[marginparmargin=right]{didactic}
+
+% Unicode character replacements for symbols not in Latin Modern fonts
+% These appear in TUI code and documentation describing terminal output
+\usepackage{newunicodechar}
+\newunicodechar{✓}{\checkmark}
+\newunicodechar{✗}{$\times$}
+\newunicodechar{○}{\ensuremath{\circ}}
+\newunicodechar{─}{\textemdash}
+\newunicodechar{📝}{\texttt{[note]}}
+\newunicodechar{🤖}{\texttt{[AI]}}
