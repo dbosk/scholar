@@ -74,6 +74,7 @@ import pytest
 from pathlib import Path
 from unittest.mock import Mock
 
+from scholar import Paper
 from scholar.notes import *
 
 
@@ -341,6 +342,7 @@ def get_paper_id(paper: Any) -> str:
     """
     Generate a stable identifier for a paper.
     
+    This is a wrapper around the Paper.id property for backward compatibility.
     Uses DOI if available, otherwise SHA256 hash of normalized
     title + first author's last name.
     
@@ -350,24 +352,7 @@ def get_paper_id(paper: Any) -> str:
     Returns:
         A string identifier unique to this paper.
     """
-    if paper.doi:
-        return f"doi:{paper.doi.lower()}"
-    
-    # Normalize title
-    title_normalized = paper.title.lower().strip()
-    
-    # Get first author's last name if available
-    author_part = ""
-    if paper.authors:
-        first_author = paper.authors[0]
-        # Extract last name (last word of author name)
-        last_name = first_author.split()[-1].lower() if first_author else ""
-        author_part = last_name
-    
-    # Create hash
-    content = f"{title_normalized}|{author_part}"
-    hash_value = hashlib.sha256(content.encode()).hexdigest()[:16]
-    return f"hash:{hash_value}"
+    return paper.id
 
 
 def get_query_hash(query: str) -> str:
@@ -382,66 +367,48 @@ def get_query_hash(query: str) -> str:
 
 \subsection{Testing paper identity}
 
+The [[get_paper_id]] function is now a thin wrapper around [[Paper.id]].
+We test that it correctly forwards to the property:
+
 <<test functions>>=
 class TestPaperIdentity:
     """Tests for paper identity functions."""
 
     def test_doi_takes_precedence(self):
         """Papers with DOI use DOI as identifier."""
-        paper = Mock()
-        paper.doi = "10.1234/TEST"
-        paper.title = "Test Paper"
-        paper.authors = ["John Doe"]
-        
+        paper = Paper(
+            title="Test Paper",
+            authors=["John Doe"],
+            doi="10.1234/TEST",
+        )
         pid = get_paper_id(paper)
         assert pid == "doi:10.1234/test"
 
     def test_hash_without_doi(self):
         """Papers without DOI use hash of title+author."""
-        paper = Mock()
-        paper.doi = None
-        paper.title = "Test Paper"
-        paper.authors = ["John Doe"]
-        
+        paper = Paper(
+            title="Test Paper",
+            authors=["John Doe"],
+        )
         pid = get_paper_id(paper)
         assert pid.startswith("hash:")
         assert len(pid) == 5 + 16  # "hash:" + 16 hex chars
 
     def test_same_paper_same_id(self):
         """Same title+author produces same ID."""
-        paper1 = Mock()
-        paper1.doi = None
-        paper1.title = "Test Paper"
-        paper1.authors = ["John Doe"]
-        
-        paper2 = Mock()
-        paper2.doi = None
-        paper2.title = "test paper"  # Different case
-        paper2.authors = ["John Doe"]
-        
+        paper1 = Paper(title="Test Paper", authors=["John Doe"])
+        paper2 = Paper(title="test paper", authors=["John Doe"])
         assert get_paper_id(paper1) == get_paper_id(paper2)
 
     def test_different_author_different_id(self):
         """Different authors produce different IDs."""
-        paper1 = Mock()
-        paper1.doi = None
-        paper1.title = "Test Paper"
-        paper1.authors = ["John Doe"]
-        
-        paper2 = Mock()
-        paper2.doi = None
-        paper2.title = "Test Paper"
-        paper2.authors = ["Jane Smith"]
-        
+        paper1 = Paper(title="Test Paper", authors=["John Doe"])
+        paper2 = Paper(title="Test Paper", authors=["Jane Smith"])
         assert get_paper_id(paper1) != get_paper_id(paper2)
 
     def test_no_authors(self):
         """Papers with no authors still get valid ID."""
-        paper = Mock()
-        paper.doi = None
-        paper.title = "Test Paper"
-        paper.authors = []
-        
+        paper = Paper(title="Test Paper", authors=[])
         pid = get_paper_id(paper)
         assert pid.startswith("hash:")
 
@@ -674,10 +641,11 @@ class TestPaperNotes:
         """Can save and retrieve a note."""
         monkeypatch.setenv("SCHOLAR_DATA_DIR", str(tmp_path))
         
-        paper = Mock()
-        paper.doi = "10.1234/test"
-        paper.title = "Test Paper"
-        paper.authors = ["Author"]
+        paper = Paper(
+            title="Test Paper",
+            authors=["Author"],
+            doi="10.1234/test",
+        )
         
         save_note(paper, "This is my note.")
         
@@ -690,10 +658,11 @@ class TestPaperNotes:
         """Updating a note preserves created_at."""
         monkeypatch.setenv("SCHOLAR_DATA_DIR", str(tmp_path))
         
-        paper = Mock()
-        paper.doi = "10.1234/test"
-        paper.title = "Test Paper"
-        paper.authors = ["Author"]
+        paper = Paper(
+            title="Test Paper",
+            authors=["Author"],
+            doi="10.1234/test",
+        )
         
         note1 = save_note(paper, "First note")
         created_at = note1.created_at
@@ -707,10 +676,11 @@ class TestPaperNotes:
         """Can delete a note."""
         monkeypatch.setenv("SCHOLAR_DATA_DIR", str(tmp_path))
         
-        paper = Mock()
-        paper.doi = "10.1234/test"
-        paper.title = "Test Paper"
-        paper.authors = ["Author"]
+        paper = Paper(
+            title="Test Paper",
+            authors=["Author"],
+            doi="10.1234/test",
+        )
         
         save_note(paper, "Note to delete")
         assert has_note(paper)
@@ -723,10 +693,11 @@ class TestPaperNotes:
         """Deleting nonexistent note returns False."""
         monkeypatch.setenv("SCHOLAR_DATA_DIR", str(tmp_path))
         
-        paper = Mock()
-        paper.doi = "10.1234/nonexistent"
-        paper.title = "Test"
-        paper.authors = []
+        paper = Paper(
+            title="Test",
+            authors=[],
+            doi="10.1234/nonexistent",
+        )
         
         result = delete_note(paper)
         assert result is False
@@ -735,15 +706,17 @@ class TestPaperNotes:
         """Can list all papers with notes."""
         monkeypatch.setenv("SCHOLAR_DATA_DIR", str(tmp_path))
         
-        paper1 = Mock()
-        paper1.doi = "10.1234/test1"
-        paper1.title = "Paper 1"
-        paper1.authors = ["A"]
+        paper1 = Paper(
+            title="Paper 1",
+            authors=["A"],
+            doi="10.1234/test1",
+        )
         
-        paper2 = Mock()
-        paper2.doi = "10.1234/test2"
-        paper2.title = "Paper 2"
-        paper2.authors = ["B"]
+        paper2 = Paper(
+            title="Paper 2",
+            authors=["B"],
+            doi="10.1234/test2",
+        )
         
         save_note(paper1, "Note 1")
         save_note(paper2, "Note 2")
@@ -757,10 +730,11 @@ class TestPaperNotes:
         """has_note correctly identifies papers with notes."""
         monkeypatch.setenv("SCHOLAR_DATA_DIR", str(tmp_path))
         
-        paper = Mock()
-        paper.doi = "10.1234/test"
-        paper.title = "Test"
-        paper.authors = []
+        paper = Paper(
+            title="Test",
+            authors=[],
+            doi="10.1234/test",
+        )
         
         assert not has_note(paper)
         save_note(paper, "A note")
@@ -937,10 +911,11 @@ class TestSearchDecisions:
         monkeypatch.setenv("SCHOLAR_DATA_DIR", str(tmp_path))
         
         query = "test query"
-        paper = Mock()
-        paper.doi = "10.1234/test"
-        paper.title = "Test"
-        paper.authors = []
+        paper = Paper(
+            title="Test",
+            authors=[],
+            doi="10.1234/test",
+        )
         
         paper_id = get_paper_id(paper)
         decisions = {
@@ -957,10 +932,11 @@ class TestSearchDecisions:
         monkeypatch.setenv("SCHOLAR_DATA_DIR", str(tmp_path))
         
         query = "test query"
-        paper = Mock()
-        paper.doi = "10.1234/unknown"
-        paper.title = "Unknown"
-        paper.authors = []
+        paper = Paper(
+            title="Unknown",
+            authors=[],
+            doi="10.1234/unknown",
+        )
         
         result = get_previous_decision(query, paper)
         assert result is None
@@ -1210,10 +1186,11 @@ class TestExportImport:
         """Can export notes to file."""
         monkeypatch.setenv("SCHOLAR_DATA_DIR", str(tmp_path))
         
-        paper = Mock()
-        paper.doi = "10.1234/test"
-        paper.title = "Test Paper"
-        paper.authors = ["Author"]
+        paper = Paper(
+            title="Test Paper",
+            authors=["Author"],
+            doi="10.1234/test",
+        )
         save_note(paper, "Test note")
         
         export_path = tmp_path / "export.json"
@@ -1232,10 +1209,11 @@ class TestExportImport:
         monkeypatch.setenv("SCHOLAR_DATA_DIR", str(tmp_path))
         
         # Create existing note
-        paper1 = Mock()
-        paper1.doi = "10.1234/existing"
-        paper1.title = "Existing"
-        paper1.authors = []
+        paper1 = Paper(
+            title="Existing",
+            authors=[],
+            doi="10.1234/existing",
+        )
         save_note(paper1, "Existing note")
         
         # Create export file with different note
