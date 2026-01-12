@@ -4934,11 +4934,17 @@ internally, simplifying our implementation.
 No API key is required---arXiv is fully open access.
 This makes the provider always available.
 
-\subsection{Rate Limiting}
+\subsection{Rate Limiting and Retry}
 
 arXiv's terms of use request no more than one request every three seconds.
 The [[arxiv]] package respects this limit by default with its
-[[delay_seconds]] parameter, so we configure the client accordingly.
+[[delay_seconds]] parameter.
+
+However, the arXiv API occasionally returns HTTP 500 errors.
+We implement our own retry logic with exponential backoff to handle transient
+failures.
+Importantly, we only cache successful results---if a request fails, the cache
+is not populated, allowing the user to retry immediately.
 
 \subsection{Limitations}
 
@@ -4956,23 +4962,25 @@ class ArxivProvider:
 
     name = "arxiv"
     MAX_LIMIT: int | None = None  # No documented maximum
+    MAX_RETRIES = 5
+    INITIAL_BACKOFF = 3.0  # seconds
 
     def __init__(self):
         """Initialize the arXiv provider."""
         self._cache: dict = load_cache(self.name)
         register_cache(self.name, self._cache)
         # arxiv.Client handles rate limiting internally
+        # We set num_retries=0 since we implement our own retry logic
         self._client = arxiv.Client(
             page_size=100,
             delay_seconds=3.0,
-            num_retries=3,
+            num_retries=0,
         )
 
     def is_available(self) -> bool:
         """arXiv is always available (no API key required)."""
         return True
 
-    @cachedmethod(lambda self: self._cache, key=lambda self, query, limit=100, filters=None: (query, limit, filters.cache_key() if filters else ""))
     def search(
         self,
         query: str,
@@ -4982,36 +4990,85 @@ class ArxivProvider:
         """
         Search arXiv for papers matching the query.
 
-        The arxiv package handles pagination automatically.
+        Only caches successful results. Failed requests are not cached,
+        allowing immediate retry.
         """
-        try:
-            logger.debug(f"arxiv: Searching for '{query}' with limit={limit}")
+        # Check cache first
+        cache_key = (query, limit, filters.cache_key() if filters else "")
+        if cache_key in self._cache:
+            logger.debug(f"arxiv: Cache hit for '{query}'")
+            return self._cache[cache_key]
 
-            # Build query with filters
-            effective_query = query
-            <<arxiv apply filters>>
+        logger.debug(f"arxiv: Searching for '{query}' with limit={limit}")
 
-            search = arxiv.Search(
-                query=effective_query,
-                max_results=limit,
-                sort_by=arxiv.SortCriterion.Relevance,
-            )
+        # Build query with filters
+        effective_query = query
+        <<arxiv apply filters>>
 
-            all_papers: list[Paper] = []
-            for result in self._client.results(search):
-                paper = self._convert_result(result)
-                <<arxiv apply year filter>>
-                all_papers.append(paper)
+        search = arxiv.Search(
+            query=effective_query,
+            max_results=limit,
+            sort_by=arxiv.SortCriterion.Relevance,
+        )
 
-            logger.debug(f"arxiv: Retrieved {len(all_papers)} papers")
-            return all_papers
-
-        except Exception as e:
-            logger.warning("arxiv: %s", e)
-            return []
+        # Retry with exponential backoff
+        <<arxiv search with retry>>
 
     <<convert arxiv result>>
     <<arxiv citation methods>>
+@
+
+\subsubsection{Retry with exponential backoff}
+
+We implement our own retry logic since the [[arxiv]] package's built-in
+retry may not handle all transient failures (especially HTTP 500 errors).
+The backoff starts at 3 seconds and doubles with each attempt.
+
+Importantly, we only cache successful results.
+If a request fails after all retries, we return an empty list without caching,
+allowing the user to retry immediately.
+
+<<arxiv search with retry>>=
+last_exception: Exception | None = None
+
+for attempt in range(self.MAX_RETRIES):
+    try:
+        all_papers: list[Paper] = []
+        for result in self._client.results(search):
+            paper = self._convert_result(result)
+            <<arxiv apply year filter>>
+            all_papers.append(paper)
+
+        logger.debug(f"arxiv: Retrieved {len(all_papers)} papers")
+
+        # Only cache successful results
+        if all_papers:
+            self._cache[cache_key] = all_papers
+
+        return all_papers
+
+    except (arxiv.HTTPError, arxiv.UnexpectedEmptyPageError) as e:
+        last_exception = e
+        if attempt < self.MAX_RETRIES - 1:
+            backoff = self.INITIAL_BACKOFF * (2 ** attempt)
+            logger.warning(
+                "arxiv: %s (attempt %d/%d, retrying in %.1fs)",
+                e, attempt + 1, self.MAX_RETRIES, backoff
+            )
+            time.sleep(backoff)
+        else:
+            logger.warning(
+                "arxiv: %s (attempt %d/%d, giving up)",
+                e, attempt + 1, self.MAX_RETRIES
+            )
+
+    except Exception as e:
+        # Non-retryable error
+        logger.warning("arxiv: %s", e)
+        return []
+
+# All retries exhausted
+return []
 @
 
 \subsubsection{Applying filters}
@@ -5146,6 +5203,8 @@ register_provider(ArxivProvider())
 \subsection{Dependencies}
 
 <<arxiv imports>>=
+import time
+
 import arxiv
 @
 
@@ -5205,12 +5264,71 @@ class TestArxivProvider:
             assert results == []
 
     def test_search_handles_api_error(self):
-        """search() returns empty list on API error."""
+        """search() returns empty list on non-retryable API error."""
         provider = ArxivProvider()
 
         with patch.object(provider._client, "results", side_effect=Exception("API error")):
             results = provider.search("test")
             assert results == []
+
+    def test_retries_on_http_error(self):
+        """search() retries with exponential backoff on HTTP errors."""
+        provider = ArxivProvider()
+
+        # Create a mock that fails twice then succeeds
+        mock_result = Mock()
+        mock_result.title = "Success Paper"
+        mock_result.authors = []
+        mock_result.published = Mock(year=2024)
+        mock_result.doi = None
+        mock_result.summary = None
+        mock_result.primary_category = None
+        mock_result.entry_id = "http://arxiv.org/abs/2401.12345v1"
+        mock_result.pdf_url = None
+
+        call_count = 0
+        def mock_results(search):
+            nonlocal call_count
+            call_count += 1
+            if call_count < 3:
+                raise arxiv.HTTPError("http://example.com", 500, "Internal Server Error")
+            return iter([mock_result])
+
+        with patch.object(provider._client, "results", side_effect=mock_results):
+            with patch("time.sleep") as mock_sleep:
+                results = provider.search("test")
+
+                # Should succeed after retries
+                assert len(results) == 1
+                assert results[0].title == "Success Paper"
+                # Should have slept twice (for 2 failed attempts)
+                assert mock_sleep.call_count == 2
+
+    def test_does_not_cache_failed_results(self):
+        """search() does not cache results from failed requests."""
+        provider = ArxivProvider()
+
+        # First call fails
+        with patch.object(provider._client, "results", side_effect=Exception("API error")):
+            results1 = provider.search("test query")
+            assert results1 == []
+
+        # Create mock success result
+        mock_result = Mock()
+        mock_result.title = "Success Paper"
+        mock_result.authors = []
+        mock_result.published = Mock(year=2024)
+        mock_result.doi = None
+        mock_result.summary = None
+        mock_result.primary_category = None
+        mock_result.entry_id = "http://arxiv.org/abs/2401.12345v1"
+        mock_result.pdf_url = None
+
+        # Second call succeeds - should not be blocked by cached failure
+        with patch.object(provider._client, "results", return_value=iter([mock_result])):
+            results2 = provider.search("test query")
+            assert len(results2) == 1
+            assert results2[0].title == "Success Paper"
 
     def test_handles_missing_fields(self):
         """search() handles results with missing optional fields."""
