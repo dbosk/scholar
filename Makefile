@@ -6,3 +6,23 @@ SUBDIR_GOALS+=	all clean distclean test
 
 INCLUDE_MAKEFILES=makefiles
 include ${INCLUDE_MAKEFILES}/subdir.mk
+
+# Extract version from pyproject.toml
+version = $(shell sed -n 's/^version *= *"\([^"]*\)"/\1/p' pyproject.toml)
+
+# Publishing targets
+.PHONY: publish publish-pypi publish-github
+
+publish: doc/scholar.pdf publish-pypi publish-github
+
+publish-pypi:
+	uv build
+	uv publish
+
+publish-github: doc/scholar.pdf
+	git push
+	gh release create -t v${version} v${version} doc/scholar.pdf
+
+# Build documentation
+doc/scholar.pdf:
+	${MAKE} -C doc scholar.pdf
