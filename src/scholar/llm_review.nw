@@ -525,6 +525,41 @@ class TestExampleGathering:
 
         assert is_valid is False
         assert "discarded" in error.lower()
+
+
+class TestZeroShotClassification:
+    """Tests for classification without example requirements."""
+
+    def test_classify_without_examples_dry_run(self):
+        """Zero-shot mode builds a prompt without raising."""
+        session = ReviewSession(
+            query="test",
+            providers=["test"],
+            timestamp=datetime.now(),
+            research_context="I am studying X.",
+        )
+        session.decisions.append(
+            ReviewDecision(
+                paper=Paper(
+                    title="Pending",
+                    authors=["A"],
+                    year=2024,
+                    abstract="Abstract.",
+                ),
+                provider="test",
+                status=DecisionStatus.PENDING,
+            )
+        )
+
+        prompt = classify_papers_with_llm(
+            session=session,
+            count=1,
+            dry_run=True,
+            require_examples=False,
+        )
+
+        assert "Research Context" in prompt
+        assert "Papers to Classify" in prompt
 @
 
 
@@ -1014,13 +1049,14 @@ def classify_papers_with_llm(
     model_id: str | None = None,
     enrich_missing: bool = True,
     dry_run: bool = False,
+    require_examples: bool = True,
 ) -> LLMBatchResult | str:
     """
     Classify pending papers using LLM.
 
     This is the main entry point for LLM-assisted classification. It:
-    1. Gathers training examples from human-reviewed papers
-    2. Validates minimum example requirements
+    1. Optionally gathers training examples from human-reviewed papers
+    2. Optionally validates minimum example requirements
     3. Optionally enriches papers lacking abstracts
     4. Constructs a prompt with examples and papers to classify
     5. Invokes the LLM and parses the response
@@ -1031,21 +1067,29 @@ def classify_papers_with_llm(
         model_id: LLM model to use (uses llm default if None)
         enrich_missing: Whether to auto-enrich papers without abstracts
         dry_run: If True, return the prompt without calling LLM
+        require_examples: If True (default), require tagged example papers
+            before classification. Set False for zero-shot classification
+            using only the research context.
 
     Returns:
         LLMBatchResult with decisions, or prompt string if dry_run=True
 
     Raises:
-        ValueError: If insufficient examples or no papers to classify
+        ValueError: If there are no papers to classify, or if
+            require_examples=True and there are insufficient examples
         ImportError: If llm package is not installed
     """
-    # Gather examples
-    kept_examples, discarded_examples = get_example_decisions(session)
+    # Gather examples (optional)
+    if require_examples:
+        kept_examples, discarded_examples = get_example_decisions(session)
 
-    # Validate
-    is_valid, error = validate_examples(kept_examples, discarded_examples)
-    if not is_valid:
-        raise ValueError(error)
+        # Validate
+        is_valid, error = validate_examples(kept_examples, discarded_examples)
+        if not is_valid:
+            raise ValueError(error)
+    else:
+        kept_examples = []
+        discarded_examples = []
 
     # Get pending papers
     pending = [
