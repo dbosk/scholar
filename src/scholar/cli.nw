@@ -204,9 +204,12 @@ elif net_verbosity == -2:
 else:  # net_verbosity <= -3
     log_level = SILENCE_LEVEL  # Silence everything
 
+# Use force=True to ensure this takes effect even if another dependency
+# configured logging before Scholar's callback runs.
 logging.basicConfig(
     level=log_level,
     format="%(levelname)s: %(message)s",
+    force=True,
 )
 @
 
