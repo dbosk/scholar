@@ -526,40 +526,6 @@ class TestExampleGathering:
         assert is_valid is False
         assert "discarded" in error.lower()
 
-
-class TestZeroShotClassification:
-    """Tests for classification without example requirements."""
-
-    def test_classify_without_examples_dry_run(self):
-        """Zero-shot mode builds a prompt without raising."""
-        session = ReviewSession(
-            query="test",
-            providers=["test"],
-            timestamp=datetime.now(),
-            research_context="I am studying X.",
-        )
-        session.decisions.append(
-            ReviewDecision(
-                paper=Paper(
-                    title="Pending",
-                    authors=["A"],
-                    year=2024,
-                    abstract="Abstract.",
-                ),
-                provider="test",
-                status=DecisionStatus.PENDING,
-            )
-        )
-
-        prompt = classify_papers_with_llm(
-            session=session,
-            count=1,
-            dry_run=True,
-            require_examples=False,
-        )
-
-        assert "Research Context" in prompt
-        assert "Papers to Classify" in prompt
 @
 
 
@@ -1042,6 +1008,13 @@ def get_papers_needing_enrichment(
 This is the primary entry point for LLM classification. It coordinates
 example gathering, prompt construction, LLM invocation, and response parsing.
 
+By default, we require a small set of human-reviewed example papers to ground
+the LLM and increase consistency.
+For early-stage workflows (e.g., research-question driven searches) there may
+be no examples yet; in that case, we support \enquote{zero-shot} classification by
+setting [[require_examples=False]], relying only on the session's research
+context.
+
 <<llm review llm interaction>>=
 def classify_papers_with_llm(
     session: ReviewSession,
@@ -1171,6 +1144,49 @@ def classify_papers_with_llm(
     )
 @
 
+
+\subsection{Zero-shot Classification}
+
+When [[require_examples=False]], we rely on the research context only. This is
+useful early in a review when no curated examples exist yet.
+We still support [[dry_run=True]] so callers can inspect prompts without
+requiring the [[llm]] package.
+
+<<test functions>>=
+class TestZeroShotClassification:
+    """Tests for classification without example requirements."""
+
+    def test_classify_without_examples_dry_run(self):
+        """Zero-shot mode builds a prompt without raising."""
+        session = ReviewSession(
+            query="test",
+            providers=["test"],
+            timestamp=datetime.now(),
+            research_context="I am studying X.",
+        )
+        session.decisions.append(
+            ReviewDecision(
+                paper=Paper(
+                    title="Pending",
+                    authors=["A"],
+                    year=2024,
+                    abstract="Abstract.",
+                ),
+                provider="test",
+                status=DecisionStatus.PENDING,
+            )
+        )
+
+        prompt = classify_papers_with_llm(
+            session=session,
+            count=1,
+            dry_run=True,
+            require_examples=False,
+        )
+
+        assert "Research Context" in prompt
+        assert "Papers to Classify" in prompt
+@
 
 \subsection{Testing LLM Interaction}
 

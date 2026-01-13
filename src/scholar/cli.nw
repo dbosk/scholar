@@ -550,7 +550,7 @@ if provider is None:
 else:
     provider_names = provider
 
-effective_limit = 10**9 if limit == 0 else limit
+effective_limit = UNLIMITED_PROVIDER_LIMIT if limit == 0 else limit
 limit_label = "unlimited" if limit == 0 else str(limit)
 
 logger.info(f"Searching with providers: {', '.join(provider_names)}")
@@ -813,7 +813,18 @@ console = Console()
 <<generate provider queries>>
 <<resolve research question>>
 
-# Determine which providers will be used
+<<select rq providers>>
+<<build rq search filters>>
+<<compute rq effective limit>>
+<<generate rq provider queries>>
+<<execute rq provider searches>>
+<<derive rq session name>>
+<<create rq session>>
+<<label rq session>>
+<<save rq session and print summary>>
+@
+
+<<select rq providers>>=
 if provider is None:
     provider_names = [p.name for p in get_default_providers()]
 else:
@@ -822,8 +833,9 @@ else:
 if not provider_names:
     console.print("[red]No providers available[/red]")
     raise typer.Exit(1)
+@
 
-# Build search filters from CLI options
+<<build rq search filters>>=
 filters = None
 if any([year, open_access, venue, min_citations is not None, pub_type]):
     filters = SearchFilters(
@@ -833,14 +845,17 @@ if any([year, open_access, venue, min_citations is not None, pub_type]):
         min_citations=min_citations,
         pub_types=pub_type,
     )
+@
 
-# Convert CLI limit to an effective provider limit
-effective_limit = 10**9 if limit == 0 else limit
+<<compute rq effective limit>>=
+effective_limit = UNLIMITED_PROVIDER_LIMIT if limit == 0 else limit
+@
 
-# Generate provider-specific search queries using LLM
+<<generate rq provider queries>>=
 provider_queries = generate_provider_queries(rq_text, provider_names, model)
+@
 
-# Execute the searches
+<<execute rq provider searches>>=
 results: list[SearchResult] = []
 timestamp = datetime.now().isoformat()
 for pname in provider_names:
@@ -863,19 +878,22 @@ for pname in provider_names:
 if not results:
     console.print("[yellow]No results returned[/yellow]")
     raise typer.Exit(0)
+@
 
-# Derive session name if not provided
+<<derive rq session name>>=
 if name is None:
     safe_name = "".join(
         c if c.isalnum() or c in "-_" else "_" for c in rq_text[:30]
     )
     name = f"rq_{safe_name}" if safe_name else "rq"
+@
 
-# Create a review session from the multi-provider results
+<<create rq session>>=
 session = create_review_session(results, rq_text, session_name=name)
 session.research_context = rq_text
+@
 
-# Label the first N pending papers using the LLM
+<<label rq session>>=
 try:
     batch = classify_papers_with_llm(
         session=session,
@@ -891,7 +909,9 @@ except ValueError as e:
 except ImportError as e:
     console.print(f"[red]{e}[/red]")
     raise typer.Exit(1)
+@
 
+<<save rq session and print summary>>=
 session_path = save_session(session)
 stats = get_review_statistics(session)
 
@@ -2972,4 +2992,6 @@ from rich.table import Table
 
 <<constants>>=
 logger = logging.getLogger(__name__)
+
+UNLIMITED_PROVIDER_LIMIT = 10**9
 @

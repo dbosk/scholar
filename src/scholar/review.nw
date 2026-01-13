@@ -1135,9 +1135,16 @@ elif previous_decisions:
 @
 
 For papers in the current search results, we merge with any existing decision
-data. If the paper was previously reviewed, we preserve the decision status,
-tags, and LLM metadata while using the fresh paper data from the search (which
-may have updated abstracts or other fields from enrichment).
+data.
+If the paper was previously reviewed, we preserve the decision status, tags,
+and LLM metadata while using the fresh paper data from the search (which may
+have updated abstracts or other fields from enrichment).
+
+Since a paper can appear in multiple providers, we also deduplicate within the
+current result set.
+When we encounter a duplicate paper ID, we keep a single [[ReviewDecision]] and
+merge the underlying [[Paper]] objects to consolidate metadata (e.g., a missing
+abstract in one provider and a present abstract in another).
 
 <<convert search results to decisions>>=
 decision_lookup: dict[str, ReviewDecision] = {
@@ -1148,15 +1155,11 @@ for result in results:
     for paper in result.papers:
         paper_id = get_paper_id(paper)
 
-        # Deduplicate within the current search results.
-        # If the same paper appears from multiple providers, we keep a single
-        # ReviewDecision but merge the Paper metadata and provenance.
         existing = decision_lookup.get(paper_id)
         if existing is not None:
             try:
                 existing.paper = existing.paper.merge_with(paper)
             except ValueError:
-                # If merge fails (unexpected identity mismatch), keep existing.
                 pass
             continue
 
