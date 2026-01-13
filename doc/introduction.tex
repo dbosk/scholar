@@ -152,6 +152,15 @@ scholar search "privacy-preserving machine learning" \
 \end{verbatim}
 The \texttt{--name} flag creates a named session for later resumption.
 
+If you start from a research question rather than a fixed search string, use
+\texttt{rq} to generate provider-specific queries with an LLM and save a review
+session:
+\begin{verbatim}
+scholar rq "How can privacy-preserving machine learning be evaluated?" \
+    --provider openalex --provider dblp \
+    --count 20 --name "privacy-ml-review"
+\end{verbatim}
+
 \paragraph{2. Review papers}
 In the TUI, browse through papers:
 \begin{itemize}
@@ -193,9 +202,13 @@ Scholar provides the following commands:
 
 \begin{description}
 \item[\texttt{scholar search}] Search bibliographic databases.
-  Options control which providers to query, output format, and whether to 
+  Options control which providers to query, output format, and whether to
   launch the interactive review.
-\item[\texttt{scholar providers}] List available search providers and their 
+\item[\texttt{scholar rq}] Research-question driven search.
+  Uses an LLM to create provider-specific search queries from a research
+  question, runs searches with the same filters as \texttt{search}, and
+  optionally labels an initial batch of papers.
+\item[\texttt{scholar providers}] List available search providers and their
   configuration status (API keys, etc.).
 \item[\texttt{scholar sessions}] Manage saved review sessions: list, show, 
   export, or resume.
