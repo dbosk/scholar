@@ -1111,7 +1111,7 @@ elif previous_decisions:
             elif prev.status == "discarded":
                 status = DecisionStatus.DISCARDED
             
-            tags = _extract_tags_from_record(prev)
+            tags = extract_tags_from_record(prev)
             
             # Restore LLM fields from notes if available
             source = ReviewSource.HUMAN
@@ -1170,7 +1170,7 @@ for result in results:
                 status = DecisionStatus.KEPT
             elif prev_record.status == "discarded":
                 status = DecisionStatus.DISCARDED
-            tags = _extract_tags_from_record(prev_record)
+            tags = extract_tags_from_record(prev_record)
             
             # Restore LLM fields from notes if available
             source = ReviewSource.HUMAN
@@ -1200,9 +1200,13 @@ for result in results:
                     status=DecisionStatus.PENDING,
                 )
             )
+@
 
+Extracting tags from a [[ReviewDecisionRecord]] is useful for backward compatibility
+with older session formats. We expose this as a public helper function.
 
-def _extract_tags_from_record(record: ReviewDecisionRecord) -> list[str]:
+<<review session functions>>=
+def extract_tags_from_record(record: ReviewDecisionRecord) -> list[str]:
     """
     Extract tags from a ReviewDecisionRecord.
     
@@ -1215,8 +1219,12 @@ def _extract_tags_from_record(record: ReviewDecisionRecord) -> list[str]:
     if hasattr(record, 'motivation') and record.motivation:
         return [record.motivation]
     return []
+@
 
+For browsing papers with notes (without keep/discard decisions), we create a
+special session that contains all previously annotated papers.
 
+<<review session functions>>=
 def create_notes_session() -> ReviewSession:
     """
     Create a session for browsing papers with notes.
