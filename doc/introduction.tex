@@ -23,6 +23,52 @@ replacing it---learning from your decisions to suggest (not dictate)
 classifications for remaining papers.
 
 
+\section{Quickstart}
+
+\paragraph{Install}
+The recommended installation method is \mintinline{text}{pipx}, which keeps CLI
+tools in isolated environments:
+\begin{verbatim}
+pipx install scholarcli
+\end{verbatim}
+
+\paragraph{Configure LLM access (optional)}
+The \mintinline{text}{rq} command and LLM-assisted review use the configuration
+of Simon Willison's \texttt{llm} package.
+To configure providers and select a default model, install the \texttt{llm}
+command (or install Scholar with \mintinline{text}{pipx --include-deps} so the
+dependency CLI is exposed):
+\begin{verbatim}
+pipx install llm
+# Or: pipx install --include-deps scholarcli
+\end{verbatim}
+
+Then configure at least one provider (examples):
+\begin{verbatim}
+llm install llm-openai-plugin
+llm keys set openai
+
+# Or:
+llm install llm-anthropic
+llm keys set anthropic
+\end{verbatim}
+
+Set a default model (used by Scholar unless overridden with \mintinline{text}{--model}):
+\begin{verbatim}
+llm models
+llm models default gpt-4o-mini
+\end{verbatim}
+
+\paragraph{Run}
+\begin{verbatim}
+# Search directly
+scholar search "machine learning privacy"
+
+# Start from a research question
+scholar rq "How do LLMs support novice programming?" --count 20
+\end{verbatim}
+
+
 \section{Motivation}
 
 Systematic literature reviews require searching multiple databases to ensure 
@@ -48,7 +94,7 @@ Scholar provides the following capabilities:
 
 \subsection{Multi-Database Search}
 
-Search across five academic databases with a single command:
+Search across six academic databases with a single command:
 \begin{description}
 \item[Semantic Scholar] AI-powered research database covering 200+ million 
   papers across all fields.
@@ -69,6 +115,9 @@ Search across five academic databases with a single command:
   Strong coverage of electrical engineering, computer science, and related 
   fields.
   Requires API key from IEEE.
+\item[arXiv] Preprint repository with strong coverage of physics, mathematics,
+  computer science, and related fields.
+  No authentication required.
 \end{description}
 
 \subsection{Result Management}
@@ -152,6 +201,15 @@ scholar search "privacy-preserving machine learning" \
 \end{verbatim}
 The \texttt{--name} flag creates a named session for later resumption.
 
+If you start from a research question rather than a fixed search string, use
+\texttt{rq} to generate provider-specific queries with an LLM and save a review
+session:
+\begin{verbatim}
+scholar rq "How can privacy-preserving machine learning be evaluated?" \
+    --provider openalex --provider dblp \
+    --count 20 --name "privacy-ml-review"
+\end{verbatim}
+
 \paragraph{2. Review papers}
 In the TUI, browse through papers:
 \begin{itemize}
@@ -193,9 +251,13 @@ Scholar provides the following commands:
 
 \begin{description}
 \item[\texttt{scholar search}] Search bibliographic databases.
-  Options control which providers to query, output format, and whether to 
+  Options control which providers to query, output format, and whether to
   launch the interactive review.
-\item[\texttt{scholar providers}] List available search providers and their 
+\item[\texttt{scholar rq}] Research-question driven search.
+  Uses an LLM to create provider-specific search queries from a research
+  question, runs searches with the same filters as \texttt{search}, and
+  optionally labels an initial batch of papers.
+\item[\texttt{scholar providers}] List available search providers and their
   configuration status (API keys, etc.).
 \item[\texttt{scholar sessions}] Manage saved review sessions: list, show, 
   export, or resume.

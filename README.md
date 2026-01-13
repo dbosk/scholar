@@ -6,20 +6,23 @@ A command-line tool for conducting structured literature searches across multipl
 
 ### Multi-Database Search
 
-Search across five academic databases with a single query:
+Search across six academic databases with a single query:
 
 - **Semantic Scholar** - AI-powered research database with 200M+ papers
 - **OpenAlex** - Open catalog of 250M+ scholarly works
 - **DBLP** - Computer science bibliography
 - **Web of Science** - Comprehensive citation index (requires API key)
 - **IEEE Xplore** - IEEE technical literature (requires API key)
+- **arXiv** - Preprints (no API key)
 
 ```bash
-# Search all available providers
-scholar search "machine learning privacy"
-
 # Search specific providers
 scholar search "federated learning" -p semantic_scholar -p openalex
+
+# Start from a research question (LLM generates provider-specific queries)
+scholar rq "How can privacy-preserving ML be evaluated?" \
+  --provider openalex --provider dblp \
+  --count 20
 ```
 
 ### Interactive Review Interface
@@ -96,16 +99,67 @@ scholar cache path    # Print cache directory
 
 PDF downloads are also cached for offline viewing.
 
-## Installation
+## Quickstart
+
+### Install
 
 ```bash
-pip install scholar-cli
+pipx install scholarcli
+```
+
+### Configure LLM access (optional, for `scholar rq` and LLM-assisted review)
+
+Scholar uses the [`llm`](https://llm.datasette.io/) package for model selection
+and API key configuration.
+
+If you want to configure it via the `llm` CLI, install it as well (or install
+`scholarcli` with `pipx --include-deps` so the dependency CLIs are exposed):
+
+```bash
+pipx install llm
+# Or: pipx install --include-deps scholarcli
+```
+
+Then configure at least one provider (examples):
+
+```bash
+llm install llm-openai-plugin
+llm keys set openai
+
+# Or:
+llm install llm-anthropic
+llm keys set anthropic
+```
+
+Set a default model for Scholar to use:
+
+```bash
+llm models
+llm models default gpt-4o-mini
+```
+
+### First run
+
+```bash
+# Search directly
+scholar search "machine learning privacy"
+
+# Start from a research question (LLM generates provider-specific queries)
+scholar rq "How do LLMs support novice programming?" --count 20
+```
+
+## Installation
+
+If you don't use `pipx`, you can install with `pip`:
+
+```bash
+pip install scholarcli
 ```
 
 Or with [uv](https://github.com/astral-sh/uv):
 
 ```bash
-uv pip install scholar-cli
+uv pip install scholarcli
 ```
 
 ## Configuration
@@ -134,8 +188,11 @@ scholar providers
 # Search with default providers (Semantic Scholar, OpenAlex, DBLP)
 scholar search "differential privacy"
 
-# Limit results per provider
+# Limit results per provider (default: 1000)
 scholar search "blockchain" -l 50
+
+# Unlimited results per provider
+scholar search "blockchain" -l 0
 ```
 
 ### Systematic Review Workflow
@@ -218,14 +275,30 @@ scholar llm-review "session-name" --count 10
 
 ### Requirements
 
-Install the `llm` package and configure a model:
+Install and configure the `llm` command (Scholar uses `llm`'s configuration and
+default model):
 
 ```bash
-pip install llm
-llm keys set openai  # Or configure another provider
+pipx install llm
+
+llm install llm-openai-plugin
+llm keys set openai
+
+# Pick a default model (used by `scholar rq` and `scholar llm-review`)
+llm models
+llm models default gpt-4o-mini
 ```
 
-The LLM module supports any model available through Simon Willison's `llm` package (OpenAI, Anthropic, local models, etc.).
+If you installed Scholar with `pipx install scholarcli` and want the `llm` CLI
+available from that same environment, you can alternatively install Scholar
+with `pipx install --include-deps scholarcli`.
+
+The LLM integration supports models available through Simon Willison's `llm`
+package (OpenAI, Anthropic, local models, etc.).
+
+Note: `scholar llm-review` learns from your existing labeled examples (typically
+~5 tagged papers). `scholar rq` can start without examples by using the research
+question as context.
 
 ## Documentation
 

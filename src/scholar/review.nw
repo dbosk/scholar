@@ -1135,33 +1135,50 @@ elif previous_decisions:
 @
 
 For papers in the current search results, we merge with any existing decision
-data. If the paper was previously reviewed, we preserve the decision status,
-tags, and LLM metadata while using the fresh paper data from the search (which
-may have updated abstracts or other fields from enrichment).
+data.
+If the paper was previously reviewed, we preserve the decision status, tags,
+and LLM metadata while using the fresh paper data from the search (which may
+have updated abstracts or other fields from enrichment).
+
+Since a paper can appear in multiple providers, we also deduplicate within the
+current result set.
+When we encounter a duplicate paper ID, we keep a single [[ReviewDecision]] and
+merge the underlying [[Paper]] objects to consolidate metadata (e.g., a missing
+abstract in one provider and a present abstract in another).
 
 <<convert search results to decisions>>=
+decision_lookup: dict[str, ReviewDecision] = {
+    get_paper_id(d.paper): d for d in session.decisions
+}
+
 for result in results:
     for paper in result.papers:
         paper_id = get_paper_id(paper)
-        
+
+        existing = decision_lookup.get(paper_id)
+        if existing is not None:
+            try:
+                existing.paper = existing.paper.merge_with(paper)
+            except ValueError:
+                pass
+            continue
+
         # Check for previous decision (prefer session data over notes)
         prev_dec = prev_decision_lookup.get(paper_id)
         prev_record = None
         if not prev_dec and previous_decisions:
             prev_record = previous_decisions.decisions.get(paper_id)
-        
+
         if prev_dec:
             # Use previous decision but with fresh paper data
-            session.decisions.append(
-                ReviewDecision(
-                    paper=paper,  # Fresh paper data from search
-                    provider=result.provider,
-                    status=prev_dec.status,
-                    tags=prev_dec.tags,
-                    source=prev_dec.source,
-                    is_example=prev_dec.is_example,
-                    llm_confidence=prev_dec.llm_confidence,
-                )
+            decision = ReviewDecision(
+                paper=paper,  # Fresh paper data from search
+                provider=result.provider,
+                status=prev_dec.status,
+                tags=prev_dec.tags,
+                source=prev_dec.source,
+                is_example=prev_dec.is_example,
+                llm_confidence=prev_dec.llm_confidence,
             )
         elif prev_record:
             # Fallback to notes module format
@@ -1171,35 +1188,34 @@ for result in results:
             elif prev_record.status == "discarded":
                 status = DecisionStatus.DISCARDED
             tags = extract_tags_from_record(prev_record)
-            
+
             # Restore LLM fields from notes if available
             source = ReviewSource.HUMAN
-            source_str = getattr(prev_record, 'source', 'human')
+            source_str = getattr(prev_record, "source", "human")
             try:
                 source = ReviewSource(source_str)
             except ValueError:
                 pass
-            
-            session.decisions.append(
-                ReviewDecision(
-                    paper=paper,
-                    provider=result.provider,
-                    status=status,
-                    tags=tags,
-                    source=source,
-                    is_example=getattr(prev_record, 'is_example', False),
-                    llm_confidence=getattr(prev_record, 'llm_confidence', None),
-                )
+
+            decision = ReviewDecision(
+                paper=paper,
+                provider=result.provider,
+                status=status,
+                tags=tags,
+                source=source,
+                is_example=getattr(prev_record, "is_example", False),
+                llm_confidence=getattr(prev_record, "llm_confidence", None),
             )
         else:
             # New paper, no previous decision
-            session.decisions.append(
-                ReviewDecision(
-                    paper=paper,
-                    provider=result.provider,
-                    status=DecisionStatus.PENDING,
-                )
+            decision = ReviewDecision(
+                paper=paper,
+                provider=result.provider,
+                status=DecisionStatus.PENDING,
             )
+
+        session.decisions.append(decision)
+        decision_lookup[paper_id] = decision
 @
 
 Extracting tags from a [[ReviewDecisionRecord]] is useful for backward compatibility
@@ -1712,15 +1728,53 @@ class TestSessionFunctions:
         result.papers = [
             Paper(title="Paper 1", authors=["Author"], year=2024),
         ]
-        
+
         session = create_review_session([result], "test query")
-        
+
         assert session.query == "test query"
         assert len(session.decisions) == 1
         assert session.decisions[0].status == DecisionStatus.PENDING
         # Check query_provider_pairs is populated
         assert len(session.query_provider_pairs) == 1
         assert ("test query", "test") in session.query_provider_pairs
+
+    def test_create_review_session_deduplicates_papers(self):
+        """Duplicate papers from multiple providers are merged."""
+        r1 = Mock()
+        r1.provider = "dblp"
+        r1.query = "q1"
+        r1.papers = [
+            Paper(
+                title="Paper",
+                authors=["Author"],
+                year=2024,
+                doi="10.1234/paper",
+                abstract=None,
+                sources=["dblp"],
+            )
+        ]
+
+        r2 = Mock()
+        r2.provider = "s2"
+        r2.query = "q2"
+        r2.papers = [
+            Paper(
+                title="Paper",
+                authors=["Author"],
+                year=2024,
+                doi="10.1234/paper",
+                abstract="Has abstract",
+                sources=["s2"],
+            )
+        ]
+
+        session = create_review_session([r1, r2], "test query")
+
+        assert len(session.decisions) == 1
+        assert session.decisions[0].paper.abstract == "Has abstract"
+        assert set(session.decisions[0].paper.sources) == {"dblp", "s2"}
+        assert ("q1", "dblp") in session.query_provider_pairs
+        assert ("q2", "s2") in session.query_provider_pairs
 
     def test_save_and_load_session(self, tmp_path, monkeypatch):
         """Can save and load a session."""
@@ -2092,6 +2146,7 @@ def generate_latex_report(session: ReviewSession, output_path: Path) -> None:
     
     The report includes:
     - Search parameters (query, providers, date)
+    - Research context (if available)
     - Summary statistics
     - Kept papers grouped by theme
     - Discarded papers grouped by motivation
@@ -2268,7 +2323,14 @@ def generate_latex_report(session: ReviewSession, output_path: Path) -> None:
             f"\\item[Providers] {', '.join(session.providers)}",
             r"\end{description}",
         ])
-    
+
+    if session.research_context:
+        lines.extend([
+            r"\subsection{Research Context}",
+        ])
+        lines.extend(markdown_to_latex(session.research_context).splitlines())
+        lines.append(r"")
+
     lines.extend([
         r"\begin{description}",
         f"\\item[Date] {session.timestamp.strftime('%Y-%m-%d %H:%M')}",
@@ -2515,7 +2577,7 @@ class TestReportGeneration:
     def test_generate_report_with_motivations(self, tmp_path):
         """Report groups discarded papers by motivation."""
         paper = Paper(title="Discarded Paper", authors=["Author"], year=2024)
-        
+
         session = ReviewSession(
             query="test",
             providers=["test"],
@@ -2523,17 +2585,45 @@ class TestReportGeneration:
         )
         session.decisions = [
             ReviewDecision(
-                paper=paper, provider="test",
-                status=DecisionStatus.DISCARDED, tags=["off-topic"]
+                paper=paper,
+                provider="test",
+                status=DecisionStatus.DISCARDED,
+                tags=["off-topic"],
             ),
         ]
-        
+
         output_path = tmp_path / "report.tex"
         generate_latex_report(session, output_path)
-        
+
         content = output_path.read_text()
         assert r"\section{Discarded Papers}" in content
         assert r"\subsection{off-topic}" in content
+
+    def test_report_includes_research_context(self, tmp_path):
+        """Report includes research context when present."""
+        paper = Paper(title="Paper", authors=["Author"], year=2024)
+
+        session = ReviewSession(
+            query="test",
+            providers=["test"],
+            timestamp=datetime.now(),
+            research_context="This is the research context.",
+        )
+        session.decisions = [
+            ReviewDecision(
+                paper=paper,
+                provider="test",
+                status=DecisionStatus.KEPT,
+                tags=["ml"],
+            ),
+        ]
+
+        output_path = tmp_path / "report.tex"
+        generate_latex_report(session, output_path)
+
+        content = output_path.read_text()
+        assert r"\subsection{Research Context}" in content
+        assert "This is the research context." in content
 
     def test_escapes_special_characters(self, tmp_path):
         """Special characters are escaped in report."""
