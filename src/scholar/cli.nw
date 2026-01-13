@@ -60,6 +60,7 @@ across bibliographic databases.
 <<typer application>>
 <<completion functions>>
 <<search command>>
+<<rq command>>
 <<enrich command>>
 <<providers command>>
 <<syntax command>>
@@ -442,12 +443,10 @@ limit: Annotated[
     int,
     typer.Option(
         "--limit", "-l",
-        help="Maximum results per provider (default: 100). "
-             "Large limits fetch multiple pages automatically, which "
-             "increases response time and API usage. "
-             "Consider API rate limits and quotas for large requests.",
+        help="Maximum results per provider (default: 1000). "
+             "Use 0 for unlimited (fetch all pages).",
     ),
-] = 100,
+] = 1000,
 enrich: Annotated[
     bool,
     typer.Option(
@@ -533,16 +532,16 @@ pub_type: Annotated[
 We import the [[Search]] class from the core module and execute the query.
 The results are then passed to the appropriate formatter.
 
-Since providers now automatically paginate to fetch results beyond their per-request
-limits, users can request any number of results.
-However, large limits have trade-offs: each page requires an additional API call,
-which increases response time and consumes API quotas.
-We warn users when requesting more than 500 results to make them aware of these
-considerations:
+Since providers automatically paginate to fetch results beyond their per-request
+limits, users can request more than a single page of results.
+The [[--limit/-l]] option controls the maximum results per provider, and
+[[--limit 0]] fetches all available pages.
+Large (or unlimited) searches may take time and consume API quotas, but the
+provider implementations handle paging and rate limiting automatically:
 
 <<execute search and display results>>=
 from scholar import Search, SearchFilters
-from scholar.providers import get_default_providers, get_provider_limits
+from scholar.providers import get_default_providers
 import sys
 
 # Determine which providers will be used
@@ -551,26 +550,12 @@ if provider is None:
 else:
     provider_names = provider
 
+effective_limit = 10**9 if limit == 0 else limit
+limit_label = "unlimited" if limit == 0 else str(limit)
+
 logger.info(f"Searching with providers: {', '.join(provider_names)}")
 logger.debug(f"Search query: '{query}'")
-logger.debug(f"Limit per provider: {limit}")
-
-# Warn about provider limits
-limits = get_provider_limits()
-for pname in provider_names:
-    max_limit = limits.get(pname)
-    if max_limit is not None and limit > max_limit:
-        logger.warning(
-            f"{pname} caps results at {max_limit} (requested {limit})"
-        )
-
-# Warn about large limits that may consume API quotas or trigger rate limits
-if limit > 500:
-    logger.warning(
-        f"Large limit ({limit}) requested. "
-        "This requires multiple API calls per provider, "
-        "which may be slow and consume API quotas."
-    )
+logger.debug(f"Limit per provider: {limit_label}")
 
 # Build search filters from CLI options
 filters = None
@@ -584,7 +569,7 @@ if any([year, open_access, venue, min_citations is not None, pub_type]):
     )
 
 s = Search(query)
-results = s.execute(providers=provider, limit=limit, filters=filters)
+results = s.execute(providers=provider, limit=effective_limit, filters=filters)
 
 logger.debug(f"Retrieved {len(results)} result sets")
 
@@ -709,6 +694,454 @@ if enrich and merged_results:
             )
 @
 
+
+\section{Research Questions}
+
+The [[rq]] command starts from a research question rather than a fixed search
+string.
+It uses an LLM to translate the question into provider-specific search queries,
+executes those searches, and then labels a subset of the results with
+keep/discard decisions and themes/motivations.
+
+The command is designed for iterative work:
+\begin{description}
+\item[Search] Generate one query per provider and fetch results.
+\item[Label] Classify the first [[--count]] papers with the LLM.
+\item[Review] The saved session can be opened later with [[scholar sessions resume]].
+\end{description}
+
+We include the same filter options as [[search]], so users can constrain results
+by year, venue, open access, citation counts, and publication type.
+
+<<rq command>>=
+@app.command()
+def rq(
+    research_question: Annotated[
+        str | None,
+        typer.Argument(
+            help="Research question (omit to write in $EDITOR).",
+        ),
+    ] = None,
+    provider: Annotated[
+        Optional[list[str]],
+        typer.Option(
+            "--provider",
+            "-p",
+            help="Provider to query. Repeatable. Default: all available providers.",
+            autocompletion=complete_provider,
+        ),
+    ] = None,
+    name: Annotated[
+        Optional[str],
+        typer.Option(
+            "--name",
+            "-n",
+            help="Session name for persistence. Defaults to derived from the research question.",
+        ),
+    ] = None,
+    limit: Annotated[
+        int,
+        typer.Option(
+            "--limit",
+            "-l",
+            help="Maximum results per provider (default: 1000). Use 0 for unlimited.",
+        ),
+    ] = 1000,
+    count: Annotated[
+        int,
+        typer.Option(
+            "--count",
+            help="Number of papers to label with the LLM (default: 20).",
+        ),
+    ] = 20,
+    model: Annotated[
+        str | None,
+        typer.Option(
+            "--model",
+            "-m",
+            help="LLM model to use (uses llm default if not specified).",
+        ),
+    ] = None,
+    no_enrich: Annotated[
+        bool,
+        typer.Option(
+            "--no-enrich",
+            help="Skip automatic enrichment of papers without abstracts.",
+        ),
+    ] = False,
+    <<search filter options>>
+) -> None:
+    """
+    Research-question driven search with LLM query generation and labeling.
+
+    The research question becomes the session's research context, and provider-
+    specific queries are recorded in [[query_provider_pairs]] for
+    reproducibility.
+
+    Examples:
+        scholar rq "How do LLMs support novice programming?" -p openalex -p dblp
+        scholar rq --year 2020- --open-access --count 20
+        scholar rq "..." --limit 0  # Fetch all pages
+    """
+    <<execute rq workflow>>
+@
+
+\subsection{Executing an RQ workflow}
+
+We treat [[--limit 0]] as \enquote{unlimited} by passing a very large limit to
+provider implementations.
+This avoids changing provider signatures while still enabling a fully paged
+search.
+
+<<execute rq workflow>>=
+from datetime import datetime
+import json
+import re
+
+from scholar import SearchFilters
+from scholar.providers import get_default_providers, get_provider
+from scholar.scholar import SearchResult
+from scholar.review import create_review_session, save_session
+from scholar.llm_review import (
+    classify_papers_with_llm,
+    apply_llm_decisions,
+    get_review_statistics,
+)
+
+console = Console()
+
+<<generate provider queries>>
+<<resolve research question>>
+
+# Determine which providers will be used
+if provider is None:
+    provider_names = [p.name for p in get_default_providers()]
+else:
+    provider_names = provider
+
+if not provider_names:
+    console.print("[red]No providers available[/red]")
+    raise typer.Exit(1)
+
+# Build search filters from CLI options
+filters = None
+if any([year, open_access, venue, min_citations is not None, pub_type]):
+    filters = SearchFilters(
+        year=year,
+        open_access=open_access,
+        venue=venue,
+        min_citations=min_citations,
+        pub_types=pub_type,
+    )
+
+# Convert CLI limit to an effective provider limit
+effective_limit = 10**9 if limit == 0 else limit
+
+# Generate provider-specific search queries using LLM
+provider_queries = generate_provider_queries(rq_text, provider_names, model)
+
+# Execute the searches
+results: list[SearchResult] = []
+timestamp = datetime.now().isoformat()
+for pname in provider_names:
+    p = get_provider(pname)
+    if p is None:
+        continue
+
+    q = provider_queries.get(pname, rq_text)
+    papers = p.search(q, limit=effective_limit, filters=filters)
+    results.append(
+        SearchResult(
+            query=q,
+            provider=pname,
+            timestamp=timestamp,
+            papers=papers,
+            filters=filters.as_dict() if filters else None,
+        )
+    )
+
+if not results:
+    console.print("[yellow]No results returned[/yellow]")
+    raise typer.Exit(0)
+
+# Derive session name if not provided
+if name is None:
+    safe_name = "".join(
+        c if c.isalnum() or c in "-_" else "_" for c in rq_text[:30]
+    )
+    name = f"rq_{safe_name}" if safe_name else "rq"
+
+# Create a review session from the multi-provider results
+session = create_review_session(results, rq_text, session_name=name)
+session.research_context = rq_text
+
+# Label the first N pending papers using the LLM
+try:
+    batch = classify_papers_with_llm(
+        session=session,
+        count=count,
+        model_id=model,
+        enrich_missing=not no_enrich,
+        require_examples=False,
+    )
+    updated = apply_llm_decisions(session, batch)
+except ValueError as e:
+    console.print(f"[red]Error: {e}[/red]")
+    raise typer.Exit(1)
+except ImportError as e:
+    console.print(f"[red]{e}[/red]")
+    raise typer.Exit(1)
+
+session_path = save_session(session)
+stats = get_review_statistics(session)
+
+console.print(f"[green]Saved session:[/green] {session_path}")
+console.print(f"  Total papers: {stats['total']}")
+console.print(f"  Labeled by LLM: {len(updated)}")
+console.print(f"  Pending: {stats['pending']}")
+@
+
+\subsection{Resolving the research question}
+
+If the user doesn't provide a research question on the command line, we open the
+editor to let them write a multi-line question.
+We strip comment lines (starting with [[#]]) so users can leave notes in the
+buffer.
+
+<<resolve research question>>=
+if research_question is None:
+    template = (
+        "# Write your research question below. Lines starting with # are ignored.\n"
+        "\n"
+    )
+    edited = typer.edit(template) or ""
+    lines = [
+        line
+        for line in edited.splitlines()
+        if not line.strip().startswith("#")
+    ]
+    rq_text = "\n".join(lines).strip()
+else:
+    rq_text = research_question.strip()
+
+if not rq_text:
+    console.print("[red]Research question cannot be empty[/red]")
+    raise typer.Exit(1)
+@
+
+\subsection{Generating provider queries}
+
+We ask the LLM to generate one query per provider.
+To keep parsing robust, we require JSON output.
+
+<<generate provider queries>>=
+def generate_provider_queries(
+    rq_text: str,
+    provider_names: list[str],
+    model_id: str | None,
+) -> dict[str, str]:
+    try:
+        import llm
+    except ImportError:
+        raise ImportError(
+            "The 'llm' package is required for 'rq'. "
+            "Install it with: pip install llm"
+        )
+
+    model_obj = llm.get_model(model_id) if model_id else llm.get_model()
+
+    rules = {
+        "s2": (
+            "Semantic Scholar: plain keywords and quoted phrases are fine; "
+            "avoid provider-specific field prefixes."
+        ),
+        "openalex": (
+            "OpenAlex: natural-language keywords work well; use UPPERCASE "
+            "AND/OR/NOT if you include boolean operators."
+        ),
+        "dblp": (
+            "DBLP: no OR/NOT support; space-separated terms behave like AND; "
+            "keep it simple (keywords/phrases only)."
+        ),
+        "wos": (
+            "Web of Science: use UPPERCASE boolean operators; if you include "
+            "field tags use TS=(...), TI=(...), AU=(...). Prefer TS=(...)."
+        ),
+        "ieee": (
+            "IEEE Xplore: supports boolean operators; keep query concise; "
+            "avoid field-tag syntax."
+        ),
+        "arxiv": (
+            "arXiv: supports boolean operators; avoid adding category filters "
+            "(cat:) because --venue handles that separately."
+        ),
+    }
+
+    rule_lines = [
+        f"- {p}: {rules[p]}" for p in provider_names if p in rules
+    ]
+    rules_text = "\n".join(rule_lines)
+
+    prompt = (
+        "You generate search queries for academic literature databases.\n"
+        "Given this research question, generate one concise query per provider.\n\n"
+        "Important: Do NOT include year ranges, venue names, open access, "
+        "citation counts, or publication types in the query text; those are "
+        "handled separately via CLI filters.\n\n"
+        f"Research question:\n{rq_text}\n\n"
+        f"Providers: {', '.join(provider_names)}\n\n"
+        "Provider-specific query rules:\n"
+        f"{rules_text}\n\n"
+        "Return JSON in exactly this format:\n"
+        "{\"queries\":[{\"provider\":\"openalex\",\"query\":\"...\"}, ...]}\n"
+    )
+
+    response = model_obj.prompt(prompt)
+    text = response.text()
+
+    # Extract JSON from possible markdown fences
+    match = re.search(
+        r"```(?:json)?\s*(\{.*?\})\s*```", text, re.DOTALL
+    )
+    json_str = match.group(1) if match else text
+
+    try:
+        data = json.loads(json_str)
+    except json.JSONDecodeError:
+        # Fallback: try to find any JSON object
+        match = re.search(r"\{.*\}", text, re.DOTALL)
+        if not match:
+            raise ValueError("LLM did not return valid JSON for queries")
+        data = json.loads(match.group(0))
+
+    queries: dict[str, str] = {}
+    if (
+        isinstance(data, dict)
+        and "queries" in data
+        and isinstance(data["queries"], list)
+    ):
+        for item in data["queries"]:
+            pname = str(item.get("provider", "")).strip()
+            q = str(item.get("query", "")).strip()
+            if pname and q:
+                queries[pname] = q
+    elif isinstance(data, dict):
+        # Allow mapping form: {"openalex": "...", ...}
+        for pname, q in data.items():
+            if isinstance(q, str) and q.strip():
+                queries[str(pname)] = q.strip()
+
+    # Fill missing providers with a simple fallback query
+    for pname in provider_names:
+        if pname not in queries:
+            queries[pname] = rq_text.splitlines()[0][:200]
+
+    return queries
+@
+
+\subsection{Testing the rq command}
+
+We test the full RQ workflow by mocking providers and the [[llm]] package.
+The test disables enrichment to avoid any external API calls.
+
+<<test functions>>=
+class TestRQCommand:
+    """Tests for the rq command."""
+
+    def test_rq_runs_and_saves_session(self, tmp_path, monkeypatch):
+        """rq generates queries, searches, labels, and saves a session."""
+        import json
+        import sys
+        import types
+
+        from scholar import providers
+
+        monkeypatch.setenv("SCHOLAR_DATA_DIR", str(tmp_path))
+
+        mock_provider = Mock()
+        mock_provider.name = "mock"
+        mock_provider.is_available.return_value = True
+        mock_provider.search.return_value = [
+            Paper(
+                title="Test Paper",
+                authors=["Alice"],
+                year=2024,
+                doi="10.1234/test",
+                abstract="Abstract.",
+                sources=["mock"],
+            )
+        ]
+        monkeypatch.setattr(providers, "PROVIDERS", {"mock": mock_provider})
+
+        class DummyResponse:
+            def __init__(self, text: str):
+                self._text = text
+
+            def text(self) -> str:
+                return self._text
+
+        class DummyModel:
+            model_id = "dummy"
+
+            def __init__(self):
+                self._calls = 0
+
+            def prompt(self, prompt: str):
+                self._calls += 1
+                if "Papers to Classify" in prompt:
+                    return DummyResponse(
+                        json.dumps(
+                            {
+                                "classifications": [
+                                    {
+                                        "paper_index": 0,
+                                        "decision": "kept",
+                                        "tags": ["theme"],
+                                        "confidence": 0.9,
+                                        "reasoning": "Relevant.",
+                                    }
+                                ]
+                            }
+                        )
+                    )
+                return DummyResponse(
+                    json.dumps(
+                        {
+                            "queries": [
+                                {"provider": "mock", "query": "test query"}
+                            ]
+                        }
+                    )
+                )
+
+        llm_mod = types.ModuleType("llm")
+        llm_mod.get_model = lambda model_id=None: DummyModel()  # noqa: E731
+        sys.modules["llm"] = llm_mod
+
+        rq_text = "How do we test rq?"
+        result = runner.invoke(
+            app,
+            [
+                "rq",
+                rq_text,
+                "--provider",
+                "mock",
+                "--count",
+                "1",
+                "--no-enrich",
+            ],
+        )
+        assert result.exit_code == 0
+
+        safe = "".join(c if c.isalnum() or c in "-_" else "_" for c in rq_text[:30])
+        session_file = tmp_path / "review_sessions" / f"rq_{safe}.json"
+        assert session_file.exists()
+
+        data = json.loads(session_file.read_text(encoding="utf-8"))
+        assert data["research_context"] == rq_text
+        assert ("test query", "mock") in [tuple(x) for x in data["query_provider_pairs"]]
+        assert data["decisions"][0]["source"] == "llm"
+@
 
 \section{Enriching Papers}
 
