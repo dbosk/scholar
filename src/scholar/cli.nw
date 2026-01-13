@@ -12,6 +12,10 @@ The CLI exposes every major Scholar capability as a subcommand:
 \begin{description}
 \item[[scholar search]] Query multiple databases, with options for output
   format and interactive review.
+\item[[scholar rq]] Start from a research question.
+  Uses an LLM to generate provider-specific search queries, runs those searches
+  with the same filter options as [[search]], and can label an initial batch of
+  papers.
 \item[[scholar sessions]] Manage saved review sessions: list, resume, export.
 \item[[scholar providers]] Show available search providers and their
   configuration status.
@@ -23,9 +27,9 @@ The CLI exposes every major Scholar capability as a subcommand:
 \end{description}
 
 This chapter presents the implementation of each command.
-We start with the core search command, then cover utility commands (enrich,
-providers, cache, pdf, notes), session management, and finally LLM-assisted
-review.
+We start with the core search commands ([[search]] and [[rq]]), then cover
+utility commands (enrich, providers, cache, pdf, notes), session management,
+and finally LLM-assisted review.
 
 
 \section{Design decisions}
@@ -38,8 +42,9 @@ We use Typer for the CLI framework because it provides:
 \end{itemize}
 
 The CLI is organized as subcommands to prepare for future extensions.
-Currently, we have the [[search]] command; later we will add [[snowball]] and
-[[tuxedo]] as git submodules that register their own commands.
+Currently, the core commands are [[search]] and [[rq]].
+Later we will add [[snowball]] and [[tuxedo]] as git submodules that register
+their own commands.
 
 
 \section{Module structure}
@@ -154,6 +159,7 @@ def callback(
     Scholar: A tool for structured literature searches.
 
     Use 'scholar search' to query bibliographic databases.
+    Use 'scholar rq' to start from a research question.
     """
     <<configure logging>>
 @
