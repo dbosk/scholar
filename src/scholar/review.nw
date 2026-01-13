@@ -2146,6 +2146,7 @@ def generate_latex_report(session: ReviewSession, output_path: Path) -> None:
     
     The report includes:
     - Search parameters (query, providers, date)
+    - Research context (if available)
     - Summary statistics
     - Kept papers grouped by theme
     - Discarded papers grouped by motivation
@@ -2322,7 +2323,14 @@ def generate_latex_report(session: ReviewSession, output_path: Path) -> None:
             f"\\item[Providers] {', '.join(session.providers)}",
             r"\end{description}",
         ])
-    
+
+    if session.research_context:
+        lines.extend([
+            r"\subsection{Research Context}",
+        ])
+        lines.extend(markdown_to_latex(session.research_context).splitlines())
+        lines.append(r"")
+
     lines.extend([
         r"\begin{description}",
         f"\\item[Date] {session.timestamp.strftime('%Y-%m-%d %H:%M')}",
@@ -2569,7 +2577,7 @@ class TestReportGeneration:
     def test_generate_report_with_motivations(self, tmp_path):
         """Report groups discarded papers by motivation."""
         paper = Paper(title="Discarded Paper", authors=["Author"], year=2024)
-        
+
         session = ReviewSession(
             query="test",
             providers=["test"],
@@ -2577,17 +2585,45 @@ class TestReportGeneration:
         )
         session.decisions = [
             ReviewDecision(
-                paper=paper, provider="test",
-                status=DecisionStatus.DISCARDED, tags=["off-topic"]
+                paper=paper,
+                provider="test",
+                status=DecisionStatus.DISCARDED,
+                tags=["off-topic"],
             ),
         ]
-        
+
         output_path = tmp_path / "report.tex"
         generate_latex_report(session, output_path)
-        
+
         content = output_path.read_text()
         assert r"\section{Discarded Papers}" in content
         assert r"\subsection{off-topic}" in content
+
+    def test_report_includes_research_context(self, tmp_path):
+        """Report includes research context when present."""
+        paper = Paper(title="Paper", authors=["Author"], year=2024)
+
+        session = ReviewSession(
+            query="test",
+            providers=["test"],
+            timestamp=datetime.now(),
+            research_context="This is the research context.",
+        )
+        session.decisions = [
+            ReviewDecision(
+                paper=paper,
+                provider="test",
+                status=DecisionStatus.KEPT,
+                tags=["ml"],
+            ),
+        ]
+
+        output_path = tmp_path / "report.tex"
+        generate_latex_report(session, output_path)
+
+        content = output_path.read_text()
+        assert r"\subsection{Research Context}" in content
+        assert "This is the research context." in content
 
     def test_escapes_special_characters(self, tmp_path):
         """Special characters are escaped in report."""
