@@ -751,10 +751,9 @@ from rich.progress import Progress
 console = Console()
 
 # Load the session
-try:
-    session_data = load_session(session)
-except FileNotFoundError:
-    console.print(f"[red]Session '{session}' not found.[/red]")
+session_data = load_session(session)
+if session_data is None:
+    console.print(f"Session not found: {session}")
     raise typer.Exit(1)
 
 # Extract papers from decisions
