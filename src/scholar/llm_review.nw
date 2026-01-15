@@ -92,6 +92,7 @@ from datetime import datetime
 from unittest.mock import Mock, patch, MagicMock
 
 from scholar.llm_review import *
+from scholar.cache import save_all_caches
 from scholar.llm_review import _format_paper_for_prompt, _collect_available_tags
 from scholar.review import (
     ReviewSession, ReviewDecision, DecisionStatus, ReviewSource
@@ -113,10 +114,12 @@ the user wants to use OpenAI, Anthropic, local models, or other providers.
 from dataclasses import dataclass, field
 from datetime import datetime
 from typing import Any
+import hashlib
 import json
 import logging
 import re
 
+from scholar.cache import load_cache, register_cache
 from scholar.review import (
     ReviewSession, ReviewDecision, DecisionStatus, ReviewSource
 )
@@ -1731,6 +1734,12 @@ SYNTHESIS_SECTION_END = "===SECTION_END==="
 SYNTHESIS_SUMMARY_START = "===SUMMARY_START==="
 SYNTHESIS_SUMMARY_END = "===SUMMARY_END==="
 
+SYNTHESIS_CACHE_VERSION = "v1"
+SYNTHESIS_THEME_CACHE = load_cache("llm_synthesis_theme")
+SYNTHESIS_CONCLUSION_CACHE = load_cache("llm_synthesis_conclusion")
+register_cache("llm_synthesis_theme", SYNTHESIS_THEME_CACHE)
+register_cache("llm_synthesis_conclusion", SYNTHESIS_CONCLUSION_CACHE)
+
 
 @dataclass
 class ThemeSectionResult:
@@ -1972,7 +1981,100 @@ class TestSynthesisCitationKeys:
 We format papers with their citation keys, titles, authors, abstracts, and
 assigned themes so the LLM can reference them properly.
 
+The same paper metadata should also invalidate cached synthesis output.
+We therefore keep a separate fingerprint function that includes only the
+fields that are prompt-relevant.
+
 <<llm review synthesis>>=
+<<synthesis caching helpers>>
+<<synthesis prompt paper formatting>>
+
+
+<<synthesis prompt paper formatting>>=
+def _paper_cache_fingerprint(paper: Paper) -> dict[str, Any]:
+    """Return a deterministic JSON-serializable paper fingerprint."""
+    return {
+        "title": paper.title or "",
+        "authors": paper.authors or [],
+        "year": paper.year or "",
+        "abstract": paper.abstract or "",
+        "venue": paper.venue or "",
+        "doi": paper.doi or "",
+        "url": paper.url or "",
+    }
+@
+
+<<synthesis caching helpers>>=
+def _decision_cache_fingerprint(decision: ReviewDecision) -> dict[str, Any]:
+    """Return a deterministic fingerprint for cache invalidation."""
+    from scholar.notes import get_paper_id
+
+    paper_id = get_paper_id(decision.paper)
+    return {
+        "paper_id": paper_id,
+        "paper": _paper_cache_fingerprint(decision.paper),
+        "tags": sorted(decision.tags),
+    }
+
+
+def _hash_cache_payload(payload: dict[str, Any]) -> str:
+    """Hash a JSON payload into a stable cache key."""
+    raw = json.dumps(payload, sort_keys=True, ensure_ascii=True)
+    return hashlib.sha256(raw.encode("utf-8")).hexdigest()
+
+
+def _theme_cache_key(
+    *,
+    theme: str | None,
+    decisions: list[ReviewDecision],
+    research_context: str,
+    model_id: str,
+    output_format: str,
+) -> str:
+    fingerprints = [_decision_cache_fingerprint(d) for d in decisions]
+    fingerprints.sort(key=lambda d: d["paper_id"])
+
+    payload = {
+        "version": SYNTHESIS_CACHE_VERSION,
+        "kind": "theme",
+        "theme": theme,
+        "research_context": research_context,
+        "model_id": model_id,
+        "output_format": output_format,
+        "papers": fingerprints,
+    }
+    return _hash_cache_payload(payload)
+
+
+def _conclusion_cache_key(
+    *,
+    theme_sections: list[ThemeSectionResult],
+    theme_cache_keys: list[str],
+    research_context: str,
+    model_id: str,
+    output_format: str,
+) -> str:
+    summaries = [
+        {
+            "theme": section.theme,
+            "summary": section.summary,
+        }
+        for section in theme_sections
+    ]
+
+    payload = {
+        "version": SYNTHESIS_CACHE_VERSION,
+        "kind": "conclusion",
+        "research_context": research_context,
+        "model_id": model_id,
+        "output_format": output_format,
+        "theme_cache_keys": theme_cache_keys,
+        "theme_summaries": summaries,
+    }
+    return _hash_cache_payload(payload)
+@
+
+<<synthesis prompt paper formatting>>=
 def _format_paper_for_synthesis(
     decision: ReviewDecision,
     citation_key: str,
@@ -2022,6 +2124,64 @@ def _format_paper_for_synthesis(
 @
 
 
+\subsection{Caching synthesis results}
+
+Synthesis generation can be expensive, especially when each theme section is
+computed in a separate LLM round.
+To support iterative writing and avoid repeated LLM calls, we cache:
+\begin{description}
+\item[Theme sections] A cache entry per theme (or an unthemed synthesis).
+\item[Conclusion] A cache entry keyed by the research question and the theme
+  summaries.
+\end{description}
+
+We reuse the project's existing persistent cache layer:
+entries are stored as pickled dictionaries under the standard cache directory
+([[SCHOLAR_CACHE_DIR]] can override it).
+The cache is initialized at import time for simplicity; the overhead is small
+(a few dictionaries) while it avoids repeated LLM calls.
+
+\subsubsection{Why include paper content?}
+
+A naive cache key could include only stable identifiers (paper IDs and theme
+names).
+That is insufficient because enrichment can change prompt content without
+changing identifiers.
+For example, if an abstract is fetched after the first synthesis run, the prompt
+changes and we must regenerate.
+
+Our cache keys therefore incorporate a fingerprint of every paper's
+prompt-relevant content (title, authors, year, venue, DOI, URL, abstract) and
+all tags used for theme grouping.
+The key also includes the effective model identifier and output format, so
+switching model or choosing Markdown vs \LaTeX{} creates a separate cache entry.
+
+\subsubsection{Cache key example}
+
+We hash a JSON payload to produce a stable cache key.
+
+This uses the [[minted]] package in the generated documentation.
+
+\begin{minted}{json}
+{
+  "kind": "theme",
+  "theme": "privacy",
+  "research_context": "...",
+  "model_id": "gpt-4o-mini",
+  "output_format": "markdown",
+  "papers": [
+    {
+      "paper_id": "doi:10.1234/test",
+      "tags": ["privacy"],
+      "paper": {
+        "title": "...",
+        "abstract": "..."
+      }
+    }
+  ]
+}
+\end{minted}
+
 \subsection{Multi-round Prompt Construction}
 
 A single-prompt synthesis that includes all papers can easily exceed the
@@ -2045,7 +2205,7 @@ We then extract the section text and a short summary for the conclusion round.
 
 A theme-level response is expected to contain two blocks, one with the section
 text and one with a short summary:
-\begin{verbatim}
+\begin{minted}{text}
 ===SECTION_START===
 ### privacy
 
@@ -2055,7 +2215,7 @@ The literature identifies ... [Smith, 2024].
 ===SUMMARY_START===
 Privacy work since 2020 primarily focuses on ... [Smith, 2024].
 ===SUMMARY_END===
-\end{verbatim}
+\end{minted}
 
 Without explicit markers, we would have to guess where the section ends and
 where the summary begins.
@@ -2810,22 +2970,54 @@ def generate_literature_synthesis(
 
     # Import llm and call
     try:
-        import llm
+        import llm as llm_module
     except ImportError:
         raise ImportError(
             "The 'llm' package is required for synthesis. "
             "Install it with: pip install llm"
         )
 
+    llm = globals().get("llm", llm_module)
     model = llm.get_model(model_id) if model_id else llm.get_model()
+    effective_model_id = model.model_id
     logger.info(
         f"Generating multi-round synthesis from {len(kept_decisions)} papers "
-        f"with {model.model_id}"
+        f"with {effective_model_id}"
     )
 
     theme_results: list[ThemeSectionResult] = []
+    theme_cache_keys: list[str] = []
     for theme, prompt in theme_prompts:
         group_decisions = groups[theme]
+        cache_key = _theme_cache_key(
+            theme=theme,
+            decisions=group_decisions,
+            research_context=session.research_context,
+            model_id=effective_model_id,
+            output_format=output_format,
+        )
+        theme_cache_keys.append(cache_key)
+
+        cached = SYNTHESIS_THEME_CACHE.get(cache_key)
+        if isinstance(cached, dict):
+            logger.info(
+                "synthesis: Cache hit for theme "
+                f"{theme if theme is not None else 'UNTHEMED'}"
+            )
+            theme_results.append(
+                ThemeSectionResult(
+                    theme=cached.get("theme"),
+                    section=cached.get("section", ""),
+                    summary=cached.get("summary", ""),
+                    paper_count=cached.get("paper_count", len(group_decisions)),
+                )
+            )
+            continue
+
+        logger.info(
+            "synthesis: Cache miss for theme "
+            f"{theme if theme is not None else 'UNTHEMED'}"
+        )
         response = model.prompt(prompt)
         parsed = parse_theme_section_response(
             response.text(),
@@ -2834,22 +3026,44 @@ def generate_literature_synthesis(
             paper_count=len(group_decisions),
         )
         theme_results.append(parsed)
+        SYNTHESIS_THEME_CACHE[cache_key] = {
+            "theme": parsed.theme,
+            "section": parsed.section,
+            "summary": parsed.summary,
+            "paper_count": parsed.paper_count,
+        }
 
     # Conclusion round based on summaries.
-    conclusion_prompt = build_conclusion_prompt(
-        research_context=session.research_context,
+    conclusion_cache_key = _conclusion_cache_key(
         theme_sections=theme_results,
+        theme_cache_keys=theme_cache_keys,
+        research_context=session.research_context,
+        model_id=effective_model_id,
         output_format=output_format,
     )
-    conclusion_response = model.prompt(conclusion_prompt)
-    conclusion_text = _extract_marked_block(
-        conclusion_response.text(),
-        SYNTHESIS_SECTION_START,
-        SYNTHESIS_SECTION_END,
-    )
-    if conclusion_text is None:
-        conclusion_text = conclusion_response.text().strip()
-    conclusion_text = _strip_conclusion_heading(conclusion_text, output_format)
+    cached_conclusion = SYNTHESIS_CONCLUSION_CACHE.get(conclusion_cache_key)
+    if isinstance(cached_conclusion, dict) and cached_conclusion.get("conclusion"):
+        logger.info("synthesis: Cache hit for conclusion")
+        conclusion_text = str(cached_conclusion.get("conclusion"))
+    else:
+        logger.info("synthesis: Cache miss for conclusion")
+        conclusion_prompt = build_conclusion_prompt(
+            research_context=session.research_context,
+            theme_sections=theme_results,
+            output_format=output_format,
+        )
+        conclusion_response = model.prompt(conclusion_prompt)
+        conclusion_text = _extract_marked_block(
+            conclusion_response.text(),
+            SYNTHESIS_SECTION_START,
+            SYNTHESIS_SECTION_END,
+        )
+        if conclusion_text is None:
+            conclusion_text = conclusion_response.text().strip()
+        conclusion_text = _strip_conclusion_heading(conclusion_text, output_format)
+        SYNTHESIS_CONCLUSION_CACHE[conclusion_cache_key] = {
+            "conclusion": conclusion_text,
+        }
 
     # Build references list and assemble final output.
     references: list[dict[str, Any]] = []
@@ -2891,9 +3105,12 @@ def generate_literature_synthesis(
             total_kept_papers=total_kept_papers,
         )
 
+    # Persist final output too, since it's cheap and avoids re-assembly.
+    SYNTHESIS_CONCLUSION_CACHE[conclusion_cache_key]["assembled"] = synthesis_text
+
     return SynthesisResult(
         synthesis=synthesis_text,
-        model_id=model.model_id,
+        model_id=effective_model_id,
         timestamp=datetime.now().isoformat(),
         paper_count=len(kept_decisions),
         themes=themes,
@@ -3011,4 +3228,183 @@ class TestSynthesisOrchestration:
         result = generate_literature_synthesis(session, dry_run=True)
 
         assert "UNTHEMED" in result
+
+
+class TestSynthesisCaching:
+    def test_synthesis_cache_persists_to_disk(self, tmp_path, monkeypatch):
+        """Theme and conclusion caches are persisted via the cache module."""
+        import importlib
+        import scholar.llm_review as llm_review
+
+        monkeypatch.setenv("SCHOLAR_CACHE_DIR", str(tmp_path))
+
+        llm_review = importlib.reload(llm_review)
+        llm_review.SYNTHESIS_THEME_CACHE.clear()
+        llm_review.SYNTHESIS_CONCLUSION_CACHE.clear()
+
+        llm_review.SYNTHESIS_THEME_CACHE["k"] = {
+            "theme": "privacy",
+            "section": "sec",
+            "summary": "sum",
+            "paper_count": 1,
+        }
+        llm_review.SYNTHESIS_CONCLUSION_CACHE["c"] = {
+            "conclusion": "con",
+            "assembled": "assembled",
+        }
+
+        save_all_caches()
+
+        llm_review = importlib.reload(llm_review)
+        assert llm_review.SYNTHESIS_THEME_CACHE.get("k")
+        assert llm_review.SYNTHESIS_CONCLUSION_CACHE.get("c")
+
+    def test_synthesis_uses_cache_on_second_run(self, monkeypatch):
+        session = ReviewSession(
+            query="test",
+            providers=["test"],
+            timestamp=datetime.now(),
+            research_context="Test question",
+        )
+        paper = Paper(
+            title="Privacy in ML",
+            authors=["Alice Smith"],
+            year=2024,
+            abstract="This paper studies privacy.",
+        )
+        session.decisions.append(
+            ReviewDecision(
+                paper=paper,
+                provider="test",
+                status=DecisionStatus.KEPT,
+                tags=["privacy"],
+            )
+        )
+
+        class FakeResponse:
+            def __init__(self, text):
+                self._text = text
+
+            def text(self):
+                return self._text
+
+        class FakeModel:
+            model_id = "fake-model"
+
+            def __init__(self):
+                self.calls = 0
+
+            def prompt(self, prompt):
+                self.calls += 1
+                if "Return your answer in two marked blocks" in prompt:
+                    return FakeResponse(
+                        "===SECTION_START===\n"
+                        "### privacy\n\n"
+                        "Theme synthesis [Smith, 2024].\n"
+                        "===SECTION_END===\n\n"
+                        "===SUMMARY_START===\n"
+                        "Summary [Smith, 2024].\n"
+                        "===SUMMARY_END==="
+                    )
+                return FakeResponse(
+                    "===SECTION_START===\n"
+                    "Conclusion [Smith, 2024].\n"
+                    "===SECTION_END==="
+                )
+
+        fake_model = FakeModel()
+
+        class FakeLLMModule:
+            def get_model(self, _model_id=None):
+                return fake_model
+
+        import scholar.llm_review as llm_review
+
+        monkeypatch.setattr(llm_review, "llm", FakeLLMModule(), raising=False)
+
+        # Ensure empty caches for this test.
+        llm_review.SYNTHESIS_THEME_CACHE.clear()
+        llm_review.SYNTHESIS_CONCLUSION_CACHE.clear()
+
+        result1 = generate_literature_synthesis(session, model_id="fake")
+        calls_after_first = fake_model.calls
+        assert calls_after_first == 2
+
+        result2 = generate_literature_synthesis(session, model_id="fake")
+        assert fake_model.calls == calls_after_first
+        assert result1.synthesis == result2.synthesis
+
+    def test_synthesis_cache_invalidates_on_abstract_change(self, monkeypatch):
+        session = ReviewSession(
+            query="test",
+            providers=["test"],
+            timestamp=datetime.now(),
+            research_context="Test question",
+        )
+        paper = Paper(
+            title="Privacy in ML",
+            authors=["Alice Smith"],
+            year=2024,
+            abstract="Old abstract",
+        )
+        decision = ReviewDecision(
+            paper=paper,
+            provider="test",
+            status=DecisionStatus.KEPT,
+            tags=["privacy"],
+        )
+        session.decisions.append(decision)
+
+        class FakeResponse:
+            def __init__(self, text):
+                self._text = text
+
+            def text(self):
+                return self._text
+
+        class FakeModel:
+            model_id = "fake-model"
+
+            def __init__(self):
+                self.calls = 0
+
+            def prompt(self, prompt):
+                self.calls += 1
+                if "Return your answer in two marked blocks" in prompt:
+                    return FakeResponse(
+                        "===SECTION_START===\n"
+                        "### privacy\n\n"
+                        "Theme synthesis [Smith, 2024].\n"
+                        "===SECTION_END===\n\n"
+                        "===SUMMARY_START===\n"
+                        "Summary [Smith, 2024].\n"
+                        "===SUMMARY_END==="
+                    )
+                return FakeResponse(
+                    "===SECTION_START===\n"
+                    "Conclusion [Smith, 2024].\n"
+                    "===SECTION_END==="
+                )
+
+        fake_model = FakeModel()
+
+        class FakeLLMModule:
+            def get_model(self, _model_id=None):
+                return fake_model
+
+        import scholar.llm_review as llm_review
+
+        monkeypatch.setattr(llm_review, "llm", FakeLLMModule(), raising=False)
+
+        llm_review.SYNTHESIS_THEME_CACHE.clear()
+        llm_review.SYNTHESIS_CONCLUSION_CACHE.clear()
+
+        generate_literature_synthesis(session, model_id="fake")
+        calls_after_first = fake_model.calls
+
+        # Simulate enrichment: abstract changes should invalidate.
+        decision.paper.abstract = "New abstract"
+
+        generate_literature_synthesis(session, model_id="fake")
+        assert fake_model.calls == calls_after_first + 2
 @
