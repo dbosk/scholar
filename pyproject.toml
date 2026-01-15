@@ -1,6 +1,6 @@
 [project]
 name = "scholarcli"
-version = "1.2"
+version = "1.3"
 description = "A tool for structured literature searches across bibliographic databases"
 authors = [{ name = "Daniel Bosk", email = "dbosk@kth.se" },
            { name = "Ric Glassey", email = "glassey@kth.se" }]
