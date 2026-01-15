@@ -512,6 +512,19 @@ The [[get_default_providers]] function returns only providers that are
 currently available.
 We test this behavior:
 
+When testing providers that require API keys, we must use [[monkeypatch]] to
+remove any environment variables that might be set in the developer's
+environment.
+Otherwise, the test would pass or fail depending on whether the developer has
+the API key configured, making the test non-reproducible.
+
+We also need a [[# type: ignore]] comment when re-registering providers like
+[[IEEEXploreProvider]] that don't implement all methods of the
+[[SearchProvider]] protocol (such as [[get_paper_citations]]).
+The protocol includes optional methods that not all providers support, but
+Python's structural typing requires all methods to be present.
+At runtime this works fine due to duck typing.
+
 <<test functions>>=
 class TestDefaultProviders:
     """Tests for get_default_providers functionality."""
@@ -556,7 +569,7 @@ class TestDefaultProviders:
         # Re-register provider without key
         ieee_provider = IEEEXploreProvider(api_key=None)
         ieee_provider.api_key = None
-        register_provider(ieee_provider)
+        register_provider(ieee_provider)  # type: ignore[arg-type]
         defaults = get_default_providers()
         assert "ieee" not in [p.name for p in defaults]
 @
@@ -855,8 +868,15 @@ we can look up the paper directly in Semantic Scholar to get its abstract.
 The API endpoint is [[https://api.semanticscholar.org/graph/v1/paper/DOI:{doi}]].
 We request the same fields as the search API for consistency.
 
+The method signature accepts [[str | None]] rather than just [[str]] because
+callers often have a [[Paper]] object whose [[doi]] field may be [[None]].
+Accepting [[None]] directly and returning [[None]] immediately simplifies
+calling code---they can write [[get_paper_by_doi(paper.doi)]] without first
+checking if [[paper.doi]] is set.
+The tests verify this behavior by passing [[None]] explicitly.
+
 <<semantic scholar get paper by doi>>=
-def get_paper_by_doi(self, doi: str) -> Paper | None:
+def get_paper_by_doi(self, doi: str | None) -> Paper | None:
     """
     Fetch a single paper by its DOI.
 
@@ -1313,6 +1333,8 @@ class TestSemanticScholarGetPaperByDoi:
             paper2 = provider.get_paper_by_doi("10.1234/test")
 
             assert mock_get.call_count == 1  # Only one API call
+            assert paper1 is not None
+            assert paper2 is not None
             assert paper1.title == paper2.title
 
 
@@ -1645,8 +1667,12 @@ def _convert_work(self, work: dict) -> Paper:
 Like Semantic Scholar, we can fetch a single paper by its DOI.
 OpenAlex uses DOI URLs as identifiers, so we query by the full DOI URL.
 
+As with the Semantic Scholar implementation, we accept [[str | None]] to
+simplify calling code that passes [[paper.doi]] without checking for [[None]]
+first.
+
 <<openalex get paper by doi>>=
-def get_paper_by_doi(self, doi: str) -> Paper | None:
+def get_paper_by_doi(self, doi: str | None) -> Paper | None:
     """
     Fetch a single paper by its DOI.
 
@@ -1874,6 +1900,8 @@ class TestOpenAlexGetPaperByDoi:
             paper2 = provider.get_paper_by_doi("10.1234/test")
 
             assert mock_works.return_value.__getitem__.call_count == 1  # Only one API call
+            assert paper1 is not None
+            assert paper2 is not None
             assert paper1.title == paper2.title
 
 
@@ -3220,7 +3248,9 @@ def search_for_citation_report(
         logger.warning("wos: search_for_citation_report failed: %s", e)
         return None
 
-def get_paper_by_doi(self, doi: str) -> Paper | None:
+# Accept str | None to simplify calling code - callers can pass paper.doi
+# without checking for None first (see Semantic Scholar implementation notes).
+def get_paper_by_doi(self, doi: str | None) -> Paper | None:
     """
     Look up a paper by its DOI and return it with WOS metadata.
 
@@ -4595,8 +4625,9 @@ class TestIEEEXploreProvider:
         provider = IEEEXploreProvider(api_key="test_key")
         assert provider.is_available() is True
 
-    def test_search_returns_empty_without_api_key(self):
+    def test_search_returns_empty_without_api_key(self, monkeypatch):
         """search() returns empty list when no API key is configured."""
+        monkeypatch.delenv("IEEE_API_KEY", raising=False)
         provider = IEEEXploreProvider(api_key=None)
         results = provider.search("test")
         assert results == []
@@ -5239,7 +5270,9 @@ class TestArxivProvider:
             nonlocal call_count
             call_count += 1
             if call_count < 3:
-                raise arxiv.HTTPError("http://example.com", 500, "Internal Server Error")
+                # arxiv.HTTPError signature is (url: str, retry: int, status: int),
+                # not (url, status, message) as one might expect.
+                raise arxiv.HTTPError("http://example.com", 0, 500)
             return iter([mock_result])
 
         with patch.object(provider._client, "results", side_effect=mock_results):
