@@ -74,6 +74,7 @@ learning from human-tagged examples in a round-based workflow.
 <<llm review llm interaction>>
 <<llm review decision application>>
 <<llm review statistics>>
+<<llm review synthesis>>
 @
 
 
@@ -1695,4 +1696,1319 @@ class TestStatistics:
         assert stats["pending"] == 1
         assert stats["examples"] == 1
         assert stats["total"] == 7
+@
+
+
+\section{Literature Synthesis}
+\label{sec:literature-synthesis}
+
+After classifying papers, the natural next step is synthesizing the kept papers
+into a coherent narrative that addresses the research question.
+Unlike a simple summary that describes each paper individually, a \emph{synthesis}
+draws connections between papers, identifies patterns, and builds an argument
+about how the literature collectively contributes to answering the research
+question.
+
+The synthesis process uses the same LLM infrastructure as classification but
+with a different prompt structure.
+Instead of asking for binary decisions, we ask the LLM to write prose that:
+\begin{enumerate}
+\item Addresses the research question directly
+\item Organizes discussion by themes (derived from paper tags)
+\item Cites papers using author-year format for every substantive claim
+\item Identifies gaps, consensus, debates, and limitations
+\end{enumerate}
+
+
+\subsection{Synthesis Result}
+
+The [[SynthesisResult]] dataclass captures the output from synthesis generation,
+including metadata about the process.
+
+<<llm review synthesis>>=
+SYNTHESIS_SECTION_START = "===SECTION_START==="
+SYNTHESIS_SECTION_END = "===SECTION_END==="
+SYNTHESIS_SUMMARY_START = "===SUMMARY_START==="
+SYNTHESIS_SUMMARY_END = "===SUMMARY_END==="
+
+
+@dataclass
+class ThemeSectionResult:
+    """
+    Result from generating one theme section of a synthesis.
+
+    Attributes:
+        theme: Theme name, or None for an unthemed synthesis
+        section: Generated section text (Markdown or LaTeX fragment)
+        summary: Short summary used as input to the conclusion round
+        paper_count: Number of papers included in this section
+    """
+
+    theme: str | None
+    section: str
+    summary: str
+    paper_count: int
+
+
+@dataclass
+class SynthesisResult:
+    """
+    Result from literature synthesis generation.
+
+    Attributes:
+        synthesis: The assembled synthesis document
+        model_id: Identifier of the LLM model used
+        timestamp: When the synthesis was generated
+        paper_count: Number of papers included in synthesis
+        themes: Themes used to organize the synthesis
+        references: Paper metadata used to build the bibliography
+        theme_sections: Generated theme sections from multi-round synthesis
+        conclusion: Generated conclusion text (without heading)
+    """
+
+    synthesis: str
+    model_id: str
+    timestamp: str
+    paper_count: int
+    themes: list[str]
+    references: list[dict[str, Any]]
+    theme_sections: list[ThemeSectionResult] = field(default_factory=list)
+    conclusion: str = ""
+@
+
+\subsubsection{Testing data structures}
+
+<<test functions>>=
+class TestSynthesisDataStructures:
+    def test_synthesis_result_creation(self):
+        result = SynthesisResult(
+            synthesis="This is a test synthesis.",
+            model_id="test-model",
+            timestamp="2024-01-01T00:00:00",
+            paper_count=5,
+            themes=["theme1", "theme2"],
+            references=[{"key": "smith2024", "title": "Test"}],
+        )
+        assert result.synthesis == "This is a test synthesis."
+        assert result.paper_count == 5
+        assert len(result.themes) == 2
+@
+
+\subsection{Citation Key Generation}
+
+To keep the tests close to the functionality they verify, we place synthesis
+unit tests throughout this section.
+
+For author-year citations, we generate keys like \enquote{[Smith, 2024]} or
+\enquote{[Smith \& Jones, 2024]} or \enquote{[Smith et al., 2024]} depending
+on the number of authors.
+
+For \LaTeX{} output, we also need BibTeX-style keys like [[smith2024]] for use
+with [[\cite{}]] commands.
+
+<<llm review synthesis>>=
+def _get_author_surname(author: str) -> str:
+    """
+    Extract surname from author name.
+
+    Handles formats like "John Smith", "Smith, John", "J. Smith".
+    """
+    author = author.strip()
+    if "," in author:
+        # "Smith, John" format
+        return author.split(",")[0].strip()
+    parts = author.split()
+    if parts:
+        # "John Smith" or "J. Smith" - take last part
+        return parts[-1]
+    return author
+
+
+def _generate_citation_key(
+    paper: Paper,
+    output_format: str = "markdown",
+) -> tuple[str, str]:
+    """
+    Generate citation key for a paper.
+
+    Args:
+        paper: The paper to generate a key for
+        output_format: "markdown" for [Author, Year] or "latex" for cite key
+
+    Returns:
+        Tuple of (display_key, bibtex_key)
+        - display_key: "[Smith, 2024]" for markdown, "smith2024" for latex
+        - bibtex_key: Always "smith2024" style for reference list
+    """
+    # Get first author surname
+    if paper.authors:
+        first_surname = _get_author_surname(paper.authors[0])
+    else:
+        first_surname = "Unknown"
+
+    year = paper.year or "n.d."
+
+    # Generate BibTeX-style key (always needed for reference list)
+    bibtex_key = f"{first_surname.lower()}{year}".replace(" ", "")
+
+    if output_format == "latex":
+        display_key = bibtex_key
+    else:
+        # Author-year display format
+        if len(paper.authors) == 1:
+            display_key = f"[{first_surname}, {year}]"
+        elif len(paper.authors) == 2:
+            second_surname = _get_author_surname(paper.authors[1])
+            display_key = f"[{first_surname} \\& {second_surname}, {year}]"
+        else:
+            display_key = f"[{first_surname} et al., {year}]"
+
+    return display_key, bibtex_key
+
+
+def _generate_all_citation_keys(
+    decisions: list[ReviewDecision],
+    output_format: str = "markdown",
+) -> dict[str, tuple[str, str]]:
+    """
+    Generate citation keys for all papers.
+
+    Args:
+        decisions: List of kept paper decisions
+        output_format: "markdown" or "latex"
+
+    Returns:
+        Dict mapping paper_id to (display_key, bibtex_key)
+    """
+    from scholar.notes import get_paper_id
+
+    keys: dict[str, tuple[str, str]] = {}
+    seen_bibtex: dict[str, int] = {}
+
+    for decision in decisions:
+        paper_id = get_paper_id(decision.paper)
+        display_key, bibtex_key = _generate_citation_key(
+            decision.paper, output_format
+        )
+
+        # Handle duplicate BibTeX keys by adding suffix
+        if bibtex_key in seen_bibtex:
+            seen_bibtex[bibtex_key] += 1
+            suffix = chr(ord('a') + seen_bibtex[bibtex_key] - 1)
+            bibtex_key = f"{bibtex_key}{suffix}"
+            if output_format == "latex":
+                display_key = bibtex_key
+            else:
+                # Add suffix to display key too
+                display_key = display_key[:-1] + suffix + "]"
+        else:
+            seen_bibtex[bibtex_key] = 1
+
+        keys[paper_id] = (display_key, bibtex_key)
+
+    return keys
+@
+
+\subsubsection{Testing citation keys}
+
+<<test functions>>=
+class TestSynthesisCitationKeys:
+    def test_get_author_surname_simple(self):
+        from scholar.llm_review import _get_author_surname
+
+        assert _get_author_surname("John Smith") == "Smith"
+        assert _get_author_surname("Smith") == "Smith"
+
+    def test_get_author_surname_comma_format(self):
+        from scholar.llm_review import _get_author_surname
+
+        assert _get_author_surname("Smith, John") == "Smith"
+        assert _get_author_surname("van Gogh, Vincent") == "van Gogh"
+
+    def test_generate_citation_key_single_author(self):
+        from scholar.llm_review import _generate_citation_key
+
+        paper = Paper(title="Test", authors=["Alice Smith"], year=2024)
+        display, bibtex = _generate_citation_key(paper, "markdown")
+        assert display == "[Smith, 2024]"
+        assert bibtex == "smith2024"
+
+    def test_generate_citation_key_two_authors(self):
+        from scholar.llm_review import _generate_citation_key
+
+        paper = Paper(
+            title="Test",
+            authors=["Alice Smith", "Bob Jones"],
+            year=2024,
+        )
+        display, bibtex = _generate_citation_key(paper, "markdown")
+        assert "Smith" in display
+        assert "Jones" in display
+        assert bibtex == "smith2024"
+
+    def test_generate_citation_key_many_authors(self):
+        from scholar.llm_review import _generate_citation_key
+
+        paper = Paper(
+            title="Test",
+            authors=["Alice Smith", "Bob Jones", "Carol White"],
+            year=2024,
+        )
+        display, bibtex = _generate_citation_key(paper, "markdown")
+        assert "et al." in display
+        assert bibtex == "smith2024"
+
+    def test_generate_citation_key_latex(self):
+        from scholar.llm_review import _generate_citation_key
+
+        paper = Paper(title="Test", authors=["John Smith"], year=2024)
+        display, bibtex = _generate_citation_key(paper, "latex")
+        assert display == "smith2024"
+        assert bibtex == "smith2024"
+@
+
+\subsection{Paper Formatting for Synthesis Prompt}
+
+We format papers with their citation keys, titles, authors, abstracts, and
+assigned themes so the LLM can reference them properly.
+
+<<llm review synthesis>>=
+def _format_paper_for_synthesis(
+    decision: ReviewDecision,
+    citation_key: str,
+    bibtex_key: str,
+) -> str:
+    """
+    Format a kept paper for inclusion in synthesis prompt.
+
+    Args:
+        decision: The review decision containing the paper
+        citation_key: Display citation key (e.g., "[Smith, 2024]")
+        bibtex_key: BibTeX key (e.g., "smith2024")
+
+    Returns:
+        Formatted string representation
+    """
+    paper = decision.paper
+    lines = [
+        f"### {citation_key} (key: {bibtex_key})",
+        f"**Title:** {paper.title}",
+    ]
+
+    if paper.authors:
+        author_str = ", ".join(paper.authors[:5])
+        if len(paper.authors) > 5:
+            author_str += " et al."
+        lines.append(f"**Authors:** {author_str}")
+
+    if paper.year:
+        lines.append(f"**Year:** {paper.year}")
+
+    if paper.venue:
+        lines.append(f"**Venue:** {paper.venue}")
+
+    if decision.tags:
+        lines.append(f"**Themes:** {', '.join(decision.tags)}")
+
+    if paper.abstract:
+        abstract = paper.abstract
+        if len(abstract) > 1500:
+            abstract = abstract[:1500] + "..."
+        lines.append(f"**Abstract:** {abstract}")
+    else:
+        lines.append("**Abstract:** [Not available]")
+
+    return "\n".join(lines)
+@
+
+
+\subsection{Multi-round Prompt Construction}
+
+A single-prompt synthesis that includes all papers can easily exceed the
+context window of the model.
+To avoid this, we generate the synthesis in multiple rounds:
+\begin{enumerate}
+\item For each theme, generate a focused synthesis subsection using only the
+  papers tagged with that theme.
+\item Generate a final conclusion that connects the theme-level synthesis back
+  to the research question.
+\item Assemble the final document with a provenance section (research question,
+  search parameters, and review statistics), followed by the synthesis,
+  conclusion, and a deterministic reference list.
+\end{enumerate}
+
+To make the intermediate results robust to minor variations in LLM formatting,
+we ask the model to wrap its outputs in explicit marker blocks.
+We then extract the section text and a short summary for the conclusion round.
+
+\subsubsection{Marked output example}
+
+A theme-level response is expected to contain two blocks, one with the section
+text and one with a short summary:
+\begin{verbatim}
+===SECTION_START===
+### privacy
+
+The literature identifies ... [Smith, 2024].
+===SECTION_END===
+
+===SUMMARY_START===
+Privacy work since 2020 primarily focuses on ... [Smith, 2024].
+===SUMMARY_END===
+\end{verbatim}
+
+Without explicit markers, we would have to guess where the section ends and
+where the summary begins.
+
+<<llm review synthesis>>=
+def _extract_marked_block(
+    text: str,
+    start_marker: str,
+    end_marker: str,
+) -> str | None:
+    """Return the text between two markers, or None if not present."""
+    start_index = text.find(start_marker)
+    end_index = text.find(end_marker)
+    if start_index == -1 or end_index == -1 or end_index < start_index:
+        return None
+    start_index += len(start_marker)
+    return text[start_index:end_index].strip()
+
+
+def _fallback_summary(
+    text: str,
+    max_sentences: int = 3,
+    max_chars: int = 600,
+) -> str:
+    """Create a small summary if the LLM omitted summary markers."""
+    flattened = re.sub(r"\s+", " ", text.strip())
+    sentences = re.split(r"(?<=[.!?])\s+", flattened)
+    summary = " ".join(sentences[:max_sentences]).strip()
+    if len(summary) > max_chars:
+        summary = summary[:max_chars].rstrip() + "..."
+    return summary
+
+
+def _strip_conclusion_heading(text: str, output_format: str) -> str:
+    """Strip a Conclusion heading if the model included one."""
+    lines = text.strip().splitlines()
+    if not lines:
+        return ""
+
+    first = lines[0].strip()
+    if output_format == "latex":
+        if first.startswith("\\section{Conclusion}") or first.startswith(
+            "\\subsection{Conclusion}"
+        ):
+            return "\n".join(lines[1:]).lstrip()
+    else:
+        if first.lower().startswith("## conclusion"):
+            return "\n".join(lines[1:]).lstrip()
+
+    return text.strip()
+
+
+def _ensure_theme_heading(
+    text: str,
+    theme: str,
+    output_format: str,
+) -> str:
+    """Ensure the section starts with a theme heading."""
+    stripped = text.lstrip()
+    if output_format == "latex":
+        if stripped.startswith("\\subsection"):
+            return text.strip()
+        return f"\\subsection{{{theme}}}\n" + text.strip()
+
+    if stripped.startswith("###"):
+        return text.strip()
+    return f"### {theme}\n\n" + text.strip()
+
+
+def parse_theme_section_response(
+    response_text: str,
+    theme: str | None,
+    output_format: str,
+    paper_count: int,
+) -> ThemeSectionResult:
+    """Parse an LLM theme section response into section + summary."""
+    section = _extract_marked_block(
+        response_text, SYNTHESIS_SECTION_START, SYNTHESIS_SECTION_END
+    )
+    if section is None:
+        section = response_text.strip()
+
+    summary = _extract_marked_block(
+        response_text, SYNTHESIS_SUMMARY_START, SYNTHESIS_SUMMARY_END
+    )
+    if not summary:
+        summary = _fallback_summary(section)
+
+    if theme is not None:
+        section = _ensure_theme_heading(section, theme, output_format)
+
+    return ThemeSectionResult(
+        theme=theme,
+        section=section,
+        summary=summary,
+        paper_count=paper_count,
+    )
+
+
+def _group_kept_papers_by_theme(
+    kept_decisions: list[ReviewDecision],
+) -> tuple[list[str], dict[str | None, list[ReviewDecision]]]:
+    """Group kept papers by theme; returns (themes, groups)."""
+    themes = sorted({tag for d in kept_decisions for tag in d.tags})
+    if not themes:
+        return [], {None: kept_decisions}
+
+    groups: dict[str | None, list[ReviewDecision]] = {}
+    for theme in themes:
+        groups[theme] = [d for d in kept_decisions if theme in d.tags]
+    return themes, groups
+
+
+def build_theme_section_prompt(
+    theme: str | None,
+    kept_decisions: list[ReviewDecision],
+    research_context: str,
+    citation_keys: dict[str, tuple[str, str]],
+    output_format: str = "markdown",
+) -> str:
+    """Construct a prompt for a single theme (or unthemed) synthesis section."""
+    from scholar.notes import get_paper_id
+
+    sections: list[str] = []
+    sections.append(
+        "You are a research assistant writing part of a literature synthesis "
+        "for a systematic review. Write only the requested synthesis text, "
+        "grounded strictly in the provided papers."
+    )
+    sections.append(f"\n## Research Question\n\n{research_context}")
+
+    if theme is None:
+        sections.append(
+            "\n## Synthesis Focus\n\n"
+            "Write the body text for the Synthesis section. Do not add any "
+            "theme heading."
+        )
+    else:
+        sections.append(
+            "\n## Theme Focus\n\n"
+            f"Write a focused synthesis for the theme: {theme}."
+        )
+
+    sections.append(f"\n## Papers for This Round ({len(kept_decisions)} total)\n")
+    for decision in kept_decisions:
+        paper_id = get_paper_id(decision.paper)
+        display_key, bibtex_key = citation_keys[paper_id]
+        sections.append(
+            _format_paper_for_synthesis(decision, display_key, bibtex_key)
+        )
+        sections.append("")
+
+    if output_format == "latex":
+        cite_instruction = (
+            "Use \\cite{bibtex_key} for citations (e.g., \\cite{smith2024})."
+        )
+        format_note = "Output must be a valid LaTeX fragment (no preamble)."
+        if theme is None:
+            heading_requirement = (
+                "Do not include any \\section or \\subsection heading."
+            )
+            heading_example = ""
+        else:
+            heading_requirement = (
+                "Start the section block with this exact heading on a single line:"
+            )
+            heading_example = f"```latex\n\\subsection{{{theme}}}\n```"
+    else:
+        cite_instruction = (
+            "Use [Author, Year] format for citations (e.g., [Smith, 2024])."
+        )
+        format_note = "Output must be Markdown format."
+        if theme is None:
+            heading_requirement = "Do not include a theme heading."
+            heading_example = ""
+        else:
+            heading_requirement = (
+                "Start the section block with this exact heading on a single line:"
+            )
+            heading_example = f"```markdown\n### {theme}\n```"
+
+    sections.append(
+        f"""
+## Instructions
+
+Write a synthesis section that:
+
+1. **Stays focused** - Use only the papers provided for this round.
+2. **Synthesizes, don't summarize** - Draw connections and compare approaches.
+3. **Uses proper citations** - {cite_instruction} Every substantive claim must cite.
+4. **No references section** - Do not add a reference list.
+
+### Heading Requirement
+
+{heading_requirement}
+{heading_example}
+
+Return your answer in two marked blocks exactly as follows:
+
+{SYNTHESIS_SECTION_START}
+<your synthesis text>
+{SYNTHESIS_SECTION_END}
+
+{SYNTHESIS_SUMMARY_START}
+<2--4 sentence summary for the conclusion round, including citations>
+{SYNTHESIS_SUMMARY_END}
+
+{format_note}
+"""
+    )
+
+    return "\n".join(sections)
+
+
+def build_conclusion_prompt(
+    research_context: str,
+    theme_sections: list[ThemeSectionResult],
+    output_format: str = "markdown",
+) -> str:
+    """Construct a prompt for the final conclusion round."""
+    sections: list[str] = []
+    sections.append(
+        "You are a research assistant writing the conclusion of a literature "
+        "synthesis for a systematic review."
+    )
+    sections.append(f"\n## Research Question\n\n{research_context}")
+
+    sections.append("\n## Theme Summaries\n")
+    for section in theme_sections:
+        label = section.theme if section.theme is not None else "Synthesis"
+        sections.append(f"### {label}\n{section.summary}\n")
+
+    if output_format == "latex":
+        cite_instruction = (
+            "Use \\cite{bibtex_key} for citations (e.g., \\cite{smith2024})."
+        )
+        format_note = "Output must be a valid LaTeX fragment (no preamble)."
+    else:
+        cite_instruction = (
+            "Use [Author, Year] format for citations (e.g., [Smith, 2024])."
+        )
+        format_note = "Output must be Markdown format."
+
+    sections.append(
+        f"""
+## Instructions
+
+Write a conclusion that:
+
+1. **Connects to the research question** - Answer it based on the synthesis.
+2. **Connects across themes** - Compare, contrast, and relate the themes.
+3. **Identifies gaps** - Note limitations and open questions.
+4. **Uses citations** - {cite_instruction}
+5. **No headings** - Do not include a \"Conclusion\" heading.
+6. **No references section** - Do not add a reference list.
+
+Return your answer in a marked block exactly as follows:
+
+{SYNTHESIS_SECTION_START}
+<your conclusion text>
+{SYNTHESIS_SECTION_END}
+
+{format_note}
+"""
+    )
+
+    return "\n".join(sections)
+@
+
+\subsubsection{Testing prompt construction}
+
+<<test functions>>=
+class TestSynthesisPrompts:
+    def test_build_theme_section_prompt_includes_context(self):
+        from scholar.llm_review import (
+            SYNTHESIS_SECTION_START,
+            SYNTHESIS_SUMMARY_START,
+            build_theme_section_prompt,
+            _generate_all_citation_keys,
+        )
+
+        paper = Paper(
+            title="Test Paper",
+            authors=["Alice Smith"],
+            year=2024,
+            abstract="Abstract text.",
+        )
+        decision = ReviewDecision(
+            paper=paper,
+            provider="test",
+            status=DecisionStatus.KEPT,
+            tags=["privacy"],
+        )
+        keys = _generate_all_citation_keys([decision], "markdown")
+        prompt = build_theme_section_prompt(
+            theme="privacy",
+            kept_decisions=[decision],
+            research_context="What are privacy concerns in ML?",
+            citation_keys=keys,
+            output_format="markdown",
+        )
+
+        assert "privacy concerns" in prompt.lower()
+        assert "Test Paper" in prompt
+        assert SYNTHESIS_SECTION_START in prompt
+        assert SYNTHESIS_SUMMARY_START in prompt
+
+    def test_build_conclusion_prompt_includes_summaries(self):
+        from scholar.llm_review import SYNTHESIS_SECTION_START, build_conclusion_prompt
+
+        prompt = build_conclusion_prompt(
+            research_context="What are privacy concerns in ML?",
+            theme_sections=[
+                ThemeSectionResult(
+                    theme="privacy",
+                    section="",
+                    summary="Key point [Smith, 2024].",
+                    paper_count=1,
+                )
+            ],
+            output_format="markdown",
+        )
+
+        assert "Key point" in prompt
+        assert SYNTHESIS_SECTION_START in prompt
+@
+
+\subsection{Main Synthesis Function}
+
+The [[generate_literature_synthesis]] function coordinates the multi-round
+synthesis process:
+\begin{enumerate}
+\item Gather kept papers and citation keys
+\item Group papers by theme (or use an unthemed synthesis if no tags exist)
+\item Generate one synthesis subsection per theme
+\item Generate a conclusion based on the theme summaries
+\item Assemble a full document including provenance and references
+\end{enumerate}
+
+<<llm review synthesis>>=
+def _build_research_question_section_markdown(
+    session: ReviewSession,
+    included_kept_papers: int,
+    total_kept_papers: int,
+) -> str:
+    """Build the provenance section for Markdown output."""
+    lines: list[str] = ["## Research Question", ""]
+
+    lines.extend(["### Search Parameters", ""])
+    if len(session.query_provider_pairs) > 1:
+        lines.append("| Provider | Query |")
+        lines.append("| --- | --- |")
+        for query, provider in session.query_provider_pairs:
+            lines.append(f"| {provider} | {query} |")
+        lines.append("")
+    else:
+        providers = ", ".join(session.providers)
+        lines.append(f"- Query: {session.query}")
+        lines.append(f"- Providers: {providers}")
+        lines.append("")
+
+    if session.research_context:
+        lines.extend(["### Research Context", ""])
+        lines.append(session.research_context)
+        lines.append("")
+
+    lines.extend(["### Summary", ""])
+    lines.append(f"- Date: {session.timestamp.strftime('%Y-%m-%d %H:%M')}")
+    lines.append(f"- Total Papers: {len(session.decisions)}")
+    lines.append(f"- Kept: {len(session.kept_papers)}")
+    lines.append(f"- Discarded: {len(session.discarded_papers)}")
+    lines.append(f"- Pending: {len(session.pending_papers)}")
+    if included_kept_papers != total_kept_papers:
+        lines.append(
+            f"- Included kept papers: {included_kept_papers}/{total_kept_papers} "
+            "(due to --max-papers)"
+        )
+    lines.append("")
+
+    if session.snowball_rounds:
+        lines.extend(["### Snowballing", ""])
+        lines.append(
+            "| Round | Direction | Papers Added | Source Papers |"
+        )
+        lines.append("| --- | --- | --- | --- |")
+        for i, round_info in enumerate(session.snowball_rounds, 1):
+            direction = (
+                "References"
+                if round_info.direction == "references"
+                else "Citations"
+            )
+            source_label = f"{len(round_info.source_papers)}"
+            lines.append(
+                f"| {i} | {direction} | {round_info.papers_added} | {source_label} |"
+            )
+        lines.append("")
+
+    return "\n".join(lines)
+
+
+def _build_research_question_section_latex(
+    session: ReviewSession,
+    included_kept_papers: int,
+    total_kept_papers: int,
+) -> str:
+    """Build the provenance section for LaTeX output."""
+    from scholar.review import escape_latex, markdown_to_latex
+
+    lines: list[str] = [r"\section{Research Question}", ""]
+
+    lines.extend([r"\subsection{Search Parameters}", ""])
+    if len(session.query_provider_pairs) > 1:
+        lines.extend(
+            [
+                r"\begin{longtable}{lp{10cm}}",
+                r"\toprule",
+                r"Provider & Query \\",
+                r"\midrule",
+            ]
+        )
+        for query, provider in session.query_provider_pairs:
+            lines.append(
+                f"{escape_latex(provider)} & {escape_latex(query)} \\\\"
+            )
+        lines.extend(
+            [
+                r"\bottomrule",
+                r"\end{longtable}",
+                "",
+            ]
+        )
+    else:
+        providers = ", ".join(session.providers)
+        lines.extend(
+            [
+                r"\begin{description}",
+                f"\\item[Query] {escape_latex(session.query)}",
+                f"\\item[Providers] {escape_latex(providers)}",
+                r"\end{description}",
+                "",
+            ]
+        )
+
+    if session.research_context:
+        lines.append(r"\subsection{Research Context}")
+        lines.extend(
+            markdown_to_latex(session.research_context).splitlines()
+        )
+        lines.append("")
+
+    lines.extend([r"\subsection{Summary}", ""])
+    lines.extend(
+        [
+            r"\begin{description}",
+            f"\\item[Date] {session.timestamp.strftime('%Y-%m-%d %H:%M')}",
+            f"\\item[Total Papers] {len(session.decisions)}",
+            f"\\item[Kept] {len(session.kept_papers)}",
+            f"\\item[Discarded] {len(session.discarded_papers)}",
+            f"\\item[Pending] {len(session.pending_papers)}",
+        ]
+    )
+    if included_kept_papers != total_kept_papers:
+        lines.append(
+            f"\\item[Included kept papers] {included_kept_papers}/{total_kept_papers}"
+        )
+    lines.extend([r"\end{description}", ""])
+
+    if session.snowball_rounds:
+        lines.extend([r"\subsection{Snowballing}", ""])
+        lines.extend(
+            [
+                r"\begin{longtable}{llcl}",
+                r"\toprule",
+                r"Round & Direction & Papers Added & Source Papers \\",
+                r"\midrule",
+            ]
+        )
+        for i, round_info in enumerate(session.snowball_rounds, 1):
+            direction = (
+                "References"
+                if round_info.direction == "references"
+                else "Citations"
+            )
+            source_count = len(round_info.source_papers)
+            source_label = (
+                f"{source_count} paper{'s' if source_count != 1 else ''}"
+            )
+            lines.append(
+                f"{i} & {direction} & {round_info.papers_added} & {source_label} \\\\"
+            )
+        lines.extend([r"\bottomrule", r"\end{longtable}", ""])
+
+    return "\n".join(lines)
+
+
+def _build_references_markdown(
+    kept_decisions: list[ReviewDecision],
+    citation_keys: dict[str, tuple[str, str]],
+) -> str:
+    """Build a deterministic reference list in Markdown."""
+    from scholar.notes import get_paper_id
+
+    lines: list[str] = []
+    for decision in kept_decisions:
+        paper = decision.paper
+        paper_id = get_paper_id(paper)
+        display_key, _ = citation_keys[paper_id]
+
+        authors = ", ".join(paper.authors[:5]) if paper.authors else ""
+        if paper.authors and len(paper.authors) > 5:
+            authors += " et al."
+        year = paper.year or "n.d."
+        venue = paper.venue or ""
+
+        entry = f"{display_key} {paper.title} ({year}). {authors}. {venue}."
+        if paper.doi:
+            entry += f" DOI: {paper.doi}."
+        if paper.url:
+            entry += f" URL: {paper.url}."
+        lines.append(f"- {entry}")
+
+    return "\n".join(lines)
+
+
+def _format_bibtex_entry(paper: Paper, cite_key: str) -> str:
+    """Format a paper as a BibTeX entry."""
+    from scholar.review import escape_bibtex
+
+    lines = [f"@article{{{cite_key},"]
+    lines.append(f"  title = {{{escape_bibtex(paper.title)}}},")
+    if paper.authors:
+        authors = " and ".join(paper.authors)
+        lines.append(f"  author = {{{escape_bibtex(authors)}}},")
+    if paper.year:
+        lines.append(f"  year = {{{paper.year}}},")
+    if paper.venue:
+        lines.append(f"  journal = {{{escape_bibtex(paper.venue)}}},")
+    if paper.doi:
+        lines.append(f"  doi = {{{paper.doi}}},")
+    if paper.url:
+        lines.append(f"  url = {{{paper.url}}},")
+    lines.append("}")
+    return "\n".join(lines)
+
+
+def _build_bibtex_content(
+    kept_decisions: list[ReviewDecision],
+    citation_keys: dict[str, tuple[str, str]],
+) -> str:
+    """Build BibTeX content for the included kept papers."""
+    from scholar.notes import get_paper_id
+
+    entries: list[str] = []
+    for decision in kept_decisions:
+        paper_id = get_paper_id(decision.paper)
+        _, bibtex_key = citation_keys[paper_id]
+        entries.append(_format_bibtex_entry(decision.paper, bibtex_key))
+
+    return "\n\n".join(entries)
+
+
+def _assemble_markdown_synthesis(
+    session: ReviewSession,
+    theme_sections: list[ThemeSectionResult],
+    conclusion: str,
+    references_markdown: str,
+    included_kept_papers: int,
+    total_kept_papers: int,
+) -> str:
+    parts: list[str] = []
+    parts.append(
+        _build_research_question_section_markdown(
+            session,
+            included_kept_papers=included_kept_papers,
+            total_kept_papers=total_kept_papers,
+        )
+    )
+
+    parts.append("## Synthesis\n")
+    for section in theme_sections:
+        parts.append(section.section.strip())
+        parts.append("")
+
+    parts.append("## Conclusion\n")
+    parts.append(conclusion.strip())
+    parts.append("")
+
+    parts.append("## References\n")
+    parts.append(references_markdown.strip())
+
+    return "\n".join(parts).strip() + "\n"
+
+
+def _assemble_latex_synthesis(
+    session: ReviewSession,
+    theme_sections: list[ThemeSectionResult],
+    conclusion: str,
+    bibtex_content: str,
+    included_kept_papers: int,
+    total_kept_papers: int,
+) -> str:
+    lines: list[str] = []
+
+    # BibTeX file embedded into the generated LaTeX.
+    lines.extend(
+        [
+            r"\begin{filecontents*}{synthesis.bib}",
+            bibtex_content,
+            r"\end{filecontents*}",
+            "",
+        ]
+    )
+
+    lines.extend(
+        [
+            r"\documentclass{article}",
+            r"\usepackage[utf8]{inputenc}",
+            r"\usepackage{hyperref}",
+            r"\usepackage{enumitem}",
+            r"\usepackage{longtable}",
+            r"\usepackage{booktabs}",
+            r"\usepackage{array}",
+            r"\usepackage{geometry}",
+            r"\usepackage[backend=biber,style=authoryear]{biblatex}",
+            r"\addbibresource{synthesis.bib}",
+            r"\geometry{margin=1in}",
+            "",
+            r"\title{Literature Synthesis}",
+            f"\\date{{{session.timestamp.strftime('%Y-%m-%d')}}}",
+            "",
+            r"\begin{document}",
+            r"\maketitle",
+            "",
+        ]
+    )
+
+    lines.append(
+        _build_research_question_section_latex(
+            session,
+            included_kept_papers=included_kept_papers,
+            total_kept_papers=total_kept_papers,
+        )
+    )
+    lines.append("")
+
+    lines.extend([r"\section{Synthesis}", ""])
+    for section in theme_sections:
+        lines.append(section.section.strip())
+        lines.append("")
+
+    lines.extend([r"\section{Conclusion}", ""])
+    lines.append(conclusion.strip())
+    lines.append("")
+
+    lines.extend([r"\printbibliography", r"\end{document}"])
+
+    return "\n".join(lines).strip() + "\n"
+
+
+def generate_literature_synthesis(
+    session: ReviewSession,
+    model_id: str | None = None,
+    output_format: str = "markdown",
+    max_papers: int | None = None,
+    dry_run: bool = False,
+) -> SynthesisResult | str:
+    """Generate a multi-round literature synthesis from kept papers."""
+    from scholar.notes import get_paper_id
+
+    # Validate research context
+    if not session.research_context:
+        raise ValueError(
+            "No research context set. Use 'scholar llm context <session> "
+            "<context>' to set the research question first."
+        )
+
+    kept_all = [
+        d for d in session.decisions if d.status == DecisionStatus.KEPT
+    ]
+    if not kept_all:
+        raise ValueError(
+            "No kept papers to synthesize. Use 'scholar sessions show' to "
+            "check session status, or review papers first."
+        )
+
+    total_kept_papers = len(kept_all)
+    kept_decisions = kept_all
+
+    # Limit papers if requested
+    if max_papers and len(kept_decisions) > max_papers:
+        logger.warning(
+            f"Limiting synthesis to {max_papers} papers "
+            f"(session has {len(kept_decisions)})"
+        )
+        kept_decisions = kept_decisions[:max_papers]
+
+    # Warn about large paper counts
+    if len(kept_decisions) > 30 and not max_papers:
+        logger.warning(
+            f"Synthesizing {len(kept_decisions)} papers may exceed token "
+            "limits. Consider using --max-papers to limit."
+        )
+
+    included_kept_papers = len(kept_decisions)
+
+    citation_keys = _generate_all_citation_keys(kept_decisions, output_format)
+    themes, groups = _group_kept_papers_by_theme(kept_decisions)
+
+    # Prepare prompts (for dry-run and execution).
+    theme_prompts: list[tuple[str | None, str]] = []
+    for theme, group_decisions in groups.items():
+        theme_prompts.append(
+            (
+                theme,
+                build_theme_section_prompt(
+                    theme=theme,
+                    kept_decisions=group_decisions,
+                    research_context=session.research_context,
+                    citation_keys=citation_keys,
+                    output_format=output_format,
+                ),
+            )
+        )
+
+    if dry_run:
+        parts: list[str] = []
+        for theme, prompt in theme_prompts:
+            label = theme if theme is not None else "UNTHEMED"
+            parts.append(f"--- THEME PROMPT: {label} ---\n{prompt}\n")
+
+        placeholder_sections: list[ThemeSectionResult] = []
+        for theme in groups:
+            label = theme if theme is not None else "Synthesis"
+            placeholder_sections.append(
+                ThemeSectionResult(
+                    theme=theme,
+                    section="",
+                    summary=(
+                        f"[Placeholder summary for {label}; generated in a previous round.]"
+                    ),
+                    paper_count=len(groups[theme]),
+                )
+            )
+
+        conclusion_prompt = build_conclusion_prompt(
+            research_context=session.research_context,
+            theme_sections=placeholder_sections,
+            output_format=output_format,
+        )
+        parts.append(f"--- CONCLUSION PROMPT ---\n{conclusion_prompt}\n")
+        return "\n".join(parts)
+
+    # Import llm and call
+    try:
+        import llm
+    except ImportError:
+        raise ImportError(
+            "The 'llm' package is required for synthesis. "
+            "Install it with: pip install llm"
+        )
+
+    model = llm.get_model(model_id) if model_id else llm.get_model()
+    logger.info(
+        f"Generating multi-round synthesis from {len(kept_decisions)} papers "
+        f"with {model.model_id}"
+    )
+
+    theme_results: list[ThemeSectionResult] = []
+    for theme, prompt in theme_prompts:
+        group_decisions = groups[theme]
+        response = model.prompt(prompt)
+        parsed = parse_theme_section_response(
+            response.text(),
+            theme=theme,
+            output_format=output_format,
+            paper_count=len(group_decisions),
+        )
+        theme_results.append(parsed)
+
+    # Conclusion round based on summaries.
+    conclusion_prompt = build_conclusion_prompt(
+        research_context=session.research_context,
+        theme_sections=theme_results,
+        output_format=output_format,
+    )
+    conclusion_response = model.prompt(conclusion_prompt)
+    conclusion_text = _extract_marked_block(
+        conclusion_response.text(),
+        SYNTHESIS_SECTION_START,
+        SYNTHESIS_SECTION_END,
+    )
+    if conclusion_text is None:
+        conclusion_text = conclusion_response.text().strip()
+    conclusion_text = _strip_conclusion_heading(conclusion_text, output_format)
+
+    # Build references list and assemble final output.
+    references: list[dict[str, Any]] = []
+    for decision in kept_decisions:
+        paper_id = get_paper_id(decision.paper)
+        _, bibtex_key = citation_keys[paper_id]
+        references.append(
+            {
+                "key": bibtex_key,
+                "title": decision.paper.title,
+                "authors": decision.paper.authors,
+                "year": decision.paper.year,
+                "venue": decision.paper.venue,
+                "doi": decision.paper.doi,
+                "url": decision.paper.url,
+            }
+        )
+
+    if output_format == "latex":
+        bibtex_content = _build_bibtex_content(kept_decisions, citation_keys)
+        synthesis_text = _assemble_latex_synthesis(
+            session=session,
+            theme_sections=theme_results,
+            conclusion=conclusion_text,
+            bibtex_content=bibtex_content,
+            included_kept_papers=included_kept_papers,
+            total_kept_papers=total_kept_papers,
+        )
+    else:
+        references_markdown = _build_references_markdown(
+            kept_decisions, citation_keys
+        )
+        synthesis_text = _assemble_markdown_synthesis(
+            session=session,
+            theme_sections=theme_results,
+            conclusion=conclusion_text,
+            references_markdown=references_markdown,
+            included_kept_papers=included_kept_papers,
+            total_kept_papers=total_kept_papers,
+        )
+
+    return SynthesisResult(
+        synthesis=synthesis_text,
+        model_id=model.model_id,
+        timestamp=datetime.now().isoformat(),
+        paper_count=len(kept_decisions),
+        themes=themes,
+        references=references,
+        theme_sections=theme_results,
+        conclusion=conclusion_text,
+    )
+@
+
+
+\subsection{Testing synthesis orchestration}
+
+The synthesis tests are placed close to the functionality they verify:
+\begin{description}
+\item[Data structures] Immediately after the dataclass definitions.
+\item[Citation keys] Immediately after key generation.
+\item[Prompt construction] Immediately after prompt builders.
+\item[Orchestration] Here, after the full synthesis pipeline.
+\end{description}
+
+<<test functions>>=
+class TestSynthesisOrchestration:
+    def test_synthesis_requires_kept_papers(self):
+        session = ReviewSession(
+            query="test",
+            providers=["test"],
+            timestamp=datetime.now(),
+            research_context="Test question",
+        )
+        paper = Paper(title="Test", authors=["A"], year=2024)
+        session.decisions.append(
+            ReviewDecision(
+                paper=paper,
+                provider="test",
+                status=DecisionStatus.PENDING,
+            )
+        )
+
+        with pytest.raises(ValueError, match="No kept papers"):
+            generate_literature_synthesis(session, dry_run=True)
+
+    def test_synthesis_requires_research_context(self):
+        session = ReviewSession(
+            query="test",
+            providers=["test"],
+            timestamp=datetime.now(),
+            research_context=None,
+        )
+        paper = Paper(title="Test", authors=["A"], year=2024)
+        session.decisions.append(
+            ReviewDecision(
+                paper=paper,
+                provider="test",
+                status=DecisionStatus.KEPT,
+                tags=["relevant"],
+            )
+        )
+
+        with pytest.raises(ValueError, match="No research context"):
+            generate_literature_synthesis(session, dry_run=True)
+
+    def test_synthesis_dry_run_returns_prompts(self):
+        session = ReviewSession(
+            query="test",
+            providers=["test"],
+            timestamp=datetime.now(),
+            research_context="What is the state of ML privacy?",
+        )
+        paper = Paper(
+            title="Privacy in ML",
+            authors=["Alice Smith"],
+            year=2024,
+            abstract="This paper studies privacy.",
+        )
+        session.decisions.append(
+            ReviewDecision(
+                paper=paper,
+                provider="test",
+                status=DecisionStatus.KEPT,
+                tags=["privacy"],
+            )
+        )
+
+        result = generate_literature_synthesis(session, dry_run=True)
+
+        assert isinstance(result, str)
+        assert "--- THEME PROMPT:" in result
+        assert "--- CONCLUSION PROMPT ---" in result
+        assert "Research Question" in result
+        assert "Privacy in ML" in result
+        assert "[Smith, 2024]" in result
+
+    def test_synthesis_dry_run_uses_unthemed_when_no_tags(self):
+        session = ReviewSession(
+            query="test",
+            providers=["test"],
+            timestamp=datetime.now(),
+            research_context="What is the state of ML privacy?",
+        )
+        paper = Paper(
+            title="Privacy in ML",
+            authors=["Alice Smith"],
+            year=2024,
+            abstract="This paper studies privacy.",
+        )
+        session.decisions.append(
+            ReviewDecision(
+                paper=paper,
+                provider="test",
+                status=DecisionStatus.KEPT,
+                tags=[],
+            )
+        )
+
+        result = generate_literature_synthesis(session, dry_run=True)
+
+        assert "UNTHEMED" in result
 @

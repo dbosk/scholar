@@ -2530,6 +2530,156 @@ def llm_context(
         console.print("[green]Research context updated.[/green]")
 @
 
+\subsection{Literature synthesis generation}
+
+Once the review decisions are in place (and we have a research context that
+defines the review's overall research question), we can ask the LLM to generate
+a narrative synthesis of the kept papers.
+
+A naive approach is to include all kept papers in a single prompt.
+This fails for larger reviews because the prompt quickly exceeds the model's
+context window.
+Instead, we generate the synthesis in multiple rounds:
+\begin{enumerate}
+\item Generate a focused synthesis subsection for each theme.
+\item Generate a conclusion that connects the themes back to the research
+  question.
+\item Assemble a full report including provenance and references.
+\end{enumerate}
+
+The [[--dry-run]] option prints all prompts so the user can inspect what is
+sent to the model.
+
+For LaTeX output, the synthesis is a complete compilable document.
+The output embeds a BibTeX file and uses [[biblatex]]; compilation therefore
+requires running [[biber]].
+
+@
+
+<<llm command>>=
+@llm_app.command("synthesis")
+def llm_synthesis(
+    session_name: Annotated[
+        str,
+        typer.Argument(
+            help="Session name to synthesize.",
+            autocompletion=complete_session_name,
+        ),
+    ],
+    model: Annotated[
+        str | None,
+        typer.Option(
+            "--model", "-m",
+            help="LLM model to use (uses llm default if not specified).",
+        ),
+    ] = None,
+    output: Annotated[
+        Path | None,
+        typer.Option(
+            "--output", "-o",
+            help="Output file path (prints to stdout if not specified).",
+        ),
+    ] = None,
+    output_format: Annotated[
+        str,
+        typer.Option(
+            "--format", "-f",
+            help="Output format: markdown or latex.",
+        ),
+    ] = "markdown",
+    max_papers: Annotated[
+        int | None,
+        typer.Option(
+            "--max-papers",
+            help="Maximum papers to include (manages token limits).",
+        ),
+    ] = None,
+    dry_run: Annotated[
+        bool,
+        typer.Option(
+            "--dry-run",
+            help="Show the prompt without calling LLM.",
+        ),
+    ] = False,
+) -> None:
+    """
+    Generate a prose literature synthesis from kept papers.
+
+    Creates a coherent narrative explaining how papers in the review
+    contribute to answering the research question.
+
+    The output always begins with a "Research Question" section that
+    includes provenance (query/provider pairs, timestamp, and review
+    statistics), followed by a "Synthesis" section (organized by themes
+    when paper tags are present), a "Conclusion", and a deterministic
+    reference list.
+
+    For LaTeX output, a full compilable document is produced, including an
+    embedded BibTeX file and a biblatex reference section (run biber when
+    compiling).
+
+    Requires:
+    - At least one kept paper in the session
+    - A research context set for the session
+
+    Examples:
+        scholar llm synthesis "my review"
+        scholar llm synthesis "my review" -o synthesis.md
+        scholar llm synthesis "my review" --format latex -o synthesis.tex
+    """
+    from scholar.review import load_session
+    from scholar.llm_review import generate_literature_synthesis
+
+    console = Console()
+    session = load_session(session_name)
+
+    if session is None:
+        console.print(f"[red]Session not found: {session_name}[/red]")
+        raise typer.Exit(1)
+
+    # Validate output format
+    if output_format not in ("markdown", "latex"):
+        console.print(
+            f"[red]Invalid format: {output_format}. "
+            "Use 'markdown' or 'latex'.[/red]"
+        )
+        raise typer.Exit(1)
+
+    try:
+        result = generate_literature_synthesis(
+            session=session,
+            model_id=model,
+            output_format=output_format,
+            max_papers=max_papers,
+            dry_run=dry_run,
+        )
+
+        if dry_run:
+            console.print("[bold]Prompt (dry run):[/bold]")
+            console.print(result)
+            return
+
+        # Output the synthesis
+        synthesis_text = result.synthesis
+
+        if output:
+            output.write_text(synthesis_text)
+            console.print(f"[green]Synthesis written to {output}[/green]")
+            console.print(f"  Papers: {result.paper_count}")
+            console.print(f"  Themes: {', '.join(result.themes)}")
+            console.print(f"  Model: {result.model_id}")
+        else:
+            # Print to stdout
+            console.print(synthesis_text)
+
+    except ValueError as e:
+        console.print(f"[red]Error: {e}[/red]")
+        raise typer.Exit(1)
+    except ImportError as e:
+        console.print(f"[red]{e}[/red]")
+        raise typer.Exit(1)
+@
+
 
 \subsection{Testing LLM Commands}
 
@@ -2554,6 +2704,33 @@ class TestLLMCommands:
         result = runner.invoke(app, ["llm", "classify", "nonexistent"])
         assert result.exit_code == 1
         assert "not found" in result.stdout.lower()
+
+    def test_llm_synthesis_session_not_found(self):
+        """llm synthesis shows error for missing session."""
+        result = runner.invoke(app, ["llm", "synthesis", "nonexistent"])
+        assert result.exit_code == 1
+        assert "not found" in result.stdout.lower()
+
+    def test_llm_synthesis_invalid_format(self, monkeypatch, tmp_path):
+        """llm synthesis rejects invalid output format."""
+        from scholar import review
+        from datetime import datetime
+
+        # Create a mock session
+        session = review.ReviewSession(
+            query="test",
+            providers=["test"],
+            timestamp=datetime.now(),
+            research_context="Test question",
+            name="test-session",
+        )
+        monkeypatch.setattr(review, "load_session", lambda x: session)
+
+        result = runner.invoke(
+            app, ["llm", "synthesis", "test-session", "--format", "invalid"]
+        )
+        assert result.exit_code == 1
+        assert "invalid format" in result.stdout.lower()
 @
 
 
