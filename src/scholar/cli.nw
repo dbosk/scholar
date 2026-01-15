@@ -2064,8 +2064,23 @@ def sessions_list(
 
         console.print(table)
         console.print(f"\n[dim]Total: {len(sessions)} session(s)[/dim]")
+@
 
+\paragraph{The [[sessions show]] command}
 
+The [[sessions show]] command displays detailed information about a specific
+review session. We always display the query used for each provider, since
+different providers may receive different queries (for example, when using
+[[scholar rq]] with provider-specific query optimization). Each paper also
+shows which provider returned it, helping users understand where results
+originated.
+
+For output, we define a helper function [[print_session_details]] that prints
+directly to a Rich console. This avoids the color encoding issues that arise
+from rendering to a string buffer with ANSI codes and then re-printing---Rich
+handles the terminal detection and styling correctly when printing directly.
+
+<<sessions command>>=
 @sessions_app.command("show")
 def sessions_show(
     name: Annotated[
@@ -2091,7 +2106,6 @@ def sessions_show(
     Uses a pager for interactive viewing when output is a terminal.
     """
     import sys
-    from rich.pager import Pager
     from scholar.review import load_session
 
     console = Console()
@@ -2121,59 +2135,65 @@ def sessions_show(
         }
         print(json.dumps(output, indent=2))
     else:
-        # Build rich output, use pager if TTY
-        from io import StringIO
-        from rich.console import Console as RichConsole
-        
-        # Render to string first to check if pager needed
-        string_io = StringIO()
-        render_console = RichConsole(file=string_io, force_terminal=True)
-        
-        render_console.print(f"[bold]Session: {session.query}[/bold]")
-        render_console.print(f"[dim]Date: {session.timestamp.strftime('%Y-%m-%d %H:%M')}[/dim]")
-        
-        # Show query-provider pairs if multiple, else simple providers list
-        if len(session.query_provider_pairs) > 1:
-            render_console.print("[dim]Queries by provider:[/dim]")
-            for query, provider in session.query_provider_pairs:
-                render_console.print(f"[dim]  {provider}: {query}[/dim]")
-        else:
-            render_console.print(f"[dim]Providers: {', '.join(session.providers)}[/dim]")
-        render_console.print()
+        # Build output using Rich markup, render directly to console
+        def print_session_details(con: Console) -> None:
+            """Print session details with Rich formatting."""
+            con.print(f"[bold]Session: {session.query}[/bold]")
+            con.print(
+                f"[dim]Date: "
+                f"{session.timestamp.strftime('%Y-%m-%d %H:%M')}[/dim]"
+            )
 
-        # Show kept papers
-        kept = session.kept_papers
-        if kept:
-            render_console.print(f"[green bold]Kept ({len(kept)}):[/green bold]")
-            for d in kept:
-                tags = f" [dim]\\[{', '.join(d.tags)}][/dim]" if d.tags else ""
-                render_console.print(f"  • {d.paper.title}{tags}")
-            render_console.print()
+            # Always show query per provider
+            if session.query_provider_pairs:
+                con.print("[dim]Queries by provider:[/dim]")
+                for query, provider in session.query_provider_pairs:
+                    con.print(f"[dim]  {provider}: {query}[/dim]")
+            else:
+                # Fallback: show providers with session query
+                con.print("[dim]Queries by provider:[/dim]")
+                for provider in session.providers:
+                    con.print(f"[dim]  {provider}: {session.query}[/dim]")
+            con.print()
 
-        # Show discarded papers
-        discarded = session.discarded_papers
-        if discarded:
-            render_console.print(f"[red bold]Discarded ({len(discarded)}):[/red bold]")
-            for d in discarded:
-                tags = f" [dim]\\[{', '.join(d.tags)}][/dim]" if d.tags else ""
-                render_console.print(f"  • {d.paper.title}{tags}")
-            render_console.print()
+            # Show kept papers
+            kept = session.kept_papers
+            if kept:
+                con.print(f"[green bold]Kept ({len(kept)}):[/green bold]")
+                for d in kept:
+                    provider = f" [dim]({d.provider})[/dim]" if d.provider else ""
+                    tags = f" [dim]\\[{', '.join(d.tags)}][/dim]" if d.tags else ""
+                    con.print(f"  • {d.paper.title}{provider}{tags}")
+                con.print()
 
-        # Show pending papers
-        pending = session.pending_papers
-        if pending:
-            render_console.print(f"[yellow bold]Pending ({len(pending)}):[/yellow bold]")
-            for d in pending:
-                render_console.print(f"  • {d.paper.title}")
-        
-        output_text = string_io.getvalue()
-        
-        # Use pager if TTY, otherwise just print
+            # Show discarded papers
+            discarded = session.discarded_papers
+            if discarded:
+                con.print(
+                    f"[red bold]Discarded ({len(discarded)}):[/red bold]"
+                )
+                for d in discarded:
+                    provider = f" [dim]({d.provider})[/dim]" if d.provider else ""
+                    tags = f" [dim]\\[{', '.join(d.tags)}][/dim]" if d.tags else ""
+                    con.print(f"  • {d.paper.title}{provider}{tags}")
+                con.print()
+
+            # Show pending papers
+            pending = session.pending_papers
+            if pending:
+                con.print(
+                    f"[yellow bold]Pending ({len(pending)}):[/yellow bold]"
+                )
+                for d in pending:
+                    provider = f" [dim]({d.provider})[/dim]" if d.provider else ""
+                    con.print(f"  • {d.paper.title}{provider}")
+
+        # Use pager if TTY, otherwise print directly
         if sys.stdout.isatty():
             with console.pager(styles=True):
-                console.print(output_text, end="")
+                print_session_details(console)
         else:
-            print(output_text, end="")
+            print_session_details(console)
 
 
 @sessions_app.command("export")
