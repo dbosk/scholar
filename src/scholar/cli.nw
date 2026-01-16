@@ -2447,6 +2447,7 @@ def llm_status(
         typer.Option(
             "--format", "-f",
             help="Output format: table or json.",
+            autocompletion=complete_display_format,
         ),
     ] = "table",
 ) -> None:
