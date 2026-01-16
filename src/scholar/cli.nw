@@ -399,6 +399,31 @@ def complete_session_name(incomplete: str) -> list[str]:
         return [s["name"] for s in sessions if s["name"].startswith(incomplete)]
     except Exception:
         return []
+
+
+def complete_model(incomplete: str) -> list[str]:
+    """Provide shell completion for installed llm models."""
+    try:
+        import llm
+    except Exception:
+        return []
+
+    try:
+        model_ids = [m.model_id for m in llm.get_models()]
+    except Exception:
+        return []
+
+    # Keep ordering stable and drop duplicates.
+    seen: set[str] = set()
+    results: list[str] = []
+    for model_id in model_ids:
+        if model_id in seen:
+            continue
+        seen.add(model_id)
+        if model_id.startswith(incomplete):
+            results.append(model_id)
+
+    return results
 @
 
 \paragraph{Paper ID completion}
@@ -775,6 +800,7 @@ def rq(
             "--model",
             "-m",
             help="LLM model to use (uses llm default if not specified).",
+            autocompletion=complete_model,
         ),
     ] = None,
     no_enrich: Annotated[
@@ -2358,6 +2384,7 @@ def llm_classify(
         typer.Option(
             "--model", "-m",
             help="LLM model to use (uses llm default if not specified).",
+            autocompletion=complete_model,
         ),
     ] = None,
     dry_run: Annotated[
@@ -2578,6 +2605,7 @@ def llm_synthesis(
         typer.Option(
             "--model", "-m",
             help="LLM model to use (uses llm default if not specified).",
+            autocompletion=complete_model,
         ),
     ] = None,
     output: Annotated[
