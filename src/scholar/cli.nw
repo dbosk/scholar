@@ -343,6 +343,7 @@ We define completers for each set of valid formats:
 SEARCH_FORMATS = ["auto", "table", "csv", "json", "bibtex"]
 DISPLAY_FORMATS = ["table", "json"]
 EXPORT_FORMATS = ["csv", "latex", "all"]
+SYNTHESIS_FORMATS = ["markdown", "latex"]
 
 
 def complete_search_format(incomplete: str) -> list[str]:
@@ -358,6 +359,11 @@ def complete_display_format(incomplete: str) -> list[str]:
 def complete_export_format(incomplete: str) -> list[str]:
     """Provide shell completion for export formats."""
     return [f for f in EXPORT_FORMATS if f.startswith(incomplete)]
+
+
+def complete_synthesis_format(incomplete: str) -> list[str]:
+    """Provide shell completion for synthesis formats."""
+    return [f for f in SYNTHESIS_FORMATS if f.startswith(incomplete)]
 @
 
 \paragraph{Action completion}
@@ -2585,6 +2591,7 @@ def llm_synthesis(
         typer.Option(
             "--format", "-f",
             help="Output format: markdown or latex.",
+            autocompletion=complete_synthesis_format,
         ),
     ] = "markdown",
     max_papers: Annotated[
