@@ -2645,10 +2645,10 @@ def build_synthesis_abstract_prompt(
     )
     lines.append(f"\n## Research Question\n\n{research_context}")
 
-    lines.append("\n## Section Titles\n")
+    lines.append("\n## Section Abstracts\n")
     for section in theme_sections:
-        if section.title:
-            lines.append(f"- {section.title}")
+        if section.abstract:
+            lines.append(f"- {section.abstract}")
 
     lines.append("\n## Conclusion\n")
     lines.append(conclusion)
@@ -2658,8 +2658,8 @@ def build_synthesis_abstract_prompt(
 ## Instructions
 
 Write one paragraph suitable as a report abstract.
-It should summarize the synthesis at a high level and mention the main
-aspects covered by the section titles.
+It should summarize the synthesis at a high level, grounded in the research
+question, the section abstracts, and the conclusion.
 Do not include citations.
 
 Return your answer as a marked block exactly as follows:
