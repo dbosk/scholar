@@ -2423,7 +2423,7 @@ def generate_latex_report(session: ReviewSession, output_path: Path) -> None:
     lines = [
         r"\documentclass{article}",
         r"\usepackage[utf8]{inputenc}",
-        r"\usepackage{hyperref}",
+        r"\usepackage[colorlinks=true,allcolors=blue]{hyperref}",
         r"\usepackage{enumitem}",
         r"\usepackage{longtable}",
         r"\usepackage{booktabs}",

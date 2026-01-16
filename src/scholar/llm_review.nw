@@ -2427,7 +2427,8 @@ def build_theme_section_prompt(
 
     if output_format == "latex":
         cite_instruction = (
-            "Use \\cite{bibtex_key} for citations (e.g., \\cite{smith2024})."
+            "Use biblatex citation commands like \\textcite{key}, \\parencite{key}, "
+            "or \\autocite{key} (e.g., \\textcite{smith2024})."
         )
         format_note = "Output must be a valid LaTeX fragment (no preamble)."
         if theme is None:
@@ -2520,7 +2521,8 @@ def build_conclusion_prompt(
 
     if output_format == "latex":
         cite_instruction = (
-            "Use \\cite{bibtex_key} for citations (e.g., \\cite{smith2024})."
+            "Use biblatex citation commands like \\textcite{key}, \\parencite{key}, "
+            "or \\autocite{key} (e.g., \\textcite{smith2024})."
         )
         format_note = "Output must be a valid LaTeX fragment (no preamble)."
     else:
@@ -2921,7 +2923,7 @@ def _assemble_latex_synthesis(
         [
             r"\documentclass{article}",
             r"\usepackage[utf8]{inputenc}",
-            r"\usepackage{hyperref}",
+             r"\usepackage[colorlinks=true,allcolors=blue]{hyperref}",
             r"\usepackage{enumitem}",
             r"\usepackage{longtable}",
             r"\usepackage{booktabs}",
