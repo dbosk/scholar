@@ -1734,7 +1734,7 @@ SYNTHESIS_SECTION_END = "===SECTION_END==="
 SYNTHESIS_SUMMARY_START = "===SUMMARY_START==="
 SYNTHESIS_SUMMARY_END = "===SUMMARY_END==="
 
-SYNTHESIS_CACHE_VERSION = "v1"
+SYNTHESIS_CACHE_VERSION = "v3"
 SYNTHESIS_THEME_CACHE = load_cache("llm_synthesis_theme")
 SYNTHESIS_CONCLUSION_CACHE = load_cache("llm_synthesis_conclusion")
 register_cache("llm_synthesis_theme", SYNTHESIS_THEME_CACHE)
@@ -1748,15 +1748,21 @@ class ThemeSectionResult:
 
     Attributes:
         theme: Theme name, or None for an unthemed synthesis
+        title: LLM-generated human-readable section title
         section: Generated section text (Markdown or LaTeX fragment)
         summary: Short summary used as input to the conclusion round
+        subquestions: Sub-questions answered by this section
+        abstract: One-paragraph section abstract, for report abstracts
         paper_count: Number of papers included in this section
     """
 
     theme: str | None
+    title: str
     section: str
     summary: str
-    paper_count: int
+    subquestions: list[str] = field(default_factory=list)
+    abstract: str = ""
+    paper_count: int = 0
 
 
 @dataclass
@@ -1797,6 +1803,15 @@ class TestSynthesisDataStructures:
             paper_count=5,
             themes=["theme1", "theme2"],
             references=[{"key": "smith2024", "title": "Test"}],
+            theme_sections=[
+                ThemeSectionResult(
+                    theme="theme1",
+                    title="Theme 1",
+                    section="",
+                    summary="",
+                    paper_count=1,
+                )
+            ],
         )
         assert result.synthesis == "This is a test synthesis."
         assert result.paper_count == 5
@@ -2270,19 +2285,39 @@ def _strip_conclusion_heading(text: str, output_format: str) -> str:
 
 def _ensure_theme_heading(
     text: str,
-    theme: str,
+    title: str,
     output_format: str,
 ) -> str:
-    """Ensure the section starts with a theme heading."""
+    """Ensure the section starts with a heading using the given title."""
     stripped = text.lstrip()
     if output_format == "latex":
         if stripped.startswith("\\subsection"):
             return text.strip()
-        return f"\\subsection{{{theme}}}\n" + text.strip()
+        return f"\\subsection{{{title}}}\n" + text.strip()
 
     if stripped.startswith("###"):
         return text.strip()
-    return f"### {theme}\n\n" + text.strip()
+    return f"### {title}\n\n" + text.strip()
+
+
+SYNTHESIS_TITLE_START = "===TITLE_START==="
+SYNTHESIS_TITLE_END = "===TITLE_END==="
+SYNTHESIS_SUBQUESTIONS_START = "===SUBQUESTIONS_START==="
+SYNTHESIS_SUBQUESTIONS_END = "===SUBQUESTIONS_END==="
+SYNTHESIS_SECTION_ABSTRACT_START = "===SECTION_ABSTRACT_START==="
+SYNTHESIS_SECTION_ABSTRACT_END = "===SECTION_ABSTRACT_END==="
+
+
+def _parse_subquestions(text: str | None) -> list[str]:
+    if not text:
+        return []
+    lines = []
+    for raw in text.splitlines():
+        stripped = raw.strip()
+        stripped = stripped.lstrip("-*").strip()
+        if stripped:
+            lines.append(stripped)
+    return lines
 
 
 def parse_theme_section_response(
@@ -2291,7 +2326,7 @@ def parse_theme_section_response(
     output_format: str,
     paper_count: int,
 ) -> ThemeSectionResult:
-    """Parse an LLM theme section response into section + summary."""
+    """Parse an LLM theme section response into section + metadata."""
     section = _extract_marked_block(
         response_text, SYNTHESIS_SECTION_START, SYNTHESIS_SECTION_END
     )
@@ -2304,13 +2339,35 @@ def parse_theme_section_response(
     if not summary:
         summary = _fallback_summary(section)
 
+    title = _extract_marked_block(
+        response_text, SYNTHESIS_TITLE_START, SYNTHESIS_TITLE_END
+    )
+    if not title:
+        title = theme or "Synthesis"
+
+    section_abstract = _extract_marked_block(
+        response_text,
+        SYNTHESIS_SECTION_ABSTRACT_START,
+        SYNTHESIS_SECTION_ABSTRACT_END,
+    )
+    if not section_abstract:
+        section_abstract = _fallback_summary(summary, max_sentences=2, max_chars=400)
+
+    subquestions_text = _extract_marked_block(
+        response_text, SYNTHESIS_SUBQUESTIONS_START, SYNTHESIS_SUBQUESTIONS_END
+    )
+    subquestions = _parse_subquestions(subquestions_text)
+
     if theme is not None:
-        section = _ensure_theme_heading(section, theme, output_format)
+        section = _ensure_theme_heading(section, title, output_format)
 
     return ThemeSectionResult(
         theme=theme,
+        title=title,
         section=section,
         summary=summary,
+        subquestions=subquestions,
+        abstract=section_abstract,
         paper_count=paper_count,
     )
 
@@ -2413,7 +2470,20 @@ Write a synthesis section that:
 {heading_requirement}
 {heading_example}
 
-Return your answer in two marked blocks exactly as follows:
+Return your answer in four marked blocks exactly as follows:
+
+{SYNTHESIS_TITLE_START}
+<short section title derived from your summary>
+{SYNTHESIS_TITLE_END}
+
+{SYNTHESIS_SUBQUESTIONS_START}
+- <subresearch question 1 answered by this section>
+- <subresearch question 2 answered by this section>
+{SYNTHESIS_SUBQUESTIONS_END}
+
+{SYNTHESIS_SECTION_ABSTRACT_START}
+<one paragraph that can be used in the report abstract>
+{SYNTHESIS_SECTION_ABSTRACT_END}
 
 {SYNTHESIS_SECTION_START}
 <your synthesis text>
@@ -2531,6 +2601,7 @@ class TestSynthesisPrompts:
             theme_sections=[
                 ThemeSectionResult(
                     theme="privacy",
+                    title="Privacy methods",
                     section="",
                     summary="Key point [Smith, 2024].",
                     paper_count=1,
@@ -2556,31 +2627,79 @@ synthesis process:
 \end{enumerate}
 
 <<llm review synthesis>>=
-def _build_research_question_section_markdown(
+SYNTHESIS_REPORT_ABSTRACT_START = "===REPORT_ABSTRACT_START==="
+SYNTHESIS_REPORT_ABSTRACT_END = "===REPORT_ABSTRACT_END==="
+
+
+def build_synthesis_abstract_prompt(
+    research_context: str,
+    theme_sections: list[ThemeSectionResult],
+    conclusion: str,
+    output_format: str,
+) -> str:
+    """Build a prompt for generating an overall report abstract."""
+    lines: list[str] = []
+    lines.append(
+        "You are a research assistant writing the abstract for a literature "
+        "synthesis report."
+    )
+    lines.append(f"\n## Research Question\n\n{research_context}")
+
+    lines.append("\n## Section Titles\n")
+    for section in theme_sections:
+        if section.title:
+            lines.append(f"- {section.title}")
+
+    lines.append("\n## Conclusion\n")
+    lines.append(conclusion)
+
+    lines.append(
+        f"""
+## Instructions
+
+Write one paragraph suitable as a report abstract.
+It should summarize the synthesis at a high level and mention the main
+aspects covered by the section titles.
+Do not include citations.
+
+Return your answer as a marked block exactly as follows:
+
+{SYNTHESIS_REPORT_ABSTRACT_START}
+<one paragraph abstract>
+{SYNTHESIS_REPORT_ABSTRACT_END}
+"""
+    )
+
+    return "\n".join(lines)
+
+
+def parse_report_abstract(response_text: str) -> str:
+    abstract = _extract_marked_block(
+        response_text,
+        SYNTHESIS_REPORT_ABSTRACT_START,
+        SYNTHESIS_REPORT_ABSTRACT_END,
+    )
+    if abstract is None:
+        abstract = response_text.strip()
+    return re.sub(r"\s+", " ", abstract).strip()
+
+
+def build_research_question_section_markdown(
     session: ReviewSession,
     included_kept_papers: int,
     total_kept_papers: int,
 ) -> str:
     """Build the provenance section for Markdown output."""
+    from scholar.review import (
+        build_research_context_markdown,
+        build_search_parameters_markdown,
+    )
+
     lines: list[str] = ["## Research Question", ""]
 
-    lines.extend(["### Search Parameters", ""])
-    if len(session.query_provider_pairs) > 1:
-        lines.append("| Provider | Query |")
-        lines.append("| --- | --- |")
-        for query, provider in session.query_provider_pairs:
-            lines.append(f"| {provider} | {query} |")
-        lines.append("")
-    else:
-        providers = ", ".join(session.providers)
-        lines.append(f"- Query: {session.query}")
-        lines.append(f"- Providers: {providers}")
-        lines.append("")
-
-    if session.research_context:
-        lines.extend(["### Research Context", ""])
-        lines.append(session.research_context)
-        lines.append("")
+    # Put research context first.
+    lines.extend(build_research_context_markdown(session, heading_level=3))
+    lines.extend(build_search_parameters_markdown(session, heading_level=3))
 
     lines.extend(["### Summary", ""])
     lines.append(f"- Date: {session.timestamp.strftime('%Y-%m-%d %H:%M')}")
@@ -2616,55 +2735,22 @@ def _build_research_question_section_markdown(
     return "\n".join(lines)
 
 
-def _build_research_question_section_latex(
+def build_research_question_section_latex(
     session: ReviewSession,
     included_kept_papers: int,
     total_kept_papers: int,
 ) -> str:
     """Build the provenance section for LaTeX output."""
-    from scholar.review import escape_latex, markdown_to_latex
+    from scholar.review import (
+        build_research_context_latex,
+        build_search_parameters_latex,
+    )
 
     lines: list[str] = [r"\section{Research Question}", ""]
 
-    lines.extend([r"\subsection{Search Parameters}", ""])
-    if len(session.query_provider_pairs) > 1:
-        lines.extend(
-            [
-                r"\begin{longtable}{lp{10cm}}",
-                r"\toprule",
-                r"Provider & Query \\",
-                r"\midrule",
-            ]
-        )
-        for query, provider in session.query_provider_pairs:
-            lines.append(
-                f"{escape_latex(provider)} & {escape_latex(query)} \\\\"
-            )
-        lines.extend(
-            [
-                r"\bottomrule",
-                r"\end{longtable}",
-                "",
-            ]
-        )
-    else:
-        providers = ", ".join(session.providers)
-        lines.extend(
-            [
-                r"\begin{description}",
-                f"\\item[Query] {escape_latex(session.query)}",
-                f"\\item[Providers] {escape_latex(providers)}",
-                r"\end{description}",
-                "",
-            ]
-        )
-
-    if session.research_context:
-        lines.append(r"\subsection{Research Context}")
-        lines.extend(
-            markdown_to_latex(session.research_context).splitlines()
-        )
-        lines.append("")
+    # Put research context first.
+    lines.extend(build_research_context_latex(session, heading_command=r"\subsection"))
+    lines.extend(build_search_parameters_latex(session, heading_command=r"\subsection"))
 
     lines.extend([r"\subsection{Summary}", ""])
     lines.extend(
@@ -2787,7 +2873,7 @@ def _assemble_markdown_synthesis(
 ) -> str:
     parts: list[str] = []
     parts.append(
-        _build_research_question_section_markdown(
+        build_research_question_section_markdown(
             session,
             included_kept_papers=included_kept_papers,
             total_kept_papers=total_kept_papers,
@@ -2816,7 +2902,9 @@ def _assemble_latex_synthesis(
     bibtex_content: str,
     included_kept_papers: int,
     total_kept_papers: int,
+    report_abstract: str,
 ) -> str:
+    """Assemble a complete LaTeX synthesis document."""
     lines: list[str] = []
 
     # BibTeX file embedded into the generated LaTeX.
@@ -2838,10 +2926,8 @@ def _assemble_latex_synthesis(
             r"\usepackage{longtable}",
             r"\usepackage{booktabs}",
             r"\usepackage{array}",
-            r"\usepackage{geometry}",
             r"\usepackage[backend=biber,style=authoryear]{biblatex}",
             r"\addbibresource{synthesis.bib}",
-            r"\geometry{margin=1in}",
             "",
             r"\title{Literature Synthesis}",
             f"\\date{{{session.timestamp.strftime('%Y-%m-%d')}}}",
@@ -2849,11 +2935,19 @@ def _assemble_latex_synthesis(
             r"\begin{document}",
             r"\maketitle",
             "",
+            r"\begin{abstract}",
+            report_abstract,
+            r"\end{abstract}",
+            r"\clearpage",
+            r"\clearpage",
+            r"\tableofcontents",
+            r"\clearpage",
+            "",
         ]
     )
 
     lines.append(
-        _build_research_question_section_latex(
+        build_research_question_section_latex(
             session,
             included_kept_papers=included_kept_papers,
             total_kept_papers=total_kept_papers,
@@ -2952,10 +3046,12 @@ def generate_literature_synthesis(
             placeholder_sections.append(
                 ThemeSectionResult(
                     theme=theme,
+                    title=label,
                     section="",
                     summary=(
                         f"[Placeholder summary for {label}; generated in a previous round.]"
                     ),
+                    abstract="",
                     paper_count=len(groups[theme]),
                 )
             )
@@ -3007,8 +3103,11 @@ def generate_literature_synthesis(
             theme_results.append(
                 ThemeSectionResult(
                     theme=cached.get("theme"),
+                    title=cached.get("title") or (theme or "Synthesis"),
                     section=cached.get("section", ""),
                     summary=cached.get("summary", ""),
+                    subquestions=cached.get("subquestions", []),
+                    abstract=cached.get("abstract", ""),
                     paper_count=cached.get("paper_count", len(group_decisions)),
                 )
             )
@@ -3028,8 +3127,11 @@ def generate_literature_synthesis(
         theme_results.append(parsed)
         SYNTHESIS_THEME_CACHE[cache_key] = {
             "theme": parsed.theme,
+            "title": parsed.title,
             "section": parsed.section,
             "summary": parsed.summary,
+            "subquestions": parsed.subquestions,
+            "abstract": parsed.abstract,
             "paper_count": parsed.paper_count,
         }
 
@@ -3082,6 +3184,22 @@ def generate_literature_synthesis(
             }
         )
 
+    # Report abstract (cached via conclusion cache entry).
+    cached_abstract = SYNTHESIS_CONCLUSION_CACHE.get(conclusion_cache_key, {}).get(
+        "report_abstract"
+    )
+    if cached_abstract:
+        report_abstract = str(cached_abstract)
+    else:
+        abstract_prompt = build_synthesis_abstract_prompt(
+            research_context=session.research_context,
+            theme_sections=theme_results,
+            conclusion=conclusion_text,
+            output_format=output_format,
+        )
+        abstract_response = model.prompt(abstract_prompt)
+        report_abstract = parse_report_abstract(abstract_response.text())
+
     if output_format == "latex":
         bibtex_content = _build_bibtex_content(kept_decisions, citation_keys)
         synthesis_text = _assemble_latex_synthesis(
@@ -3091,6 +3209,7 @@ def generate_literature_synthesis(
             bibtex_content=bibtex_content,
             included_kept_papers=included_kept_papers,
             total_kept_papers=total_kept_papers,
+            report_abstract=report_abstract,
         )
     else:
         references_markdown = _build_references_markdown(
@@ -3107,6 +3226,9 @@ def generate_literature_synthesis(
 
     # Persist final output too, since it's cheap and avoids re-assembly.
     SYNTHESIS_CONCLUSION_CACHE[conclusion_cache_key]["assembled"] = synthesis_text
+    SYNTHESIS_CONCLUSION_CACHE[conclusion_cache_key][
+        "report_abstract"
+    ] = report_abstract
 
     return SynthesisResult(
         synthesis=synthesis_text,
@@ -3244,13 +3366,17 @@ class TestSynthesisCaching:
 
         llm_review.SYNTHESIS_THEME_CACHE["k"] = {
             "theme": "privacy",
+            "title": "Privacy methods",
             "section": "sec",
             "summary": "sum",
+            "subquestions": ["What is privacy?"],
+            "abstract": "Section abstract.",
             "paper_count": 1,
         }
         llm_review.SYNTHESIS_CONCLUSION_CACHE["c"] = {
             "conclusion": "con",
             "assembled": "assembled",
+            "report_abstract": "report abstract",
         }
 
         save_all_caches()
@@ -3296,8 +3422,18 @@ class TestSynthesisCaching:
 
             def prompt(self, prompt):
                 self.calls += 1
-                if "Return your answer in two marked blocks" in prompt:
+
+                if "Return your answer in four marked blocks" in prompt:
                     return FakeResponse(
+                        "===TITLE_START===\n"
+                        "Privacy methods\n"
+                        "===TITLE_END===\n\n"
+                        "===SUBQUESTIONS_START===\n"
+                        "- What is privacy?\n"
+                        "===SUBQUESTIONS_END===\n\n"
+                        "===SECTION_ABSTRACT_START===\n"
+                        "Section abstract.\n"
+                        "===SECTION_ABSTRACT_END===\n\n"
                         "===SECTION_START===\n"
                         "### privacy\n\n"
                         "Theme synthesis [Smith, 2024].\n"
@@ -3306,6 +3442,14 @@ class TestSynthesisCaching:
                         "Summary [Smith, 2024].\n"
                         "===SUMMARY_END==="
                     )
+
+                if "Return your answer as a marked block" in prompt:
+                    return FakeResponse(
+                        "===REPORT_ABSTRACT_START===\n"
+                        "Overall abstract.\n"
+                        "===REPORT_ABSTRACT_END==="
+                    )
+
                 return FakeResponse(
                     "===SECTION_START===\n"
                     "Conclusion [Smith, 2024].\n"
@@ -3328,7 +3472,7 @@ class TestSynthesisCaching:
 
         result1 = generate_literature_synthesis(session, model_id="fake")
         calls_after_first = fake_model.calls
-        assert calls_after_first == 2
+        assert calls_after_first == 3
 
         result2 = generate_literature_synthesis(session, model_id="fake")
         assert fake_model.calls == calls_after_first
@@ -3370,8 +3514,18 @@ class TestSynthesisCaching:
 
             def prompt(self, prompt):
                 self.calls += 1
-                if "Return your answer in two marked blocks" in prompt:
+
+                if "Return your answer in four marked blocks" in prompt:
                     return FakeResponse(
+                        "===TITLE_START===\n"
+                        "Privacy methods\n"
+                        "===TITLE_END===\n\n"
+                        "===SUBQUESTIONS_START===\n"
+                        "- What is privacy?\n"
+                        "===SUBQUESTIONS_END===\n\n"
+                        "===SECTION_ABSTRACT_START===\n"
+                        "Section abstract.\n"
+                        "===SECTION_ABSTRACT_END===\n\n"
                         "===SECTION_START===\n"
                         "### privacy\n\n"
                         "Theme synthesis [Smith, 2024].\n"
@@ -3380,6 +3534,14 @@ class TestSynthesisCaching:
                         "Summary [Smith, 2024].\n"
                         "===SUMMARY_END==="
                     )
+
+                if "Return your answer as a marked block" in prompt:
+                    return FakeResponse(
+                        "===REPORT_ABSTRACT_START===\n"
+                        "Overall abstract.\n"
+                        "===REPORT_ABSTRACT_END==="
+                    )
+
                 return FakeResponse(
                     "===SECTION_START===\n"
                     "Conclusion [Smith, 2024].\n"
@@ -3406,5 +3568,5 @@ class TestSynthesisCaching:
         decision.paper.abstract = "New abstract"
 
         generate_literature_synthesis(session, model_id="fake")
-        assert fake_model.calls == calls_after_first + 2
+        assert fake_model.calls == calls_after_first + 3
 @

@@ -2130,7 +2130,7 @@ def escape_latex(text: str) -> str:
 def markdown_to_latex(markdown_text: str) -> str:
     """
     Convert Markdown text to LaTeX using pypandoc.
-    
+
     Falls back to escaped plain text if pypandoc is not available.
     """
     try:
@@ -2138,6 +2138,150 @@ def markdown_to_latex(markdown_text: str) -> str:
         return pypandoc.convert_text(markdown_text, 'latex', format='markdown')
     except Exception:
         return escape_latex(markdown_text)
+
+
+def get_query_provider_pairs(session: ReviewSession) -> list[tuple[str, str]]:
+    """Return query/provider pairs with backward-compatible fallback."""
+    if session.query_provider_pairs:
+        return session.query_provider_pairs
+    return [(session.query, provider) for provider in session.providers]
+
+
+def provider_queries_differ(session: ReviewSession) -> bool:
+    """Whether any provider-specific query differs from the base query."""
+    pairs = get_query_provider_pairs(session)
+    return any(query != session.query for query, _ in pairs)
+
+
+def build_research_context_markdown(
+    session: ReviewSession,
+    heading_level: int = 3,
+) -> list[str]:
+    """Build the research context section as Markdown lines."""
+    if not session.research_context:
+        return []
+
+    heading = "#" * heading_level
+    return [
+        f"{heading} Research Context",
+        "",
+        session.research_context,
+        "",
+    ]
+
+
+def build_search_parameters_markdown(
+    session: ReviewSession,
+    heading_level: int = 3,
+) -> list[str]:
+    """Build search parameters (including executed queries) as Markdown lines."""
+    heading = "#" * heading_level
+    providers = ", ".join(session.providers)
+
+    lines: list[str] = [
+        f"{heading} Search Parameters",
+        "",
+        f"- Base query: {session.query}",
+        f"- Providers: {providers}",
+        "",
+    ]
+
+    if provider_queries_differ(session):
+        heading2 = "#" * (heading_level + 1)
+        lines.extend([
+            f"{heading2} Provider-specific queries",
+            "",
+            "| Provider | Query |",
+            "| --- | --- |",
+        ])
+        for query, provider in get_query_provider_pairs(session):
+            lines.append(f"| {provider} | {query} |")
+        lines.append("")
+
+    return lines
+
+
+def build_research_context_latex(
+    session: ReviewSession,
+    heading_command: str = r"\section",
+) -> list[str]:
+    """Build the research context section as LaTeX lines."""
+    if not session.research_context:
+        return []
+
+    lines = [f"{heading_command}{{Research Context}}"]
+    lines.extend(markdown_to_latex(session.research_context).splitlines())
+    lines.append("")
+    return lines
+
+
+def build_search_parameters_latex(
+    session: ReviewSession,
+    heading_command: str = r"\section",
+) -> list[str]:
+    """Build search parameters (including executed queries) as LaTeX lines."""
+    providers = ", ".join(session.providers)
+
+    lines: list[str] = [f"{heading_command}{{Search Parameters}}", ""]
+    lines.extend(
+        [
+            r"\begin{description}",
+            f"\\item[Base query] {escape_latex(session.query)}",
+            f"\\item[Providers] {escape_latex(providers)}",
+            r"\end{description}",
+            "",
+        ]
+    )
+
+    if provider_queries_differ(session):
+        lines.extend(
+            [
+                r"\subsection{Provider-specific queries}",
+                r"\begin{longtable}{lp{10cm}}",
+                r"\toprule",
+                r"Provider & Query \\",
+                r"\midrule",
+            ]
+        )
+        for query, provider in get_query_provider_pairs(session):
+            lines.append(
+                f"{escape_latex(provider)} & {escape_latex(query)} \\\\"
+            )
+        lines.extend(
+            [
+                r"\bottomrule",
+                r"\end{longtable}",
+                "",
+            ]
+        )
+
+    return lines
+
+
+def build_review_report_abstract(session: ReviewSession) -> str:
+    """Build a deterministic one-paragraph abstract for the review report."""
+    kept = len(session.kept_papers)
+    discarded = len(session.discarded_papers)
+    pending = len(session.pending_papers)
+    total = len(session.decisions)
+
+    context = (session.research_context or "").strip()
+    if context:
+        first = context.splitlines()[0].strip()
+        lead = first.rstrip(".") + "."
+    else:
+        lead = "This report documents a systematic literature review session."
+
+    providers = ", ".join(session.providers)
+    summary = (
+        f"{lead} The search covered {providers} and yielded {total} papers "
+        f"({kept} kept, {discarded} discarded, {pending} pending)."
+    )
+
+    if session.snowball_rounds:
+        summary += " Manual snowballing was used to discover additional papers."
+
+    return summary
 
 
 def generate_latex_report(session: ReviewSession, output_path: Path) -> None:
@@ -2286,10 +2430,8 @@ def generate_latex_report(session: ReviewSession, output_path: Path) -> None:
         r"\usepackage{array}",
         r"\usepackage{amssymb}",
         r"\usepackage{graphicx}",
-        r"\usepackage{geometry}",
         r"\usepackage[backend=biber,style=authoryear]{biblatex}",
         f"\\addbibresource{{{bib_path.name}}}",
-        r"\geometry{margin=1in}",
         r"",
         r"\title{Literature Review Report}",
         f"\\date{{{session.timestamp.strftime('%Y-%m-%d')}}}",
@@ -2297,39 +2439,18 @@ def generate_latex_report(session: ReviewSession, output_path: Path) -> None:
         r"\begin{document}",
         r"\maketitle",
         r"",
-        r"\section{Search Parameters}",
+        r"\begin{abstract}",
+        build_review_report_abstract(session),
+        r"\end{abstract}",
+        r"\clearpage",
+        r"\clearpage",
+        r"\tableofcontents",
+        r"\clearpage",
+        r"",
     ]
-    
-    # Show query-provider pairs as table if multiple, else simple list
-    if len(session.query_provider_pairs) > 1:
-        lines.extend([
-            r"\begin{longtable}{lp{10cm}}",
-            r"\toprule",
-            r"Provider & Query \\",
-            r"\midrule",
-        ])
-        for query, provider in session.query_provider_pairs:
-            lines.append(
-                f"{escape_latex(provider)} & {escape_latex(query)} \\\\"
-            )
-        lines.extend([
-            r"\bottomrule",
-            r"\end{longtable}",
-        ])
-    else:
-        lines.extend([
-            r"\begin{description}",
-            f"\\item[Query] {escape_latex(session.query)}",
-            f"\\item[Providers] {', '.join(session.providers)}",
-            r"\end{description}",
-        ])
 
-    if session.research_context:
-        lines.extend([
-            r"\subsection{Research Context}",
-        ])
-        lines.extend(markdown_to_latex(session.research_context).splitlines())
-        lines.append(r"")
+    lines.extend(build_research_context_latex(session, heading_command=r"\section"))
+    lines.extend(build_search_parameters_latex(session, heading_command=r"\section"))
 
     lines.extend([
         r"\begin{description}",
@@ -2622,7 +2743,7 @@ class TestReportGeneration:
         generate_latex_report(session, output_path)
 
         content = output_path.read_text()
-        assert r"\subsection{Research Context}" in content
+        assert r"\section{Research Context}" in content
         assert "This is the research context." in content
 
     def test_escapes_special_characters(self, tmp_path):
