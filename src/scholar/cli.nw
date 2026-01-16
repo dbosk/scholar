@@ -2591,8 +2591,8 @@ requires running [[biber]].
 @
 
 <<llm command>>=
-@llm_app.command("synthesis")
-def llm_synthesis(
+@llm_app.command("synthesize")
+def llm_synthesize(
     session_name: Annotated[
         str,
         typer.Argument(
@@ -2659,9 +2659,9 @@ def llm_synthesis(
     - A research context set for the session
 
     Examples:
-        scholar llm synthesis "my review"
-        scholar llm synthesis "my review" -o synthesis.md
-        scholar llm synthesis "my review" --format latex -o synthesis.tex
+         scholar llm synthesize "my review"
+        scholar llm synthesize "my review" -o synthesis.md
+        scholar llm synthesize "my review" --format latex -o synthesis.tex
     """
     from scholar.review import load_session
     from scholar.llm_review import generate_literature_synthesis
@@ -2741,14 +2741,14 @@ class TestLLMCommands:
         assert result.exit_code == 1
         assert "not found" in result.stdout.lower()
 
-    def test_llm_synthesis_session_not_found(self):
-        """llm synthesis shows error for missing session."""
-        result = runner.invoke(app, ["llm", "synthesis", "nonexistent"])
+    def test_llm_synthesize_session_not_found(self):
+        """llm synthesize shows error for missing session."""
+        result = runner.invoke(app, ["llm", "synthesize", "nonexistent"])
         assert result.exit_code == 1
         assert "not found" in result.stdout.lower()
 
-    def test_llm_synthesis_invalid_format(self, monkeypatch, tmp_path):
-        """llm synthesis rejects invalid output format."""
+    def test_llm_synthesize_invalid_format(self, monkeypatch, tmp_path):
+        """llm synthesize rejects invalid output format."""
         from scholar import review
         from datetime import datetime
 
@@ -2763,7 +2763,7 @@ class TestLLMCommands:
         monkeypatch.setattr(review, "load_session", lambda x: session)
 
         result = runner.invoke(
-            app, ["llm", "synthesis", "test-session", "--format", "invalid"]
+            app, ["llm", "synthesize", "test-session", "--format", "invalid"]
         )
         assert result.exit_code == 1
         assert "invalid format" in result.stdout.lower()
