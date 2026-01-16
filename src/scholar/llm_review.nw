@@ -2929,7 +2929,7 @@ def _assemble_latex_synthesis(
             r"\usepackage[backend=biber,style=authoryear]{biblatex}",
             r"\addbibresource{synthesis.bib}",
             "",
-            r"\title{Literature Synthesis}",
+            f"\\title{{{session.name or session.query}}}",
             f"\\date{{{session.timestamp.strftime('%Y-%m-%d')}}}",
             "",
             r"\begin{document}",
