@@ -1734,7 +1734,7 @@ SYNTHESIS_SECTION_END = "===SECTION_END==="
 SYNTHESIS_SUMMARY_START = "===SUMMARY_START==="
 SYNTHESIS_SUMMARY_END = "===SUMMARY_END==="
 
-SYNTHESIS_CACHE_VERSION = "v3"
+SYNTHESIS_CACHE_VERSION = "v4"
 SYNTHESIS_THEME_CACHE = load_cache("llm_synthesis_theme")
 SYNTHESIS_CONCLUSION_CACHE = load_cache("llm_synthesis_conclusion")
 register_cache("llm_synthesis_theme", SYNTHESIS_THEME_CACHE)
@@ -2300,6 +2300,29 @@ def _ensure_theme_heading(
     return f"### {title}\n\n" + text.strip()
 
 
+def _replace_theme_heading(
+    text: str,
+    title: str,
+    output_format: str,
+) -> str:
+    """Replace the first heading with the given title, or insert one."""
+    stripped = text.lstrip()
+    if not stripped:
+        return _ensure_theme_heading(text, title, output_format)
+
+    lines = stripped.splitlines()
+    if output_format == "latex":
+        if lines and lines[0].startswith("\\subsection{"):
+            lines[0] = f"\\subsection{{{title}}}"
+            return "\n".join(lines).strip()
+        return _ensure_theme_heading(stripped, title, output_format)
+
+    if lines and lines[0].startswith("###"):
+        lines[0] = f"### {title}"
+        return "\n".join(lines).strip()
+    return _ensure_theme_heading(stripped, title, output_format)
+
+
 SYNTHESIS_TITLE_START = "===TITLE_START==="
 SYNTHESIS_TITLE_END = "===TITLE_END==="
 SYNTHESIS_SUBQUESTIONS_START = "===SUBQUESTIONS_START==="
@@ -2318,6 +2341,49 @@ def _parse_subquestions(text: str | None) -> list[str]:
         if stripped:
             lines.append(stripped)
     return lines
+
+
+def title_needs_improvement(theme: str | None, title: str) -> bool:
+    """Heuristic: did the model just repeat the theme tag as title?"""
+    if theme is None:
+        return False
+
+    theme_norm = re.sub(r"\s+", " ", theme.strip().lower())
+    title_norm = re.sub(r"\s+", " ", title.strip().lower())
+    if not title_norm:
+        return True
+
+    if title_norm == theme_norm:
+        return True
+
+    # Common minimal variations that still indicate no real improvement.
+    if title_norm.replace("-", " ") == theme_norm.replace("-", " "):
+        return True
+
+    return False
+
+
+def build_title_from_abstract_prompt(
+    theme: str,
+    section_abstract: str,
+    output_format: str,
+) -> str:
+    """Ask the LLM for a better title if the theme title was not improved."""
+    return (
+        "You are a research assistant improving section titles in a literature "
+        "synthesis report.\n\n"
+        f"Theme keyword: {theme}\n\n"
+        "Section abstract:\n"
+        f"{section_abstract}\n\n"
+        "Instructions:\n"
+        "- Propose a concise, descriptive section title (max 10 words).\n"
+        "- Do not include citations.\n"
+        "- Do not include punctuation at the end.\n\n"
+        "Return the title in this marked block:\n\n"
+        f"{SYNTHESIS_TITLE_START}\n"
+        "<title>\n"
+        f"{SYNTHESIS_TITLE_END}\n"
+    )
 
 
 def parse_theme_section_response(
@@ -3126,6 +3192,33 @@ def generate_literature_synthesis(
             output_format=output_format,
             paper_count=len(group_decisions),
         )
+
+        # If the model failed to propose a better title, do a focused follow-up
+        # prompt using the section abstract.
+        if (
+            theme is not None
+            and title_needs_improvement(theme, parsed.title)
+            and parsed.abstract
+        ):
+            title_prompt = build_title_from_abstract_prompt(
+                theme=theme,
+                section_abstract=parsed.abstract,
+                output_format=output_format,
+            )
+            title_response = model.prompt(title_prompt)
+            better_title = _extract_marked_block(
+                title_response.text(),
+                SYNTHESIS_TITLE_START,
+                SYNTHESIS_TITLE_END,
+            )
+            if better_title:
+                parsed.title = better_title.strip()
+                parsed.section = _replace_theme_heading(
+                    parsed.section,
+                    parsed.title,
+                    output_format,
+                )
+
         theme_results.append(parsed)
         SYNTHESIS_THEME_CACHE[cache_key] = {
             "theme": parsed.theme,
@@ -3445,6 +3538,13 @@ class TestSynthesisCaching:
                         "===SUMMARY_END==="
                     )
 
+                if "Theme keyword:" in prompt:
+                    return FakeResponse(
+                        "===TITLE_START===\n"
+                        "Improved title\n"
+                        "===TITLE_END==="
+                    )
+
                 if "Return your answer as a marked block" in prompt:
                     return FakeResponse(
                         "===REPORT_ABSTRACT_START===\n"
@@ -3535,6 +3635,13 @@ class TestSynthesisCaching:
                         "===SUMMARY_START===\n"
                         "Summary [Smith, 2024].\n"
                         "===SUMMARY_END==="
+                    )
+
+                if "Theme keyword:" in prompt:
+                    return FakeResponse(
+                        "===TITLE_START===\n"
+                        "Improved title\n"
+                        "===TITLE_END==="
                     )
 
                 if "Return your answer as a marked block" in prompt:
