@@ -3043,6 +3043,7 @@ def generate_literature_synthesis(
     output_format: str = "markdown",
     max_papers: int | None = None,
     dry_run: bool = False,
+    themes: list[str | None] | None = None,
 ) -> SynthesisResult | str:
     """Generate a multi-round literature synthesis from kept papers."""
     from scholar.notes import get_paper_id
@@ -3085,6 +3086,18 @@ def generate_literature_synthesis(
 
     citation_keys = _generate_all_citation_keys(kept_decisions, output_format)
     themes, groups = _group_kept_papers_by_theme(kept_decisions)
+
+    # If caller provided a themes filter, apply it. CLI uses 'unthemed' -> None
+    if themes is not None:
+        # Validate requested themes against available groups
+        available_labels = [t if t is not None else "unthemed" for t in groups.keys()]
+        requested = set(themes)
+        keep_keys = [k for k in groups.keys() if k in requested]
+        if not keep_keys:
+            raise ValueError(f"No matching themes found in session. Available themes: {', '.join(available_labels)}")
+        groups = {k: v for k, v in groups.items() if k in keep_keys}
+        # Update themes variable to reflect filtered, non-None theme names
+        themes = sorted([k for k in groups.keys() if k is not None])
 
     # Prepare prompts (for dry-run and execution).
     theme_prompts: list[tuple[str | None, str]] = []
