@@ -50,6 +50,7 @@ def llm_synthesize(
         typer.Option(
             "--themes", "-t",
             help="Restrict synthesis to these theme names (repeatable). Use 'unthemed' for papers without tags.",
+            autocompletion=complete_theme,
         ),
     ] = None,
     interactive: Annotated[
@@ -89,6 +90,19 @@ def llm_synthesize(
     from scholar.llm_review import generate_literature_synthesis
 
     import questionary
+    # For theme autocompletion we need a small closure that can access the session
+    def complete_theme(incomplete: str) -> list[str]:
+        try:
+            # load_session is available in this scope
+            s = load_session(session_name)
+            if s is None:
+                return []
+            labels = sorted(list(s.all_themes()))
+            if any(not d.tags for d in s.kept_papers):
+                labels.append("unthemed")
+            return [t for t in labels if t.startswith(incomplete)]
+        except Exception:
+            return []
 
     console = Console()
     session = load_session(session_name)
