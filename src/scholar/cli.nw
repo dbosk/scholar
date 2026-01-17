@@ -1,73 +1,4 @@
 <<llm command>>=
-def complete_theme(*cb_args):
-    """Autocomplete theme labels for sessions.
-
-    Accepts multiple calling conventions used by completion systems:
-    - (incomplete: str)
-    - (ctx, args, incomplete)
-
-    The function attempts to extract the session name from the Click/Typer
-    context when available, then from provided args, and finally falls back
-    to sys.argv. It always returns a list and never raises.
-    """
-    try:
-        # Normalize inputs from different completion callback signatures
-        ctx = None
-        args = None
-        if len(cb_args) == 1:
-            incomplete = cb_args[0]
-        elif len(cb_args) == 3:
-            ctx, args, incomplete = cb_args
-        else:
-            # Fallback: assume last arg is the incomplete text
-            incomplete = cb_args[-1]
-            if len(cb_args) >= 2:
-                args = cb_args[0]
-
-        # Try to get session_name from context params
-        session_name = None
-        if ctx and hasattr(ctx, "params"):
-            session_name = ctx.params.get("session_name")
-
-        # Try to get session_name from args (e.g., ['synthesize', 'name'])
-        if not session_name and args:
-            try:
-                if isinstance(args, (list, tuple)):
-                    if "synthesize" in args:
-                        i = args.index("synthesize")
-                        if i + 1 < len(args):
-                            session_name = args[i + 1]
-                    else:
-                        # If first positional arg is likely the session name
-                        session_name = args[0]
-            except Exception:
-                session_name = None
-
-        # Final fallback to sys.argv
-        if not session_name:
-            import sys
-            argv = sys.argv[1:]
-            if "synthesize" in argv:
-                synth_idx = argv.index("synthesize")
-                if synth_idx + 1 < len(argv):
-                    session_name = argv[synth_idx + 1]
-
-        if not session_name:
-            return []
-
-        from scholar.review import load_session
-        s = load_session(session_name)
-        if s is None:
-            return []
-
-        labels = sorted(list(s.all_themes()))
-        if any(not d.tags for d in s.kept_papers):
-            labels.append("unthemed")
-
-        return [t for t in labels if t.startswith(incomplete)]
-    except Exception:
-        return []
-
 @llm_app.command("synthesize")
 def llm_synthesize(
     session_name: Annotated[
@@ -158,6 +89,21 @@ def llm_synthesize(
     from scholar.review import load_session
     from scholar.llm_review import generate_literature_synthesis
 
+    import questionary
+    # For theme autocompletion we need a small closure that can access the session
+    def complete_theme(incomplete: str) -> list[str]:
+        try:
+            # load_session is available in this scope
+            s = load_session(session_name)
+            if s is None:
+                return []
+            labels = sorted(list(s.all_themes()))
+            if any(not d.tags for d in s.kept_papers):
+                labels.append("unthemed")
+            return [t for t in labels if t.startswith(incomplete)]
+        except Exception:
+            return []
+
     console = Console()
     session = load_session(session_name)
 
@@ -202,16 +148,8 @@ def llm_synthesize(
         if not prompt_candidates:
             console.print("[red]No themes available for selection.[/red]")
             raise typer.Exit(1)
-        # Lazy import questionary here so the package is optional at module
-        # import time. If it's missing, raise to inform the user that
-        # interactive mode requires the package.
-        try:
-            import questionary
-        except Exception:
-            raise ImportError("Interactive mode requires the 'questionary' package.")
-
         answer = questionary.checkbox(
-            message="Select themes to include in synthesis (space to toggle, ENTER to accept):",
+            "Select themes to include in synthesis (space to toggle, ENTER to accept):",
             choices=prompt_candidates,
         ).ask()
         # None if user aborted
