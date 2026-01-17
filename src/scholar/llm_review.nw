@@ -3043,6 +3043,7 @@ def generate_literature_synthesis(
     output_format: str = "markdown",
     max_papers: int | None = None,
     dry_run: bool = False,
+    filter_themes: list[str | None] | None = None,
     themes: list[str | None] | None = None,
 ) -> SynthesisResult | str:
     """Generate a multi-round literature synthesis from kept papers."""
@@ -3085,19 +3086,24 @@ def generate_literature_synthesis(
     included_kept_papers = len(kept_decisions)
 
     citation_keys = _generate_all_citation_keys(kept_decisions, output_format)
-    themes, groups = _group_kept_papers_by_theme(kept_decisions)
+    available_themes, groups = _group_kept_papers_by_theme(kept_decisions)
+
+    # Backwards compatibility: support either 'filter_themes' (new param) or
+    # 'themes' (older param name) if callers pass it by keyword.
+    effective_filter = filter_themes if filter_themes is not None else themes
 
     # If caller provided a themes filter, apply it. CLI uses 'unthemed' -> None
-    if themes is not None:
+    if effective_filter is not None:
         # Validate requested themes against available groups
         available_labels = [t if t is not None else "unthemed" for t in groups.keys()]
-        requested = set(themes)
+        requested = set(effective_filter)
         keep_keys = [k for k in groups.keys() if k in requested]
         if not keep_keys:
             raise ValueError(f"No matching themes found in session. Available themes: {', '.join(available_labels)}")
         groups = {k: v for k, v in groups.items() if k in keep_keys}
-        # Update themes variable to reflect filtered, non-None theme names
-        themes = sorted([k for k in groups.keys() if k is not None])
+
+    # Compute final list of non-None theme names (for return value)
+    final_themes = sorted([k for k in groups.keys() if k is not None])
 
     # Prepare prompts (for dry-run and execution).
     theme_prompts: list[tuple[str | None, str]] = []
@@ -3343,7 +3349,7 @@ def generate_literature_synthesis(
         model_id=effective_model_id,
         timestamp=datetime.now().isoformat(),
         paper_count=len(kept_decisions),
-        themes=themes,
+        themes=final_themes,
         references=references,
         theme_sections=theme_results,
         conclusion=conclusion_text,

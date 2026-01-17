@@ -1,4 +1,95 @@
-<<llm command>>=
+<<[[cli.py]]>>=
+
+# Minimal module header: imports, Typer apps, and stub completions
+from __future__ import annotations
+from typing import Optional, Annotated
+from pathlib import Path
+import typer
+from rich.console import Console
+
+app = typer.Typer(help="Scholar CLI")
+llm_app = typer.Typer(help="LLM commands")
+app.add_typer(llm_app, name="llm")
+
+# Stub completion helpers (safe at import time)
+def complete_session_name(ctx=None, args=None, incomplete=""):
+    """Safe session name completion stub for import time."""
+    return []
+
+
+def complete_model(ctx=None, args=None, incomplete=""):
+    """Safe model completion stub for import time."""
+    return []
+
+
+def complete_synthesis_format(ctx=None, args=None, incomplete=""):
+    """Safe output format completion stub for import time."""
+    return []
+
+
+def complete_theme(ctx=None, args=None, incomplete=""):
+    """Autocomplete theme labels for sessions (module-level, defensive).
+
+    Accepts different completion callback signatures (Typer/Click varies):
+    - (incomplete: str)
+    - (ctx, args, incomplete)
+
+    Tries to infer session name from context params, provided args, or
+    sys.argv. Never raises; returns an empty list on error.
+    """
+    try:
+        ctx = None
+        args = None
+        if len(cb_args) == 1:
+            incomplete = cb_args[0]
+        elif len(cb_args) == 3:
+            ctx, args, incomplete = cb_args
+        else:
+            incomplete = cb_args[-1]
+            if len(cb_args) >= 2:
+                args = cb_args[0]
+
+        session_name = None
+        if ctx and getattr(ctx, "params", None):
+            session_name = ctx.params.get("session_name")
+
+        if not session_name and args:
+            try:
+                if isinstance(args, (list, tuple)):
+                    if "synthesize" in args:
+                        i = args.index("synthesize")
+                        if i + 1 < len(args):
+                            session_name = args[i + 1]
+                    else:
+                        session_name = args[0]
+            except Exception:
+                session_name = None
+
+        if not session_name:
+            import sys
+            argv = sys.argv[1:]
+            if "synthesize" in argv:
+                synth_idx = argv.index("synthesize")
+                if synth_idx + 1 < len(argv):
+                    session_name = argv[synth_idx + 1]
+
+        if not session_name:
+            return []
+
+        from scholar.review import load_session
+        s = load_session(session_name)
+        if s is None:
+            return []
+
+        labels = sorted(list(s.all_themes()))
+        if any(not d.tags for d in s.kept_papers):
+            labels.append("unthemed")
+
+        return [t for t in labels if t.startswith(incomplete)]
+    except Exception:
+        return []
+
+
 @llm_app.command("synthesize")
 def llm_synthesize(
     session_name: Annotated[
@@ -66,43 +157,9 @@ def llm_synthesize(
 
     Creates a coherent narrative explaining how papers in the review
     contribute to answering the research question.
-
-    The output always begins with a "Research Question" section that
-    includes provenance (query/provider pairs, timestamp, and review
-    statistics), followed by a "Synthesis" section (organized by themes
-    when paper tags are present), a "Conclusion", and a deterministic
-    reference list.
-
-    For LaTeX output, a full compilable document is produced, including an
-    embedded BibTeX file and a biblatex reference section (run biber when
-    compiling).
-
-    Requires:
-    - At least one kept paper in the session
-    - A research context set for the session
-
-    Examples:
-         scholar llm synthesize "my review"
-        scholar llm synthesize "my review" -o synthesis.md
-        scholar llm synthesize "my review" --format latex -o synthesis.tex
     """
     from scholar.review import load_session
     from scholar.llm_review import generate_literature_synthesis
-
-    import questionary
-    # For theme autocompletion we need a small closure that can access the session
-    def complete_theme(incomplete: str) -> list[str]:
-        try:
-            # load_session is available in this scope
-            s = load_session(session_name)
-            if s is None:
-                return []
-            labels = sorted(list(s.all_themes()))
-            if any(not d.tags for d in s.kept_papers):
-                labels.append("unthemed")
-            return [t for t in labels if t.startswith(incomplete)]
-        except Exception:
-            return []
 
     console = Console()
     session = load_session(session_name)
@@ -148,11 +205,18 @@ def llm_synthesize(
         if not prompt_candidates:
             console.print("[red]No themes available for selection.[/red]")
             raise typer.Exit(1)
+
+        # Lazy import questionary so interactive mode is optional at runtime
+        try:
+            import questionary
+        except Exception:
+            raise ImportError("Interactive mode requires the 'questionary' package.")
+
         answer = questionary.checkbox(
-            "Select themes to include in synthesis (space to toggle, ENTER to accept):",
+            message="Select themes to include in synthesis (space to toggle, ENTER to accept):",
             choices=prompt_candidates,
         ).ask()
-        # None if user aborted
+        # None or empty means abort
         if not answer:
             console.print("[red]No themes selected; aborting.[/red]")
             raise typer.Exit(1)
@@ -204,4 +268,124 @@ def llm_synthesize(
     except ImportError as e:
         console.print(f"[red]{e}[/red]")
         raise typer.Exit(1)
+@
+
+<<test functions>>=
+import types
+import sys
+from typer.testing import CliRunner
+from unittest.mock import patch
+
+from scholar.cli import app
+
+
+runner = CliRunner()
+
+
+def test_cli_synthesize_with_themes_and_interactive(monkeypatch, tmp_path):
+    # Build a fake session with themes
+    import scholar.review as review
+    from scholar.review import ReviewSession, ReviewDecision, DecisionStatus
+    from scholar.scholar import Paper
+    from datetime import datetime
+
+    session = ReviewSession(
+        query="test",
+        providers=["test"],
+        timestamp=datetime.now(),
+        research_context="Testing themes",
+        name="test-session",
+    )
+
+    # kept paper with 'privacy' tag
+    p1 = Paper(title="A", authors=["A"], year=2024, abstract="abs")
+    d1 = ReviewDecision(paper=p1, provider="test", status=DecisionStatus.KEPT, tags=["privacy"])
+    session.decisions.append(d1)
+
+    # kept paper with 'ml' tag
+    p2 = Paper(title="B", authors=["B"], year=2024, abstract="abs")
+    d2 = ReviewDecision(paper=p2, provider="test", status=DecisionStatus.KEPT, tags=["ml"])
+    session.decisions.append(d2)
+
+    # Monkeypatch load_session
+    monkeypatch.setenv("SCHOLAR_DATA_DIR", str(tmp_path))
+    monkeypatch.setattr(review, "load_session", lambda x: session)
+
+    # Monkeypatch questionary to simulate user selecting only 'ml'
+    import questionary
+
+    class FakeQuestion:
+        def __init__(self, choices):
+            self.choices = choices
+
+        def ask(self):
+            return ["ml"]
+
+    monkeypatch.setattr(questionary, "checkbox", lambda **kw: FakeQuestion(kw.get("choices")))
+
+    # Monkeypatch generate_literature_synthesis to inspect 'themes' arg
+    import scholar.llm_review as llm_review
+
+    called = {}
+
+    def fake_generate(session, model_id=None, output_format="markdown", max_papers=None, dry_run=False, themes=None):
+        called['themes'] = themes
+        class R: pass
+        r = R()
+        r.synthesis = "synth"
+        r.paper_count = 2
+        r.themes = [t for t in (themes or []) if t is not None]
+        r.model_id = "fake"
+        return r
+
+    monkeypatch.setattr(llm_review, "generate_literature_synthesis", fake_generate)
+
+    result = runner.invoke(app, ["llm", "synthesize", "test-session", "-t", "privacy", "-t", "ml", "-i"]) 
+    assert result.exit_code == 0
+    assert called['themes'] == ['ml']
+
+
+def test_cli_synthesize_with_themes_noninteractive(monkeypatch, tmp_path):
+    import scholar.review as review
+    from scholar.review import ReviewSession, ReviewDecision, DecisionStatus
+    from scholar.scholar import Paper
+    from datetime import datetime
+
+    session = ReviewSession(
+        query="test",
+        providers=["test"],
+        timestamp=datetime.now(),
+        research_context="Testing themes",
+        name="test-session",
+    )
+
+    p1 = Paper(title="A", authors=["A"], year=2024, abstract="abs")
+    d1 = ReviewDecision(paper=p1, provider="test", status=DecisionStatus.KEPT, tags=["privacy"])
+    session.decisions.append(d1)
+
+    p2 = Paper(title="B", authors=["B"], year=2024, abstract="abs")
+    d2 = ReviewDecision(paper=p2, provider="test", status=DecisionStatus.KEPT, tags=["ml"])
+    session.decisions.append(d2)
+
+    monkeypatch.setattr(review, "load_session", lambda x: session)
+
+    import scholar.llm_review as llm_review
+
+    called = {}
+
+    def fake_generate(session, model_id=None, output_format="markdown", max_papers=None, dry_run=False, themes=None):
+        called['themes'] = themes
+        class R: pass
+        r = R()
+        r.synthesis = "synth"
+        r.paper_count = 2
+        r.themes = [t for t in (themes or []) if t is not None]
+        r.model_id = "fake"
+        return r
+
+    monkeypatch.setattr(llm_review, "generate_literature_synthesis", fake_generate)
+
+    result = runner.invoke(app, ["llm", "synthesize", "test-session", "-t", "privacy"]) 
+    assert result.exit_code == 0
+    assert called['themes'] == ['privacy']
 @
