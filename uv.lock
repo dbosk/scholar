@@ -947,6 +947,19 @@ wheels = [
 ]
 
 [[package]]
+name = "llm-github-copilot"
+version = "0.3.1"
+source = { registry = "https://pypi.org/simple" }
+dependencies = [
+    { name = "httpx" },
+    { name = "llm" },
+]
+sdist = { url = "https://files.pythonhosted.org/packages/03/51/c51ba3b807dec05450b73dfd7a253dc7387a579eecaca2c84e1fce1139e6/llm_github_copilot-0.3.1.tar.gz", hash = "sha256:369974427ca535125c74ed42c51ab2c7ae06f544b461bf111ec53fd5d4ba5717", size = 18531, upload-time = "2025-07-19T21:44:47.501Z" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/50/b8/058ae98d8096f46e31524036979b90e1a6b2effa1c44bbbb58409a16aaf9/llm_github_copilot-0.3.1-py3-none-any.whl", hash = "sha256:963292916debb414827ac3645f4287d9579abcf72959e82186dd9ac2f460855b", size = 12917, upload-time = "2025-07-19T21:44:46.119Z" },
+]
+
+[[package]]
 name = "llm-gpt4all"
 version = "0.4"
 source = { registry = "https://pypi.org/simple" }
@@ -1894,6 +1907,7 @@ dependencies = [
     { name = "llm-anthropic" },
     { name = "llm-azure" },
     { name = "llm-gemini" },
+    { name = "llm-github-copilot" },
     { name = "llm-gpt4all" },
     { name = "llm-openai-plugin" },
     { name = "openai" },
@@ -1933,6 +1947,7 @@ requires-dist = [
     { name = "llm-anthropic", specifier = ">=0.23" },
     { name = "llm-azure", specifier = ">=2.1" },
     { name = "llm-gemini", specifier = ">=0.28.2" },
+    { name = "llm-github-copilot", specifier = ">=0.3.1" },
     { name = "llm-gpt4all", specifier = ">=0.4" },
     { name = "llm-openai-plugin", specifier = ">=0.7" },
     { name = "openai", specifier = ">=1.0.0" },
