@@ -800,7 +800,23 @@ def rq(
         typer.Option(
             "--model",
             "-m",
-            help="LLM model to use (uses llm default if not specified).",
+            help="Base LLM model to use (uses llm default if not specified).",
+            autocompletion=complete_model,
+        ),
+    ] = None,
+    model_analytic: Annotated[
+        str | None,
+        typer.Option(
+            "--model-analytic",
+            help="Override -m for analytic tasks (classification, query generation).",
+            autocompletion=complete_model,
+        ),
+    ] = None,
+    model_writing: Annotated[
+        str | None,
+        typer.Option(
+            "--model-writing",
+            help="Override -m for writing tasks (synthesis generation).",
             autocompletion=complete_model,
         ),
     ] = None,
@@ -852,6 +868,14 @@ from scholar.llm_review import (
 
 console = Console()
 
+from scholar.utils import LLMModelSelection, select_model_id
+
+model_selection = LLMModelSelection(
+    base=model,
+    analytic=model_analytic,
+    writing=model_writing,
+)
+
 <<generate provider queries>>
 <<resolve research question>>
 
@@ -894,7 +918,11 @@ effective_limit = UNLIMITED_PROVIDER_LIMIT if limit == 0 else limit
 @
 
 <<generate rq provider queries>>=
-provider_queries = generate_provider_queries(rq_text, provider_names, model)
+provider_queries = generate_provider_queries(
+    rq_text,
+    provider_names,
+    select_model_id(model_selection, "analytic"),
+)
 @
 
 <<execute rq provider searches>>=
@@ -940,7 +968,7 @@ try:
     batch = classify_papers_with_llm(
         session=session,
         count=count,
-        model_id=model,
+        model_id=select_model_id(model_selection, "analytic"),
         enrich_missing=not no_enrich,
         require_examples=False,
     )
@@ -2392,15 +2420,31 @@ def llm_classify(
             help="Number of papers to classify in this batch.",
         ),
     ] = 10,
-    model: Annotated[
-        str | None,
-        typer.Option(
-            "--model", "-m",
-            help="LLM model to use (uses llm default if not specified).",
-            autocompletion=complete_model,
-        ),
-    ] = None,
-    dry_run: Annotated[
+     model: Annotated[
+         str | None,
+         typer.Option(
+             "--model", "-m",
+             help="Base LLM model to use (uses llm default if not specified).",
+             autocompletion=complete_model,
+         ),
+     ] = None,
+     model_analytic: Annotated[
+         str | None,
+         typer.Option(
+             "--model-analytic",
+             help="Override -m for analytic tasks (classification, query generation).",
+             autocompletion=complete_model,
+         ),
+     ] = None,
+     model_writing: Annotated[
+         str | None,
+         typer.Option(
+             "--model-writing",
+             help="Override -m for writing tasks (synthesis generation).",
+             autocompletion=complete_model,
+         ),
+     ] = None,
+     dry_run: Annotated[
         bool,
         typer.Option(
             "--dry-run",
@@ -2424,7 +2468,9 @@ def llm_classify(
     Example:
         scholar llm classify "my review" --count 20
     """
-    from scholar.review import load_session, save_session
+    import scholar.review as review
+    from scholar.review import save_session
+    from scholar.utils import LLMModelSelection, select_model_id
     from scholar.llm_review import (
         classify_papers_with_llm,
         apply_llm_decisions,
@@ -2432,17 +2478,23 @@ def llm_classify(
     )
 
     console = Console()
-    session = load_session(session_name)
+    session = review.load_session(session_name)
 
     if session is None:
         console.print(f"[red]Session not found: {session_name}[/red]")
         raise typer.Exit(1)
 
+    model_selection = LLMModelSelection(
+        base=model,
+        analytic=model_analytic,
+        writing=model_writing,
+    )
+
     try:
         result = classify_papers_with_llm(
             session=session,
             count=count,
-            model_id=model,
+            model_id=select_model_id(model_selection, "analytic"),
             enrich_missing=not no_enrich,
             dry_run=dry_run,
         )
@@ -2651,7 +2703,7 @@ def _select_themes_interactively(
     ]
 
     selected = questionary.checkbox(
-        "Select themes to include in synthesis:",
+        message="Select themes to include in synthesis:",
         choices=choices,
     ).ask()
 
@@ -2683,10 +2735,10 @@ def _resolve_themes(
     """
     from scholar.llm_review import get_session_theme_counts
 
-    # If --themes was specified, use those directly
+    theme_counts = get_session_theme_counts(session)
+
+    # If --themes was specified, validate (and optionally interactively narrow)
     if themes_option:
-        # Validate that themes exist
-        theme_counts = get_session_theme_counts(session)
         available = set(theme_counts.keys())
         requested = set(themes_option)
         invalid = requested - available
@@ -2705,12 +2757,26 @@ def _resolve_themes(
             )
             raise typer.Exit(1)
 
-        return valid_themes
+        if not interactive:
+            return valid_themes
+
+        # Restrict counts to the provided themes for interactive selection
+        restricted_counts = {
+            t: theme_counts[t] for t in valid_themes if t in theme_counts
+        }
+
+        if suggest_groups and len(restricted_counts) > 1:
+            restricted_counts = _apply_theme_groupings(
+                theme_counts=restricted_counts,
+                research_context=session.research_context,
+                model_id=model_id,
+                console=console,
+            )
+
+        return _select_themes_interactively(restricted_counts, console)
 
     # If --interactive, show checklist
     if interactive:
-        theme_counts = get_session_theme_counts(session)
-
         if not theme_counts:
             console.print(
                 "[yellow]No themes assigned to kept papers. "
@@ -2819,7 +2885,23 @@ def llm_synthesize(
         str | None,
         typer.Option(
             "--model", "-m",
-            help="LLM model to use (uses llm default if not specified).",
+            help="Base LLM model to use (uses llm default if not specified).", 
+            autocompletion=complete_model,
+        ),
+    ] = None,
+    model_analytic: Annotated[
+        str | None,
+        typer.Option(
+            "--model-analytic",
+            help="Override -m for analytic tasks (theme grouping).",
+            autocompletion=complete_model,
+        ),
+    ] = None,
+    model_writing: Annotated[
+        str | None,
+        typer.Option(
+            "--model-writing",
+            help="Override -m for writing tasks (synthesis generation).",
             autocompletion=complete_model,
         ),
     ] = None,
@@ -2902,14 +2984,15 @@ def llm_synthesize(
         scholar llm synthesize "my review" --interactive
         scholar llm synthesize "my review" -i --suggest-groups
     """
-    from scholar.review import load_session
+    import scholar.review as review
+    from scholar.utils import LLMModelSelection, select_model_id
     from scholar.llm_review import (
         generate_literature_synthesis,
         get_session_theme_counts,
     )
 
     console = Console()
-    session = load_session(session_name)
+    session = review.load_session(session_name)
 
     if session is None:
         console.print(f"[red]Session not found: {session_name}[/red]")
@@ -2923,24 +3006,30 @@ def llm_synthesize(
         )
         raise typer.Exit(1)
 
+    model_selection = LLMModelSelection(
+        base=model,
+        analytic=model_analytic,
+        writing=model_writing,
+    )
+
     # Determine selected themes
     selected_themes = _resolve_themes(
         session=session,
         themes_option=themes,
         interactive=interactive,
         suggest_groups=suggest_groups,
-        model_id=model,
+        model_id=select_model_id(model_selection, "analytic"),
         console=console,
     )
 
     try:
         result = generate_literature_synthesis(
             session=session,
-            model_id=model,
+            model_id=select_model_id(model_selection, "writing"),
             output_format=output_format,
             max_papers=max_papers,
             dry_run=dry_run,
-            selected_themes=selected_themes,
+            themes=selected_themes,
         )
 
         if dry_run:
