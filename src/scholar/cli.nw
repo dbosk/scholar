@@ -3029,7 +3029,7 @@ def llm_synthesize(
             output_format=output_format,
             max_papers=max_papers,
             dry_run=dry_run,
-            themes=selected_themes,
+            selected_themes=selected_themes,
         )
 
         if dry_run:
