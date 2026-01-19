@@ -2103,8 +2103,10 @@ def sessions_list(
 The [[sessions show]] command displays detailed information about a specific
 review session. We always display the query used for each provider, since
 different providers may receive different queries (for example, when using
-[[scholar rq]] with provider-specific query optimization). Each paper also
-shows which provider returned it, helping users understand where results
+[[scholar rq]] with provider-specific query optimization). Before listing
+papers, we show a summary of themes (tags from kept papers) with counts,
+giving users a quick overview of what topics the session covers. Each paper
+also shows which provider returned it, helping users understand where results
 originated.
 
 For output, we define a helper function [[print_session_details]] that prints
@@ -2153,6 +2155,7 @@ def sessions_show(
             "providers": session.providers,
             "query_provider_pairs": session.query_provider_pairs,
             "timestamp": session.timestamp.isoformat(),
+            "themes": dict(session.theme_counts()),
             "decisions": [
                 {
                     "title": d.paper.title,
@@ -2187,6 +2190,15 @@ def sessions_show(
                 for provider in session.providers:
                     con.print(f"[dim]  {provider}: {session.query}[/dim]")
             con.print()
+
+            # Show themes overview
+            themes = session.theme_counts()
+            if themes:
+                con.print("[cyan bold]Themes:[/cyan bold]")
+                for theme, count in sorted(themes.items()):
+                    papers = "paper" if count == 1 else "papers"
+                    con.print(f"  • {theme} ({count} {papers})")
+                con.print()
 
             # Show kept papers
             kept = session.kept_papers
