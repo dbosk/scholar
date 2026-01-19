@@ -73,6 +73,7 @@ across bibliographic databases.
 <<pdf command>>
 <<notes command>>
 <<sessions command>>
+<<llm command helpers>>
 <<llm command>>
 <<submodule registration>>
 <<main entry point>>
@@ -2103,8 +2104,10 @@ def sessions_list(
 The [[sessions show]] command displays detailed information about a specific
 review session. We always display the query used for each provider, since
 different providers may receive different queries (for example, when using
-[[scholar rq]] with provider-specific query optimization). Each paper also
-shows which provider returned it, helping users understand where results
+[[scholar rq]] with provider-specific query optimization). Before listing
+papers, we show a summary of themes (tags from kept papers) with counts,
+giving users a quick overview of what topics the session covers. Each paper
+also shows which provider returned it, helping users understand where results
 originated.
 
 For output, we define a helper function [[print_session_details]] that prints
@@ -2153,6 +2156,7 @@ def sessions_show(
             "providers": session.providers,
             "query_provider_pairs": session.query_provider_pairs,
             "timestamp": session.timestamp.isoformat(),
+            "themes": dict(session.theme_counts()),
             "decisions": [
                 {
                     "title": d.paper.title,
@@ -2187,6 +2191,15 @@ def sessions_show(
                 for provider in session.providers:
                     con.print(f"[dim]  {provider}: {session.query}[/dim]")
             con.print()
+
+            # Show themes overview
+            themes = session.theme_counts()
+            if themes:
+                con.print("[cyan bold]Themes:[/cyan bold]")
+                for theme, count in sorted(themes.items()):
+                    papers = "paper" if count == 1 else "papers"
+                    con.print(f"  • {theme} ({count} {papers})")
+                con.print()
 
             # Show kept papers
             kept = session.kept_papers
@@ -2588,6 +2601,208 @@ For LaTeX output, the synthesis is a complete compilable document.
 The output embeds a BibTeX file and uses [[biblatex]]; compilation therefore
 requires running [[biber]].
 
+\paragraph{Theme selection.}
+By default, all themes are included in the synthesis.
+Users can select specific themes using the [[--themes/-t]] option (which can be
+repeated) or the [[--interactive/-i]] flag to present a checklist.
+
+When [[--interactive]] is specified with many themes, the user can optionally
+run LLM-based theme grouping analysis ([[--suggest-groups]]) to identify similar
+themes that could be treated together.
+
+@
+
+\paragraph{Theme selection helpers.}
+We factor out theme resolution logic into helper functions to keep the main
+command body clean and to enable reuse of theme selection in future commands.
+
+<<llm command helpers>>=
+def _select_themes_interactively(
+    theme_counts: dict[str, int],
+    console: Console,
+) -> list[str] | None:
+    """Display checklist of themes and let user select which to include.
+
+    Args:
+        theme_counts: Dict mapping theme names to paper counts.
+        console: Rich console for output.
+
+    Returns:
+        List of selected theme names, or None if selection cancelled.
+    """
+    import questionary
+
+    if not theme_counts:
+        console.print("[yellow]No themes found in kept papers.[/yellow]")
+        return None
+
+    # Build choices sorted by paper count (descending), then alphabetically
+    sorted_themes = sorted(
+        theme_counts.items(),
+        key=lambda x: (-x[1], x[0]),
+    )
+    choices = [
+        questionary.Choice(
+            title=f"{theme} ({count} paper{'s' if count != 1 else ''})",
+            value=theme,
+            checked=True,  # All selected by default
+        )
+        for theme, count in sorted_themes
+    ]
+
+    selected = questionary.checkbox(
+        "Select themes to include in synthesis:",
+        choices=choices,
+    ).ask()
+
+    return selected if selected else None
+
+
+def _resolve_themes(
+    session,
+    themes_option: list[str] | None,
+    interactive: bool,
+    suggest_groups: bool,
+    model_id: str | None,
+    console: Console,
+) -> list[str] | None:
+    """Determine which themes to include in synthesis.
+
+    Handles the --themes, --interactive, and --suggest-groups options.
+
+    Args:
+        session: The review session.
+        themes_option: List of themes from --themes option, or None.
+        interactive: Whether --interactive flag was set.
+        suggest_groups: Whether --suggest-groups flag was set.
+        model_id: LLM model ID for theme grouping.
+        console: Rich console for output.
+
+    Returns:
+        List of selected theme names, or None to include all themes.
+    """
+    from scholar.llm_review import get_session_theme_counts
+
+    # If --themes was specified, use those directly
+    if themes_option:
+        # Validate that themes exist
+        theme_counts = get_session_theme_counts(session)
+        available = set(theme_counts.keys())
+        requested = set(themes_option)
+        invalid = requested - available
+
+        if invalid:
+            console.print(
+                f"[yellow]Warning: Unknown themes ignored: "
+                f"{', '.join(sorted(invalid))}[/yellow]"
+            )
+
+        valid_themes = [t for t in themes_option if t in available]
+        if not valid_themes:
+            console.print(
+                "[red]None of the specified themes exist. "
+                f"Available: {', '.join(sorted(available))}[/red]"
+            )
+            raise typer.Exit(1)
+
+        return valid_themes
+
+    # If --interactive, show checklist
+    if interactive:
+        theme_counts = get_session_theme_counts(session)
+
+        if not theme_counts:
+            console.print(
+                "[yellow]No themes assigned to kept papers. "
+                "Synthesis will include all papers without theme structure.[/yellow]"
+            )
+            return None
+
+        # Optionally run theme grouping analysis
+        if suggest_groups and len(theme_counts) > 1:
+            theme_counts = _apply_theme_groupings(
+                theme_counts=theme_counts,
+                research_context=session.research_context,
+                model_id=model_id,
+                console=console,
+            )
+
+        return _select_themes_interactively(theme_counts, console)
+
+    # Default: include all themes
+    return None
+
+
+def _apply_theme_groupings(
+    theme_counts: dict[str, int],
+    research_context: str | None,
+    model_id: str | None,
+    console: Console,
+) -> dict[str, int]:
+    """Run LLM theme grouping analysis and apply accepted groupings.
+
+    Args:
+        theme_counts: Dict mapping theme names to paper counts.
+        research_context: The research question context.
+        model_id: LLM model to use.
+        console: Rich console for output.
+
+    Returns:
+        Updated theme_counts dict with applied groupings.
+    """
+    import questionary
+    from scholar.llm_review import suggest_theme_groups
+
+    console.print("[dim]Analyzing themes for potential groupings...[/dim]")
+
+    try:
+        result = suggest_theme_groups(
+            theme_counts=theme_counts,
+            research_context=research_context,
+            model_id=model_id,
+        )
+    except ImportError as e:
+        console.print(f"[yellow]Warning: {e}[/yellow]")
+        return theme_counts
+
+    if not result.groups:
+        console.print("[dim]No theme groupings suggested.[/dim]")
+        return theme_counts
+
+    # Show the overall explanation
+    console.print(f"\n[bold]Theme grouping analysis:[/bold]")
+    console.print(f"  {result.explanation}\n")
+
+    # Process each suggested group
+    updated_counts = dict(theme_counts)
+    for group in result.groups:
+        console.print(f"[bold]Suggested merge: {group.merged_name}[/bold]")
+        console.print(f"  Themes: {', '.join(group.themes)}")
+        console.print(f"  Reasoning: {group.reasoning}")
+
+        accept = questionary.confirm(
+            f"Accept this grouping?",
+            default=True,
+        ).ask()
+
+        if accept:
+            # Calculate combined paper count
+            combined_count = sum(
+                updated_counts.get(t, 0) for t in group.themes
+            )
+            # Remove original themes
+            for t in group.themes:
+                updated_counts.pop(t, None)
+            # Add merged theme
+            updated_counts[group.merged_name] = combined_count
+            console.print(
+                f"  [green]Merged {len(group.themes)} themes → "
+                f"{group.merged_name} ({combined_count} papers)[/green]\n"
+            )
+        else:
+            console.print("  [dim]Skipped[/dim]\n")
+
+    return updated_counts
 @
 
 <<llm command>>=
@@ -2637,6 +2852,27 @@ def llm_synthesize(
             help="Show the prompt without calling LLM.",
         ),
     ] = False,
+    themes: Annotated[
+        list[str] | None,
+        typer.Option(
+            "--themes", "-t",
+            help="Theme to include (can be repeated: -t theme1 -t theme2).",
+        ),
+    ] = None,
+    interactive: Annotated[
+        bool,
+        typer.Option(
+            "--interactive", "-i",
+            help="Interactively select themes to include.",
+        ),
+    ] = False,
+    suggest_groups: Annotated[
+        bool,
+        typer.Option(
+            "--suggest-groups",
+            help="Use LLM to suggest similar themes for grouping.",
+        ),
+    ] = False,
 ) -> None:
     """
     Generate a prose literature synthesis from kept papers.
@@ -2659,12 +2895,18 @@ def llm_synthesize(
     - A research context set for the session
 
     Examples:
-         scholar llm synthesize "my review"
+        scholar llm synthesize "my review"
         scholar llm synthesize "my review" -o synthesis.md
         scholar llm synthesize "my review" --format latex -o synthesis.tex
+        scholar llm synthesize "my review" -t security -t privacy
+        scholar llm synthesize "my review" --interactive
+        scholar llm synthesize "my review" -i --suggest-groups
     """
     from scholar.review import load_session
-    from scholar.llm_review import generate_literature_synthesis
+    from scholar.llm_review import (
+        generate_literature_synthesis,
+        get_session_theme_counts,
+    )
 
     console = Console()
     session = load_session(session_name)
@@ -2681,6 +2923,16 @@ def llm_synthesize(
         )
         raise typer.Exit(1)
 
+    # Determine selected themes
+    selected_themes = _resolve_themes(
+        session=session,
+        themes_option=themes,
+        interactive=interactive,
+        suggest_groups=suggest_groups,
+        model_id=model,
+        console=console,
+    )
+
     try:
         result = generate_literature_synthesis(
             session=session,
@@ -2688,6 +2940,7 @@ def llm_synthesize(
             output_format=output_format,
             max_papers=max_papers,
             dry_run=dry_run,
+            selected_themes=selected_themes,
         )
 
         if dry_run:

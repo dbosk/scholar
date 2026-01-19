@@ -2452,6 +2452,26 @@ def _group_kept_papers_by_theme(
     return themes, groups
 
 
+def get_session_theme_counts(session: ReviewSession) -> dict[str, int]:
+    """Get themes and paper counts from a session's kept papers.
+
+    Args:
+        session: The review session to analyze.
+
+    Returns:
+        Dictionary mapping theme names to number of kept papers with that theme.
+        Empty dict if no themes are assigned or no kept papers.
+    """
+    kept_decisions = [
+        d for d in session.decisions if d.status == DecisionStatus.KEPT
+    ]
+    if not kept_decisions:
+        return {}
+
+    themes, groups = _group_kept_papers_by_theme(kept_decisions)
+    return {theme: len(groups[theme]) for theme in themes if theme is not None}
+
+
 def build_theme_section_prompt(
     theme: str | None,
     kept_decisions: list[ReviewDecision],
@@ -3043,8 +3063,18 @@ def generate_literature_synthesis(
     output_format: str = "markdown",
     max_papers: int | None = None,
     dry_run: bool = False,
+    selected_themes: list[str] | None = None,
 ) -> SynthesisResult | str:
-    """Generate a multi-round literature synthesis from kept papers."""
+    """Generate a multi-round literature synthesis from kept papers.
+
+    Args:
+        session: The review session to synthesize.
+        model_id: LLM model to use (uses llm default if not specified).
+        output_format: Output format: "markdown" or "latex".
+        max_papers: Maximum papers to include (manages token limits).
+        dry_run: If True, show prompts without calling LLM.
+        selected_themes: If provided, only include these themes in synthesis.
+    """
     from scholar.notes import get_paper_id
 
     # Validate research context
@@ -3085,6 +3115,16 @@ def generate_literature_synthesis(
 
     citation_keys = _generate_all_citation_keys(kept_decisions, output_format)
     themes, groups = _group_kept_papers_by_theme(kept_decisions)
+
+    # Filter to selected themes if specified
+    if selected_themes is not None:
+        themes = [t for t in themes if t in selected_themes]
+        groups = {t: groups[t] for t in themes if t in groups}
+        if not themes:
+            raise ValueError(
+                "No matching themes found. Available themes: "
+                + ", ".join(sorted(_group_kept_papers_by_theme(kept_decisions)[0]))
+            )
 
     # Prepare prompts (for dry-run and execution).
     theme_prompts: list[tuple[str | None, str]] = []
@@ -3678,4 +3718,239 @@ class TestSynthesisCaching:
 
         generate_literature_synthesis(session, model_id="fake")
         assert fake_model.calls == calls_after_first + 3
+@
+
+
+\subsection{Theme grouping analysis}
+
+When a review has many themes, some may be related or overlapping.
+LLM-based analysis can suggest which themes could be treated together.
+This is useful for consolidating the synthesis structure before generation.
+
+\subsubsection{Data structures for theme grouping}
+
+We define dataclasses to represent theme grouping suggestions.
+
+<<llm review synthesis>>=
+@dataclass
+class ThemeGroup:
+    """A suggested grouping of similar themes.
+
+    Attributes:
+        merged_name: Suggested name for the merged theme.
+        themes: List of original theme names to merge.
+        reasoning: Explanation for why these themes are similar.
+    """
+
+    merged_name: str
+    themes: list[str]
+    reasoning: str
+
+
+@dataclass
+class ThemeGroupingResult:
+    """Result from LLM-based theme grouping analysis.
+
+    Attributes:
+        groups: Suggested theme groupings.
+        standalone: Themes that should remain separate.
+        explanation: Overall explanation of the grouping strategy.
+    """
+
+    groups: list[ThemeGroup]
+    standalone: list[str]
+    explanation: str
+@
+
+
+\subsubsection{Theme grouping prompt}
+
+We construct a prompt asking the LLM to identify similar themes.
+
+<<llm review synthesis>>=
+def build_theme_grouping_prompt(
+    theme_counts: dict[str, int],
+    research_context: str | None,
+) -> str:
+    """Build prompt asking LLM to identify similar themes.
+
+    Args:
+        theme_counts: Dict mapping theme names to paper counts.
+        research_context: The research question context.
+
+    Returns:
+        Prompt string for theme grouping analysis.
+    """
+    sections: list[str] = []
+
+    sections.append(
+        "You are helping organize themes for a literature synthesis. "
+        "Some themes may be similar or overlapping and could be treated together."
+    )
+
+    if research_context:
+        sections.append(f"\n## Research Context\n\n{research_context}")
+
+    sections.append("\n## Current Themes\n")
+    for theme, count in sorted(theme_counts.items(), key=lambda x: (-x[1], x[0])):
+        sections.append(f"- {theme} ({count} paper{'s' if count != 1 else ''})")
+
+    sections.append(
+        "\n## Task\n\n"
+        "Analyze these themes and identify any that are similar enough to be "
+        "treated together in a synthesis. Consider:\n"
+        "- Semantic overlap (themes covering the same concept)\n"
+        "- Hierarchical relationships (one theme is a subset of another)\n"
+        "- Related concepts that would flow naturally together\n\n"
+        "For themes that should remain separate, explain why.\n\n"
+        "Return your analysis in this exact format:\n"
+        "```\n"
+        "===GROUPING_START===\n"
+        "EXPLANATION: <overall explanation of your grouping strategy>\n"
+        "GROUP: <merged_name> | <theme1>, <theme2>, ... | <reasoning>\n"
+        "GROUP: <merged_name> | <theme1>, <theme2>, ... | <reasoning>\n"
+        "STANDALONE: <theme> | <why it should stay separate>\n"
+        "STANDALONE: <theme> | <why it should stay separate>\n"
+        "===GROUPING_END===\n"
+        "```\n\n"
+        "If no themes should be grouped, just list all as STANDALONE."
+    )
+
+    return "\n".join(sections)
+@
+
+
+\subsubsection{Parsing theme grouping response}
+
+<<llm review synthesis>>=
+def parse_theme_grouping_response(response_text: str) -> ThemeGroupingResult:
+    """Parse LLM response into ThemeGroupingResult.
+
+    Args:
+        response_text: Raw LLM response.
+
+    Returns:
+        Parsed ThemeGroupingResult.
+    """
+    import re
+
+    groups: list[ThemeGroup] = []
+    standalone: list[str] = []
+    explanation = ""
+
+    # Extract the marked block
+    match = re.search(
+        r"===GROUPING_START===\s*(.*?)\s*===GROUPING_END===",
+        response_text,
+        re.DOTALL,
+    )
+    if not match:
+        # If no markers found, treat all as standalone
+        return ThemeGroupingResult(
+            groups=[],
+            standalone=[],
+            explanation="Could not parse grouping response",
+        )
+
+    content = match.group(1).strip()
+
+    for line in content.split("\n"):
+        line = line.strip()
+        if not line:
+            continue
+
+        if line.startswith("EXPLANATION:"):
+            explanation = line[len("EXPLANATION:") :].strip()
+        elif line.startswith("GROUP:"):
+            parts = line[len("GROUP:") :].strip().split("|")
+            if len(parts) >= 3:
+                merged_name = parts[0].strip()
+                themes = [t.strip() for t in parts[1].strip().split(",")]
+                reasoning = parts[2].strip()
+                groups.append(ThemeGroup(merged_name, themes, reasoning))
+        elif line.startswith("STANDALONE:"):
+            parts = line[len("STANDALONE:") :].strip().split("|")
+            if parts:
+                standalone.append(parts[0].strip())
+
+    return ThemeGroupingResult(
+        groups=groups,
+        standalone=standalone,
+        explanation=explanation,
+    )
+@
+
+
+\subsubsection{Theme grouping function}
+
+<<llm review synthesis>>=
+def suggest_theme_groups(
+    theme_counts: dict[str, int],
+    research_context: str | None = None,
+    model_id: str | None = None,
+) -> ThemeGroupingResult:
+    """Use LLM to suggest theme groupings.
+
+    Args:
+        theme_counts: Dict mapping theme names to paper counts.
+        research_context: The research question context.
+        model_id: LLM model to use.
+
+    Returns:
+        ThemeGroupingResult with suggested groupings.
+    """
+    try:
+        import llm as llm_module
+    except ImportError:
+        raise ImportError(
+            "The 'llm' package is required for theme grouping. "
+            "Install it with: pip install llm"
+        )
+
+    llm = globals().get("llm", llm_module)
+    model = llm.get_model(model_id) if model_id else llm.get_model()
+
+    prompt = build_theme_grouping_prompt(theme_counts, research_context)
+    response = model.prompt(prompt)
+
+    return parse_theme_grouping_response(response.text())
+@
+
+
+\subsubsection{Testing theme grouping}
+
+<<test functions>>=
+class TestThemeGrouping:
+    def test_theme_grouping_prompt_includes_all_themes(self):
+        theme_counts = {"security": 5, "privacy": 3, "authentication": 1}
+        prompt = build_theme_grouping_prompt(theme_counts, "Test context")
+
+        assert "security (5 papers)" in prompt
+        assert "privacy (3 papers)" in prompt
+        assert "authentication (1 paper)" in prompt
+        assert "Test context" in prompt
+
+    def test_parse_grouping_response_extracts_groups(self):
+        response = """
+        ===GROUPING_START===
+        EXPLANATION: Security and authentication are closely related.
+        GROUP: Security & Auth | security, authentication | Both deal with access control
+        STANDALONE: privacy | Distinct topic about data protection
+        ===GROUPING_END===
+        """
+        result = parse_theme_grouping_response(response)
+
+        assert result.explanation == "Security and authentication are closely related."
+        assert len(result.groups) == 1
+        assert result.groups[0].merged_name == "Security & Auth"
+        assert result.groups[0].themes == ["security", "authentication"]
+        assert "access control" in result.groups[0].reasoning
+        assert "privacy" in result.standalone
+
+    def test_parse_grouping_response_handles_no_markers(self):
+        response = "Sorry, I couldn't analyze the themes."
+        result = parse_theme_grouping_response(response)
+
+        assert result.groups == []
+        assert "Could not parse" in result.explanation
 @
