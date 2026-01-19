@@ -55,6 +55,53 @@ or not a dictionary:
 
 <<utils functions>>=
 from typing import Any
+from dataclasses import dataclass
+from typing import Literal
+
+
+@dataclass(frozen=True)
+class LLMModelSelection:
+    """Model selection policy for task-specific LLM calls.
+
+    Scholar uses Simon Willison's [[llm]] package, where users may configure a
+    global default model. For Scholar's workflow it is often useful to use a
+    stronger model for analytic steps (classification, query generation) and a
+    cheaper model for writing steps (long-form synthesis).
+
+    [[base]] corresponds to the CLI [[-m/--model]] option.
+    [[analytic]] and [[writing]] are optional overrides.
+
+    When a field is [[None]], Scholar falls back to the next available choice:
+    task override → base → llm default.
+    """
+
+    base: str | None
+    analytic: str | None
+    writing: str | None
+
+
+LLMTask = Literal["analytic", "writing"]
+
+
+def select_model_id(
+    selection: LLMModelSelection,
+    task: LLMTask,
+) -> str | None:
+    """Return the model id for a given task.
+
+    Args:
+        selection: The user-provided model selection.
+        task: Which kind of LLM task to run.
+
+    Returns:
+        Model id to pass to [[llm.get_model()]], or [[None]] to use llm's default.
+    """
+
+    if task == "analytic" and selection.analytic:
+        return selection.analytic
+    if task == "writing" and selection.writing:
+        return selection.writing
+    return selection.base
 
 
 def safe_get_nested(obj: Any, *keys: str, default: Any = None) -> Any:
@@ -92,6 +139,40 @@ def safe_get_nested(obj: Any, *keys: str, default: Any = None) -> Any:
 \subsection{Testing safe\_get\_nested}
 
 <<test functions>>=
+class TestLLMModelSelection:
+    """Tests for model selection helpers."""
+
+    def test_select_model_id_prefers_task_override(self):
+        selection = LLMModelSelection(
+            base="base-model",
+            analytic="analytic-model",
+            writing="writing-model",
+        )
+
+        assert select_model_id(selection, "analytic") == "analytic-model"
+        assert select_model_id(selection, "writing") == "writing-model"
+
+    def test_select_model_id_falls_back_to_base(self):
+        selection = LLMModelSelection(
+            base="base-model",
+            analytic=None,
+            writing=None,
+        )
+
+        assert select_model_id(selection, "analytic") == "base-model"
+        assert select_model_id(selection, "writing") == "base-model"
+
+    def test_select_model_id_allows_llm_default(self):
+        selection = LLMModelSelection(
+            base=None,
+            analytic=None,
+            writing=None,
+        )
+
+        assert select_model_id(selection, "analytic") is None
+        assert select_model_id(selection, "writing") is None
+
+
 class TestSafeGetNested:
     """Tests for safe_get_nested function."""
 
