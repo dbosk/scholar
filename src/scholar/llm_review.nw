@@ -2727,6 +2727,16 @@ synthesis process:
 \item Assemble a full document including provenance and references
 \end{enumerate}
 
+\paragraph{Theme groupings for merged themes}
+When users interactively merge themes (for example, combining \enquote{security}
+and \enquote{authentication} into \enquote{Security \& Auth}), the merged name
+does not match any actual paper tags.
+The [[theme_groupings]] parameter provides a mapping from merged theme names to
+their constituent original themes, allowing the synthesis to combine papers from
+all constituent themes under the merged name.
+This deduplicates papers that might carry multiple tags belonging to the same
+merged group.
+
 <<llm review synthesis>>=
 SYNTHESIS_REPORT_ABSTRACT_START = "===REPORT_ABSTRACT_START==="
 SYNTHESIS_REPORT_ABSTRACT_END = "===REPORT_ABSTRACT_END==="
@@ -3079,6 +3089,7 @@ def generate_literature_synthesis(
     max_papers: int | None = None,
     dry_run: bool = False,
     selected_themes: list[str] | None = None,
+    theme_groupings: dict[str, list[str]] | None = None,
 ) -> SynthesisResult | str:
     """Generate a multi-round literature synthesis from kept papers.
 
@@ -3090,6 +3101,8 @@ def generate_literature_synthesis(
         max_papers: Maximum papers to include (manages token limits).
         dry_run: If True, show prompts without calling LLM.
         selected_themes: If provided, only include these themes in synthesis.
+        theme_groupings: Maps merged theme names to their constituent original
+            themes (e.g., {"Security & Auth": ["security", "authentication"]}).
     """
     from scholar.notes import get_paper_id
 
@@ -3134,8 +3147,40 @@ def generate_literature_synthesis(
 
     # Filter to selected themes if specified
     if selected_themes is not None:
-        themes = [t for t in themes if t in selected_themes]
-        groups = {t: groups[t] for t in themes if t in groups}
+        if theme_groupings:
+            # Build new groups for merged themes
+            new_themes = []
+            new_groups = {}
+            for selected in selected_themes:
+                if selected in theme_groupings:
+                    # Merged theme: combine papers from constituent themes
+                    constituent_themes = theme_groupings[selected]
+                    combined_decisions = []
+                    for orig_theme in constituent_themes:
+                        if orig_theme in groups:
+                            combined_decisions.extend(groups[orig_theme])
+                    # Deduplicate (papers may have multiple tags)
+                    seen_ids = set()
+                    unique_decisions = []
+                    for d in combined_decisions:
+                        pid = get_paper_id(d.paper)
+                        if pid not in seen_ids:
+                            seen_ids.add(pid)
+                            unique_decisions.append(d)
+                    if unique_decisions:
+                        new_themes.append(selected)
+                        new_groups[selected] = unique_decisions
+                elif selected in groups:
+                    # Original theme: use as-is
+                    new_themes.append(selected)
+                    new_groups[selected] = groups[selected]
+            themes = new_themes
+            groups = new_groups
+        else:
+            # Simple filtering (no groupings)
+            themes = [t for t in themes if t in selected_themes]
+            groups = {t: groups[t] for t in themes if t in groups}
+
         if not themes:
             raise ValueError(
                 "No matching themes found. Available themes: "

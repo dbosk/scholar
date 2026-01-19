@@ -2668,6 +2668,14 @@ themes that could be treated together.
 We factor out theme resolution logic into helper functions to keep the main
 command body clean and to enable reuse of theme selection in future commands.
 
+When users accept merged theme suggestions (for example, merging
+\enquote{security} and \enquote{authentication} into \enquote{Security \& Auth}),
+the merged name does not correspond to any actual paper tag.
+To handle this, [[_resolve_themes]] returns both the selected theme names and a
+mapping of any accepted groupings.
+This mapping is then passed to [[generate_literature_synthesis]], which uses it
+to combine papers from all constituent themes under the merged name.
+
 <<llm command helpers>>=
 def _select_themes_interactively(
     theme_counts: dict[str, int],
@@ -2717,7 +2725,7 @@ def _resolve_themes(
     suggest_groups: bool,
     model_id: str | None,
     console: Console,
-) -> list[str] | None:
+) -> tuple[list[str] | None, dict[str, list[str]] | None]:
     """Determine which themes to include in synthesis.
 
     Handles the --themes, --interactive, and --suggest-groups options.
@@ -2731,7 +2739,8 @@ def _resolve_themes(
         console: Rich console for output.
 
     Returns:
-        List of selected theme names, or None to include all themes.
+        Tuple of (selected_themes, theme_groupings).
+        theme_groupings maps merged names to constituent original themes.
     """
     from scholar.llm_review import get_session_theme_counts
 
@@ -2758,22 +2767,26 @@ def _resolve_themes(
             raise typer.Exit(1)
 
         if not interactive:
-            return valid_themes
+            return valid_themes, None
 
         # Restrict counts to the provided themes for interactive selection
         restricted_counts = {
             t: theme_counts[t] for t in valid_themes if t in theme_counts
         }
 
+        groupings: dict[str, list[str]] | None = None
         if suggest_groups and len(restricted_counts) > 1:
-            restricted_counts = _apply_theme_groupings(
+            restricted_counts, groupings = _apply_theme_groupings(
                 theme_counts=restricted_counts,
                 research_context=session.research_context,
                 model_id=model_id,
                 console=console,
             )
+            if not groupings:
+                groupings = None
 
-        return _select_themes_interactively(restricted_counts, console)
+        selected = _select_themes_interactively(restricted_counts, console)
+        return selected, groupings
 
     # If --interactive, show checklist
     if interactive:
@@ -2782,21 +2795,25 @@ def _resolve_themes(
                 "[yellow]No themes assigned to kept papers. "
                 "Synthesis will include all papers without theme structure.[/yellow]"
             )
-            return None
+            return None, None
 
         # Optionally run theme grouping analysis
+        groupings = None
         if suggest_groups and len(theme_counts) > 1:
-            theme_counts = _apply_theme_groupings(
+            theme_counts, groupings = _apply_theme_groupings(
                 theme_counts=theme_counts,
                 research_context=session.research_context,
                 model_id=model_id,
                 console=console,
             )
+            if not groupings:
+                groupings = None
 
-        return _select_themes_interactively(theme_counts, console)
+        selected = _select_themes_interactively(theme_counts, console)
+        return selected, groupings
 
     # Default: include all themes
-    return None
+    return None, None
 
 
 def _apply_theme_groupings(
@@ -2804,7 +2821,7 @@ def _apply_theme_groupings(
     research_context: str | None,
     model_id: str | None,
     console: Console,
-) -> dict[str, int]:
+) -> tuple[dict[str, int], dict[str, list[str]]]:
     """Run LLM theme grouping analysis and apply accepted groupings.
 
     Args:
@@ -2814,7 +2831,8 @@ def _apply_theme_groupings(
         console: Rich console for output.
 
     Returns:
-        Updated theme_counts dict with applied groupings.
+        Tuple of (updated_theme_counts, accepted_groupings).
+        accepted_groupings maps merged names to original theme lists.
     """
     import questionary
     from scholar.llm_review import suggest_theme_groups
@@ -2829,11 +2847,11 @@ def _apply_theme_groupings(
         )
     except ImportError as e:
         console.print(f"[yellow]Warning: {e}[/yellow]")
-        return theme_counts
+        return theme_counts, {}
 
     if not result.groups:
         console.print("[dim]No theme groupings suggested.[/dim]")
-        return theme_counts
+        return theme_counts, {}
 
     # Show the overall explanation
     console.print(f"\n[bold]Theme grouping analysis:[/bold]")
@@ -2841,6 +2859,7 @@ def _apply_theme_groupings(
 
     # Process each suggested group
     updated_counts = dict(theme_counts)
+    accepted_groupings: dict[str, list[str]] = {}
     for group in result.groups:
         console.print(f"[bold]Suggested merge: {group.merged_name}[/bold]")
         console.print(f"  Themes: {', '.join(group.themes)}")
@@ -2861,6 +2880,8 @@ def _apply_theme_groupings(
                 updated_counts.pop(t, None)
             # Add merged theme
             updated_counts[group.merged_name] = combined_count
+            # Track the grouping for synthesis
+            accepted_groupings[group.merged_name] = list(group.themes)
             console.print(
                 f"  [green]Merged {len(group.themes)} themes → "
                 f"{group.merged_name} ({combined_count} papers)[/green]\n"
@@ -2868,7 +2889,7 @@ def _apply_theme_groupings(
         else:
             console.print("  [dim]Skipped[/dim]\n")
 
-    return updated_counts
+    return updated_counts, accepted_groupings
 @
 
 <<llm command>>=
@@ -3012,8 +3033,8 @@ def llm_synthesize(
         writing=model_writing,
     )
 
-    # Determine selected themes
-    selected_themes = _resolve_themes(
+    # Determine selected themes and any groupings
+    selected_themes, theme_groupings = _resolve_themes(
         session=session,
         themes_option=themes,
         interactive=interactive,
@@ -3030,6 +3051,7 @@ def llm_synthesize(
             max_papers=max_papers,
             dry_run=dry_run,
             selected_themes=selected_themes,
+            theme_groupings=theme_groupings,
         )
 
         if dry_run:
