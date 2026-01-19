@@ -1023,6 +1023,8 @@ context.
 def classify_papers_with_llm(
     session: ReviewSession,
     count: int = DEFAULT_BATCH_SIZE,
+    model_selection=None,
+    *,
     model_id: str | None = None,
     enrich_missing: bool = True,
     dry_run: bool = False,
@@ -1041,7 +1043,8 @@ def classify_papers_with_llm(
     Args:
         session: The review session
         count: Number of papers to classify in this batch
-        model_id: LLM model to use (uses llm default if None)
+        model_selection: LLM model selection policy (task override → base → llm default)
+        model_id: Deprecated compatibility alias for selecting the analytic model
         enrich_missing: Whether to auto-enrich papers without abstracts
         dry_run: If True, return the prompt without calling LLM
         require_examples: If True (default), require tagged example papers
@@ -1122,7 +1125,17 @@ def classify_papers_with_llm(
             "Install it with: pip install llm"
         )
 
-    model = llm.get_model(model_id) if model_id else llm.get_model()
+    from scholar.utils import select_model_id
+
+    selected_model_id = model_id
+    if selected_model_id is None and model_selection is not None:
+        selected_model_id = select_model_id(model_selection, "analytic")
+
+    model = (
+        llm.get_model(selected_model_id)
+        if selected_model_id
+        else llm.get_model()
+    )
     logger.info(f"Classifying {len(to_classify)} papers with {model.model_id}")
 
     # Log papers being sent for classification
@@ -3059,6 +3072,8 @@ def _assemble_latex_synthesis(
 
 def generate_literature_synthesis(
     session: ReviewSession,
+    model_selection=None,
+    *,
     model_id: str | None = None,
     output_format: str = "markdown",
     max_papers: int | None = None,
@@ -3069,7 +3084,8 @@ def generate_literature_synthesis(
 
     Args:
         session: The review session to synthesize.
-        model_id: LLM model to use (uses llm default if not specified).
+        model_selection: LLM model selection policy for analytic/writing steps.
+        model_id: Deprecated compatibility alias for selecting the writing model.
         output_format: Output format: "markdown" or "latex".
         max_papers: Maximum papers to include (manages token limits).
         dry_run: If True, show prompts without calling LLM.
@@ -3182,7 +3198,17 @@ def generate_literature_synthesis(
         )
 
     llm = globals().get("llm", llm_module)
-    model = llm.get_model(model_id) if model_id else llm.get_model()
+    from scholar.utils import select_model_id
+
+    selected_model_id = model_id
+    if selected_model_id is None and model_selection is not None:
+        selected_model_id = select_model_id(model_selection, "writing")
+
+    model = (
+        llm.get_model(selected_model_id)
+        if selected_model_id
+        else llm.get_model()
+    )
     effective_model_id = model.model_id
     logger.info(
         f"Generating multi-round synthesis from {len(kept_decisions)} papers "
@@ -3887,6 +3913,8 @@ def parse_theme_grouping_response(response_text: str) -> ThemeGroupingResult:
 def suggest_theme_groups(
     theme_counts: dict[str, int],
     research_context: str | None = None,
+    model_selection=None,
+    *,
     model_id: str | None = None,
 ) -> ThemeGroupingResult:
     """Use LLM to suggest theme groupings.
@@ -3894,7 +3922,8 @@ def suggest_theme_groups(
     Args:
         theme_counts: Dict mapping theme names to paper counts.
         research_context: The research question context.
-        model_id: LLM model to use.
+        model_selection: LLM model selection policy for analytic steps.
+        model_id: Deprecated compatibility alias for selecting the analytic model.
 
     Returns:
         ThemeGroupingResult with suggested groupings.
@@ -3907,8 +3936,19 @@ def suggest_theme_groups(
             "Install it with: pip install llm"
         )
 
+    from scholar.utils import select_model_id
+
     llm = globals().get("llm", llm_module)
-    model = llm.get_model(model_id) if model_id else llm.get_model()
+
+    selected_model_id = model_id
+    if selected_model_id is None and model_selection is not None:
+        selected_model_id = select_model_id(model_selection, "analytic")
+
+    model = (
+        llm.get_model(selected_model_id)
+        if selected_model_id
+        else llm.get_model()
+    )
 
     prompt = build_theme_grouping_prompt(theme_counts, research_context)
     response = model.prompt(prompt)
