@@ -2055,7 +2055,9 @@ class TestFilterDecisions:
         filters = SearchFilters(year="2015-")
         result = filter_decisions(sample_decisions, filters)
         assert len(result) == 2
-        assert all(d.paper.year >= 2015 for d in result)
+        assert all(
+            d.paper.year is not None and d.paper.year >= 2015 for d in result
+        )
 
     def test_filter_by_venue(self, sample_decisions):
         """Can filter decisions by venue."""
@@ -2452,20 +2454,72 @@ def generate_latex_report(session: ReviewSession, output_path: Path) -> None:
     lines.extend(build_research_context_latex(session, heading_command=r"\section"))
     lines.extend(build_search_parameters_latex(session, heading_command=r"\section"))
 
-    lines.extend([
-        r"\begin{description}",
-        f"\\item[Date] {session.timestamp.strftime('%Y-%m-%d %H:%M')}",
-        f"\\item[Total Papers] {len(session.decisions)}",
-        r"\end{description}",
-        r"",
-        r"\section{Summary}",
-        r"\begin{description}",
+    has_llm_decisions = any(
+        d.source in (ReviewSource.LLM_UNREVIEWED, ReviewSource.LLM_REVIEWED)
+        for d in session.decisions
+    )
+
+    llm_confirmed = 0
+    llm_changed_total = 0
+    llm_changed_kept_to_discarded = 0
+    llm_changed_discarded_to_kept = 0
+
+    if has_llm_decisions:
+        llm_confirmed = sum(
+            1
+            for d in session.decisions
+            if d.source == ReviewSource.LLM_REVIEWED and not d.is_example
+        )
+        llm_changed_total = sum(
+            1
+            for d in session.decisions
+            if d.source == ReviewSource.LLM_REVIEWED and d.is_example
+        )
+        llm_changed_kept_to_discarded = sum(
+            1
+            for d in session.decisions
+            if d.source == ReviewSource.LLM_REVIEWED
+            and d.is_example
+            and d.status == DecisionStatus.DISCARDED
+        )
+        llm_changed_discarded_to_kept = sum(
+            1
+            for d in session.decisions
+            if d.source == ReviewSource.LLM_REVIEWED
+            and d.is_example
+            and d.status == DecisionStatus.KEPT
+        )
+
+    summary_items = [
         f"\\item[Kept] {len(session.kept_papers)}",
         f"\\item[Discarded] {len(session.discarded_papers)}",
         f"\\item[Pending] {len(session.pending_papers)}",
-        r"\end{description}",
-        r"",
-    ])
+    ]
+
+    if has_llm_decisions:
+        summary_items.extend(
+            [
+                f"\\item[LLM confirmed] {llm_confirmed}",
+                f"\\item[LLM changed] {llm_changed_total}",
+                f"\\item[LLM changed (kept->discarded)] {llm_changed_kept_to_discarded}",
+                f"\\item[LLM changed (discarded->kept)] {llm_changed_discarded_to_kept}",
+            ]
+        )
+
+    lines.extend(
+        [
+            r"\begin{description}",
+            f"\\item[Date] {session.timestamp.strftime('%Y-%m-%d %H:%M')}",
+            f"\\item[Total Papers] {len(session.decisions)}",
+            r"\end{description}",
+            r"",
+            r"\section{Summary}",
+            r"\begin{description}",
+            *summary_items,
+            r"\end{description}",
+            r"",
+        ]
+    )
 
     # Snowballing section (if any rounds were performed)
     if session.snowball_rounds:
@@ -2621,51 +2675,151 @@ def generate_latex_report(session: ReviewSession, output_path: Path) -> None:
 def generate_csv_report(session: ReviewSession, output_path: Path) -> None:
     """
     Generate a CSV report of the review session.
-    
+
     The CSV includes all papers (kept and discarded) with columns:
     - status: kept/discarded/pending
     - title, authors, year, venue, doi, url
     - tags: semicolon-separated list of themes/motivations
     - abstract: full abstract text
-    - provider: source of the paper
-    
+    - provider: search provider that returned the paper
+    - decision_source: where the keep/discard decision originated
+    - llm_confidence: 0.0-1.0 confidence for LLM decisions (if available)
+    - llm_review_outcome: human/unreviewed/confirmed/changed
+    - llm_change_direction: kept->discarded or discarded->kept (only for changed)
+
     Args:
         session: The ReviewSession to report on.
         output_path: Path for the .csv file.
     """
     import csv
-    
-    with open(output_path, 'w', newline='', encoding='utf-8') as f:
+
+    def llm_review_outcome(decision: ReviewDecision) -> str:
+        if decision.source == ReviewSource.HUMAN:
+            return "human"
+        if decision.source == ReviewSource.LLM_UNREVIEWED:
+            return "unreviewed"
+        if decision.source == ReviewSource.LLM_REVIEWED:
+            return "changed" if decision.is_example else "confirmed"
+        return ""
+
+    def llm_change_direction(decision: ReviewDecision) -> str:
+        if decision.source != ReviewSource.LLM_REVIEWED or not decision.is_example:
+            return ""
+        if decision.status == DecisionStatus.DISCARDED:
+            return "kept->discarded"
+        if decision.status == DecisionStatus.KEPT:
+            return "discarded->kept"
+        return ""
+
+    with open(output_path, "w", newline="", encoding="utf-8") as f:
         writer = csv.writer(f)
-        
+
         # Header row
-        writer.writerow([
-            'status', 'title', 'authors', 'year', 'venue', 
-            'doi', 'url', 'tags', 'abstract', 'provider'
-        ])
-        
+        writer.writerow(
+            [
+                "status",
+                "title",
+                "authors",
+                "year",
+                "venue",
+                "doi",
+                "url",
+                "tags",
+                "abstract",
+                "provider",
+                "decision_source",
+                "llm_confidence",
+                "llm_review_outcome",
+                "llm_change_direction",
+            ]
+        )
+
         # Write all decisions
         for decision in session.decisions:
             paper = decision.paper
-            writer.writerow([
-                decision.status.value,
-                paper.title,
-                '; '.join(paper.authors) if paper.authors else '',
-                paper.year or '',
-                paper.venue or '',
-                paper.doi or '',
-                paper.url or '',
-                '; '.join(decision.tags) if decision.tags else '',
-                paper.abstract or '',
-                decision.provider,
-            ])
+            writer.writerow(
+                [
+                    decision.status.value,
+                    paper.title,
+                    "; ".join(paper.authors) if paper.authors else "",
+                    paper.year or "",
+                    paper.venue or "",
+                    paper.doi or "",
+                    paper.url or "",
+                    "; ".join(decision.tags) if decision.tags else "",
+                    paper.abstract or "",
+                    decision.provider,
+                    decision.source.value,
+                    (
+                        f"{decision.llm_confidence:.3f}"
+                        if decision.llm_confidence is not None
+                        else ""
+                    ),
+                    llm_review_outcome(decision),
+                    llm_change_direction(decision),
+                ]
+            )
 @
 
 \subsection{Testing Report Generation}
 
 <<test functions>>=
 class TestReportGeneration:
-    """Tests for LaTeX report generation."""
+    """Tests for LaTeX and CSV report generation."""
+
+    def test_csv_report_includes_llm_columns(self, tmp_path):
+        """CSV report includes LLM review metadata columns."""
+        session = ReviewSession(
+            query="test",
+            providers=["test"],
+            timestamp=datetime.now(),
+        )
+        session.decisions = [
+            ReviewDecision(
+                paper=Paper(title="Human", authors=["A"], year=2024),
+                provider="test",
+                status=DecisionStatus.KEPT,
+                tags=["ml"],
+                source=ReviewSource.HUMAN,
+            ),
+            ReviewDecision(
+                paper=Paper(title="LLM unreviewed", authors=["B"], year=2024),
+                provider="test",
+                status=DecisionStatus.KEPT,
+                source=ReviewSource.LLM_UNREVIEWED,
+                llm_confidence=0.9,
+            ),
+            ReviewDecision(
+                paper=Paper(title="LLM confirmed", authors=["C"], year=2024),
+                provider="test",
+                status=DecisionStatus.KEPT,
+                source=ReviewSource.LLM_REVIEWED,
+                is_example=False,
+                llm_confidence=0.8,
+            ),
+            ReviewDecision(
+                paper=Paper(title="LLM changed", authors=["D"], year=2024),
+                provider="test",
+                status=DecisionStatus.DISCARDED,
+                tags=["off-topic"],
+                source=ReviewSource.LLM_REVIEWED,
+                is_example=True,
+                llm_confidence=0.2,
+            ),
+        ]
+
+        output_path = tmp_path / "report.csv"
+        generate_csv_report(session, output_path)
+
+        content = output_path.read_text()
+        assert "decision_source" in content
+        assert "llm_review_outcome" in content
+        assert "llm_change_direction" in content
+        assert "human" in content
+        assert "unreviewed" in content
+        assert "confirmed" in content
+        assert "changed" in content
+        assert "kept->discarded" in content
 
     def test_generate_report_with_themes(self, tmp_path):
         """Report groups kept papers by theme."""
@@ -2745,6 +2899,85 @@ class TestReportGeneration:
         content = output_path.read_text()
         assert r"\section{Research Context}" in content
         assert "This is the research context." in content
+
+    def test_report_includes_llm_agreement_and_changes(self, tmp_path):
+        """Report includes LLM confirmed/changed counts when LLM used."""
+        paper_confirmed = Paper(
+            title="LLM confirmed", authors=["A"], year=2024
+        )
+        paper_changed_to_kept = Paper(
+            title="LLM changed to kept", authors=["B"], year=2024
+        )
+        paper_changed_to_discarded = Paper(
+            title="LLM changed to discarded", authors=["C"], year=2024
+        )
+
+        session = ReviewSession(
+            query="test",
+            providers=["test"],
+            timestamp=datetime.now(),
+        )
+        session.decisions = [
+            # Confirmed LLM decision
+            ReviewDecision(
+                paper=paper_confirmed,
+                provider="test",
+                status=DecisionStatus.KEPT,
+                source=ReviewSource.LLM_REVIEWED,
+                is_example=False,
+            ),
+            # Changed from the LLM's classification (tracked via is_example)
+            ReviewDecision(
+                paper=paper_changed_to_kept,
+                provider="test",
+                status=DecisionStatus.KEPT,
+                source=ReviewSource.LLM_REVIEWED,
+                is_example=True,
+            ),
+            ReviewDecision(
+                paper=paper_changed_to_discarded,
+                provider="test",
+                status=DecisionStatus.DISCARDED,
+                tags=["off-topic"],
+                source=ReviewSource.LLM_REVIEWED,
+                is_example=True,
+            ),
+        ]
+
+        output_path = tmp_path / "report.tex"
+        generate_latex_report(session, output_path)
+
+        content = output_path.read_text()
+        assert r"\item[LLM confirmed] 1" in content
+        assert r"\item[LLM changed] 2" in content
+        assert r"\item[LLM changed (kept->discarded)] 1" in content
+        assert r"\item[LLM changed (discarded->kept)] 1" in content
+
+    def test_report_omits_llm_counts_when_no_llm(self, tmp_path):
+        """Report omits LLM lines if there were no LLM decisions."""
+        paper = Paper(title="Human", authors=["A"], year=2024)
+
+        session = ReviewSession(
+            query="test",
+            providers=["test"],
+            timestamp=datetime.now(),
+        )
+        session.decisions = [
+            ReviewDecision(
+                paper=paper,
+                provider="test",
+                status=DecisionStatus.KEPT,
+                tags=["ml"],
+                source=ReviewSource.HUMAN,
+            ),
+        ]
+
+        output_path = tmp_path / "report.tex"
+        generate_latex_report(session, output_path)
+
+        content = output_path.read_text()
+        assert "LLM confirmed" not in content
+        assert "LLM changed" not in content
 
     def test_escapes_special_characters(self, tmp_path):
         """Special characters are escaped in report."""

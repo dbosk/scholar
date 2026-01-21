@@ -2301,7 +2301,11 @@ def sessions_export(
     Use --format to select specific formats.
     """
     from scholar.review import (
-        load_session, generate_latex_report, generate_csv_report,
+        load_session,
+        generate_latex_report,
+        generate_csv_report,
+        ReviewSource,
+        DecisionStatus,
     )
 
     console = Console()
@@ -2336,6 +2340,51 @@ def sessions_export(
     console.print("[green]Exported:[/green]")
     for f in files_created:
         console.print(f"  - {f}")
+
+    # If the session includes any LLM decisions, report agreement/change counts.
+    has_llm_decisions = any(
+        d.source in (ReviewSource.LLM_UNREVIEWED, ReviewSource.LLM_REVIEWED)
+        for d in session.decisions
+    )
+
+    if has_llm_decisions:
+        llm_confirmed = sum(
+            1
+            for d in session.decisions
+            if d.source == ReviewSource.LLM_REVIEWED and not d.is_example
+        )
+        llm_changed_total = sum(
+            1
+            for d in session.decisions
+            if d.source == ReviewSource.LLM_REVIEWED and d.is_example
+        )
+        llm_changed_kept_to_discarded = sum(
+            1
+            for d in session.decisions
+            if d.source == ReviewSource.LLM_REVIEWED
+            and d.is_example
+            and d.status == DecisionStatus.DISCARDED
+        )
+        llm_changed_discarded_to_kept = sum(
+            1
+            for d in session.decisions
+            if d.source == ReviewSource.LLM_REVIEWED
+            and d.is_example
+            and d.status == DecisionStatus.KEPT
+        )
+
+        table = Table(title="LLM Review", box=box.HORIZONTALS)
+        table.add_column("Category", style="cyan")
+        table.add_column("Count", justify="right")
+        table.add_row("LLM confirmed", str(llm_confirmed))
+        table.add_row("LLM changed", str(llm_changed_total))
+        table.add_row(
+            "LLM changed (kept->discarded)", str(llm_changed_kept_to_discarded)
+        )
+        table.add_row(
+            "LLM changed (discarded->kept)", str(llm_changed_discarded_to_kept)
+        )
+        console.print(table)
 
 
 @sessions_app.command("resume")
