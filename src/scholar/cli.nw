@@ -3004,6 +3004,13 @@ def llm_synthesize(
             help="Show the prompt without calling LLM.",
         ),
     ] = False,
+    no_enrich: Annotated[
+        bool,
+        typer.Option(
+            "--no-enrich",
+            help="Skip automatic enrichment of papers without abstracts.",
+        ),
+    ] = False,
     themes: Annotated[
         list[str] | None,
         typer.Option(
@@ -3098,6 +3105,7 @@ def llm_synthesize(
             model_id=select_model_id(model_selection, "writing"),
             output_format=output_format,
             max_papers=max_papers,
+            enrich_missing=not no_enrich,
             dry_run=dry_run,
             selected_themes=selected_themes,
             theme_groupings=theme_groupings,
@@ -3107,6 +3115,10 @@ def llm_synthesize(
             console.print("[bold]Prompt (dry run):[/bold]")
             console.print(result)
             return
+
+        # Persist any automatic enrichment (abstracts) to disk so later
+        # sessions resume already has the enriched data.
+        review.save_session(session)
 
         # Output the synthesis
         synthesis_text = result.synthesis
