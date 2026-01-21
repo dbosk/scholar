@@ -54,14 +54,14 @@ Scholar models this with two distinct fields on [[Paper]]:
 
 We map provider fields to these concepts as follows:
 \begin{description}
-\item[Semantic Scholar] [[fieldsOfStudy]] $ightarrow$ [[tags]]
-\item[OpenAlex] [[keywords]] (curated/derived) $ightarrow$ [[tags]];
-  fall back to [[concepts]] $ightarrow$ [[tags]]
-\item[IEEE Xplore] [[index_terms.author_terms]] $ightarrow$ [[keywords]];
+\item[Semantic Scholar] [[fieldsOfStudy]] $\to$ [[tags]]
+\item[OpenAlex] [[keywords]] (curated/derived) $\to$ [[tags]];
+  fall back to [[concepts]] $\to$ [[tags]]
+\item[IEEE Xplore] [[index_terms.author_terms]] $\to$ [[keywords]];
   [[index_terms.ieee_terms]] and [[index_terms.controlled_terms]]
-  $ightarrow$ [[tags]]
-\item[Web of Science (Expanded)] [[keywords]] $ightarrow$ [[keywords]];
-  [[keywords_plus]] $ightarrow$ [[tags]]
+  $\to$ [[tags]]
+\item[Web of Science (Expanded)] [[keywords]] $\to$ [[keywords]];
+  [[keywords_plus]] $\to$ [[tags]]
 \end{description}
 
 \section{Caching}
