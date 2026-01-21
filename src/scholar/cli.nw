@@ -493,12 +493,23 @@ enrich: Annotated[
     typer.Option(
         "--enrich", "-e",
         help=(
-            "Fetch missing abstracts/metadata via DOI lookup. "
-            "Order: IEEE, WoS, Semantic Scholar, OpenAlex (skips unconfigured providers). "
+            "Fetch missing abstracts/metadata/keywords via DOI lookup. "
+            "Default order: Semantic Scholar, OpenAlex, IEEE, WoS. "
+            "Unconfigured providers are skipped. "
             "Only works for papers with DOIs."
         ),
     ),
 ] = False,
+enrich_providers: Annotated[
+    Optional[str],
+    typer.Option(
+        "--enrich-providers",
+        help=(
+            "Comma-separated provider names to use for enrichment. "
+            "Overrides the default order."
+        ),
+    ),
+] = None,
 <<report option>>
 <<search filter options>>
 @
@@ -701,13 +712,18 @@ else:
 
 \subsection{Enriching papers}
 
-When the [[--enrich]] flag is provided, we fetch missing abstracts for papers
-that have DOIs.
+When the [[--enrich]] flag is provided, we fetch missing abstracts/metadata for
+papers that have DOIs.
 This is particularly useful when searching DBLP (which doesn't include
 abstracts) alongside other providers.
 
-We show a progress indicator since enrichment requires API calls for each
-paper missing an abstract.
+We show a progress indicator since enrichment requires API calls for each paper
+that is missing requested metadata.
+
+The [[--enrich-providers]] option overrides which providers are tried and in
+which order.
+For example, to restrict enrichment to Semantic Scholar and OpenAlex:
+[[scholar search "..." --enrich --enrich-providers s2,openalex]].
 
 <<enrich papers if requested>>=
 if enrich and merged_results:
@@ -716,7 +732,16 @@ if enrich and merged_results:
 
     # Count papers that need enrichment
     papers = merged_results[0].papers
-    papers_to_enrich = [p for p in papers if needs_enrichment(p, ["abstract"]) and p.doi]
+    enrich_fields = ["abstract", "pdf_url", "keywords"]
+    papers_to_enrich = [
+        p for p in papers if needs_enrichment(p, enrich_fields) and p.doi
+    ]
+
+    providers_for_enrich = (
+        [p.strip() for p in enrich_providers.split(",") if p.strip()]
+        if enrich_providers
+        else None
+    )
 
     if papers_to_enrich:
         with Progress() as progress:
@@ -728,7 +753,12 @@ if enrich and merged_results:
             def update_progress(current: int, total: int) -> None:
                 progress.update(task, completed=current)
 
-            enriched = enrich_papers(papers, progress_callback=update_progress)
+            enriched = enrich_papers(
+                papers,
+                fields=enrich_fields,
+                providers=providers_for_enrich,
+                progress_callback=update_progress,
+            )
             merged_results[0] = SearchResult(
                 query=merged_results[0].query,
                 provider=merged_results[0].provider,
@@ -1238,7 +1268,7 @@ class TestRQCommand:
 
 \section{Enriching Papers}
 
-The [[enrich]] command fetches missing abstracts for papers in a review session.
+The [[enrich]] command fetches missing abstracts/metadata for papers in a review session.
 This is useful when you've already done a search and want to fill in abstracts
 without re-running the search.
 
@@ -1252,6 +1282,16 @@ def enrich(
             autocompletion=complete_session_name,
         ),
     ],
+    enrich_providers: Annotated[
+        Optional[str],
+        typer.Option(
+            "--enrich-providers",
+            help=(
+                "Comma-separated provider names to use for enrichment. "
+                "Overrides the default order."
+            ),
+        ),
+    ] = None,
 ) -> None:
     """
     Fetch missing abstracts/metadata for papers in a review session.
@@ -1286,7 +1326,14 @@ if session_data is None:
 # Extract papers from decisions
 papers = [decision.paper for decision in session_data.decisions]
 papers_with_doi = [p for p in papers if p.doi]
-papers_to_enrich = [p for p in papers_with_doi if needs_enrichment(p, ["abstract"])]
+enrich_fields = ["abstract", "pdf_url", "keywords"]
+papers_to_enrich = [p for p in papers_with_doi if needs_enrichment(p, enrich_fields)]
+
+providers_for_enrich = (
+    [p.strip() for p in enrich_providers.split(",") if p.strip()]
+    if enrich_providers
+    else None
+)
 
 if not papers_to_enrich:
     console.print("[yellow]No papers need enrichment (all have abstracts or lack DOIs).[/yellow]")
@@ -1301,7 +1348,12 @@ with Progress() as progress:
     def update_progress(current: int, total: int) -> None:
         progress.update(task, completed=current)
 
-    enriched_papers = enrich_papers(papers, progress_callback=update_progress)
+    enriched_papers = enrich_papers(
+        papers,
+        fields=enrich_fields,
+        providers=providers_for_enrich,
+        progress_callback=update_progress,
+    )
 
 # Update decisions with enriched papers
 paper_map = {p.doi: p for p in enriched_papers if p.doi}

@@ -90,19 +90,18 @@ of Science require API keys; if they are not available, we move on to the next
 provider.
 
 \begin{description}
-\item[IEEE Xplore] Strong coverage for IEEE publications.
-  Requires an API key; best used first when available.
-\item[Web of Science] High-quality bibliographic metadata.
-  Requires an API key.
 \item[Semantic Scholar] Excellent abstract coverage, free API with optional
   key for higher rate limits.
 \item[OpenAlex] Very broad coverage (250M+ works), always free.
-  Final fallback.
+\item[IEEE Xplore] Strong coverage for IEEE publications.
+  Requires an API key.
+\item[Web of Science] High-quality bibliographic metadata.
+  Requires an API key.
 \end{description}
 
 <<constants>>=
 # Providers to try for DOI-based metadata enrichment (in priority order)
-ENRICHMENT_PROVIDERS = ["ieee", "wos", "s2", "openalex"]
+ENRICHMENT_PROVIDERS = ["s2", "openalex", "ieee", "wos"]
 
 # Global cache for enriched paper data (refs/cites)
 # Stored in data dir (not cache dir) since fetching refs/cites is expensive
@@ -121,14 +120,23 @@ The function is general-purpose: by default it enriches all common fields
 (title, authors, abstract, year, venue, pdf\_url), but callers can specify a
 subset of fields if they only care about specific ones.
 
+Some metadata is optional and not always available.
+For example, author keywords/index terms may be missing in many databases.
+To avoid triggering enrichment for every paper, these fields are typically
+requested explicitly by passing them in the [[fields]] parameter.
+
+Callers can also override which providers to try (and in what order) by passing
+provider names in [[providers]].
+
 <<enrichment functions>>=
-# All fields that can be enriched via DOI lookup
+# Default fields enriched via DOI lookup.
 ENRICHABLE_FIELDS = ["title", "authors", "abstract", "year", "venue", "pdf_url"]
 
 
 def enrich_paper(
     paper: Paper,
     fields: list[str] | None = None,
+    providers: list[str] | None = None,
     fetch_refs_cites: bool = False,
 ) -> Paper:
     """
@@ -148,6 +156,8 @@ def enrich_paper(
         paper: The paper to enrich.
         fields: Fields to check and enrich. If None, checks all enrichable
             fields (title, authors, abstract, year, venue, pdf_url).
+        providers: Provider names to try, in priority order. If None, uses
+            [[ENRICHMENT_PROVIDERS]].
         fetch_refs_cites: If True, also fetch references and citations.
 
     Returns:
@@ -167,8 +177,10 @@ def enrich_paper(
         else:
             logger.debug(f"Enriching paper '{paper.title_preview()}' (DOI: {paper.doi})")
 
+            providers_to_try = providers or ENRICHMENT_PROVIDERS
+
             # Try each enrichment provider in order
-            for provider_name in ENRICHMENT_PROVIDERS:
+            for provider_name in providers_to_try:
                 if not needs_enrichment(result, fields):
                     break
 
@@ -684,12 +696,6 @@ class TestEnrichPaper:
             doi="10.1234/test"
         )
 
-        ieee_provider = MagicMock()
-        ieee_provider.get_paper_by_doi.return_value = None  # Not found
-
-        wos_provider = MagicMock()
-        wos_provider.get_paper_by_doi.return_value = None  # Not found
-
         s2_provider = MagicMock()
         s2_provider.get_paper_by_doi.return_value = None  # Not found
 
@@ -703,18 +709,14 @@ class TestEnrichPaper:
         )
 
         def mock_get_provider(name):
-            if name == "ieee":
-                return ieee_provider
-            elif name == "wos":
-                return wos_provider
-            elif name == "s2":
+            if name == "s2":
                 return s2_provider
-            elif name == "openalex":
+            if name == "openalex":
                 return openalex_provider
-            return None
+            raise AssertionError(f"Unexpected provider lookup: {name}")
 
         with patch("scholar.enrich.get_provider", side_effect=mock_get_provider):
-            result = enrich_paper(paper)
+            result = enrich_paper(paper, fields=["abstract"])
 
         assert result.abstract == "Found in OpenAlex"
 
@@ -726,27 +728,97 @@ class TestEnrichPaper:
             doi="10.1234/test",
         )
 
-        ieee_provider = MagicMock()
-        ieee_provider.is_available.return_value = True
-        ieee_provider.get_paper_by_doi.return_value = Paper(
+        s2_provider = MagicMock()
+        s2_provider.is_available.return_value = True
+        s2_provider.get_paper_by_doi.return_value = Paper(
             title="Test Paper",
             authors=["Author"],
             doi="10.1234/test",
-            abstract="Abstract from IEEE",
-            sources=["ieee"],
+            abstract="Abstract from S2",
+            sources=["s2"],
         )
 
-        wos_provider = MagicMock()
-        wos_provider.is_available.return_value = True
-        wos_provider.get_paper_by_doi.return_value = Paper(
+        openalex_provider = MagicMock()
+        openalex_provider.is_available.return_value = True
+        openalex_provider.get_paper_by_doi.return_value = Paper(
             title="Test Paper",
             authors=["Author"],
             doi="10.1234/test",
             pdf_url="https://example.com/paper.pdf",
-            sources=["wos"],
+            sources=["openalex"],
         )
 
         def mock_get_provider(name):
+            if name == "s2":
+                return s2_provider
+            if name == "openalex":
+                return openalex_provider
+            raise AssertionError(f"Unexpected provider lookup: {name}")
+
+        with patch("scholar.enrich.get_provider", side_effect=mock_get_provider):
+            result = enrich_paper(paper, fields=["abstract", "pdf_url"])
+
+        assert result.abstract == "Abstract from S2"
+        assert result.pdf_url == "https://example.com/paper.pdf"
+        assert "s2" in result.sources
+        assert "openalex" in result.sources
+
+    def test_falls_back_to_ieee_then_wos_if_needed(self):
+        """enrich_paper uses ieee then wos when still missing fields."""
+        paper = Paper(
+            title="Test Paper",
+            authors=["Author"],
+            doi="10.1234/test",
+        )
+
+        call_order: list[str] = []
+
+        def record(name: str) -> None:
+            call_order.append(name)
+
+        s2_provider = MagicMock()
+        s2_provider.is_available.return_value = True
+        s2_provider.get_paper_by_doi.side_effect = lambda doi: (
+            record("s2")
+            or Paper(
+                title="Test Paper",
+                authors=["Author"],
+                doi=doi,
+                abstract="Abstract from S2",
+                sources=["s2"],
+            )
+        )
+
+        openalex_provider = MagicMock()
+        openalex_provider.is_available.return_value = True
+        openalex_provider.get_paper_by_doi.side_effect = lambda doi: (
+            record("openalex") or None
+        )
+
+        ieee_provider = MagicMock()
+        ieee_provider.is_available.return_value = True
+        ieee_provider.get_paper_by_doi.side_effect = lambda doi: (
+            record("ieee") or None
+        )
+
+        wos_provider = MagicMock()
+        wos_provider.is_available.return_value = True
+        wos_provider.get_paper_by_doi.side_effect = lambda doi: (
+            record("wos")
+            or Paper(
+                title="Test Paper",
+                authors=["Author"],
+                doi=doi,
+                pdf_url="https://example.com/paper.pdf",
+                sources=["wos"],
+            )
+        )
+
+        def mock_get_provider(name):
+            if name == "s2":
+                return s2_provider
+            if name == "openalex":
+                return openalex_provider
             if name == "ieee":
                 return ieee_provider
             if name == "wos":
@@ -756,10 +828,9 @@ class TestEnrichPaper:
         with patch("scholar.enrich.get_provider", side_effect=mock_get_provider):
             result = enrich_paper(paper, fields=["abstract", "pdf_url"])
 
-        assert result.abstract == "Abstract from IEEE"
+        assert result.abstract == "Abstract from S2"
         assert result.pdf_url == "https://example.com/paper.pdf"
-        assert "ieee" in result.sources
-        assert "wos" in result.sources
+        assert call_order == ["s2", "openalex", "ieee", "wos"]
 
     def test_returns_original_if_no_provider_finds(self):
         """enrich_paper returns original if no provider can enrich."""
@@ -837,6 +908,7 @@ function with optional progress reporting.
 def enrich_papers(
     papers: list[Paper],
     fields: list[str] | None = None,
+    providers: list[str] | None = None,
     progress_callback: Callable[[int, int], None] | None = None,
 ) -> list[Paper]:
     """
@@ -845,6 +917,8 @@ def enrich_papers(
     Args:
         papers: List of papers to enrich.
         fields: Fields to enrich. If None, enriches 'abstract' and 'pdf_url'.
+        providers: Provider names to try, in priority order. If None, uses
+            [[ENRICHMENT_PROVIDERS]].
         progress_callback: Called with (current, total) after each paper.
 
     Returns:
@@ -860,7 +934,7 @@ def enrich_papers(
     enriched_count = 0
 
     for i, paper in enumerate(papers):
-        result = enrich_paper(paper, fields)
+        result = enrich_paper(paper, fields, providers=providers)
         if result != paper:  # Paper was enriched
             enriched_count += 1
         enriched.append(result)
