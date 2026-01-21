@@ -40,6 +40,30 @@ The chapter covers six providers:
   Uses the [[arxiv]] client library.
 \end{description}
 
+\section{Keyword metadata mapping}
+\label{sec:providers-keyword-mapping}
+
+Providers expose different kinds of term metadata.
+Some preserve author-provided index terms, while others provide derived
+topic labels.
+Scholar models this with two distinct fields on [[Paper]]:
+\begin{description}
+\item[[[keywords]]] author-provided keywords or index terms.
+\item[[[tags]]] provider-derived topical labels.
+\end{description}
+
+We map provider fields to these concepts as follows:
+\begin{description}
+\item[Semantic Scholar] [[fieldsOfStudy]] $ightarrow$ [[tags]]
+\item[OpenAlex] [[keywords]] (curated/derived) $ightarrow$ [[tags]];
+  fall back to [[concepts]] $ightarrow$ [[tags]]
+\item[IEEE Xplore] [[index_terms.author_terms]] $ightarrow$ [[keywords]];
+  [[index_terms.ieee_terms]] and [[index_terms.controlled_terms]]
+  $ightarrow$ [[tags]]
+\item[Web of Science (Expanded)] [[keywords]] $ightarrow$ [[keywords]];
+  [[keywords_plus]] $ightarrow$ [[tags]]
+\end{description}
+
 \section{Caching}
 
 Each provider caches search results using [[cachetools]].
@@ -744,7 +768,7 @@ def search(
                 "query": query,
                 "limit": current_page_size,
                 "offset": offset,
-                "fields": "title,authors,year,abstract,venue,externalIds,url,openAccessPdf,citationCount,publicationTypes",
+                "fields": "title,authors,year,abstract,venue,externalIds,url,openAccessPdf,citationCount,publicationTypes,fieldsOfStudy",
             }
 
             # Apply filters (Semantic Scholar supports most filters natively)
@@ -909,7 +933,7 @@ def get_paper_by_doi(self, doi: str | None) -> Paper | None:
         response = self._session.get(
             url,
             params={
-                "fields": "title,authors,year,abstract,venue,externalIds,url,openAccessPdf",
+                "fields": "title,authors,year,abstract,venue,externalIds,url,openAccessPdf,fieldsOfStudy",
             },
             headers=headers,
             timeout=30,
@@ -1039,7 +1063,7 @@ def _get_related_papers(
             response = self._session.get(
                 url,
                 params={
-                    "fields": "title,authors,year,abstract,venue,externalIds,url,openAccessPdf",
+                    "fields": "title,authors,year,abstract,venue,externalIds,url,openAccessPdf,fieldsOfStudy",
                     "limit": page_size,
                     "offset": offset,
                 },
@@ -1119,6 +1143,14 @@ def _convert_paper(self, paper_data: dict) -> Paper:
     if open_access_pdf:
         pdf_url = open_access_pdf.get("url")
 
+    tags = [
+        t
+        for t in ensure_list(paper_data.get("fieldsOfStudy"))
+        if isinstance(t, str) and t
+    ]
+    if not tags:
+        tags = None
+
     return Paper(
         title=paper_data.get("title") or "",
         authors=authors,
@@ -1128,6 +1160,7 @@ def _convert_paper(self, paper_data: dict) -> Paper:
         venue=paper_data.get("venue"),
         url=paper_data.get("url"),
         pdf_url=pdf_url,
+        tags=tags,
         sources=[self.name],
     )
 @
@@ -1189,6 +1222,7 @@ class TestSemanticScholarProvider:
                     "url": "https://arxiv.org/pdf/1234.5678.pdf",
                     "status": "GREEN",
                 },
+                "fieldsOfStudy": ["Computer Science"],
             }]
         }
 
@@ -1205,6 +1239,7 @@ class TestSemanticScholarProvider:
             assert "Alice" in paper.authors
             assert "Bob" in paper.authors
             assert paper.pdf_url == "https://arxiv.org/pdf/1234.5678.pdf"
+            assert paper.tags == ["Computer Science"]
 
     def test_search_handles_empty_results(self):
         """search() returns empty list when no results."""
@@ -1649,6 +1684,23 @@ def _convert_work(self, work: dict) -> Paper:
     if not pdf_url and primary_location:
         pdf_url = primary_location.get("pdf_url")
 
+    tags: list[str] = []
+    for kw in work.get("keywords", []) or []:
+        if isinstance(kw, dict):
+            name = kw.get("display_name")
+            if name:
+                tags.append(name)
+        elif isinstance(kw, str) and kw:
+            tags.append(kw)
+    if not tags:
+        for concept in work.get("concepts", []) or []:
+            if isinstance(concept, dict):
+                name = concept.get("display_name")
+                if name:
+                    tags.append(name)
+    if not tags:
+        tags = None
+
     return Paper(
         title=work.get("title", ""),
         authors=authors,
@@ -1658,6 +1710,7 @@ def _convert_work(self, work: dict) -> Paper:
         venue=venue,
         url=work.get("id"),
         pdf_url=pdf_url,
+        tags=tags,
         sources=[self.name],
     )
 @
@@ -1760,6 +1813,10 @@ class TestOpenAlexProvider:
             "primary_location": {
                 "source": {"display_name": "Test Journal"}
             },
+            "concepts": [
+                {"display_name": "Machine learning"},
+                {"display_name": "Neural networks"},
+            ],
             "id": "https://openalex.org/W123456",
         }
 
@@ -1780,6 +1837,7 @@ class TestOpenAlexProvider:
             assert paper.doi == "10.1234/test"
             assert paper.venue == "Test Journal"
             assert paper.sources == ["openalex"]
+            assert paper.tags == ["Machine learning", "Neural networks"]
 
     def test_search_handles_empty_results(self):
         """search() returns empty list when no results."""
@@ -2977,6 +3035,32 @@ def _convert_expanded_hit(self, rec: dict) -> Paper:
     uid = rec.get("UID", "")
     url = f"https://www.webofscience.com/wos/woscc/full-record/{uid}" if uid else None
 
+    keywords_list: list[str] = []
+    keywords_nodes = ensure_list(
+        safe_get_nested(fullrecord, "keywords", "keyword", default=[])
+    )
+    for k in keywords_nodes:
+        if isinstance(k, dict):
+            value = k.get("content") or k.get("value")
+            if value:
+                keywords_list.append(value)
+        elif isinstance(k, str) and k:
+            keywords_list.append(k)
+    keywords = keywords_list or None
+
+    tags_list: list[str] = []
+    tags_nodes = ensure_list(
+        safe_get_nested(fullrecord, "keywords_plus", "keyword", default=[])
+    )
+    for k in tags_nodes:
+        if isinstance(k, dict):
+            value = k.get("content") or k.get("value")
+            if value:
+                tags_list.append(value)
+        elif isinstance(k, str) and k:
+            tags_list.append(k)
+    tags = tags_list or None
+
     return Paper(
         title=title,
         authors=authors,
@@ -2985,6 +3069,8 @@ def _convert_expanded_hit(self, rec: dict) -> Paper:
         abstract=abstract,
         venue=venue,
         url=url,
+        keywords=keywords,
+        tags=tags,
         sources=[self.name],
     )
 @
@@ -3822,7 +3908,16 @@ class TestWebOfScienceExpandedAPI:
                                         "abstract": {
                                             "abstract_text": {"p": "This is the abstract."}
                                         }
-                                    }
+                                    },
+                                    "keywords": {
+                                        "keyword": [
+                                            {"content": "kw1"},
+                                            {"content": "kw2"},
+                                        ]
+                                    },
+                                    "keywords_plus": {
+                                        "keyword": [{"content": "kp1"}]
+                                    },
                                 },
                             },
                             "dynamic_data": {
@@ -3856,6 +3951,8 @@ class TestWebOfScienceExpandedAPI:
             assert paper.doi == "10.1234/test"
             assert paper.venue == "Nature"
             assert paper.abstract == "This is the abstract."
+            assert paper.keywords == ["kw1", "kw2"]
+            assert paper.tags == ["kp1"]
             assert paper.sources == ["wos"]
 
     def test_handles_malformed_nested_fields(self):
@@ -4618,7 +4715,38 @@ The IEEE Xplore API returns articles with fields including:
 
 We convert each article to our common [[Paper]] type:
 
+We treat author-provided terms as [[keywords]] and controlled vocabulary / IEEE
+taxonomy terms as [[tags]] (see \cref{sec:providers-keyword-mapping}).
+
 <<convert ieee article>>=
+def _extract_ieee_terms(self, obj: object) -> list[str]:
+    if not isinstance(obj, dict):
+        return []
+    raw_terms = obj.get("terms")
+    terms: list[str] = []
+    for t in ensure_list(raw_terms):
+        if isinstance(t, dict):
+            value = t.get("term") or t.get("content")
+            if value:
+                terms.append(value)
+        elif isinstance(t, str) and t:
+            terms.append(t)
+    return terms
+
+
+def _parse_ieee_index_terms(
+    self,
+    index_terms: object,
+) -> tuple[list[str] | None, list[str] | None]:
+    if not isinstance(index_terms, dict):
+        return None, None
+    keywords_list = self._extract_ieee_terms(index_terms.get("author_terms"))
+    tags_list: list[str] = []
+    tags_list.extend(self._extract_ieee_terms(index_terms.get("ieee_terms")))
+    tags_list.extend(self._extract_ieee_terms(index_terms.get("controlled_terms")))
+    return keywords_list or None, tags_list or None
+
+
 def _convert_article(self, article: dict) -> Paper:
     """Convert an IEEE Xplore article to our Paper type."""
     # Extract publication year
@@ -4641,6 +4769,8 @@ def _convert_article(self, article: dict) -> Paper:
     # Prefer html_url, fall back to abstract_url
     url = article.get("html_url") or article.get("abstract_url")
 
+    keywords, tags = self._parse_ieee_index_terms(article.get("index_terms"))
+
     return Paper(
         title=article.get("title", "") or "",
         authors=authors,
@@ -4649,6 +4779,8 @@ def _convert_article(self, article: dict) -> Paper:
         abstract=article.get("abstract"),
         venue=article.get("publication_title"),
         url=url,
+        keywords=keywords,
+        tags=tags,
         sources=[self.name],
     )
 @
@@ -4716,6 +4848,10 @@ class TestIEEEXploreProvider:
                     "publication_year": "2024",
                     "doi": "10.1109/TNN.2024.1234567",
                     "abstract": "Abstract",
+                    "index_terms": {
+                        "author_terms": {"terms": [{"term": "deep learning"}]},
+                        "ieee_terms": {"terms": [{"term": "neural networks"}]},
+                    },
                     "publication_title": "IEEE Trans. Neural Networks",
                     "html_url": "https://ieeexplore.ieee.org/document/1234567",
                 }
@@ -4731,6 +4867,8 @@ class TestIEEEXploreProvider:
         assert paper.doi == "10.1109/TNN.2024.1234567"
         assert paper.title == "Test Paper"
         assert paper.abstract == "Abstract"
+        assert paper.keywords == ["deep learning"]
+        assert paper.tags == ["neural networks"]
         assert paper.sources == ["ieee"]
 
     def test_get_paper_by_doi_caches_results(self):
