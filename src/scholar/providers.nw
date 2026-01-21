@@ -4485,8 +4485,72 @@ class IEEEXploreProvider:
         except Exception as e:
             logger.warning("ieee: %s", e)
             return all_papers
+@
+
+\subsubsection{DOI lookup (for enrichment)}
+
+The Scholar enrichment pipeline uses DOI lookups to fill missing metadata.
+IEEE Xplore does not offer a separate DOI lookup endpoint in our integration,
+so we perform a normal search with the DOI as the query string and request a
+single record.
+
+To keep enrichment fast, we cache DOI lookups (including negative results)
+in the provider cache.
+
+<<ieee provider>>=
+
+    def get_paper_by_doi(self, doi: str | None) -> Paper | None:
+        """Fetch a single paper by DOI via the IEEE Xplore API."""
+        if not doi or not self.api_key:
+            return None
+
+        cache_key = ("doi", doi)
+        if cache_key in self._cache:
+            logger.info(f"ieee: Cache hit for DOI {doi}")
+            return self._cache[cache_key]
+
+        logger.info(f"ieee: Cache miss for DOI {doi}, fetching from API")
+
+        try:
+            response = requests.get(
+                IEEE_API_URL,
+                params={
+                    "querytext": f'"{doi}"',
+                    "max_records": 1,
+                    "start_record": 1,
+                    "apikey": self.api_key,
+                },
+                timeout=30,
+            )
+
+            if response.status_code == 429:
+                logger.warning("ieee: Rate limited during DOI lookup")
+                return None
+
+            if response.status_code == 403:
+                logger.warning("ieee: Access denied during DOI lookup")
+                return None
+
+            response.raise_for_status()
+            data = response.json()
+            articles = data.get("articles", [])
+            if not articles:
+                self._cache[cache_key] = None
+                return None
+
+            article = articles[0]
+            paper = self._convert_article(article)
+            self._cache[cache_key] = paper
+            return paper
+        except requests.exceptions.HTTPError as e:
+            logger.warning("ieee: DOI lookup error: %s", e)
+            return None
+        except Exception as e:
+            logger.warning("ieee: DOI lookup failed: %s", e)
+            return None
 
     <<convert ieee article>>
+
 @
 
 \subsubsection{Applying filters}
@@ -4631,6 +4695,69 @@ class TestIEEEXploreProvider:
         provider = IEEEXploreProvider(api_key=None)
         results = provider.search("test")
         assert results == []
+
+    def test_get_paper_by_doi_returns_none_without_api_key(self, monkeypatch):
+        """get_paper_by_doi() returns None when no API key is configured."""
+        monkeypatch.delenv("IEEE_API_KEY", raising=False)
+        provider = IEEEXploreProvider(api_key=None)
+        assert provider.get_paper_by_doi("10.1109/TNN.2024.1234567") is None
+
+    def test_get_paper_by_doi_returns_paper(self):
+        """get_paper_by_doi() returns a Paper when found."""
+        provider = IEEEXploreProvider(api_key="test_key")
+
+        mock_response = Mock()
+        mock_response.status_code = 200
+        mock_response.json.return_value = {
+            "articles": [
+                {
+                    "title": "Test Paper",
+                    "authors": {"authors": [{"full_name": "Alice Smith"}]},
+                    "publication_year": "2024",
+                    "doi": "10.1109/TNN.2024.1234567",
+                    "abstract": "Abstract",
+                    "publication_title": "IEEE Trans. Neural Networks",
+                    "html_url": "https://ieeexplore.ieee.org/document/1234567",
+                }
+            ]
+        }
+        mock_response.raise_for_status = Mock()
+
+        with patch("requests.get") as mock_get:
+            mock_get.return_value = mock_response
+            paper = provider.get_paper_by_doi("10.1109/TNN.2024.1234567")
+
+        assert paper is not None
+        assert paper.doi == "10.1109/TNN.2024.1234567"
+        assert paper.title == "Test Paper"
+        assert paper.abstract == "Abstract"
+        assert paper.sources == ["ieee"]
+
+    def test_get_paper_by_doi_caches_results(self):
+        """get_paper_by_doi() caches successful lookups."""
+        provider = IEEEXploreProvider(api_key="test_key")
+
+        mock_response = Mock()
+        mock_response.status_code = 200
+        mock_response.json.return_value = {
+            "articles": [
+                {
+                    "title": "Test Paper",
+                    "authors": {"authors": []},
+                    "doi": "10.1109/TNN.2024.1234567",
+                }
+            ]
+        }
+        mock_response.raise_for_status = Mock()
+
+        with patch("requests.get") as mock_get:
+            mock_get.return_value = mock_response
+            paper1 = provider.get_paper_by_doi("10.1109/TNN.2024.1234567")
+            paper2 = provider.get_paper_by_doi("10.1109/TNN.2024.1234567")
+
+        assert mock_get.call_count == 1
+        assert paper1 is not None
+        assert paper2 is not None
 
     def test_search_converts_articles(self):
         """search() converts API results to Paper objects."""
