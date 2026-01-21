@@ -77,19 +77,32 @@ from scholar.enrich import (
 \label{sec:enrichment-providers}
 
 Not all providers support DOI lookups or provide abstracts.
-We define which providers to use for enrichment and in what order:
+We define which providers to use for enrichment and in what order.
+
+Unlike search (where we query multiple providers and merge the resulting paper
+sets), enrichment starts from an existing paper record and fills in missing
+fields.
+To maximize coverage, we try multiple providers in sequence and keep going as
+long as any requested fields are still missing.
+
+We also skip providers that are not configured. For example, IEEE Xplore and Web
+of Science require API keys; if they are not available, we move on to the next
+provider.
 
 \begin{description}
+\item[IEEE Xplore] Strong coverage for IEEE publications.
+  Requires an API key; best used first when available.
+\item[Web of Science] High-quality bibliographic metadata.
+  Requires an API key.
 \item[Semantic Scholar] Excellent abstract coverage, free API with optional
   key for higher rate limits.
-  Primary enrichment source.
 \item[OpenAlex] Very broad coverage (250M+ works), always free.
-  Fallback if Semantic Scholar doesn't have the paper.
+  Final fallback.
 \end{description}
 
 <<constants>>=
-# Providers that support DOI lookup and provide abstracts
-ENRICHMENT_PROVIDERS = ["s2", "openalex"]
+# Providers to try for DOI-based metadata enrichment (in priority order)
+ENRICHMENT_PROVIDERS = ["ieee", "wos", "s2", "openalex"]
 
 # Global cache for enriched paper data (refs/cites)
 # Stored in data dir (not cache dir) since fetching refs/cites is expensive
@@ -156,8 +169,14 @@ def enrich_paper(
 
             # Try each enrichment provider in order
             for provider_name in ENRICHMENT_PROVIDERS:
+                if not needs_enrichment(result, fields):
+                    break
+
                 provider = get_provider(provider_name)
                 if provider is None:
+                    continue
+
+                if hasattr(provider, "is_available") and not provider.is_available():
                     continue
 
                 if not hasattr(provider, "get_paper_by_doi"):
@@ -172,8 +191,7 @@ def enrich_paper(
                 # Merge the enriched data into our paper
                 # We want to keep our paper's existing data and fill in gaps
                 logger.info(f"Successfully enriched paper from {provider_name}")
-                result = paper.merge_with(enriched)
-                break
+                result = result.merge_with(enriched)
     else:
         logger.debug(f"Paper '{paper.title_preview()}' doesn't need metadata enrichment")
 
@@ -666,29 +684,82 @@ class TestEnrichPaper:
             doi="10.1234/test"
         )
 
-        first_provider = MagicMock()
-        first_provider.get_paper_by_doi.return_value = None  # Not found
+        ieee_provider = MagicMock()
+        ieee_provider.get_paper_by_doi.return_value = None  # Not found
 
-        second_provider = MagicMock()
-        second_provider.get_paper_by_doi.return_value = Paper(
+        wos_provider = MagicMock()
+        wos_provider.get_paper_by_doi.return_value = None  # Not found
+
+        s2_provider = MagicMock()
+        s2_provider.get_paper_by_doi.return_value = None  # Not found
+
+        openalex_provider = MagicMock()
+        openalex_provider.get_paper_by_doi.return_value = Paper(
             title="Test Paper",
             authors=["Author"],
             doi="10.1234/test",
-            abstract="Found in second provider",
+            abstract="Found in OpenAlex",
             sources=["openalex"]
         )
 
         def mock_get_provider(name):
-            if name == "s2":
-                return first_provider
+            if name == "ieee":
+                return ieee_provider
+            elif name == "wos":
+                return wos_provider
+            elif name == "s2":
+                return s2_provider
             elif name == "openalex":
-                return second_provider
+                return openalex_provider
             return None
 
         with patch("scholar.enrich.get_provider", side_effect=mock_get_provider):
             result = enrich_paper(paper)
 
-        assert result.abstract == "Found in second provider"
+        assert result.abstract == "Found in OpenAlex"
+
+    def test_merges_multiple_providers_until_complete(self):
+        """enrich_paper merges provider records until fields are complete."""
+        paper = Paper(
+            title="Test Paper",
+            authors=["Author"],
+            doi="10.1234/test",
+        )
+
+        ieee_provider = MagicMock()
+        ieee_provider.is_available.return_value = True
+        ieee_provider.get_paper_by_doi.return_value = Paper(
+            title="Test Paper",
+            authors=["Author"],
+            doi="10.1234/test",
+            abstract="Abstract from IEEE",
+            sources=["ieee"],
+        )
+
+        wos_provider = MagicMock()
+        wos_provider.is_available.return_value = True
+        wos_provider.get_paper_by_doi.return_value = Paper(
+            title="Test Paper",
+            authors=["Author"],
+            doi="10.1234/test",
+            pdf_url="https://example.com/paper.pdf",
+            sources=["wos"],
+        )
+
+        def mock_get_provider(name):
+            if name == "ieee":
+                return ieee_provider
+            if name == "wos":
+                return wos_provider
+            raise AssertionError(f"Unexpected provider lookup: {name}")
+
+        with patch("scholar.enrich.get_provider", side_effect=mock_get_provider):
+            result = enrich_paper(paper, fields=["abstract", "pdf_url"])
+
+        assert result.abstract == "Abstract from IEEE"
+        assert result.pdf_url == "https://example.com/paper.pdf"
+        assert "ieee" in result.sources
+        assert "wos" in result.sources
 
     def test_returns_original_if_no_provider_finds(self):
         """enrich_paper returns original if no provider can enrich."""

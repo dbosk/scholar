@@ -492,8 +492,11 @@ enrich: Annotated[
     bool,
     typer.Option(
         "--enrich", "-e",
-        help="Fetch missing abstracts from Semantic Scholar/OpenAlex. "
-             "Only works for papers with DOIs.",
+        help=(
+            "Fetch missing abstracts/metadata via DOI lookup. "
+            "Order: IEEE, WoS, Semantic Scholar, OpenAlex (skips unconfigured providers). "
+            "Only works for papers with DOIs."
+        ),
     ),
 ] = False,
 <<report option>>
@@ -1251,10 +1254,11 @@ def enrich(
     ],
 ) -> None:
     """
-    Fetch missing abstracts for papers in a review session.
+    Fetch missing abstracts/metadata for papers in a review session.
 
-    Looks up papers by DOI in Semantic Scholar and OpenAlex to fill in
-    missing abstracts. Only papers with DOIs can be enriched.
+    Looks up papers by DOI in available providers to fill in missing
+    abstracts/metadata. Providers requiring API keys (IEEE, WoS) are used
+    only when configured.
 
     Example:
         scholar enrich "machine learning"
