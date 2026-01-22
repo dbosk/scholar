@@ -1958,7 +1958,7 @@ wheels = [
 
 [[package]]
 name = "scholarcli"
-version = "1.9"
+version = "1.10"
 source = { editable = "." }
 dependencies = [
     { name = "arxiv" },
