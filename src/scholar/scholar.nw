@@ -464,6 +464,8 @@ class Paper:
     url: str | None = None
     pdf_url: str | None = None
     citation_count: int | None = None
+    keywords: list[str] | None = None
+    tags: list[str] | None = None
     sources: list[str] = field(default_factory=list)
     references: list["Paper"] | None = None
     citations: list["Paper"] | None = None
@@ -474,8 +476,32 @@ class Paper:
 We use a dataclass for simplicity.
 The [[citation_count]] field stores the number of citations if available from
 the provider.
+The [[keywords]] field stores author-provided keywords or index terms when a
+provider exposes them.
+The [[tags]] field stores provider-specific topical labels (e.g., OpenAlex
+concepts or Semantic Scholar fields of study) as a fallback when author keywords
+are not available.
 The [[sources]] field tracks which databases returned this paper, useful for
 provenance in reports when merging results from multiple providers.
+
+\subsubsection{Keywords versus tags}
+
+Different providers expose different 
+\enquote{keyword-like} metadata.
+Some databases preserve the authors' own terms, while others provide derived
+topic labels.
+We keep these separate so downstream consumers can prefer author intent when it
+exists, while still benefiting from topical labels as a fallback.
+
+As a concrete example, IEEE Xplore might provide author index terms like
+[["threshold cryptography"]], while Semantic Scholar may only provide a broader
+field label like [["Computer Science"]].
+
+In general:
+\begin{description}
+\item[[[keywords]]] author-provided keywords or index terms.
+\item[[[tags]]] provider-derived topical labels.
+\end{description}
 
 \subsubsection{Paper identity and deduplication}
 
@@ -577,6 +603,8 @@ def to_dict(self, include_refs_cites: bool = False) -> dict:
         "url": self.url,
         "pdf_url": self.pdf_url,
         "citation_count": self.citation_count,
+        "keywords": self.keywords,
+        "tags": self.tags,
         "sources": self.sources,
     }
 
@@ -658,6 +686,8 @@ def _from_dict_without_registry(cls, data: dict) -> "Paper":
         url=data.get("url"),
         pdf_url=data.get("pdf_url"),
         citation_count=data.get("citation_count"),
+        keywords=data.get("keywords"),
+        tags=data.get("tags"),
         sources=data.get("sources", []),
         references=references,
         citations=citations,
@@ -703,6 +733,33 @@ The [[sources]] lists are combined as a union, preserving the order with
 [[self]]'s sources first.
 
 <<paper methods>>=
+@staticmethod
+def _merge_term_lists(
+    a: list[str] | None,
+    b: list[str] | None,
+) -> list[str] | None:
+    """Merge two lists of terms, preserving order and deduplicating."""
+    if a is None:
+        a = []
+    if b is None:
+        b = []
+
+    merged: list[str] = []
+    seen: set[str] = set()
+    for raw in a + b:
+        if not raw:
+            continue
+        term = raw.strip()
+        if not term:
+            continue
+        key = term.casefold()
+        if key in seen:
+            continue
+        seen.add(key)
+        merged.append(term)
+
+    return merged or None
+
 def merge_with(self, other: "Paper") -> "Paper":
     """
     Create a consolidated paper from two equal papers.
@@ -741,6 +798,8 @@ def merge_with(self, other: "Paper") -> "Paper":
         url=self.url or other.url,
         pdf_url=self.pdf_url or other.pdf_url,
         citation_count=merged_citation_count,
+        keywords=self._merge_term_lists(self.keywords, other.keywords),
+        tags=self._merge_term_lists(self.tags, other.tags),
         sources=combined_sources,
         references=self.references if self.references is not None else other.references,
         citations=self.citations if self.citations is not None else other.citations,
@@ -866,6 +925,27 @@ class TestPaperMergeWith:
             assert merged.url == "http://example.com"  # From p2
             assert merged.pdf_url == "http://example.com/pdf"  # From p2
 
+    def test_merge_unions_keywords_and_tags(self):
+        """Merging unions keywords/tags, keeping order."""
+        with isolated_registry():
+            p1 = Paper(
+                title="Test",
+                authors=["A"],
+                doi="10.1/test",
+                keywords=["foo", "bar"],
+                tags=["ml"],
+            )
+            p2 = Paper(
+                title="Test",
+                authors=["A"],
+                doi="10.1/test",
+                keywords=["bar", "baz"],
+                tags=["ml", "ai"],
+            )
+            merged = p1.merge_with(p2)
+            assert merged.keywords == ["foo", "bar", "baz"]
+            assert merged.tags == ["ml", "ai"]
+
 
 class TestPaperSerialization:
     """Tests for Paper.to_dict() and Paper.from_dict()."""
@@ -883,6 +963,8 @@ class TestPaperSerialization:
                 url="http://example.com",
                 pdf_url="http://example.com/pdf",
                 citation_count=42,
+                keywords=["kw1", "kw2"],
+                tags=["tag1"],
                 sources=["s2", "dblp"],
             )
             d = paper.to_dict()
@@ -895,6 +977,8 @@ class TestPaperSerialization:
             assert d["url"] == "http://example.com"
             assert d["pdf_url"] == "http://example.com/pdf"
             assert d["citation_count"] == 42
+            assert d["keywords"] == ["kw1", "kw2"]
+            assert d["tags"] == ["tag1"]
             assert d["sources"] == ["s2", "dblp"]
 
     def test_to_dict_excludes_refs_cites_by_default(self):
@@ -954,6 +1038,8 @@ class TestPaperSerialization:
                 "url": "http://example.com",
                 "pdf_url": "http://example.com/pdf",
                 "citation_count": 10,
+                "keywords": ["kw"],
+                "tags": ["tag"],
                 "sources": ["s2"],
             }
             paper = Paper.from_dict(d)
@@ -966,6 +1052,8 @@ class TestPaperSerialization:
             assert paper.url == "http://example.com"
             assert paper.pdf_url == "http://example.com/pdf"
             assert paper.citation_count == 10
+            assert paper.keywords == ["kw"]
+            assert paper.tags == ["tag"]
             assert paper.sources == ["s2"]
 
     def test_from_dict_with_refs_cites(self):
@@ -1004,6 +1092,8 @@ class TestPaperSerialization:
                 doi="10.1/test",
                 abstract="Abstract",
                 venue="Venue",
+                keywords=["kw1"],
+                tags=["tag1"],
                 sources=["s2"],
                 references=[Paper(title="Ref", authors=["R"], year=2020)],
             )
@@ -1014,6 +1104,8 @@ class TestPaperSerialization:
             assert restored.authors == original.authors
             assert restored.year == original.year
             assert restored.doi == original.doi
+            assert restored.keywords == original.keywords
+            assert restored.tags == original.tags
             assert restored.references is not None
             assert len(restored.references) == 1
             assert restored.references[0].title == "Ref"

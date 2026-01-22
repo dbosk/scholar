@@ -492,10 +492,24 @@ enrich: Annotated[
     bool,
     typer.Option(
         "--enrich", "-e",
-        help="Fetch missing abstracts from Semantic Scholar/OpenAlex. "
-             "Only works for papers with DOIs.",
+        help=(
+            "Fetch missing abstracts/metadata/keywords via DOI lookup. "
+            "Default order: Semantic Scholar, OpenAlex, IEEE, WoS. "
+            "Unconfigured providers are skipped. "
+            "Only works for papers with DOIs."
+        ),
     ),
 ] = False,
+enrich_providers: Annotated[
+    Optional[str],
+    typer.Option(
+        "--enrich-providers",
+        help=(
+            "Comma-separated provider names to use for enrichment. "
+            "Overrides the default order."
+        ),
+    ),
+] = None,
 <<report option>>
 <<search filter options>>
 @
@@ -698,13 +712,18 @@ else:
 
 \subsection{Enriching papers}
 
-When the [[--enrich]] flag is provided, we fetch missing abstracts for papers
-that have DOIs.
+When the [[--enrich]] flag is provided, we fetch missing abstracts/metadata for
+papers that have DOIs.
 This is particularly useful when searching DBLP (which doesn't include
 abstracts) alongside other providers.
 
-We show a progress indicator since enrichment requires API calls for each
-paper missing an abstract.
+We show a progress indicator since enrichment requires API calls for each paper
+that is missing requested metadata.
+
+The [[--enrich-providers]] option overrides which providers are tried and in
+which order.
+For example, to restrict enrichment to Semantic Scholar and OpenAlex:
+[[scholar search "..." --enrich --enrich-providers s2,openalex]].
 
 <<enrich papers if requested>>=
 if enrich and merged_results:
@@ -713,7 +732,16 @@ if enrich and merged_results:
 
     # Count papers that need enrichment
     papers = merged_results[0].papers
-    papers_to_enrich = [p for p in papers if needs_enrichment(p, ["abstract"]) and p.doi]
+    enrich_fields = ["abstract", "pdf_url", "keywords"]
+    papers_to_enrich = [
+        p for p in papers if needs_enrichment(p, enrich_fields) and p.doi
+    ]
+
+    providers_for_enrich = (
+        [p.strip() for p in enrich_providers.split(",") if p.strip()]
+        if enrich_providers
+        else None
+    )
 
     if papers_to_enrich:
         with Progress() as progress:
@@ -725,7 +753,12 @@ if enrich and merged_results:
             def update_progress(current: int, total: int) -> None:
                 progress.update(task, completed=current)
 
-            enriched = enrich_papers(papers, progress_callback=update_progress)
+            enriched = enrich_papers(
+                papers,
+                fields=enrich_fields,
+                providers=providers_for_enrich,
+                progress_callback=update_progress,
+            )
             merged_results[0] = SearchResult(
                 query=merged_results[0].query,
                 provider=merged_results[0].provider,
@@ -974,10 +1007,10 @@ try:
     )
     updated = apply_llm_decisions(session, batch)
 except ValueError as e:
-    console.print(f"[red]Error: {e}[/red]")
+    console.print(f"[red]Error: {escape(str(e))}[/red]")
     raise typer.Exit(1)
 except ImportError as e:
-    console.print(f"[red]{e}[/red]")
+    console.print(f"[red]{escape(str(e))}[/red]")
     raise typer.Exit(1)
 @
 
@@ -985,7 +1018,7 @@ except ImportError as e:
 session_path = save_session(session)
 stats = get_review_statistics(session)
 
-console.print(f"[green]Saved session:[/green] {session_path}")
+console.print(f"[green]Saved session:[/green] {escape(str(session_path))}")
 console.print(f"  Total papers: {stats['total']}")
 console.print(f"  Labeled by LLM: {len(updated)}")
 console.print(f"  Pending: {stats['pending']}")
@@ -1235,7 +1268,7 @@ class TestRQCommand:
 
 \section{Enriching Papers}
 
-The [[enrich]] command fetches missing abstracts for papers in a review session.
+The [[enrich]] command fetches missing abstracts/metadata for papers in a review session.
 This is useful when you've already done a search and want to fill in abstracts
 without re-running the search.
 
@@ -1249,12 +1282,23 @@ def enrich(
             autocompletion=complete_session_name,
         ),
     ],
+    enrich_providers: Annotated[
+        Optional[str],
+        typer.Option(
+            "--enrich-providers",
+            help=(
+                "Comma-separated provider names to use for enrichment. "
+                "Overrides the default order."
+            ),
+        ),
+    ] = None,
 ) -> None:
     """
-    Fetch missing abstracts for papers in a review session.
+    Fetch missing abstracts/metadata for papers in a review session.
 
-    Looks up papers by DOI in Semantic Scholar and OpenAlex to fill in
-    missing abstracts. Only papers with DOIs can be enriched.
+    Looks up papers by DOI in available providers to fill in missing
+    abstracts/metadata. Providers requiring API keys (IEEE, WoS) are used
+    only when configured.
 
     Example:
         scholar enrich "machine learning"
@@ -1276,13 +1320,20 @@ console = Console()
 # Load the session
 session_data = load_session(session)
 if session_data is None:
-    console.print(f"Session not found: {session}")
+    console.print(f"Session not found: {escape(session)}")
     raise typer.Exit(1)
 
 # Extract papers from decisions
 papers = [decision.paper for decision in session_data.decisions]
 papers_with_doi = [p for p in papers if p.doi]
-papers_to_enrich = [p for p in papers_with_doi if needs_enrichment(p, ["abstract"])]
+enrich_fields = ["abstract", "pdf_url", "keywords"]
+papers_to_enrich = [p for p in papers_with_doi if needs_enrichment(p, enrich_fields)]
+
+providers_for_enrich = (
+    [p.strip() for p in enrich_providers.split(",") if p.strip()]
+    if enrich_providers
+    else None
+)
 
 if not papers_to_enrich:
     console.print("[yellow]No papers need enrichment (all have abstracts or lack DOIs).[/yellow]")
@@ -1297,7 +1348,12 @@ with Progress() as progress:
     def update_progress(current: int, total: int) -> None:
         progress.update(task, completed=current)
 
-    enriched_papers = enrich_papers(papers, progress_callback=update_progress)
+    enriched_papers = enrich_papers(
+        papers,
+        fields=enrich_fields,
+        providers=providers_for_enrich,
+        progress_callback=update_progress,
+    )
 
 # Update decisions with enriched papers
 paper_map = {p.doi: p for p in enriched_papers if p.doi}
@@ -1665,7 +1721,7 @@ def cache(
         print(stats["cache_dir"])
 
     else:
-        console.print(f"[red]Unknown action: {action}[/red]")
+        console.print(f"[red]Unknown action: {escape(action)}[/red]")
         console.print("Valid actions: clear, info, path")
         raise typer.Exit(1)
 @
@@ -1784,15 +1840,19 @@ def pdf(
         try:
             console.print(f"[dim]Fetching PDF...[/dim]")
             pdf_path = get_pdf(url)
-            console.print(f"[green]PDF cached at: {pdf_path}[/green]")
+            console.print(
+                f"[green]PDF cached at: {escape(str(pdf_path))}[/green]"
+            )
             
             if open_pdf(pdf_path):
                 console.print("[dim]Opened in system viewer[/dim]")
             else:
                 console.print("[yellow]Could not open PDF viewer[/yellow]")
-                console.print(f"[dim]PDF available at: {pdf_path}[/dim]")
+                console.print(
+                    f"[dim]PDF available at: {escape(str(pdf_path))}[/dim]"
+                )
         except PDFDownloadError as e:
-            console.print(f"[red]Download failed: {e}[/red]")
+            console.print(f"[red]Download failed: {escape(str(e))}[/red]")
             raise typer.Exit(1)
 
     elif action == "info":
@@ -1816,7 +1876,7 @@ def pdf(
         print(get_pdf_cache_dir())
 
     else:
-        console.print(f"[red]Unknown action: {action}[/red]")
+        console.print(f"[red]Unknown action: {escape(action)}[/red]")
         console.print("Valid actions: open, info, clear, path")
         raise typer.Exit(1)
 @
@@ -1921,9 +1981,12 @@ def notes_list(
             preview = note.note[:50] + "..." if len(note.note) > 50 else note.note
             preview = preview.replace("\n", " ")
             table.add_row(
-                note.title[:50] + ("..." if len(note.title) > 50 else ""),
-                preview,
-                note.updated_at.strftime("%Y-%m-%d"),
+                Text(
+                    (note.title or "")[:50]
+                    + ("..." if len(note.title or "") > 50 else "")
+                ),
+                Text(preview),
+                Text(note.updated_at.strftime("%Y-%m-%d")),
             )
 
         console.print(table)
@@ -1952,14 +2015,17 @@ def notes_show(
 
     for note in notes:
         if note.paper_id == paper_id or paper_id in note.paper_id:
-            console.print(f"[bold]{note.title}[/bold]")
-            console.print(f"[dim]ID: {note.paper_id}[/dim]")
-            console.print(f"[dim]Updated: {note.updated_at.strftime('%Y-%m-%d %H:%M')}[/dim]")
+            console.print(f"[bold]{escape(str(note.title or ''))}[/bold]")
+            console.print(f"[dim]ID: {escape(note.paper_id)}[/dim]")
+            console.print(
+                f"[dim]Updated: "
+                f"{note.updated_at.strftime('%Y-%m-%d %H:%M')}[/dim]"
+            )
             console.print()
-            console.print(note.note)
+            console.print(note.note, markup=False)
             return
 
-    console.print(f"[red]No notes found for paper ID: {paper_id}[/red]")
+    console.print(f"[red]No notes found for paper ID: {escape(paper_id)}[/red]")
     raise typer.Exit(1)
 
 
@@ -1979,7 +2045,9 @@ def notes_export(
 
     console = Console()
     count = export_notes(output)
-    console.print(f"[green]Exported {count} note(s) to {output}[/green]")
+    console.print(
+        f"[green]Exported {count} note(s) to {escape(str(output))}[/green]"
+    )
 
 
 @notes_app.command("import")
@@ -2006,12 +2074,17 @@ def notes_import(
     console = Console()
 
     if not input_file.exists():
-        console.print(f"[red]File not found: {input_file}[/red]")
+        console.print(
+            f"[red]File not found: {escape(str(input_file))}[/red]"
+        )
         raise typer.Exit(1)
 
     count = import_notes(input_file, merge=merge)
     action = "Merged" if merge else "Imported"
-    console.print(f"[green]{action} {count} note(s) from {input_file}[/green]")
+    console.print(
+        f"[green]{escape(action)} {count} note(s) from "
+        f"{escape(str(input_file))}[/green]"
+    )
 
 
 @notes_app.command("clear")
@@ -2116,11 +2189,11 @@ def sessions_list(
 
         for s in sessions:
             table.add_row(
-                s["name"],
-                s["timestamp"].strftime("%Y-%m-%d %H:%M"),
-                str(s["kept"]),
-                str(s["discarded"]),
-                str(s["pending"]),
+                Text(str(s["name"])),
+                Text(s["timestamp"].strftime("%Y-%m-%d %H:%M")),
+                Text(str(s["kept"])),
+                Text(str(s["discarded"])),
+                Text(str(s["pending"])),
             )
 
         console.print(table)
@@ -2175,7 +2248,7 @@ def sessions_show(
     session = load_session(name)
 
     if session is None:
-        console.print(f"[red]Session not found: {name}[/red]")
+        console.print(f"[red]Session not found: {escape(name)}[/red]")
         raise typer.Exit(1)
 
     if output_format == "json":
@@ -2202,7 +2275,7 @@ def sessions_show(
         # Build output using Rich markup, render directly to console
         def print_session_details(con: Console) -> None:
             """Print session details with Rich formatting."""
-            con.print(f"[bold]Session: {session.query}[/bold]")
+            con.print(f"[bold]Session: {escape(session.query)}[/bold]")
             con.print(
                 f"[dim]Date: "
                 f"{session.timestamp.strftime('%Y-%m-%d %H:%M')}[/dim]"
@@ -2212,12 +2285,16 @@ def sessions_show(
             if session.query_provider_pairs:
                 con.print("[dim]Queries by provider:[/dim]")
                 for query, provider in session.query_provider_pairs:
-                    con.print(f"[dim]  {provider}: {query}[/dim]")
+                    con.print(
+                        f"[dim]  {provider}: {escape(query)}[/dim]"
+                    )
             else:
                 # Fallback: show providers with session query
                 con.print("[dim]Queries by provider:[/dim]")
                 for provider in session.providers:
-                    con.print(f"[dim]  {provider}: {session.query}[/dim]")
+                    con.print(
+                        f"[dim]  {provider}: {escape(session.query)}[/dim]"
+                    )
             con.print()
 
             # Show themes overview
@@ -2226,7 +2303,9 @@ def sessions_show(
                 con.print("[cyan bold]Themes:[/cyan bold]")
                 for theme, count in sorted(themes.items()):
                     papers = "paper" if count == 1 else "papers"
-                    con.print(f"  • {theme} ({count} {papers})")
+                    con.print(
+                        f"  • {escape(str(theme))} ({count} {papers})"
+                    )
                 con.print()
 
             # Show kept papers
@@ -2235,8 +2314,11 @@ def sessions_show(
                 con.print(f"[green bold]Kept ({len(kept)}):[/green bold]")
                 for d in kept:
                     provider = f" [dim]({d.provider})[/dim]" if d.provider else ""
-                    tags = f" [dim]\\[{', '.join(d.tags)}][/dim]" if d.tags else ""
-                    con.print(f"  • {d.paper.title}{provider}{tags}")
+                    tag_list = ", ".join(escape(t) for t in d.tags) if d.tags else ""
+                    tags = f" [dim]\\[{tag_list}][/dim]" if d.tags else ""
+                    con.print(
+                        f"  • {escape(d.paper.title or '')}{provider}{tags}"
+                    )
                 con.print()
 
             # Show discarded papers
@@ -2247,8 +2329,11 @@ def sessions_show(
                 )
                 for d in discarded:
                     provider = f" [dim]({d.provider})[/dim]" if d.provider else ""
-                    tags = f" [dim]\\[{', '.join(d.tags)}][/dim]" if d.tags else ""
-                    con.print(f"  • {d.paper.title}{provider}{tags}")
+                    tag_list = ", ".join(escape(t) for t in d.tags) if d.tags else ""
+                    tags = f" [dim]\\[{tag_list}][/dim]" if d.tags else ""
+                    con.print(
+                        f"  • {escape(d.paper.title or '')}{provider}{tags}"
+                    )
                 con.print()
 
             # Show pending papers
@@ -2259,7 +2344,9 @@ def sessions_show(
                 )
                 for d in pending:
                     provider = f" [dim]({d.provider})[/dim]" if d.provider else ""
-                    con.print(f"  • {d.paper.title}{provider}")
+                    con.print(
+                        f"  • {escape(d.paper.title or '')}{provider}"
+                    )
 
         # Use pager if TTY, otherwise print directly
         if sys.stdout.isatty():
@@ -2312,7 +2399,7 @@ def sessions_export(
     session = load_session(name)
 
     if session is None:
-        console.print(f"[red]Session not found: {name}[/red]")
+        console.print(f"[red]Session not found: {escape(name)}[/red]")
         raise typer.Exit(1)
 
     # Use session query as default output name (sanitized)
@@ -2339,7 +2426,7 @@ def sessions_export(
 
     console.print("[green]Exported:[/green]")
     for f in files_created:
-        console.print(f"  - {f}")
+        console.print(f"  - {escape(str(f))}")
 
     # If the session includes any LLM decisions, report agreement/change counts.
     has_llm_decisions = any(
@@ -2411,10 +2498,10 @@ def sessions_resume(
     session = load_session(name)
 
     if session is None:
-        console.print(f"[red]Session not found: {name}[/red]")
+        console.print(f"[red]Session not found: {escape(name)}[/red]")
         raise typer.Exit(1)
 
-    console.print(f"[dim]Resuming session: {session.query}[/dim]")
+    console.print(f"[dim]Resuming session: {escape(session.query)}[/dim]")
 
     app = PaperReviewApp(session)
     app.run()
@@ -2530,7 +2617,7 @@ def llm_classify(
     session = review.load_session(session_name)
 
     if session is None:
-        console.print(f"[red]Session not found: {session_name}[/red]")
+        console.print(f"[red]Session not found: {escape(session_name)}[/red]")
         raise typer.Exit(1)
 
     model_selection = LLMModelSelection(
@@ -2567,10 +2654,10 @@ def llm_classify(
         console.print(f"  Pending: {stats['pending']}")
 
     except ValueError as e:
-        console.print(f"[red]Error: {e}[/red]")
+        console.print(f"[red]Error: {escape(str(e))}[/red]")
         raise typer.Exit(1)
     except ImportError as e:
-        console.print(f"[red]{e}[/red]")
+        console.print(f"[red]{escape(str(e))}[/red]")
         raise typer.Exit(1)
 
 
@@ -2605,7 +2692,7 @@ def llm_status(
     session = load_session(session_name)
 
     if session is None:
-        console.print(f"[red]Session not found: {session_name}[/red]")
+        console.print(f"[red]Session not found: {escape(session_name)}[/red]")
         raise typer.Exit(1)
 
     stats = get_review_statistics(session)
@@ -2613,7 +2700,10 @@ def llm_status(
     if output_format == "json":
         print(json.dumps(stats, indent=2))
     else:
-        table = Table(title=f"LLM Review Status: {session.query}", box=box.ROUNDED)
+        table = Table(
+            title=Text(f"LLM Review Status: {session.query}"),
+            box=box.ROUNDED,
+        )
         table.add_column("Category", style="cyan")
         table.add_column("Count", justify="right")
 
@@ -2658,7 +2748,7 @@ def llm_context(
     session = load_session(session_name)
 
     if session is None:
-        console.print(f"[red]Session not found: {session_name}[/red]")
+        console.print(f"[red]Session not found: {escape(session_name)}[/red]")
         raise typer.Exit(1)
 
     if context is None:
@@ -2895,7 +2985,7 @@ def _apply_theme_groupings(
             model_id=model_id,
         )
     except ImportError as e:
-        console.print(f"[yellow]Warning: {e}[/yellow]")
+        console.print(f"[yellow]Warning: {escape(str(e))}[/yellow]")
         return theme_counts, {}
 
     if not result.groups:
@@ -2904,15 +2994,19 @@ def _apply_theme_groupings(
 
     # Show the overall explanation
     console.print(f"\n[bold]Theme grouping analysis:[/bold]")
-    console.print(f"  {result.explanation}\n")
+    console.print(f"  {escape(result.explanation)}\n")
 
     # Process each suggested group
     updated_counts = dict(theme_counts)
     accepted_groupings: dict[str, list[str]] = {}
     for group in result.groups:
-        console.print(f"[bold]Suggested merge: {group.merged_name}[/bold]")
-        console.print(f"  Themes: {', '.join(group.themes)}")
-        console.print(f"  Reasoning: {group.reasoning}")
+        console.print(
+            f"[bold]Suggested merge: {escape(group.merged_name)}[/bold]"
+        )
+        console.print(
+            f"  Themes: {', '.join(escape(t) for t in group.themes)}"
+        )
+        console.print(f"  Reasoning: {escape(group.reasoning)}")
 
         accept = questionary.confirm(
             f"Accept this grouping?",
@@ -2933,7 +3027,7 @@ def _apply_theme_groupings(
             accepted_groupings[group.merged_name] = list(group.themes)
             console.print(
                 f"  [green]Merged {len(group.themes)} themes → "
-                f"{group.merged_name} ({combined_count} papers)[/green]\n"
+                f"{escape(group.merged_name)} ({combined_count} papers)[/green]\n"
             )
         else:
             console.print("  [dim]Skipped[/dim]\n")
@@ -3004,6 +3098,13 @@ def llm_synthesize(
             help="Show the prompt without calling LLM.",
         ),
     ] = False,
+    no_enrich: Annotated[
+        bool,
+        typer.Option(
+            "--no-enrich",
+            help="Skip automatic enrichment of papers without abstracts.",
+        ),
+    ] = False,
     themes: Annotated[
         list[str] | None,
         typer.Option(
@@ -3065,7 +3166,7 @@ def llm_synthesize(
     session = review.load_session(session_name)
 
     if session is None:
-        console.print(f"[red]Session not found: {session_name}[/red]")
+        console.print(f"[red]Session not found: {escape(session_name)}[/red]")
         raise typer.Exit(1)
 
     # Validate output format
@@ -3098,6 +3199,7 @@ def llm_synthesize(
             model_id=select_model_id(model_selection, "writing"),
             output_format=output_format,
             max_papers=max_papers,
+            enrich_missing=not no_enrich,
             dry_run=dry_run,
             selected_themes=selected_themes,
             theme_groupings=theme_groupings,
@@ -3108,24 +3210,32 @@ def llm_synthesize(
             console.print(result)
             return
 
+        # Persist any automatic enrichment (abstracts) to disk so later
+        # sessions resume already has the enriched data.
+        review.save_session(session)
+
         # Output the synthesis
         synthesis_text = result.synthesis
 
         if output:
             output.write_text(synthesis_text)
-            console.print(f"[green]Synthesis written to {output}[/green]")
+            console.print(
+                f"[green]Synthesis written to {escape(str(output))}[/green]"
+            )
             console.print(f"  Papers: {result.paper_count}")
-            console.print(f"  Themes: {', '.join(result.themes)}")
+            console.print(
+                f"  Themes: {', '.join(escape(t) for t in result.themes)}"
+            )
             console.print(f"  Model: {result.model_id}")
         else:
             # Print to stdout
-            console.print(synthesis_text)
+            console.print(synthesis_text, markup=False)
 
     except ValueError as e:
-        console.print(f"[red]Error: {e}[/red]")
+        console.print(f"[red]Error: {escape(str(e))}[/red]")
         raise typer.Exit(1)
     except ImportError as e:
-        console.print(f"[red]{e}[/red]")
+        console.print(f"[red]{escape(str(e))}[/red]")
         raise typer.Exit(1)
 @
 
@@ -3287,8 +3397,10 @@ class TableFormatter:
         """Display results in formatted tables."""
         for result in results:
             table = Table(
-                title=f"Results for: {result.query}",
-                caption=f"Provider: {result.provider} | {result.timestamp}",
+                title=Text(f"Results for: {result.query}"),
+                caption=Text(
+                    f"Provider: {result.provider} | {result.timestamp}"
+                ),
                 box=box.HORIZONTALS,
             )
 
@@ -3302,10 +3414,10 @@ class TableFormatter:
                 if len(paper.authors) > 3:
                     authors += "..."
                 table.add_row(
-                    paper.title,
-                    authors,
-                    str(paper.year) if paper.year else "",
-                    paper.doi or "",
+                    Text(paper.title or ""),
+                    Text(authors),
+                    Text(str(paper.year) if paper.year else ""),
+                    Text(paper.doi or ""),
                     end_section=True,
                 )
 
@@ -3324,6 +3436,28 @@ Let's verify the table formatter produces correct output:
         formatter.format(sample_results)
         captured = capsys.readouterr()
         assert "Test Paper" in captured.out
+
+    def test_table_formatter_handles_rich_markup_in_titles(self, capsys):
+        """TableFormatter prints titles containing Rich-like markup."""
+        formatter = TableFormatter()
+        results = [
+            SearchResult(
+                query="test",
+                provider="test_provider",
+                timestamp="2024-01-01T00:00:00",
+                papers=[
+                    Paper(
+                        title="Bad [/ITAL] tag",
+                        authors=["Alice"],
+                        year=2024,
+                        doi="10.1234/test",
+                    )
+                ],
+            )
+        ]
+        formatter.format(results)
+        captured = capsys.readouterr()
+        assert "Bad [/ITAL] tag" in captured.out
 @
 
 
@@ -3642,7 +3776,9 @@ import logging
 import typer
 from rich import box
 from rich.console import Console
+from rich.markup import escape
 from rich.table import Table
+from rich.text import Text
 @
 
 <<constants>>=

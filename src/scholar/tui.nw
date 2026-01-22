@@ -168,6 +168,7 @@ from textual.message import Message
 from textual import work
 from rich.text import Text
 from rich.console import Console
+from rich.markup import escape
 
 from scholar.scholar import Paper, SearchResult, SearchFilters
 from scholar.notes import (
@@ -412,26 +413,35 @@ class AbstractScreen(Screen[None]):
         
         yield Header()
         with VerticalScroll():
-            yield Static(f"[bold]{paper.title}[/bold]", classes="title")
-            yield Static(f"[dim]Provider: {self.decision.provider}[/dim]")
+            yield Static(
+                f"[bold]{escape(paper.title or '')}[/bold]",
+                classes="title",
+            )
+            yield Static(
+                f"[dim]Provider: {escape(self.decision.provider or '')}[/dim]"
+            )
             yield Static("")
             
             authors = ", ".join(paper.authors) if paper.authors else "Unknown"
-            yield Static(f"[bold]Authors:[/bold] {authors}")
-            yield Static(f"[bold]Year:[/bold] {paper.year or 'Unknown'}")
-            yield Static(f"[bold]Venue:[/bold] {paper.venue or 'Unknown'}")
+            yield Static(f"[bold]Authors:[/bold] {escape(authors)}")
+            yield Static(
+                f"[bold]Year:[/bold] {escape(str(paper.year or 'Unknown'))}"
+            )
+            yield Static(
+                f"[bold]Venue:[/bold] {escape(paper.venue or 'Unknown')}"
+            )
             
             if paper.doi:
-                yield Static(f"[bold]DOI:[/bold] {paper.doi}")
+                yield Static(f"[bold]DOI:[/bold] {escape(paper.doi)}")
             if paper.url:
-                yield Static(f"[bold]URL:[/bold] {paper.url}")
+                yield Static(f"[bold]URL:[/bold] {escape(paper.url)}")
             if paper.pdf_url:
-                yield Static(f"[bold]PDF:[/bold] {paper.pdf_url}")
+                yield Static(f"[bold]PDF:[/bold] {escape(paper.pdf_url)}")
             
             yield Static("")
             yield Static("[bold]Abstract:[/bold]")
             if paper.abstract:
-                yield Static(paper.abstract)
+                yield Static(escape(paper.abstract))
             else:
                 if paper.pdf_url:
                     yield Static("[dim]No abstract available. Press [bold yellow]p[/bold yellow] to open PDF.[/dim]")
@@ -458,7 +468,7 @@ class AbstractScreen(Screen[None]):
                 else:
                     yield Static("[bold yellow]─── Tags ───[/bold yellow]")
                 tags_text = ", ".join(self.decision.tags)
-                yield Static(tags_text)
+                yield Static(tags_text, markup=False)
             
             # Show references if paper has them
             if paper.references:
@@ -1012,7 +1022,10 @@ count into the display label. Tags that were previously selected
 <<tui discard modal>>=
     def compose(self) -> ComposeResult:
         with Container(id="tag-dialog"):
-            yield Static(f"[bold]{self.title_text}[/bold]", id="tag-title")
+            yield Static(
+                f"[bold]{escape(self.title_text)}[/bold]",
+                id="tag-title",
+            )
             
             # Build selection list with counts
             selections = []
@@ -2121,9 +2134,16 @@ class PaperReviewApp(App):
                 
                 all_refs.extend(refs)
                 source_ids.append(get_paper_id(paper))
-                self.notify(f"Found {len(refs)} refs for {paper.title_preview(30)}")
+                self.notify(
+                    f"Found {len(refs)} refs for "
+                    f"{escape(paper.title_preview(30))}"
+                )
             except Exception as e:
-                self.notify(f"Error for {paper.title_preview(30)}: {e}", severity="warning")
+                self.notify(
+                    f"Error for {escape(paper.title_preview(30))}: "
+                    f"{escape(str(e))}",
+                    severity="warning",
+                )
 
         if all_refs:
             added = self.session.add_papers_from_snowball(
@@ -2182,9 +2202,16 @@ class PaperReviewApp(App):
                 
                 all_cites.extend(cites)
                 source_ids.append(get_paper_id(paper))
-                self.notify(f"Found {len(cites)} cites for {paper.title_preview(30)}")
+                self.notify(
+                    f"Found {len(cites)} cites for "
+                    f"{escape(paper.title_preview(30))}"
+                )
             except Exception as e:
-                self.notify(f"Error for {paper.title_preview(30)}: {e}", severity="warning")
+                self.notify(
+                    f"Error for {escape(paper.title_preview(30))}: "
+                    f"{escape(str(e))}",
+                    severity="warning",
+                )
 
         if all_cites:
             added = self.session.add_papers_from_snowball(

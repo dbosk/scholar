@@ -986,6 +986,12 @@ def parse_llm_response(
 Papers without abstracts are poor candidates for LLM classification. We
 identify them so they can be enriched before classification.
 
+Since the enrichment functions return new [[Paper]] objects (they do not mutate
+the existing ones), we must write the enriched papers back onto the
+corresponding [[ReviewDecision]] objects. This ensures the enriched abstracts
+are persisted when the session is saved, so later [[scholar sessions resume]]
+already has them.
+
 <<llm review llm interaction>>=
 def get_papers_needing_enrichment(
     papers: list[ReviewDecision],
@@ -1083,17 +1089,29 @@ def classify_papers_with_llm(
     # Limit to requested count
     to_classify = pending[:count]
 
-    # Check for papers needing enrichment
+    # Check for papers needing enrichment.
+    # Note: enrich_papers() returns new Paper objects, so we must apply the
+    # results back onto the decisions to persist enrichment to disk.
     if enrich_missing:
-        needing_enrichment = get_papers_needing_enrichment(to_classify)
-        if needing_enrichment:
+        decisions_to_enrich = [
+            d for d in to_classify if not d.paper.abstract
+        ]
+        if decisions_to_enrich:
             try:
                 from scholar.enrich import enrich_papers
+
                 logger.info(
-                    f"Enriching {len(needing_enrichment)} papers "
+                    f"Enriching {len(decisions_to_enrich)} papers "
                     "before classification"
                 )
-                enrich_papers(needing_enrichment)
+                enriched = enrich_papers(
+                    [d.paper for d in decisions_to_enrich],
+                    fields=["abstract"],
+                )
+                for decision, enriched_paper in zip(
+                    decisions_to_enrich, enriched
+                ):
+                    decision.paper = enriched_paper
             except ImportError:
                 logger.warning(
                     "Enrich module not available, "
@@ -3087,6 +3105,7 @@ def generate_literature_synthesis(
     model_id: str | None = None,
     output_format: str = "markdown",
     max_papers: int | None = None,
+    enrich_missing: bool = True,
     dry_run: bool = False,
     selected_themes: list[str] | None = None,
     theme_groupings: dict[str, list[str]] | None = None,
@@ -3099,6 +3118,7 @@ def generate_literature_synthesis(
         model_id: Deprecated compatibility alias for selecting the writing model.
         output_format: Output format: "markdown" or "latex".
         max_papers: Maximum papers to include (manages token limits).
+        enrich_missing: Whether to enrich missing abstracts before synthesis.
         dry_run: If True, show prompts without calling LLM.
         selected_themes: If provided, only include these themes in synthesis.
         theme_groupings: Maps merged theme names to their constituent original
@@ -3139,6 +3159,33 @@ def generate_literature_synthesis(
             f"Synthesizing {len(kept_decisions)} papers may exceed token "
             "limits. Consider using --max-papers to limit."
         )
+
+    # Enrich missing abstracts (and persist results on the session).
+    if enrich_missing:
+        decisions_to_enrich = [
+            d for d in kept_decisions if not d.paper.abstract
+        ]
+        if decisions_to_enrich:
+            try:
+                from scholar.enrich import enrich_papers
+
+                logger.info(
+                    f"Enriching {len(decisions_to_enrich)} kept papers "
+                    "before synthesis"
+                )
+                enriched = enrich_papers(
+                    [d.paper for d in decisions_to_enrich],
+                    fields=["abstract"],
+                )
+                for decision, enriched_paper in zip(
+                    decisions_to_enrich, enriched
+                ):
+                    decision.paper = enriched_paper
+            except ImportError:
+                logger.warning(
+                    "Enrich module not available, "
+                    "some papers may lack abstracts"
+                )
 
     included_kept_papers = len(kept_decisions)
 
