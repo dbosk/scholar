@@ -2833,9 +2833,9 @@ def build_research_question_section_markdown(
     lines.extend(["### Summary", ""])
     lines.append(f"- Date: {session.timestamp.strftime('%Y-%m-%d %H:%M')}")
     lines.append(f"- Total Papers: {len(session.decisions)}")
-    lines.append(f"- Kept: {len(session.kept_papers)}")
-    lines.append(f"- Discarded: {len(session.discarded_papers)}")
-    lines.append(f"- Pending: {len(session.pending_papers)}")
+    lines.append(f"- Kept: {len(session.kept_papers())}")
+    lines.append(f"- Discarded: {len(session.discarded_papers())}")
+    lines.append(f"- Pending: {len(session.pending_papers())}")
     if included_kept_papers != total_kept_papers:
         lines.append(
             f"- Included kept papers: {included_kept_papers}/{total_kept_papers} "
@@ -2887,9 +2887,9 @@ def build_research_question_section_latex(
             r"\begin{description}",
             f"\\item[Date] {session.timestamp.strftime('%Y-%m-%d %H:%M')}",
             f"\\item[Total Papers] {len(session.decisions)}",
-            f"\\item[Kept] {len(session.kept_papers)}",
-            f"\\item[Discarded] {len(session.discarded_papers)}",
-            f"\\item[Pending] {len(session.pending_papers)}",
+            f"\\item[Kept] {len(session.kept_papers())}",
+            f"\\item[Discarded] {len(session.discarded_papers())}",
+            f"\\item[Pending] {len(session.pending_papers())}",
         ]
     )
     if included_kept_papers != total_kept_papers:

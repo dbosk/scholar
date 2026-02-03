@@ -173,6 +173,7 @@ from rich.markup import escape
 from scholar.scholar import Paper, SearchResult, SearchFilters
 from scholar.notes import (
     get_note, has_note, edit_note_in_editor,
+    _get_cached_notes, get_paper_id,
 )
 from scholar.review import (
     DecisionStatus, ReviewDecision, ReviewSession, ReviewSource,
@@ -256,19 +257,31 @@ doesn't apply---the user is just browsing papers with notes.
 class PaperListItem(ListItem):
     """A list item displaying a paper with its review status."""
 
-    def __init__(self, decision: ReviewDecision, index: int, review_mode: bool = True) -> None:
+    def __init__(
+        self,
+        decision: ReviewDecision,
+        index: int,
+        review_mode: bool = True,
+        paper_has_note: bool | None = None,
+    ) -> None:
         super().__init__()
         self.decision = decision
         self.index = index
         self.review_mode = review_mode
+        # Pre-computed note status (None means check at render time)
+        self._paper_has_note = paper_has_note
 
     def compose(self) -> ComposeResult:
         paper = self.decision.paper
         status = self.decision.status
         source = self.decision.source
 
-        # Note indicator
-        note_indicator = "[yellow]📝[/yellow] " if has_note(paper) else "   "
+        # Note indicator - use pre-computed value if available
+        if self._paper_has_note is not None:
+            show_note = self._paper_has_note
+        else:
+            show_note = has_note(paper)
+        note_indicator = "[yellow]📝[/yellow] " if show_note else "   "
 
         # LLM source indicator
         if source == ReviewSource.LLM_UNREVIEWED:
@@ -727,6 +740,7 @@ class AbstractScreen(Screen[None]):
 
         self.decision.status = DecisionStatus.KEPT
         self.decision.clear_tags()
+        self.session._invalidate_cache()  # Status changed
 
         # Mark as reviewed if it was an LLM decision
         if was_llm:
@@ -754,6 +768,7 @@ class AbstractScreen(Screen[None]):
             if result is not None:  # None means cancelled
                 self.decision.status = DecisionStatus.KEPT
                 self.decision.tags = result
+                self.session._invalidate_cache()  # Status changed
 
                 # Mark as reviewed if it was an LLM decision
                 if was_llm:
@@ -792,6 +807,7 @@ class AbstractScreen(Screen[None]):
             if result is not None:  # None means cancelled
                 self.decision.status = DecisionStatus.DISCARDED
                 self.decision.tags = result
+                self.session._invalidate_cache()  # Status changed
 
                 # Mark as reviewed if it was an LLM decision
                 if was_llm:
@@ -1851,11 +1867,19 @@ class PaperReviewApp(App):
         """Refresh the paper list display."""
         list_view = self.query_one("#paper-list", ListView)
         list_view.clear()
-        
+
+        # Pre-compute note indicators (one cache lookup instead of N)
+        notes = _get_cached_notes()
+        papers_with_notes = set(notes.keys())
+
         filtered = self.get_filtered_decisions()
         for i, decision in enumerate(filtered):
-            list_view.append(PaperListItem(decision, i, self.review_mode))
-        
+            paper_id = get_paper_id(decision.paper)
+            paper_has_note = paper_id in papers_with_notes
+            list_view.append(
+                PaperListItem(decision, i, self.review_mode, paper_has_note)
+            )
+
         # Restore selection and focus after UI updates complete.
         # We must defer the index setting to after the DOM is updated,
         # otherwise the highlight doesn't appear when returning from screens.
@@ -1866,14 +1890,14 @@ class PaperReviewApp(App):
                 list_view.index = None
                 list_view.index = target_index
             list_view.focus()
-        
+
         self.call_after_refresh(restore_selection)
     
     def _update_status(self) -> None:
         """Update the status bar with current counts."""
-        kept = len(self.session.kept_papers)
-        discarded = len(self.session.discarded_papers)
-        pending = len(self.session.pending_papers)
+        kept = len(self.session.kept_papers())
+        discarded = len(self.session.discarded_papers())
+        pending = len(self.session.pending_papers())
         total = len(self.session.decisions)
         filtered_count = len(self.get_filtered_decisions())
         
@@ -1971,6 +1995,7 @@ class PaperReviewApp(App):
 
             decision.status = DecisionStatus.KEPT
             decision.clear_tags()
+            self.session._invalidate_cache()  # Status changed
 
             # Mark as reviewed if it was an LLM decision
             if was_llm:
@@ -2014,6 +2039,7 @@ class PaperReviewApp(App):
 
                 decision.status = DecisionStatus.KEPT
                 decision.tags = result
+                self.session._invalidate_cache()  # Status changed
 
                 # Mark as reviewed if it was an LLM decision
                 if was_llm:
@@ -2058,6 +2084,7 @@ class PaperReviewApp(App):
 
                 decision.status = DecisionStatus.DISCARDED
                 decision.tags = result
+                self.session._invalidate_cache()  # Status changed
 
                 # Mark as reviewed if it was an LLM decision
                 if was_llm:
@@ -2431,16 +2458,16 @@ def prompt_for_report(session: ReviewSession) -> None:
     
     console = Console()
     
-    kept = len(session.kept_papers)
-    discarded = len(session.discarded_papers)
-    
+    kept = len(session.kept_papers())
+    discarded = len(session.discarded_papers())
+
     if kept == 0 and discarded == 0:
         return
-    
+
     console.print(f"\n[bold]Review session complete![/bold]")
     console.print(f"  [green]Kept:[/green] {kept}")
     console.print(f"  [red]Discarded:[/red] {discarded}")
-    console.print(f"  Pending: {len(session.pending_papers)}")
+    console.print(f"  Pending: {len(session.pending_papers())}")
     
     if Confirm.ask("\nWould you like to save reports?", default=True):
         default_name = f"review_{session.timestamp.strftime('%Y%m%d_%H%M%S')}"

@@ -100,6 +100,8 @@ from typing import Any
 import json
 import logging
 
+from cachetools import cachedmethod
+
 from scholar.scholar import Paper, SearchFilters
 from scholar.notes import (
     get_paper_id, get_query_hash, get_data_dir,
@@ -365,6 +367,26 @@ retained for backward compatibility with older session files.
 The [[snowball_rounds]] field tracks manual snowballing operations, recording
 which papers were used as sources and how many new papers were discovered.
 
+\paragraph{Performance optimization.}
+With large paper sessions (1000+ papers), repeatedly computing
+[[kept_papers]], [[discarded_papers]], and [[pending_papers]] becomes expensive.
+These methods iterate over all decisions, and the TUI calls them frequently
+(for status updates, filtering, and rendering). We use [[cachetools.cachedmethod]]
+to cache these computed lists, invalidating the cache when decisions change.
+
+The [[_cache]] field is a per-instance dictionary that stores cached results.
+It uses [[field(default_factory=dict, repr=False, compare=False)]] to ensure:
+\begin{itemize}
+\item Each instance has its own cache (not shared across instances)
+\item The cache is not included in [[__repr__]] output (cleaner debugging)
+\item The cache is not used in equality comparisons (two sessions with same
+  decisions are equal regardless of cache state)
+\end{itemize}
+
+The cache is automatically cleared by [[_invalidate_cache()]], which must be
+called whenever the decisions list or individual decision statuses change.
+The [[sort_by]] method calls this since sorting changes the list structure.
+
 <<review data structures>>=
 @dataclass
 class ReviewSession:
@@ -377,6 +399,9 @@ class ReviewSession:
     The [[research_context]] field stores a description of the research goals,
     which is used by the LLM to understand what types of papers to keep or
     discard. This context is reused across LLM classification rounds.
+
+    Performance note: The kept_papers(), discarded_papers(), and pending_papers()
+    methods are cached. Call _invalidate_cache() after modifying decision statuses.
     """
     query: str
     providers: list[str]
@@ -386,62 +411,72 @@ class ReviewSession:
     research_context: str | None = None  # Research goals for LLM review
     query_provider_pairs: list[tuple[str, str]] = field(default_factory=list)
     snowball_rounds: list[SnowballRound] = field(default_factory=list)
-    
-    @property
+    # Internal cache for computed properties (not persisted)
+    _cache: dict = field(default_factory=dict, repr=False, compare=False)
+
+    def _invalidate_cache(self) -> None:
+        """Clear cached computed properties.
+
+        Call this after modifying decision statuses or the decisions list.
+        """
+        self._cache.clear()
+
+    @cachedmethod(lambda self: self._cache, key=lambda self: "kept")
     def kept_papers(self) -> list[ReviewDecision]:
-        """Get all papers marked as kept."""
+        """Get all papers marked as kept (cached)."""
         return [d for d in self.decisions if d.status == DecisionStatus.KEPT]
-    
-    @property
+
+    @cachedmethod(lambda self: self._cache, key=lambda self: "discarded")
     def discarded_papers(self) -> list[ReviewDecision]:
-        """Get all papers marked as discarded."""
+        """Get all papers marked as discarded (cached)."""
         return [d for d in self.decisions if d.status == DecisionStatus.DISCARDED]
-    
-    @property
+
+    @cachedmethod(lambda self: self._cache, key=lambda self: "pending")
     def pending_papers(self) -> list[ReviewDecision]:
-        """Get all papers still pending review."""
+        """Get all papers still pending review (cached)."""
         return [d for d in self.decisions if d.status == DecisionStatus.PENDING]
-    
+
     def all_themes(self) -> set[str]:
         """Get all unique themes from kept papers."""
         themes: set[str] = set()
-        for d in self.kept_papers:
+        for d in self.kept_papers():
             themes.update(d.tags)
         return themes
-    
+
     def all_motivations(self) -> set[str]:
         """Get all unique motivations from discarded papers."""
         motivations: set[str] = set()
-        for d in self.discarded_papers:
+        for d in self.discarded_papers():
             motivations.update(d.tags)
         return motivations
-    
+
     def theme_counts(self) -> dict[str, int]:
         """Count papers per theme."""
         counts: dict[str, int] = {}
-        for d in self.kept_papers:
+        for d in self.kept_papers():
             for tag in d.tags:
                 counts[tag] = counts.get(tag, 0) + 1
         return counts
-    
+
     def motivation_counts(self) -> dict[str, int]:
         """Count papers per motivation."""
         counts: dict[str, int] = {}
-        for d in self.discarded_papers:
+        for d in self.discarded_papers():
             for tag in d.tags:
                 counts[tag] = counts.get(tag, 0) + 1
         return counts
-    
+
     def papers_with_tag(self, tag: str) -> list[ReviewDecision]:
         """Get all decisions with a specific tag."""
         return [d for d in self.decisions if d.has_tag(tag)]
-    
+
     def sort_by(self, key: str, reverse: bool = False) -> None:
         """
         Sort decisions by a paper attribute.
-        
+
         Supported keys: title, year, author, provider
         """
+        self._invalidate_cache()  # Sorting changes list structure
         if key == "title":
             self.decisions.sort(key=lambda d: d.paper.title.lower(), reverse=reverse)
         elif key == "year":
@@ -500,7 +535,7 @@ class ReviewSession:
             if d.source == ReviewSource.LLM_REVIEWED
         )
         examples = len(self.example_papers())
-        pending = len(self.pending_papers)
+        pending = len(self.pending_papers())
 
         return {
             "human": human,
@@ -781,13 +816,13 @@ class TestReviewSession:
 
     def test_kept_papers(self, sample_session):
         """Test filtering kept papers."""
-        kept = sample_session.kept_papers
+        kept = sample_session.kept_papers()
         assert len(kept) == 1
         assert kept[0].paper.title == "Paper A"
 
     def test_discarded_papers(self, sample_session):
         """Test filtering discarded papers."""
-        discarded = sample_session.discarded_papers
+        discarded = sample_session.discarded_papers()
         assert len(discarded) == 1
         assert discarded[0].paper.title == "Paper B"
         assert "off-topic" in discarded[0].tags
@@ -825,6 +860,39 @@ class TestReviewSession:
         sample_session.sort_by("year", reverse=True)
         years = [d.paper.year for d in sample_session.decisions]
         assert years == [2022, 2021, 2020]
+
+    def test_cache_invalidation_on_status_change(self, sample_session):
+        """Test that cache is invalidated when decision status changes."""
+        # Initial state: 1 kept, 1 discarded, 1 pending
+        assert len(sample_session.kept_papers()) == 1
+        assert len(sample_session.pending_papers()) == 1
+
+        # Change pending to kept
+        pending = sample_session.pending_papers()[0]
+        pending.status = DecisionStatus.KEPT
+        sample_session._invalidate_cache()
+
+        # Cache should reflect new state
+        assert len(sample_session.kept_papers()) == 2
+        assert len(sample_session.pending_papers()) == 0
+
+    def test_cache_invalidation_on_sort(self, sample_session):
+        """Test that sort_by invalidates the cache."""
+        # Access cache to populate it
+        _ = sample_session.kept_papers()
+
+        # Sort changes list, which should invalidate cache
+        sample_session.sort_by("year")
+
+        # Should still work correctly after sort
+        assert len(sample_session.kept_papers()) == 1
+
+    def test_cached_methods_return_same_instance(self, sample_session):
+        """Test that cached methods return the same list instance."""
+        kept1 = sample_session.kept_papers()
+        kept2 = sample_session.kept_papers()
+        # With caching, these should be the same object
+        assert kept1 is kept2
 
     def test_llm_unreviewed_papers(self):
         """Test getting LLM unreviewed papers."""
@@ -1075,8 +1143,8 @@ def create_review_session(
     <<convert search results to decisions>>
     
     logger.info("Created session with %d papers (%d kept, %d discarded, %d pending)",
-               len(session.decisions), len(session.kept_papers),
-               len(session.discarded_papers), len(session.pending_papers))
+               len(session.decisions), len(session.kept_papers()),
+               len(session.discarded_papers()), len(session.pending_papers()))
     return session
 @
 
@@ -1361,8 +1429,8 @@ def save_session(session: ReviewSession) -> Path:
         json.dump(data, f, indent=2, ensure_ascii=False)
     
     logger.debug("Saved %d decisions (%d kept, %d discarded, %d pending)",
-                len(session.decisions), len(session.kept_papers),
-                len(session.discarded_papers), len(session.pending_papers))
+                len(session.decisions), len(session.kept_papers()),
+                len(session.discarded_papers()), len(session.pending_papers()))
     return session_path
 
 
@@ -2262,9 +2330,9 @@ def build_search_parameters_latex(
 
 def build_review_report_abstract(session: ReviewSession) -> str:
     """Build a deterministic one-paragraph abstract for the review report."""
-    kept = len(session.kept_papers)
-    discarded = len(session.discarded_papers)
-    pending = len(session.pending_papers)
+    kept = len(session.kept_papers())
+    discarded = len(session.discarded_papers())
+    pending = len(session.pending_papers())
     total = len(session.decisions)
 
     context = (session.research_context or "").strip()
@@ -2407,7 +2475,7 @@ def generate_latex_report(session: ReviewSession, output_path: Path) -> None:
         return lines
 
     # Generate citation keys for all papers
-    all_decisions = session.kept_papers + session.discarded_papers
+    all_decisions = session.kept_papers() + session.discarded_papers()
     cite_keys: dict[int, str] = {}
     for i, decision in enumerate(all_decisions):
         cite_keys[id(decision)] = make_cite_key(decision.paper, i)
@@ -2491,9 +2559,9 @@ def generate_latex_report(session: ReviewSession, output_path: Path) -> None:
         )
 
     summary_items = [
-        f"\\item[Kept] {len(session.kept_papers)}",
-        f"\\item[Discarded] {len(session.discarded_papers)}",
-        f"\\item[Pending] {len(session.pending_papers)}",
+        f"\\item[Kept] {len(session.kept_papers())}",
+        f"\\item[Discarded] {len(session.discarded_papers())}",
+        f"\\item[Pending] {len(session.pending_papers())}",
     ]
 
     if has_llm_decisions:
@@ -2548,8 +2616,8 @@ def generate_latex_report(session: ReviewSession, output_path: Path) -> None:
         ])
 
         # Summary of snowball-tagged papers
-        snowball_refs = [d for d in session.kept_papers if d.has_tag("snowball-refs")]
-        snowball_cite = [d for d in session.kept_papers if d.has_tag("snowball-cite")]
+        snowball_refs = [d for d in session.kept_papers() if d.has_tag("snowball-refs")]
+        snowball_cite = [d for d in session.kept_papers() if d.has_tag("snowball-cite")]
         if snowball_refs or snowball_cite:
             lines.extend([
                 r"\subsection{Papers Added via Snowballing}",
@@ -2569,46 +2637,46 @@ def generate_latex_report(session: ReviewSession, output_path: Path) -> None:
             ])
 
     # Summary Tables section
-    if session.kept_papers or session.discarded_papers:
+    if session.kept_papers() or session.discarded_papers():
         lines.extend([
             r"\section{Summary Tables}",
             r"",
         ])
 
-        if session.kept_papers:
+        if session.kept_papers():
             lines.extend([
                 r"\subsection{Kept Papers Overview}",
                 r"",
             ])
             lines.extend(format_list_table(
-                session.kept_papers, cite_keys, "Themes"
+                session.kept_papers(), cite_keys, "Themes"
             ))
             lines.append(r"")
             themes = session.all_themes()
             if themes:
                 lines.extend(format_matrix_table(
-                    session.kept_papers, cite_keys, themes
+                    session.kept_papers(), cite_keys, themes
                 ))
                 lines.append(r"")
 
-        if session.discarded_papers:
+        if session.discarded_papers():
             lines.extend([
                 r"\subsection{Discarded Papers Overview}",
                 r"",
             ])
             lines.extend(format_list_table(
-                session.discarded_papers, cite_keys, "Motivations"
+                session.discarded_papers(), cite_keys, "Motivations"
             ))
             lines.append(r"")
             motivations = session.all_motivations()
             if motivations:
                 lines.extend(format_matrix_table(
-                    session.discarded_papers, cite_keys, motivations
+                    session.discarded_papers(), cite_keys, motivations
                 ))
                 lines.append(r"")
 
     # Kept papers section - grouped by theme
-    if session.kept_papers:
+    if session.kept_papers():
         lines.extend([
             r"\section{Kept Papers}",
         ])
@@ -2618,7 +2686,7 @@ def generate_latex_report(session: ReviewSession, output_path: Path) -> None:
             # Group by theme
             for theme in sorted(themes):
                 papers_with_theme = [
-                    d for d in session.kept_papers if d.has_tag(theme)
+                    d for d in session.kept_papers() if d.has_tag(theme)
                 ]
                 lines.append(f"\\subsection{{{escape_latex(theme)}}}")
                 lines.append(r"\begin{enumerate}")
@@ -2630,24 +2698,24 @@ def generate_latex_report(session: ReviewSession, output_path: Path) -> None:
         else:
             # No themes, just list papers
             lines.append(r"\begin{enumerate}")
-            for decision in session.kept_papers:
+            for decision in session.kept_papers():
                 cite_key = cite_keys[id(decision)]
                 lines.append(f"\\item \\fullcite{{{cite_key}}}")
             lines.append(r"\end{enumerate}")
             lines.append("")
-    
+
     # Discarded papers section - grouped by motivation
-    if session.discarded_papers:
+    if session.discarded_papers():
         lines.extend([
             r"\section{Discarded Papers}",
         ])
-        
+
         motivations = session.all_motivations()
         if motivations:
             # Group by motivation
             for motivation in sorted(motivations):
                 papers_with_motivation = [
-                    d for d in session.discarded_papers if d.has_tag(motivation)
+                    d for d in session.discarded_papers() if d.has_tag(motivation)
                 ]
                 lines.append(f"\\subsection{{{escape_latex(motivation)}}}")
                 lines.append(r"\begin{enumerate}")
@@ -2659,7 +2727,7 @@ def generate_latex_report(session: ReviewSession, output_path: Path) -> None:
         else:
             # No motivations, just list papers
             lines.append(r"\begin{enumerate}")
-            for decision in session.discarded_papers:
+            for decision in session.discarded_papers():
                 cite_key = cite_keys[id(decision)]
                 lines.append(f"\\item \\fullcite{{{cite_key}}}")
             lines.append(r"\end{enumerate}")
