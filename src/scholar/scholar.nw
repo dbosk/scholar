@@ -520,8 +520,20 @@ This matches the identity used by the Paper Registry, ensuring that
 The [[id]] property returns a stable string identifier for a paper.
 This is used as the key in the Paper Registry and for persistent storage.
 
+\paragraph{Performance optimization.}
+The [[id]] property computes a SHA256 hash from the paper's title and first
+author when no DOI is available. With large paper sessions (1000+ papers),
+this property is accessed repeatedly during equality checks ([[__eq__]]),
+hash operations ([[__hash__]]), notes lookup, and list rendering---resulting
+in thousands of redundant hash computations.
+
+Using [[functools.cached_property]] instead of [[property]] caches the computed
+value as an instance attribute after the first access. Since [[Paper]] objects
+are effectively immutable (their title, authors, and DOI don't change after
+creation), this caching is safe and eliminates redundant computation.
+
 <<paper methods>>=
-@property
+@cached_property
 def id(self) -> str:
     """
     Generate a stable identifier for this paper.
@@ -1871,6 +1883,7 @@ We collect the imports used throughout the module:
 from contextlib import contextmanager
 from dataclasses import dataclass, field
 from datetime import datetime
+from functools import cached_property
 import hashlib
 import logging
 
