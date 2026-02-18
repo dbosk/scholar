@@ -1770,7 +1770,11 @@ def test_load_session_backward_compatibility(tmp_path, monkeypatch):
 def list_sessions() -> list[dict[str, Any]]:
     """
     List all saved review sessions.
-    
+
+    Sessions are sorted oldest-first (ascending by timestamp) so that the
+    most recent session appears last---at the bottom of terminal output,
+    visible without scrolling.
+
     Returns:
         List of session metadata dictionaries with keys:
         - name: Session name or query
@@ -1816,7 +1820,7 @@ def list_sessions() -> list[dict[str, Any]]:
             logger.debug("Failed to read session file %s: %s", session_file, e)
     
     logger.debug("Found %d sessions", len(sessions))
-    return sorted(sessions, key=lambda s: s.get("timestamp", datetime.min), reverse=True)
+    return sorted(sessions, key=lambda s: s.get("timestamp", datetime.min))
 
 
 def save_search_decisions(query: str, decisions: list[ReviewDecision]) -> None:
