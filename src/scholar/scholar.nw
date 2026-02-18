@@ -473,6 +473,23 @@ class Paper:
     <<paper methods>>
 @
 
+Session JSON files sometimes contain [[null]] for list fields like
+[[authors]] or [[sources]]---this happens when a provider returns incomplete
+metadata.
+Since [[dict.get("authors", [])]] returns [[None]] (not [[[]]]) when the key
+is present but the value is [[null]], we enforce the list invariant in
+[[__post_init__]] so that all downstream code can safely iterate and slice
+without [[None]]-guards.
+
+<<paper methods>>=
+def __post_init__(self):
+    """Coerce None list fields to empty lists."""
+    if self.authors is None:
+        self.authors = []
+    if self.sources is None:
+        self.sources = []
+@
+
 We use a dataclass for simplicity.
 The [[citation_count]] field stores the number of citations if available from
 the provider.
@@ -690,7 +707,7 @@ def _from_dict_without_registry(cls, data: dict) -> "Paper":
 
     return cls(
         title=data.get("title", ""),
-        authors=data.get("authors", []),
+        authors=data.get("authors") or [],
         year=data.get("year"),
         doi=data.get("doi"),
         abstract=data.get("abstract"),
@@ -700,7 +717,7 @@ def _from_dict_without_registry(cls, data: dict) -> "Paper":
         citation_count=data.get("citation_count"),
         keywords=data.get("keywords"),
         tags=data.get("tags"),
-        sources=data.get("sources", []),
+        sources=data.get("sources") or [],
         references=references,
         citations=citations,
     )

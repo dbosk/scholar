@@ -203,7 +203,14 @@ class ReviewDecisionRecord:
     source: str = "human"  # "human", "llm", "llm_reviewed"
     is_example: bool = False  # True if user corrected an LLM decision
     llm_confidence: float | None = None  # 0.0-1.0 if LLM decided
-    
+
+    def __post_init__(self):
+        """Coerce None list fields to empty lists."""
+        if self.tags is None:
+            self.tags = []
+        if self.authors is None:
+            self.authors = []
+
     @property
     def motivation(self) -> str:
         """Get first tag as motivation (backward compatibility)."""
@@ -243,7 +250,7 @@ class ReviewDecisionRecord:
     def from_dict(cls, data: dict[str, Any]) -> "ReviewDecisionRecord":
         """Create from dictionary, handling both old and new formats."""
         # Handle old format with 'motivation' field
-        tags = data.get("tags", [])
+        tags = data.get("tags") or []
         if not tags and data.get("motivation"):
             tags = [data["motivation"]]
 
@@ -251,7 +258,7 @@ class ReviewDecisionRecord:
             status=data.get("status", "pending"),
             tags=tags,
             title=data.get("title", ""),
-            authors=data.get("authors", []),
+            authors=data.get("authors") or [],
             year=data.get("year"),
             doi=data.get("doi"),
             abstract=data.get("abstract"),
