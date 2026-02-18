@@ -92,7 +92,7 @@ from scholar.scholar import Paper, SearchFilters
 \section{Imports and Constants}
 
 <<review imports>>=
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from datetime import datetime
 from enum import Enum
 from pathlib import Path
@@ -108,6 +108,8 @@ from scholar.notes import (
     load_search_decisions, save_search_decisions as notes_save_decisions,
     ReviewDecisionRecord,
 )
+
+from scholar.utils import derive_arxiv_doi, legacy_hash_paper_id
 
 logger = logging.getLogger(__name__)
 @
@@ -628,7 +630,7 @@ def add_papers_from_snowball(
     if direction == "references":
         tag = "snowball-refs"
     else:
-        tag = "snowball-cite"
+        tag = "snowball-cites"
     added_count = 0
 
     for paper in papers:
@@ -1059,6 +1061,16 @@ all fields. The notes module ([[load_search_decisions]]) serves as a fallback
 for older sessions that predate the session persistence feature.
 
 <<review session functions>>=
+def _normalize_paper_identifiers(paper: Paper) -> Paper:
+    """Return a copy of paper with derived identifiers filled in."""
+    if paper.doi:
+        return paper
+    derived = derive_arxiv_doi(paper)
+    if derived:
+        return replace(paper, doi=derived)
+    return paper
+
+
 def _build_previous_decision_lookup(
     previous_session: ReviewSession | None,
 ) -> dict[str, ReviewDecision]:
@@ -1113,7 +1125,7 @@ def create_review_session(
                         len(previous_decisions.decisions))
     
     # Create review session
-    providers = list(set(r.provider for r in results))
+    providers = list(dict.fromkeys(r.provider for r in results))
     logger.debug("Session includes providers: %s", providers)
     session = ReviewSession(
         query=query,
@@ -1139,6 +1151,7 @@ def create_review_session(
     current_paper_ids = set()
     for result in results:
         for paper in result.papers:
+            paper = _normalize_paper_identifiers(paper)
             current_paper_ids.add(get_paper_id(paper))
     
     # First, restore decisions for papers NOT in current search results
@@ -1176,8 +1189,9 @@ elif previous_decisions:
                 venue=prev.venue,
                 url=prev.url,
                 pdf_url=prev.pdf_url,
-                source=getattr(prev, 'source', "previous"),
+                sources=[getattr(prev, "provider", None) or "previous"],
             )
+            paper = _normalize_paper_identifiers(paper)
             status = DecisionStatus.PENDING
             if prev.status == "kept":
                 status = DecisionStatus.KEPT
@@ -1226,6 +1240,7 @@ decision_lookup: dict[str, ReviewDecision] = {
 
 for result in results:
     for paper in result.papers:
+        paper = _normalize_paper_identifiers(paper)
         paper_id = get_paper_id(paper)
 
         existing = decision_lookup.get(paper_id)
@@ -1241,6 +1256,15 @@ for result in results:
         prev_record = None
         if not prev_dec and previous_decisions:
             prev_record = previous_decisions.decisions.get(paper_id)
+
+        # Backward compatibility: if the paper gained a DOI, the previous
+        # decision may have been keyed by the legacy hash id.
+        if (prev_dec is None or prev_record is None) and getattr(paper, "doi", None):
+            legacy_id = legacy_hash_paper_id(paper.title, paper.authors)
+            if prev_dec is None:
+                prev_dec = prev_decision_lookup.get(legacy_id)
+            if prev_record is None and previous_decisions:
+                prev_record = previous_decisions.decisions.get(legacy_id)
 
         if prev_dec:
             # Use previous decision but with fresh paper data
@@ -1344,7 +1368,7 @@ def create_notes_session() -> ReviewSession:
             venue=getattr(paper_note, 'venue', None),
             url=getattr(paper_note, 'url', None),
             pdf_url=getattr(paper_note, 'pdf_url', None),
-            source="notes",
+            sources=["notes"],
         )
         session.decisions.append(
             ReviewDecision(paper=paper, provider="notes")
@@ -1503,6 +1527,7 @@ def load_session(name_or_query: str) -> ReviewSession | None:
                     s.strip() for s in paper_data["source"].split(",")
                 ] if paper_data["source"] else []
             paper = Paper.from_dict(paper_data)
+            paper = _normalize_paper_identifiers(paper)
             status = DecisionStatus(dec_data["status"])
             tags = dec_data.get("tags", []) or []
 
@@ -1646,7 +1671,7 @@ class TestQueryProviderPairsPersistence:
             }],
         }
         session_file = sessions_dir / "old-format.json"
-        with open(session_file, "w") as f:
+        with open(session_file, "w", encoding="utf-8") as f:
             json.dump(old_session_data, f)
 
         loaded = load_session("old-format")
@@ -1656,6 +1681,51 @@ class TestQueryProviderPairsPersistence:
         # Should have None for refs/cites (not fetched yet)
         assert loaded.decisions[0].paper.references is None
         assert loaded.decisions[0].paper.citations is None
+
+    def test_load_session_derives_arxiv_doi_from_url(self, tmp_path, monkeypatch):
+        """load_session derives canonical arXiv DOI from arXiv URLs."""
+        monkeypatch.setenv("SCHOLAR_DATA_DIR", str(tmp_path))
+
+        sessions_dir = tmp_path / "review_sessions"
+        sessions_dir.mkdir(parents=True)
+        session_data = {
+            "query": "test",
+            "name": "arxiv-normalize",
+            "providers": ["openalex"],
+            "timestamp": datetime.now().isoformat(),
+            "research_context": None,
+            "query_provider_pairs": [],
+            "snowball_rounds": [],
+            "decisions": [
+                {
+                    "paper_id": "hash:unused",
+                    "provider": "openalex",
+                    "status": "pending",
+                    "tags": [],
+                    "source": "human",
+                    "is_example": False,
+                    "llm_confidence": None,
+                    "paper": {
+                        "title": "A Paper",
+                        "authors": ["Author"],
+                        "year": 2024,
+                        "doi": None,
+                        "abstract": None,
+                        "venue": None,
+                        "url": "https://arxiv.org/abs/2401.12345v1",
+                        "pdf_url": None,
+                        "sources": ["openalex"],
+                    },
+                }
+            ],
+        }
+        session_file = sessions_dir / "arxiv-normalize.json"
+        with open(session_file, "w", encoding="utf-8") as f:
+            json.dump(session_data, f)
+
+        loaded = load_session("arxiv-normalize")
+        assert loaded is not None
+        assert loaded.decisions[0].paper.doi == "10.48550/arXiv.2401.12345"
 @
 
 \paragraph{Backward Compatibility}
@@ -1684,7 +1754,7 @@ def test_load_session_backward_compatibility(tmp_path, monkeypatch):
         "decisions": [],
     }
     session_file = sessions_dir / "old-session.json"
-    with open(session_file, "w") as f:
+    with open(session_file, "w", encoding="utf-8") as f:
         json.dump(old_session_data, f)
     
     loaded = load_session("old-session")
@@ -2622,7 +2692,7 @@ def generate_latex_report(session: ReviewSession, output_path: Path) -> None:
 
         # Summary of snowball-tagged papers
         snowball_refs = [d for d in session.kept_papers() if d.has_tag("snowball-refs")]
-        snowball_cite = [d for d in session.kept_papers() if d.has_tag("snowball-cite")]
+        snowball_cite = [d for d in session.kept_papers() if d.has_tag("snowball-cites")]
         if snowball_refs or snowball_cite:
             lines.extend([
                 r"\subsection{Papers Added via Snowballing}",

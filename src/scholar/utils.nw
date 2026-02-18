@@ -25,6 +25,7 @@ and normalizing API responses.
 """Tests for the utils module."""
 import pytest
 
+from scholar import Paper
 from scholar.utils import *
 
 
@@ -299,4 +300,176 @@ class TestEnsureList:
         """Nested lists are returned as-is."""
         data = [[1, 2], [3, 4]]
         assert ensure_list(data) == [[1, 2], [3, 4]]
+@
+
+
+\section{Paper identifier helpers}
+
+Scholar's internal paper identity uses DOI when available, otherwise a hash of
+title + first author's last name (see \cref{ch:paper-identity}).
+
+In practice, papers often transition from \enquote{no DOI} to \enquote{has DOI}
+after enrichment or when another provider returns additional metadata.
+That transition would change the paper's stable ID and could orphan existing
+notes/decisions saved under the legacy hash ID.
+
+To keep this backward compatible, we expose the legacy hash-ID algorithm and a
+small arXiv helper that can derive the canonical arXiv DOI
+[[10.48550/arXiv.<id>]] from arXiv URLs.
+
+\subsection{Legacy hash IDs}
+
+The legacy hash ID matches the [[Paper.id]] implementation for papers without
+DOIs: SHA-256 of normalized title + first author's last name, truncated to 16
+hex characters.
+
+<<utils functions>>=
+import hashlib
+import re
+
+
+def legacy_hash_paper_id(title: str, authors: list[str] | None = None) -> str:
+    """Return the legacy hash-based paper id.
+
+    This mirrors [[Paper.id]] for papers without a DOI. It is used to migrate
+    persisted notes/decisions when a paper later gains a DOI.
+    """
+    if title is None:
+        title = ""
+    if authors is None:
+        authors = []
+
+    title_normalized = title.lower().strip()
+
+    author_part = ""
+    if authors:
+        first_author = authors[0] or ""
+        last_name = first_author.split()[-1].lower() if first_author else ""
+        author_part = last_name
+
+    content = f"{title_normalized}|{author_part}"
+    hash_value = hashlib.sha256(content.encode()).hexdigest()[:16]
+    return f"hash:{hash_value}"
+@
+
+\subsection{arXiv IDs and DOIs}
+
+We treat arXiv identifiers as a special case because arXiv URLs are common in
+metadata, and arXiv provides a canonical DOI form that many other providers
+also use: [[10.48550/arXiv.<id>]].
+
+We extract the arXiv identifier from common URL shapes:
+\begin{description}
+\item[abs] [[https://arxiv.org/abs/2401.12345v1]]
+\item[pdf] [[https://arxiv.org/pdf/2401.12345v1.pdf]]
+\item[old-style] [[https://arxiv.org/abs/hep-th/9901001v2]]
+\end{description}
+
+We strip the version suffix (e.g., [[v1]]), because the canonical DOI is
+versionless.
+
+<<utils functions>>=
+_ARXIV_URL_RE = re.compile(
+    r"(?:https?://)?(?:www\.)?arxiv\.org/(?P<kind>abs|pdf)/(?P<id>[^?#]+)",
+    flags=re.IGNORECASE,
+)
+
+
+def arxiv_id_from_url(url: str | None) -> str | None:
+    """Extract a versionless arXiv id from an arXiv URL."""
+    if not url:
+        return None
+
+    m = _ARXIV_URL_RE.search(url)
+    if not m:
+        return None
+
+    raw = (m.group("id") or "").strip()
+    if not raw:
+        return None
+
+    # PDF URLs may end with ".pdf".
+    if raw.lower().endswith(".pdf"):
+        raw = raw[:-4]
+
+    # Strip version suffix, e.g. "2401.12345v2" -> "2401.12345".
+    raw = re.sub(r"v\d+$", "", raw, flags=re.IGNORECASE)
+
+    return raw or None
+
+
+def arxiv_doi_from_url(url: str | None) -> str | None:
+    """Return canonical arXiv DOI for an arXiv URL, if possible."""
+    arxiv_id = arxiv_id_from_url(url)
+    if not arxiv_id:
+        return None
+    return f"10.48550/arXiv.{arxiv_id}"
+
+
+def derive_arxiv_doi(paper: Any) -> str | None:
+    """Derive an arXiv DOI for a paper-like object.
+
+    Only returns a DOI when the object currently has no DOI.
+    """
+    if getattr(paper, "doi", None):
+        return None
+
+    for candidate in (
+        getattr(paper, "url", None),
+        getattr(paper, "pdf_url", None),
+    ):
+        doi = arxiv_doi_from_url(candidate)
+        if doi:
+            return doi
+
+    return None
+@
+
+\subsection{Testing paper identifier helpers}
+
+<<test functions>>=
+class TestPaperIdentifierHelpers:
+    """Tests for paper identifier helper functions."""
+
+    def test_legacy_hash_paper_id_matches_paper_id_without_doi(self):
+        paper = Paper(title="A Title", authors=["Ada Lovelace"], doi=None)
+        assert legacy_hash_paper_id(paper.title, paper.authors) == paper.id
+
+    def test_arxiv_id_from_url_abs_strips_version(self):
+        assert arxiv_id_from_url("https://arxiv.org/abs/2401.12345v2") == "2401.12345"
+
+    def test_arxiv_id_from_url_pdf_strips_version_and_extension(self):
+        assert (
+            arxiv_id_from_url("https://arxiv.org/pdf/2401.12345v1.pdf")
+            == "2401.12345"
+        )
+
+    def test_arxiv_id_from_url_old_style(self):
+        assert (
+            arxiv_id_from_url("https://arxiv.org/abs/hep-th/9901001v2")
+            == "hep-th/9901001"
+        )
+
+    def test_arxiv_doi_from_url(self):
+        assert (
+            arxiv_doi_from_url("http://arxiv.org/abs/2401.12345v1")
+            == "10.48550/arXiv.2401.12345"
+        )
+
+    def test_derive_arxiv_doi_only_when_missing_doi(self):
+        paper = Paper(
+            title="X",
+            authors=["A"],
+            doi=None,
+            url="https://arxiv.org/abs/2401.12345v1",
+        )
+        assert derive_arxiv_doi(paper) == "10.48550/arXiv.2401.12345"
+
+        paper2 = Paper(
+            title="X",
+            authors=["A"],
+            doi="10.9999/example",
+            url="https://arxiv.org/abs/2401.12345v1",
+        )
+        assert derive_arxiv_doi(paper2) is None
 @
