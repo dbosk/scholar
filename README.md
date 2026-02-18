@@ -17,7 +17,7 @@ Search across six academic databases with a single query:
 
 ```bash
 # Search specific providers
-scholar search "federated learning" -p semantic_scholar -p openalex
+scholar search "federated learning" -p s2 -p openalex
 
 # Start from a research question (LLM generates provider-specific queries)
 scholar rq "How can privacy-preserving ML be evaluated?" \
@@ -171,7 +171,7 @@ Some providers require API keys set as environment variables:
 | Semantic Scholar | `S2_API_KEY` | No | [api.semanticscholar.org](https://api.semanticscholar.org) |
 | OpenAlex | `OPENALEX_EMAIL` | No | Any email (for polite pool) |
 | DBLP | - | No | No key needed |
-| Web of Science | `WOS_API_KEY` | Yes | [developer.clarivate.com](https://developer.clarivate.com) |
+| Web of Science | `WOS_EXPANDED_API_KEY` or `WOS_STARTER_API_KEY` | Yes | [developer.clarivate.com](https://developer.clarivate.com) |
 | IEEE Xplore | `IEEE_API_KEY` | Yes | [developer.ieee.org](https://developer.ieee.org) |
 
 View provider status:
@@ -258,7 +258,7 @@ For large result sets, Scholar can use LLMs to assist with paper classification:
 ```bash
 # In the TUI, press 'L' to invoke LLM classification
 # Or use the CLI command directly
-scholar llm-review "session-name" --count 10
+scholar llm classify "session-name" --count 10
 ```
 
 ### How It Works
@@ -284,7 +284,7 @@ pipx install llm
 llm install llm-openai-plugin
 llm keys set openai
 
-# Pick a default model (used by `scholar rq` and `scholar llm-review`)
+# Pick a default model (used by `scholar rq` and `scholar llm classify`)
 llm models
 llm models default gpt-4o-mini
 ```
@@ -296,7 +296,7 @@ with `pipx install --include-deps scholarcli`.
 The LLM integration supports models available through Simon Willison's `llm`
 package (OpenAI, Anthropic, local models, etc.).
 
-Note: `scholar llm-review` learns from your existing labeled examples (typically
+Note: `scholar llm classify` learns from your existing labeled examples (typically
 ~5 tagged papers). `scholar rq` can start without examples by using the research
 question as context.
 

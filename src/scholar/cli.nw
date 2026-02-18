@@ -23,7 +23,7 @@ The CLI exposes every major Scholar capability as a subcommand:
 \item[[scholar pdf]] Download and manage paper PDFs.
 \item[[scholar notes]] Access the notes database.
 \item[[scholar enrich]] Fetch missing abstracts for papers.
-\item[[scholar llm-review]] Run LLM-assisted classification.
+\item[[scholar llm]] Run LLM-assisted classification.
 \end{description}
 
 This chapter presents the implementation of each command.
