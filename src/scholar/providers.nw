@@ -296,8 +296,10 @@ def get_snowball_providers() -> list[SearchProvider]:
         if not provider.is_available():
             continue
 
-        # Check if provider has citation methods
+        # Check if provider has citation/reference methods.
         if not hasattr(provider, "get_paper_citations"):
+            continue
+        if not hasattr(provider, "get_paper_references"):
             continue
 
         # For WOS, only use if Expanded API is available (required for citations)
@@ -351,11 +353,12 @@ def fetch_references(doi: str, limit: int = 100) -> list[Paper]:
 
             for paper in refs:
                 if paper.doi:
+                    doi_key = paper.doi.strip().lower()
                     # Merge with existing paper if we have it
-                    if paper.doi in all_papers:
-                        all_papers[paper.doi] = all_papers[paper.doi].merge_with(paper)
+                    if doi_key in all_papers:
+                        all_papers[doi_key] = all_papers[doi_key].merge_with(paper)
                     else:
-                        all_papers[paper.doi] = paper
+                        all_papers[doi_key] = paper
                 elif paper.title:
                     # No DOI - check if we can match by title
                     # For now, just add to the list (may have duplicates)
@@ -400,11 +403,12 @@ def fetch_citations(doi: str, limit: int = 100) -> list[Paper]:
 
             for paper in cites:
                 if paper.doi:
+                    doi_key = paper.doi.strip().lower()
                     # Merge with existing paper if we have it
-                    if paper.doi in all_papers:
-                        all_papers[paper.doi] = all_papers[paper.doi].merge_with(paper)
+                    if doi_key in all_papers:
+                        all_papers[doi_key] = all_papers[doi_key].merge_with(paper)
                     else:
-                        all_papers[paper.doi] = paper
+                        all_papers[doi_key] = paper
                 elif paper.title:
                     # No DOI - check if we can match by title
                     papers_without_doi.append(paper)
@@ -574,28 +578,42 @@ class TestDefaultProviders:
 
     def test_wos_in_defaults_only_with_key(self, monkeypatch):
         """WoS is in defaults only when API keys are set."""
+        original = PROVIDERS.get("wos")
         # Without any keys
         monkeypatch.delenv("WOS_API_KEY", raising=False)
         monkeypatch.delenv("WOS_STARTER_API_KEY", raising=False)
         monkeypatch.delenv("WOS_EXPANDED_API_KEY", raising=False)
-        # Re-register provider without keys
-        wos_provider = WebOfScienceProvider(
-            starter_api_key=None, expanded_api_key=None
-        )
-        register_provider(wos_provider)
-        defaults = get_default_providers()
-        assert "wos" not in [p.name for p in defaults]
+        try:
+            # Re-register provider without keys
+            wos_provider = WebOfScienceProvider(
+                starter_api_key=None, expanded_api_key=None
+            )
+            register_provider(wos_provider)
+            defaults = get_default_providers()
+            assert "wos" not in [p.name for p in defaults]
+        finally:
+            if original is not None:
+                PROVIDERS["wos"] = original
+            else:
+                PROVIDERS.pop("wos", None)
 
     def test_ieee_in_defaults_only_with_key(self, monkeypatch):
         """IEEE is in defaults only when IEEE_API_KEY is set."""
+        original = PROVIDERS.get("ieee")
         # Without key
         monkeypatch.delenv("IEEE_API_KEY", raising=False)
-        # Re-register provider without key
-        ieee_provider = IEEEXploreProvider(api_key=None)
-        ieee_provider.api_key = None
-        register_provider(ieee_provider)  # type: ignore[arg-type]
-        defaults = get_default_providers()
-        assert "ieee" not in [p.name for p in defaults]
+        try:
+            # Re-register provider without key
+            ieee_provider = IEEEXploreProvider(api_key=None)
+            ieee_provider.api_key = None
+            register_provider(ieee_provider)  # type: ignore[arg-type]
+            defaults = get_default_providers()
+            assert "ieee" not in [p.name for p in defaults]
+        finally:
+            if original is not None:
+                PROVIDERS["ieee"] = original
+            else:
+                PROVIDERS.pop("ieee", None)
 @
 
 
@@ -1714,22 +1732,21 @@ def _convert_work(self, work: dict) -> Paper:
             )
         )
 
-    tags: list[str] = []
+    tags_list: list[str] = []
     for kw in work.get("keywords", []) or []:
         if isinstance(kw, dict):
             name = kw.get("display_name")
             if name:
-                tags.append(name)
+                tags_list.append(name)
         elif isinstance(kw, str) and kw:
-            tags.append(kw)
-    if not tags:
+            tags_list.append(kw)
+    if not tags_list:
         for concept in work.get("concepts", []) or []:
             if isinstance(concept, dict):
                 name = concept.get("display_name")
                 if name:
-                    tags.append(name)
-    if not tags:
-        tags = None
+                    tags_list.append(name)
+    tags = tags_list or None
 
     return Paper(
         title=work.get("title", ""),

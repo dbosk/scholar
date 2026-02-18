@@ -184,7 +184,7 @@ from scholar.review import (
 from scholar.pdf import (
     get_pdf_cache_dir, get_cached_pdf_path, download_pdf, open_pdf, PDFDownloadError,
 )
-from scholar.enrich import enrich_paper, needs_enrichment
+
 @
 
 The data structures for review decisions ([[DecisionStatus]], [[ReviewDecision]], 
@@ -1827,11 +1827,11 @@ class PaperReviewApp(App):
         if self.current_filter == "all":
             decisions = self.session.decisions
         elif self.current_filter == "kept":
-            decisions = self.session.kept_papers
+            decisions = self.session.kept_papers()
         elif self.current_filter == "discarded":
-            decisions = self.session.discarded_papers
+            decisions = self.session.discarded_papers()
         elif self.current_filter == "pending":
-            decisions = self.session.pending_papers
+            decisions = self.session.pending_papers()
         elif self.current_filter == "llm_unreviewed":
             # LLM decisions pending user review
             decisions = [
@@ -2121,7 +2121,7 @@ class PaperReviewApp(App):
             self.notify("Snowballing disabled in notes mode", severity="warning")
             return
 
-        kept_papers = self.session.kept_papers
+        kept_papers = self.session.kept_papers()
         if not kept_papers:
             self.notify("No kept papers to snowball from", severity="warning")
             return
@@ -2148,12 +2148,15 @@ class PaperReviewApp(App):
             paper = decision.paper
             try:
                 # Use cached references if available
-                if decision.cached_references is not None:
-                    refs = decision.cached_references
+                if paper.references is not None:
+                    refs = paper.references
                 else:
-                    refs = fetch_references(paper.doi)
+                    doi = paper.doi
+                    if not doi:
+                        continue
+                    refs = fetch_references(doi)
                     refs = enrich_papers(refs)
-                    decision.cached_references = refs
+                    paper.references = refs
                 
                 all_refs.extend(refs)
                 source_ids.append(get_paper_id(paper))
@@ -2183,13 +2186,13 @@ class PaperReviewApp(App):
         else:
             self.notify("No references found", severity="warning")
 
-    async     def action_add_all_citations(self) -> None:
+    async def action_add_all_citations(self) -> None:
         """Add citing papers from all kept papers to session for review."""
         if not self.review_mode:
             self.notify("Snowballing disabled in notes mode", severity="warning")
             return
 
-        kept_papers = self.session.kept_papers
+        kept_papers = self.session.kept_papers()
         if not kept_papers:
             self.notify("No kept papers to snowball from", severity="warning")
             return
@@ -2216,12 +2219,15 @@ class PaperReviewApp(App):
             paper = decision.paper
             try:
                 # Use cached citations if available
-                if decision.cached_citations is not None:
-                    cites = decision.cached_citations
+                if paper.citations is not None:
+                    cites = paper.citations
                 else:
-                    cites = fetch_citations(paper.doi)
+                    doi = paper.doi
+                    if not doi:
+                        continue
+                    cites = fetch_citations(doi)
                     cites = enrich_papers(cites)
-                    decision.cached_citations = cites
+                    paper.citations = cites
                 
                 all_cites.extend(cites)
                 source_ids.append(get_paper_id(paper))

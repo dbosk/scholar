@@ -72,7 +72,6 @@ test chunks:
 import json
 import pytest
 from pathlib import Path
-from unittest.mock import Mock
 
 from scholar import Paper
 from scholar.notes import *
@@ -1038,7 +1037,10 @@ def load_search_decisions(query: str) -> SearchDecisions | None:
         return None
 
 
-def save_search_decisions(query: str, decisions: dict[str, ReviewDecisionRecord]) -> None:
+def save_search_decisions(
+    query: str,
+    decisions: dict[str, ReviewDecisionRecord],
+) -> None:
     """
     Save decisions for a search query.
     
@@ -1058,7 +1060,12 @@ def save_search_decisions(query: str, decisions: dict[str, ReviewDecisionRecord]
     decisions_file = get_decisions_dir() / f"{query_hash}.json"
     try:
         with open(decisions_file, "w", encoding="utf-8") as f:
-            json.dump(search_decisions.to_dict(), f, indent=2, ensure_ascii=False)
+            json.dump(
+                search_decisions.to_dict(),
+                f,
+                indent=2,
+                ensure_ascii=False,
+            )
     except OSError:
         pass  # Silently fail
 
@@ -1180,7 +1187,7 @@ class TestSearchDecisions:
         }
         
         decisions_file = get_decisions_dir() / f"{get_query_hash('old query')}.json"
-        with open(decisions_file, "w") as f:
+        with open(decisions_file, "w", encoding="utf-8") as f:
             json.dump(old_format, f)
         
         loaded = load_search_decisions("old query")
@@ -1523,7 +1530,7 @@ class TestExportImport:
         assert count == 1
         assert export_path.exists()
         
-        with open(export_path) as f:
+        with open(export_path, encoding="utf-8") as f:
             data = json.load(f)
         assert "notes" in data
         assert len(data["notes"]) == 1
@@ -1562,7 +1569,7 @@ class TestExportImport:
             },
         }
         export_path = tmp_path / "import.json"
-        with open(export_path, "w") as f:
+        with open(export_path, "w", encoding="utf-8") as f:
             json.dump(export_data, f)
         
         import_notes(export_path, merge=True)

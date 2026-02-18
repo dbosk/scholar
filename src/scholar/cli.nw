@@ -494,7 +494,7 @@ enrich: Annotated[
         "--enrich", "-e",
         help=(
             "Fetch missing abstracts/metadata/keywords via DOI lookup. "
-            "Default order: Semantic Scholar, OpenAlex, IEEE, WoS. "
+            "Default order: Semantic Scholar, arXiv, OpenAlex, IEEE, WoS. "
             "Unconfigured providers are skipped. "
             "Only works for papers with DOIs."
         ),
@@ -639,9 +639,9 @@ if review:
     from scholar.tui import run_review
     session_name = name if name else query
     run_review(
-        merged_results, 
-        query, 
-        session_name, 
+        merged_results,
+        query,
+        session_name,
         prompt_report=report,
         search_filters=filters,
     )
@@ -1822,8 +1822,12 @@ def pdf(
         scholar pdf clear
     """
     from scholar.pdf import (
-        get_pdf_cache_dir, get_pdf, open_pdf, 
-        clear_pdf_cache, get_pdf_cache_info, PDFDownloadError
+        PDFDownloadError,
+        clear_pdf_cache,
+        get_pdf,
+        get_pdf_cache_dir,
+        get_pdf_cache_info,
+        open_pdf,
     )
 
     console = Console()
@@ -2553,30 +2557,30 @@ def llm_classify(
             help="Number of papers to classify in this batch.",
         ),
     ] = 10,
-     model: Annotated[
-         str | None,
-         typer.Option(
-             "--model", "-m",
-             help="Base LLM model to use (uses llm default if not specified).",
-             autocompletion=complete_model,
-         ),
-     ] = None,
-     model_analytic: Annotated[
-         str | None,
-         typer.Option(
-             "--model-analytic",
-             help="Override -m for analytic tasks (classification, query generation).",
-             autocompletion=complete_model,
-         ),
-     ] = None,
-     model_writing: Annotated[
-         str | None,
-         typer.Option(
-             "--model-writing",
-             help="Override -m for writing tasks (synthesis generation).",
-             autocompletion=complete_model,
-         ),
-     ] = None,
+    model: Annotated[
+        str | None,
+        typer.Option(
+            "--model", "-m",
+            help="Base LLM model to use (uses llm default if not specified).",
+            autocompletion=complete_model,
+        ),
+    ] = None,
+    model_analytic: Annotated[
+        str | None,
+        typer.Option(
+            "--model-analytic",
+            help="Override -m for analytic tasks (classification, query generation).",
+            autocompletion=complete_model,
+        ),
+    ] = None,
+    model_writing: Annotated[
+        str | None,
+        typer.Option(
+            "--model-writing",
+            help="Override -m for writing tasks (synthesis generation).",
+            autocompletion=complete_model,
+        ),
+    ] = None,
      dry_run: Annotated[
         bool,
         typer.Option(
