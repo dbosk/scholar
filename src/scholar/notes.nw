@@ -105,7 +105,7 @@ The distinction matters: clearing decisions for one search shouldn't affect
 notes or decisions from other searches.
 
 <<notes imports>>=
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from datetime import datetime
 from pathlib import Path
 from typing import Any
@@ -116,6 +116,8 @@ import os
 from cachetools import TTLCache, cached
 import click
 import platformdirs
+
+from scholar.utils import legacy_hash_paper_id
 @
 
 \subsection{Timestamp Representation}
@@ -646,7 +648,36 @@ def get_note(paper: Any) -> PaperNote | None:
     """
     paper_id = get_paper_id(paper)
     notes = _load_all_notes()
-    return notes.get(paper_id)
+
+    note = notes.get(paper_id)
+    if note is not None:
+        return note
+
+    # Backward compatibility: if the paper gained a DOI, it may have been
+    # previously stored under its legacy hash id.
+    if getattr(paper, "doi", None):
+        legacy_id = legacy_hash_paper_id(
+            getattr(paper, "title", ""),
+            getattr(paper, "authors", []) or [],
+        )
+        legacy_note = notes.get(legacy_id)
+        if legacy_note is None:
+            return None
+
+        # Migrate to the DOI-based id for future lookups.
+        migrated = PaperNote(
+            paper_id=paper_id,
+            title=getattr(paper, "title", legacy_note.title) or legacy_note.title,
+            note=legacy_note.note,
+            created_at=legacy_note.created_at,
+            updated_at=legacy_note.updated_at,
+        )
+        notes[paper_id] = migrated
+        del notes[legacy_id]
+        _save_all_notes(notes)
+        return migrated
+
+    return None
 
 
 def save_note(paper: Any, note_text: str) -> PaperNote:
@@ -662,29 +693,38 @@ def save_note(paper: Any, note_text: str) -> PaperNote:
     """
     paper_id = get_paper_id(paper)
     notes = _load_all_notes()
-    
+
     now = datetime.now()
-    
-    if paper_id in notes:
-        # Update existing note
-        existing = notes[paper_id]
+
+    existing = notes.get(paper_id)
+
+    # If the paper gained a DOI, migrate any legacy note before updating.
+    if existing is None and getattr(paper, "doi", None):
+        legacy_id = legacy_hash_paper_id(
+            getattr(paper, "title", ""),
+            getattr(paper, "authors", []) or [],
+        )
+        if legacy_id in notes:
+            existing = notes[legacy_id]
+            del notes[legacy_id]
+
+    if existing is not None:
         notes[paper_id] = PaperNote(
             paper_id=paper_id,
-            title=paper.title,
+            title=getattr(paper, "title", existing.title) or existing.title,
             note=note_text,
             created_at=existing.created_at,
             updated_at=now,
         )
     else:
-        # Create new note
         notes[paper_id] = PaperNote(
             paper_id=paper_id,
-            title=paper.title,
+            title=getattr(paper, "title", "") or "",
             note=note_text,
             created_at=now,
             updated_at=now,
         )
-    
+
     _save_all_notes(notes)
     return notes[paper_id]
 
@@ -701,11 +741,22 @@ def delete_note(paper: Any) -> bool:
     """
     paper_id = get_paper_id(paper)
     notes = _load_all_notes()
-    
+
     if paper_id in notes:
         del notes[paper_id]
         _save_all_notes(notes)
         return True
+
+    if getattr(paper, "doi", None):
+        legacy_id = legacy_hash_paper_id(
+            getattr(paper, "title", ""),
+            getattr(paper, "authors", []) or [],
+        )
+        if legacy_id in notes:
+            del notes[legacy_id]
+            _save_all_notes(notes)
+            return True
+
     return False
 
 
@@ -738,7 +789,17 @@ def has_note(paper: Any) -> bool:
     """
     paper_id = get_paper_id(paper)
     notes = _get_cached_notes()
-    return paper_id in notes
+    if paper_id in notes:
+        return True
+
+    if getattr(paper, "doi", None):
+        legacy_id = legacy_hash_paper_id(
+            getattr(paper, "title", ""),
+            getattr(paper, "authors", []) or [],
+        )
+        return legacy_id in notes
+
+    return False
 @
 
 \subsection{Testing paper notes}
@@ -763,6 +824,36 @@ class TestPaperNotes:
         assert note is not None
         assert note.note == "This is my note."
         assert note.title == "Test Paper"
+
+    def test_get_note_migrates_legacy_hash_when_doi_added(
+        self,
+        tmp_path,
+        monkeypatch,
+    ):
+        """Legacy hash-keyed notes are migrated when a paper gains a DOI."""
+        monkeypatch.setenv("SCHOLAR_DATA_DIR", str(tmp_path))
+
+        legacy_paper = Paper(
+            title="Migrated Paper",
+            authors=["Ada Lovelace"],
+            doi=None,
+        )
+        save_note(legacy_paper, "Legacy note")
+
+        paper_with_doi = Paper(
+            title="Migrated Paper",
+            authors=["Ada Lovelace"],
+            doi="10.48550/arXiv.2401.12345",
+        )
+        note = get_note(paper_with_doi)
+        assert note is not None
+        assert note.note == "Legacy note"
+
+        # Verify storage key migration.
+        notes_file = get_data_dir() / NOTES_FILE
+        data = json.loads(notes_file.read_text(encoding="utf-8"))
+        assert get_paper_id(paper_with_doi) in data
+        assert get_paper_id(legacy_paper) not in data
 
     def test_update_note(self, tmp_path, monkeypatch):
         """Updating a note preserves created_at."""
@@ -988,7 +1079,33 @@ def get_previous_decision(query: str, paper: Any) -> ReviewDecisionRecord | None
         return None
     
     paper_id = get_paper_id(paper)
-    return search_decisions.decisions.get(paper_id)
+    record = search_decisions.decisions.get(paper_id)
+    if record is not None:
+        return record
+
+    # Backward compatibility: if the paper gained a DOI, it may have been
+    # stored under its legacy hash id.
+    if getattr(paper, "doi", None):
+        legacy_id = legacy_hash_paper_id(
+            getattr(paper, "title", ""),
+            getattr(paper, "authors", []) or [],
+        )
+        legacy_record = search_decisions.decisions.get(legacy_id)
+        if legacy_record is None:
+            return None
+
+        migrated = replace(
+            legacy_record,
+            doi=getattr(paper, "doi", None) or legacy_record.doi,
+            title=getattr(paper, "title", "") or legacy_record.title,
+            authors=getattr(paper, "authors", []) or legacy_record.authors,
+        )
+        search_decisions.decisions[paper_id] = migrated
+        del search_decisions.decisions[legacy_id]
+        save_search_decisions(query, search_decisions.decisions)
+        return migrated
+
+    return None
 
 
 def clear_all_decisions() -> int:
@@ -1101,6 +1218,38 @@ class TestSearchDecisions:
         result = get_previous_decision(query, paper)
         assert result is not None
         assert result.status == "kept"
+
+    def test_get_previous_decision_migrates_legacy_hash_when_doi_added(
+        self,
+        tmp_path,
+        monkeypatch,
+    ):
+        """Legacy hash-keyed decisions migrate when a paper gains a DOI."""
+        monkeypatch.setenv("SCHOLAR_DATA_DIR", str(tmp_path))
+
+        query = "migration query"
+
+        legacy_paper = Paper(title="Migrated", authors=["Ada Lovelace"], doi=None)
+        legacy_id = get_paper_id(legacy_paper)
+        save_search_decisions(
+            query,
+            {legacy_id: ReviewDecisionRecord(status="kept")},
+        )
+
+        paper_with_doi = Paper(
+            title="Migrated",
+            authors=["Ada Lovelace"],
+            doi="10.48550/arXiv.2401.12345",
+        )
+
+        rec = get_previous_decision(query, paper_with_doi)
+        assert rec is not None
+        assert rec.status == "kept"
+
+        decisions_file = get_decisions_dir() / f"{get_query_hash(query)}.json"
+        data = json.loads(decisions_file.read_text(encoding="utf-8"))
+        assert get_paper_id(paper_with_doi) in data.get("decisions", {})
+        assert legacy_id not in data.get("decisions", {})
 
     def test_get_previous_decision_not_found(self, tmp_path, monkeypatch):
         """Returns None for paper not in previous decisions."""

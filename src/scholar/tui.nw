@@ -512,10 +512,6 @@ class AbstractScreen(Screen[None]):
         """Fetch missing metadata, references, and citations."""
         paper = self.decision.paper
         
-        if not paper.doi:
-            self.notify("No DOI available for enrichment", severity="warning")
-            return
-        
         # Brief title preview for notifications
         title_preview = (paper.title or "")[:30]
         if len(paper.title or "") > 30:

@@ -1520,6 +1520,7 @@ class OpenAlexProvider:
     name = "openalex"
     MAX_LIMIT: int | None = None   # No documented maximum
     RATE_LIMIT = 0.1               # 10 requests/second = 0.1 seconds between requests
+    CACHE_VERSION = 2              # Invalidate persisted caches when changing parsing
 
     def __init__(self, email: str | None = None):
         """
@@ -1547,7 +1548,15 @@ class OpenAlexProvider:
             time.sleep(self.RATE_LIMIT - elapsed)
         self._last_request_time = time.time()
 
-    @cachedmethod(lambda self: self._cache, key=lambda self, query, limit=100, filters=None: (query, limit, filters.cache_key() if filters else ""))
+    @cachedmethod(
+        lambda self: self._cache,
+        key=lambda self, query, limit=100, filters=None: (
+            self.CACHE_VERSION,
+            query,
+            limit,
+            filters.cache_key() if filters else "",
+        ),
+    )
     def search(
         self,
         query: str,
@@ -1684,6 +1693,27 @@ def _convert_work(self, work: dict) -> Paper:
     if not pdf_url and primary_location:
         pdf_url = primary_location.get("pdf_url")
 
+    # Abstract: OpenAlex typically provides abstract_inverted_index.
+    abstract = work.get("abstract")
+    if not abstract:
+        inverted = work.get("abstract_inverted_index")
+        if isinstance(inverted, dict) and inverted:
+            abstract = self._reconstruct_abstract(inverted)
+
+    # Derive arXiv DOI from arXiv URLs if OpenAlex lacks a DOI.
+    if not doi:
+        doi = (
+            arxiv_doi_from_url(pdf_url)
+            or arxiv_doi_from_url(
+                open_access.get("oa_url") if open_access else None
+            )
+            or arxiv_doi_from_url(
+                primary_location.get("landing_page_url")
+                if primary_location
+                else None
+            )
+        )
+
     tags: list[str] = []
     for kw in work.get("keywords", []) or []:
         if isinstance(kw, dict):
@@ -1706,13 +1736,39 @@ def _convert_work(self, work: dict) -> Paper:
         authors=authors,
         year=work.get("publication_year"),
         doi=doi,
-        abstract=work.get("abstract"),
+        abstract=abstract,
         venue=venue,
         url=work.get("id"),
         pdf_url=pdf_url,
         tags=tags,
         sources=[self.name],
     )
+
+
+def _reconstruct_abstract(
+    self,
+    inverted_index: dict[str, list[int]],
+) -> str | None:
+    """Reconstruct abstract text from an OpenAlex inverted index."""
+    try:
+        max_pos = max(
+            max(positions)
+            for positions in inverted_index.values()
+            if isinstance(positions, list) and positions
+        )
+    except ValueError:
+        return None
+
+    words: list[str] = [""] * (max_pos + 1)
+    for word, positions in inverted_index.items():
+        if not isinstance(word, str) or not isinstance(positions, list):
+            continue
+        for pos in positions:
+            if isinstance(pos, int) and 0 <= pos <= max_pos:
+                words[pos] = word
+
+    abstract = " ".join(w for w in words if w).strip()
+    return abstract or None
 @
 
 \subsubsection{DOI lookup}
@@ -1739,7 +1795,7 @@ def get_paper_by_doi(self, doi: str | None) -> Paper | None:
         return None
 
     # Check cache first
-    cache_key = ("doi", doi)
+    cache_key = ("doi", self.CACHE_VERSION, doi)
     if cache_key in self._cache:
         logger.info(f"openalex: Cache hit for DOI {doi}")
         return self._cache[cache_key]
@@ -1779,6 +1835,8 @@ register_provider(OpenAlexProvider())
 import time
 
 import pyalex
+
+from scholar.utils import arxiv_doi_from_url
 @
 
 \subsection{Testing OpenAlex provider}
@@ -1838,6 +1896,34 @@ class TestOpenAlexProvider:
             assert paper.venue == "Test Journal"
             assert paper.sources == ["openalex"]
             assert paper.tags == ["Machine learning", "Neural networks"]
+
+    def test_search_reconstructs_abstract_from_inverted_index(self):
+        """search() reconstructs abstracts from OpenAlex inverted index."""
+        provider = OpenAlexProvider()
+
+        mock_work = {
+            "title": "Test Paper",
+            "authorships": [],
+            "publication_year": 2024,
+            "doi": "https://doi.org/10.1234/test",
+            "abstract_inverted_index": {
+                "This": [0],
+                "is": [1],
+                "an": [2],
+                "abstract": [3],
+            },
+            "id": "https://openalex.org/W123456",
+        }
+
+        with patch("pyalex.Works") as mock_works:
+            mock_works.return_value.search.return_value.paginate.return_value = [
+                [mock_work]
+            ]
+
+            results = provider.search("test query")
+
+            assert len(results) == 1
+            assert results[0].abstract == "This is an abstract"
 
     def test_search_handles_empty_results(self):
         """search() returns empty list when no results."""
@@ -5225,6 +5311,8 @@ class ArxivProvider:
         """arXiv is always available (no API key required)."""
         return True
 
+    <<arxiv get paper by doi>>
+
     def search(
         self,
         query: str,
@@ -5260,6 +5348,68 @@ class ArxivProvider:
 
     <<convert arxiv result>>
     <<arxiv citation methods>>
+@
+
+\subsubsection{DOI lookup}
+
+For metadata enrichment, we support looking up arXiv papers via the canonical
+arXiv DOI format [[10.48550/arXiv.<id>]].
+
+arXiv's API does not provide a general DOI lookup, so we only handle this DOI
+family by converting it back to an arXiv identifier and querying arXiv by ID.
+
+<<arxiv get paper by doi>>=
+def get_paper_by_doi(self, doi: str | None) -> Paper | None:
+    """Fetch a single arXiv paper by its arXiv DOI."""
+    if not doi:
+        return None
+
+    doi_str = doi.strip()
+    cache_key = ("doi", doi_str)
+    if cache_key in self._cache:
+        logger.debug(f"arxiv: Cache hit for DOI {doi_str}")
+        return self._cache[cache_key]
+
+    doi_lc = doi_str.lower()
+    prefix = "10.48550/arxiv."
+    if not doi_lc.startswith(prefix):
+        self._cache[cache_key] = None
+        return None
+
+    arxiv_id = doi_str[len("10.48550/arXiv.") :].strip()
+    if not arxiv_id:
+        self._cache[cache_key] = None
+        return None
+
+    try:
+        search = arxiv.Search(id_list=[arxiv_id], max_results=1)
+        for result in self._client.results(search):
+            converted = self._convert_result(result)
+            # Ensure the DOI matches the lookup DOI for merge_with equality.
+            paper = Paper(
+                title=converted.title,
+                authors=converted.authors,
+                year=converted.year,
+                doi=doi_str,
+                abstract=converted.abstract,
+                venue=converted.venue,
+                url=converted.url,
+                pdf_url=converted.pdf_url,
+                citation_count=converted.citation_count,
+                keywords=converted.keywords,
+                tags=converted.tags,
+                sources=converted.sources,
+                references=converted.references,
+                citations=converted.citations,
+            )
+            self._cache[cache_key] = paper
+            return paper
+
+        self._cache[cache_key] = None
+        return None
+    except Exception as e:
+        logger.warning("arxiv: DOI lookup failed: %s", e)
+        return None
 @
 
 \subsubsection{Retry with exponential backoff}
@@ -5498,6 +5648,33 @@ class TestArxivProvider:
             assert paper.abstract == "This paper presents a novel approach..."
             assert paper.venue == "cs.LG"
             assert paper.sources == ["arxiv"]
+
+    def test_get_paper_by_doi_returns_paper_and_forces_doi(self):
+        """get_paper_by_doi() returns a Paper and preserves lookup DOI."""
+        provider = ArxivProvider()
+
+        mock_result = Mock()
+        mock_result.title = "Test Paper"
+        mock_result.authors = [Mock(name="Alice")]
+        mock_result.published = Mock(year=2024)
+        # arXiv may include a journal DOI; enrichment expects the arXiv DOI.
+        mock_result.doi = "10.9999/journal-doi"
+        mock_result.summary = "Abstract"
+        mock_result.primary_category = "cs.LG"
+        mock_result.entry_id = "http://arxiv.org/abs/2401.12345v1"
+        mock_result.pdf_url = "http://arxiv.org/pdf/2401.12345v1"
+        mock_result.authors[0].name = "Alice"
+
+        with patch.object(
+            provider._client,
+            "results",
+            return_value=iter([mock_result]),
+        ):
+            paper = provider.get_paper_by_doi("10.48550/arXiv.2401.12345")
+
+            assert paper is not None
+            assert paper.doi == "10.48550/arXiv.2401.12345"
+            assert paper.abstract == "Abstract"
 
     def test_search_handles_empty_results(self):
         """search() returns empty list when no results."""

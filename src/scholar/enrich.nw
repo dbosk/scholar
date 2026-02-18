@@ -92,6 +92,7 @@ provider.
 \begin{description}
 \item[Semantic Scholar] Excellent abstract coverage, free API with optional
   key for higher rate limits.
+\item[arXiv] When a paper is an arXiv preprint, arXiv provides the abstract.
 \item[OpenAlex] Very broad coverage (250M+ works), always free.
 \item[IEEE Xplore] Strong coverage for IEEE publications.
   Requires an API key.
@@ -101,7 +102,7 @@ provider.
 
 <<constants>>=
 # Providers to try for DOI-based metadata enrichment (in priority order)
-ENRICHMENT_PROVIDERS = ["s2", "openalex", "ieee", "wos"]
+ENRICHMENT_PROVIDERS = ["s2", "arxiv", "openalex", "ieee", "wos"]
 
 # Global cache for enriched paper data (refs/cites)
 # Stored in data dir (not cache dir) since fetching refs/cites is expensive
@@ -169,13 +170,26 @@ def enrich_paper(
 
     result = paper
 
+    # Derive canonical arXiv DOI from arXiv URLs.
+    # This stabilizes paper identity and enables DOI-based enrichment for
+    # arXiv papers that were returned without a DOI.
+    if not result.doi:
+        derived = derive_arxiv_doi(result)
+        if derived:
+            result = replace(result, doi=derived)
+
     # Check if metadata enrichment is needed
-    if needs_enrichment(paper, fields):
+    if needs_enrichment(result, fields):
         # Need DOI for lookup
-        if not paper.doi:
-            logger.debug(f"Paper '{paper.title_preview()}' has no DOI, cannot enrich")
+        if not result.doi:
+            logger.debug(
+                f"Paper '{result.title_preview()}' has no DOI, cannot enrich"
+            )
         else:
-            logger.debug(f"Enriching paper '{paper.title_preview()}' (DOI: {paper.doi})")
+            logger.debug(
+                f"Enriching paper '{result.title_preview()}' "
+                f"(DOI: {result.doi})"
+            )
 
             providers_to_try = providers or ENRICHMENT_PROVIDERS
 
@@ -195,9 +209,11 @@ def enrich_paper(
                     continue
 
                 logger.debug(f"Trying to enrich from {provider_name}")
-                enriched = provider.get_paper_by_doi(paper.doi)
+                enriched = provider.get_paper_by_doi(result.doi)
                 if enriched is None:
-                    logger.debug(f"{provider_name} returned no data for DOI {paper.doi}")
+                    logger.debug(
+                        f"{provider_name} returned no data for DOI {result.doi}"
+                    )
                     continue
 
                 # Merge the enriched data into our paper
@@ -668,6 +684,20 @@ class TestEnrichPaper:
         result = enrich_paper(paper)
         assert result is paper
 
+    def test_derives_arxiv_doi_from_url(self):
+        """enrich_paper derives arXiv DOI from arXiv URLs."""
+        paper = Paper(
+            title="Test Paper",
+            authors=["Author"],
+            doi=None,
+            url="https://arxiv.org/abs/2401.12345v1",
+        )
+
+        with patch("scholar.enrich.get_provider", return_value=None):
+            result = enrich_paper(paper, fields=["abstract"])
+
+        assert result.doi == "10.48550/arXiv.2401.12345"
+
     def test_returns_original_if_already_complete(self):
         """enrich_paper returns original if fields are already filled."""
         paper = Paper(
@@ -699,6 +729,10 @@ class TestEnrichPaper:
         s2_provider = MagicMock()
         s2_provider.get_paper_by_doi.return_value = None  # Not found
 
+        arxiv_provider = MagicMock()
+        arxiv_provider.is_available.return_value = True
+        arxiv_provider.get_paper_by_doi.return_value = None
+
         openalex_provider = MagicMock()
         openalex_provider.get_paper_by_doi.return_value = Paper(
             title="Test Paper",
@@ -711,6 +745,8 @@ class TestEnrichPaper:
         def mock_get_provider(name):
             if name == "s2":
                 return s2_provider
+            if name == "arxiv":
+                return arxiv_provider
             if name == "openalex":
                 return openalex_provider
             raise AssertionError(f"Unexpected provider lookup: {name}")
@@ -748,9 +784,15 @@ class TestEnrichPaper:
             sources=["openalex"],
         )
 
+        arxiv_provider = MagicMock()
+        arxiv_provider.is_available.return_value = True
+        arxiv_provider.get_paper_by_doi.return_value = None
+
         def mock_get_provider(name):
             if name == "s2":
                 return s2_provider
+            if name == "arxiv":
+                return arxiv_provider
             if name == "openalex":
                 return openalex_provider
             raise AssertionError(f"Unexpected provider lookup: {name}")
@@ -795,6 +837,12 @@ class TestEnrichPaper:
             record("openalex") or None
         )
 
+        arxiv_provider = MagicMock()
+        arxiv_provider.is_available.return_value = True
+        arxiv_provider.get_paper_by_doi.side_effect = lambda doi: (
+            record("arxiv") or None
+        )
+
         ieee_provider = MagicMock()
         ieee_provider.is_available.return_value = True
         ieee_provider.get_paper_by_doi.side_effect = lambda doi: (
@@ -817,6 +865,8 @@ class TestEnrichPaper:
         def mock_get_provider(name):
             if name == "s2":
                 return s2_provider
+            if name == "arxiv":
+                return arxiv_provider
             if name == "openalex":
                 return openalex_provider
             if name == "ieee":
@@ -830,7 +880,7 @@ class TestEnrichPaper:
 
         assert result.abstract == "Abstract from S2"
         assert result.pdf_url == "https://example.com/paper.pdf"
-        assert call_order == ["s2", "openalex", "ieee", "wos"]
+        assert call_order == ["s2", "arxiv", "openalex", "ieee", "wos"]
 
     def test_returns_original_if_no_provider_finds(self):
         """enrich_paper returns original if no provider can enrich."""
@@ -1015,6 +1065,7 @@ from typing import Callable
 
 from scholar import Paper
 from scholar.providers import get_provider
+from scholar.utils import derive_arxiv_doi
 <<enrichment cache imports>>
 
 logger = logging.getLogger(__name__)
