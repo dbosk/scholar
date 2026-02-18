@@ -11,9 +11,12 @@ include ${INCLUDE_MAKEFILES}/subdir.mk
 version = $(shell sed -n 's/^version *= *"\([^"]*\)"/\1/p' pyproject.toml)
 
 # Publishing targets
-.PHONY: publish publish-pypi publish-github
+.PHONY: publish publish-pypi publish-github doc/scholar.pdf
 
-publish: doc/scholar.pdf publish-pypi publish-github
+publish:
+	${MAKE} all
+	${MAKE} -C tests test
+	${MAKE} publish-pypi publish-github
 
 publish-pypi:
 	uv build
@@ -23,6 +26,6 @@ publish-github: doc/scholar.pdf
 	git push
 	gh release create -t v${version} v${version} doc/scholar.pdf
 
-# Build documentation
+# Always delegate to sub-make for freshness check
 doc/scholar.pdf:
 	${MAKE} -C doc scholar.pdf
