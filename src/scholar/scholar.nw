@@ -481,9 +481,15 @@ is present but the value is [[null]], we enforce the list invariant in
 [[__post_init__]] so that all downstream code can safely iterate and slice
 without [[None]]-guards.
 
+OpenAlex also returns [[null]] for [[title]] (e.g.\ journal issues and
+editorials).  We coerce that to an empty string here so that string
+operations such as slicing and [[.lower()]] never crash.
+
 <<paper methods>>=
 def __post_init__(self):
-    """Coerce None list fields to empty lists."""
+    """Coerce None list fields to empty lists and None title to ''."""
+    if self.title is None:
+        self.title = ""
     if self.authors is None:
         self.authors = []
     if self.sources is None:
@@ -706,8 +712,8 @@ def _from_dict_without_registry(cls, data: dict) -> "Paper":
         citations = [cls._from_dict_without_registry(cit) for cit in data["citations"]]
 
     return cls(
-        title=data.get("title", ""),
-        authors=data.get("authors") or [],
+        title=data.get("title", "") or "",
+        authors=data.get("authors", []) or [],
         year=data.get("year"),
         doi=data.get("doi"),
         abstract=data.get("abstract"),
@@ -717,7 +723,7 @@ def _from_dict_without_registry(cls, data: dict) -> "Paper":
         citation_count=data.get("citation_count"),
         keywords=data.get("keywords"),
         tags=data.get("tags"),
-        sources=data.get("sources") or [],
+        sources=data.get("sources", []) or [],
         references=references,
         citations=citations,
     )

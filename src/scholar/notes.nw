@@ -205,7 +205,9 @@ class ReviewDecisionRecord:
     llm_confidence: float | None = None  # 0.0-1.0 if LLM decided
 
     def __post_init__(self):
-        """Coerce None list fields to empty lists."""
+        """Coerce None list fields to empty lists and None title to ''."""
+        if self.title is None:
+            self.title = ""
         if self.tags is None:
             self.tags = []
         if self.authors is None:
@@ -250,24 +252,24 @@ class ReviewDecisionRecord:
     def from_dict(cls, data: dict[str, Any]) -> "ReviewDecisionRecord":
         """Create from dictionary, handling both old and new formats."""
         # Handle old format with 'motivation' field
-        tags = data.get("tags") or []
+        tags = data.get("tags", []) or []
         if not tags and data.get("motivation"):
             tags = [data["motivation"]]
 
         return cls(
-            status=data.get("status", "pending"),
+            status=data.get("status", "pending") or "pending",
             tags=tags,
-            title=data.get("title", ""),
-            authors=data.get("authors") or [],
+            title=data.get("title", "") or "",
+            authors=data.get("authors", []) or [],
             year=data.get("year"),
             doi=data.get("doi"),
             abstract=data.get("abstract"),
             venue=data.get("venue"),
             url=data.get("url"),
             pdf_url=data.get("pdf_url"),
-            provider=data.get("provider", ""),
-            source=data.get("source", "human"),
-            is_example=data.get("is_example", False),
+            provider=data.get("provider", "") or "",
+            source=data.get("source", "human") or "human",
+            is_example=data.get("is_example", False) or False,
             llm_confidence=data.get("llm_confidence"),
         )
 
@@ -301,16 +303,15 @@ class SearchDecisions:
         """Create from dictionary."""
         decisions = {
             pid: ReviewDecisionRecord.from_dict(dec)
-            for pid, dec in data.get("decisions", {}).items()
+            for pid, dec in (data.get("decisions", {}) or {}).items()
         }
         return cls(
             query=data["query"],
             query_hash=data["query_hash"],
             decisions=decisions,
-            timestamp=data.get("timestamp", ""),
+            timestamp=data.get("timestamp", "") or "",
         )
 @
-
 
 \section{Paper Identity}
 \label{ch:paper-identity}
