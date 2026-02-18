@@ -205,7 +205,9 @@ class ReviewDecisionRecord:
     llm_confidence: float | None = None  # 0.0-1.0 if LLM decided
 
     def __post_init__(self):
-        """Coerce None list fields to empty lists."""
+        """Coerce None list fields to empty lists and None title to ''."""
+        if self.title is None:
+            self.title = ""
         if self.tags is None:
             self.tags = []
         if self.authors is None:
@@ -250,24 +252,24 @@ class ReviewDecisionRecord:
     def from_dict(cls, data: dict[str, Any]) -> "ReviewDecisionRecord":
         """Create from dictionary, handling both old and new formats."""
         # Handle old format with 'motivation' field
-        tags = data.get("tags") or []
+        tags = data.get("tags", []) or []
         if not tags and data.get("motivation"):
             tags = [data["motivation"]]
 
         return cls(
-            status=data.get("status", "pending"),
+            status=data.get("status", "pending") or "pending",
             tags=tags,
-            title=data.get("title", ""),
-            authors=data.get("authors") or [],
+            title=data.get("title", "") or "",
+            authors=data.get("authors", []) or [],
             year=data.get("year"),
             doi=data.get("doi"),
             abstract=data.get("abstract"),
             venue=data.get("venue"),
             url=data.get("url"),
             pdf_url=data.get("pdf_url"),
-            provider=data.get("provider", ""),
-            source=data.get("source", "human"),
-            is_example=data.get("is_example", False),
+            provider=data.get("provider", "") or "",
+            source=data.get("source", "human") or "human",
+            is_example=data.get("is_example", False) or False,
             llm_confidence=data.get("llm_confidence"),
         )
 
@@ -301,14 +303,82 @@ class SearchDecisions:
         """Create from dictionary."""
         decisions = {
             pid: ReviewDecisionRecord.from_dict(dec)
-            for pid, dec in data.get("decisions", {}).items()
+            for pid, dec in (data.get("decisions", {}) or {}).items()
         }
         return cls(
             query=data["query"],
             query_hash=data["query_hash"],
             decisions=decisions,
-            timestamp=data.get("timestamp", ""),
+            timestamp=data.get("timestamp", "") or "",
         )
+@
+
+\subsection{Testing [[ReviewDecisionRecord]] null coercion}
+
+OpenAlex (and occasionally other providers) stores [[null]] for string and
+list fields when metadata is missing.  Because [[dataclass]] field defaults
+only apply when a key is \emph{absent}, an explicit [[null]] in session JSON
+bypasses them.  We verify that [[__post_init__]] and [[from_dict]] both
+defend against this.
+
+<<test functions>>=
+class TestReviewDecisionRecordNullCoercion:
+    """Tests that None fields are coerced to safe defaults."""
+
+    def test_post_init_none_title_becomes_empty_string(self):
+        """title=None is coerced to '' by __post_init__."""
+        rec = ReviewDecisionRecord(status="pending", title=None)
+        assert rec.title == ""
+
+    def test_post_init_none_tags_becomes_empty_list(self):
+        """tags=None is coerced to [] by __post_init__."""
+        rec = ReviewDecisionRecord(status="pending", tags=None)
+        assert rec.tags == []
+
+    def test_post_init_none_authors_becomes_empty_list(self):
+        """authors=None is coerced to [] by __post_init__."""
+        rec = ReviewDecisionRecord(status="pending", authors=None)
+        assert rec.authors == []
+
+    def test_from_dict_null_title_becomes_empty_string(self):
+        """from_dict with title: null yields title == ''."""
+        rec = ReviewDecisionRecord.from_dict(
+            {"status": "pending", "title": None}
+        )
+        assert rec.title == ""
+
+    def test_from_dict_null_authors_becomes_empty_list(self):
+        """from_dict with authors: null yields authors == []."""
+        rec = ReviewDecisionRecord.from_dict(
+            {"status": "pending", "authors": None}
+        )
+        assert rec.authors == []
+
+    def test_from_dict_null_tags_becomes_empty_list(self):
+        """from_dict with tags: null yields tags == []."""
+        rec = ReviewDecisionRecord.from_dict(
+            {"status": "pending", "tags": None}
+        )
+        assert rec.tags == []
+
+    def test_from_dict_null_status_falls_back_to_pending(self):
+        """from_dict with status: null falls back to 'pending'."""
+        rec = ReviewDecisionRecord.from_dict({"status": None})
+        assert rec.status == "pending"
+
+    def test_from_dict_null_provider_becomes_empty_string(self):
+        """from_dict with provider: null yields provider == ''."""
+        rec = ReviewDecisionRecord.from_dict(
+            {"status": "pending", "provider": None}
+        )
+        assert rec.provider == ""
+
+    def test_from_dict_null_source_falls_back_to_human(self):
+        """from_dict with source: null falls back to 'human'."""
+        rec = ReviewDecisionRecord.from_dict(
+            {"status": "pending", "source": None}
+        )
+        assert rec.source == "human"
 @
 
 

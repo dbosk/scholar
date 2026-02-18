@@ -483,7 +483,7 @@ class ReviewSession:
         """
         self._invalidate_cache()  # Sorting changes list structure
         if key == "title":
-            self.decisions.sort(key=lambda d: d.paper.title.lower(), reverse=reverse)
+            self.decisions.sort(key=lambda d: (d.paper.title or "").lower(), reverse=reverse)
         elif key == "year":
             self.decisions.sort(key=lambda d: d.paper.year or 0, reverse=reverse)
         elif key == "author":
@@ -1504,15 +1504,15 @@ def load_session(name_or_query: str) -> ReviewSession | None:
                 ] if paper_data["source"] else []
             paper = Paper.from_dict(paper_data)
             status = DecisionStatus(dec_data["status"])
-            tags = dec_data.get("tags") or []
+            tags = dec_data.get("tags", []) or []
 
             # Load LLM-related fields with backward compatibility
-            source_str = dec_data.get("source", "human")
+            source_str = dec_data.get("source", "human") or "human"
             try:
                 source = ReviewSource(source_str)
             except ValueError:
                 source = ReviewSource.HUMAN
-            is_example = dec_data.get("is_example", False)
+            is_example = dec_data.get("is_example", False) or False
             llm_confidence = dec_data.get("llm_confidence")
 
             session.decisions.append(
@@ -1721,14 +1721,14 @@ def list_sessions() -> list[dict[str, Any]]:
                 data = json.load(f)
             
             # Parse timestamp string to datetime
-            timestamp_str = data.get("timestamp", "")
+            timestamp_str = data.get("timestamp", "") or ""
             try:
                 timestamp = datetime.fromisoformat(timestamp_str)
             except (ValueError, TypeError):
                 timestamp = datetime.now()
             
             # Count decisions by status
-            decisions = data.get("decisions", [])
+            decisions = data.get("decisions", []) or []
             kept = sum(1 for d in decisions if d.get("status") == "kept")
             discarded = sum(1 for d in decisions if d.get("status") == "discarded")
             pending = sum(1 for d in decisions if d.get("status") == "pending")
