@@ -313,6 +313,75 @@ class SearchDecisions:
         )
 @
 
+\subsection{Testing [[ReviewDecisionRecord]] null coercion}
+
+OpenAlex (and occasionally other providers) stores [[null]] for string and
+list fields when metadata is missing.  Because [[dataclass]] field defaults
+only apply when a key is \emph{absent}, an explicit [[null]] in session JSON
+bypasses them.  We verify that [[__post_init__]] and [[from_dict]] both
+defend against this.
+
+<<test functions>>=
+class TestReviewDecisionRecordNullCoercion:
+    """Tests that None fields are coerced to safe defaults."""
+
+    def test_post_init_none_title_becomes_empty_string(self):
+        """title=None is coerced to '' by __post_init__."""
+        rec = ReviewDecisionRecord(status="pending", title=None)
+        assert rec.title == ""
+
+    def test_post_init_none_tags_becomes_empty_list(self):
+        """tags=None is coerced to [] by __post_init__."""
+        rec = ReviewDecisionRecord(status="pending", tags=None)
+        assert rec.tags == []
+
+    def test_post_init_none_authors_becomes_empty_list(self):
+        """authors=None is coerced to [] by __post_init__."""
+        rec = ReviewDecisionRecord(status="pending", authors=None)
+        assert rec.authors == []
+
+    def test_from_dict_null_title_becomes_empty_string(self):
+        """from_dict with title: null yields title == ''."""
+        rec = ReviewDecisionRecord.from_dict(
+            {"status": "pending", "title": None}
+        )
+        assert rec.title == ""
+
+    def test_from_dict_null_authors_becomes_empty_list(self):
+        """from_dict with authors: null yields authors == []."""
+        rec = ReviewDecisionRecord.from_dict(
+            {"status": "pending", "authors": None}
+        )
+        assert rec.authors == []
+
+    def test_from_dict_null_tags_becomes_empty_list(self):
+        """from_dict with tags: null yields tags == []."""
+        rec = ReviewDecisionRecord.from_dict(
+            {"status": "pending", "tags": None}
+        )
+        assert rec.tags == []
+
+    def test_from_dict_null_status_falls_back_to_pending(self):
+        """from_dict with status: null falls back to 'pending'."""
+        rec = ReviewDecisionRecord.from_dict({"status": None})
+        assert rec.status == "pending"
+
+    def test_from_dict_null_provider_becomes_empty_string(self):
+        """from_dict with provider: null yields provider == ''."""
+        rec = ReviewDecisionRecord.from_dict(
+            {"status": "pending", "provider": None}
+        )
+        assert rec.provider == ""
+
+    def test_from_dict_null_source_falls_back_to_human(self):
+        """from_dict with source: null falls back to 'human'."""
+        rec = ReviewDecisionRecord.from_dict(
+            {"status": "pending", "source": None}
+        )
+        assert rec.source == "human"
+@
+
+
 \section{Paper Identity}
 \label{ch:paper-identity}
 
