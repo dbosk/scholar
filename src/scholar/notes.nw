@@ -762,15 +762,18 @@ def delete_note(paper: Any) -> bool:
 def list_papers_with_notes() -> list[PaperNote]:
     """
     Get all papers that have notes.
-    
+
+    Notes are sorted oldest-first (ascending by updated_at) so that the
+    most recently updated note appears last---at the bottom of terminal
+    output, visible without scrolling.
+
     Returns:
-        List of PaperNote objects, sorted by updated_at descending.
+        List of PaperNote objects, sorted by updated_at ascending.
     """
     notes = _load_all_notes()
     return sorted(
         notes.values(),
         key=lambda n: n.updated_at,
-        reverse=True,
     )
 
 
@@ -923,8 +926,8 @@ class TestPaperNotes:
         
         notes = list_papers_with_notes()
         assert len(notes) == 2
-        # Most recently updated first
-        assert notes[0].title == "Paper 2"
+        # Oldest first, newest at bottom
+        assert notes[0].title == "Paper 1"
 
     def test_has_note(self, tmp_path, monkeypatch):
         """has_note correctly identifies papers with notes."""
