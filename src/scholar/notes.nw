@@ -76,6 +76,7 @@ from unittest.mock import Mock
 
 from scholar import Paper
 from scholar.notes import *
+from scholar.notes import _get_cached_notes  # Import private function for testing
 
 
 <<test functions>>
@@ -112,6 +113,7 @@ import hashlib
 import json
 import os
 
+from cachetools import TTLCache, cached
 import click
 import platformdirs
 @
@@ -492,12 +494,40 @@ class TestDataDirectory:
 Notes are stored in a single JSON file mapping paper IDs to note objects.
 This keeps all notes together for easy backup and export.
 
+\paragraph{Performance optimization.}
+The [[has_note]] function is called once per paper during TUI list rendering.
+With 1000+ papers, repeatedly loading and parsing the entire notes file is
+expensive. We use a [[TTLCache]] with a 5-second window to cache the loaded
+notes, allowing bulk operations to complete efficiently while still picking
+up external edits within seconds.
+
+The cache key is a simple sentinel (we cache only one value: all notes),
+so we use [[maxsize=1]]. The [[_notes_cache]] is module-level, and
+[[invalidate_notes_cache()]] clears it when we modify notes ourselves.
+
 <<paper notes functions>>=
+# Cache notes for 5 seconds - allows bulk operations while picking up external edits
+_notes_cache: TTLCache = TTLCache(maxsize=1, ttl=5.0)
+
+
+def invalidate_notes_cache() -> None:
+    """Clear the notes cache (call after saving/deleting notes)."""
+    _notes_cache.clear()
+
+
+@cached(_notes_cache, key=lambda: "all_notes")
+def _get_cached_notes() -> dict[str, PaperNote]:
+    """Load notes with short-lived cache for bulk operations."""
+    return _load_all_notes()
+
+
 def _load_all_notes() -> dict[str, PaperNote]:
     """
     Load all paper notes from disk.
-    
+
     Returns empty dict if file doesn't exist or is corrupted.
+    Note: For bulk operations, prefer _get_cached_notes() to avoid
+    repeated disk reads.
     """
     notes_file = get_data_dir() / NOTES_FILE
     if not notes_file.exists():
@@ -517,6 +547,7 @@ def _save_all_notes(notes: dict[str, PaperNote]) -> None:
     """
     Save all paper notes to disk.
     """
+    invalidate_notes_cache()  # Clear cache since notes are changing
     notes_file = get_data_dir() / NOTES_FILE
     data = {pid: note.to_dict() for pid, note in notes.items()}
     try:
@@ -619,15 +650,17 @@ def list_papers_with_notes() -> list[PaperNote]:
 def has_note(paper: Any) -> bool:
     """
     Check if a paper has a note.
-    
+
+    Uses cached notes lookup for efficient bulk operations.
+
     Args:
         paper: A Paper object.
-    
+
     Returns:
         True if the paper has a note.
     """
     paper_id = get_paper_id(paper)
-    notes = _load_all_notes()
+    notes = _get_cached_notes()
     return paper_id in notes
 @
 
@@ -729,16 +762,81 @@ class TestPaperNotes:
     def test_has_note(self, tmp_path, monkeypatch):
         """has_note correctly identifies papers with notes."""
         monkeypatch.setenv("SCHOLAR_DATA_DIR", str(tmp_path))
-        
+
         paper = Paper(
             title="Test",
             authors=[],
             doi="10.1234/test",
         )
-        
+
         assert not has_note(paper)
         save_note(paper, "A note")
         assert has_note(paper)
+
+
+class TestNotesCache:
+    """Tests for notes caching behavior."""
+
+    def test_cache_invalidated_on_save(self, tmp_path, monkeypatch):
+        """Saving a note invalidates the cache."""
+        monkeypatch.setenv("SCHOLAR_DATA_DIR", str(tmp_path))
+        invalidate_notes_cache()
+
+        paper = Paper(
+            title="Test Cache",
+            authors=["Author"],
+            doi="10.1234/cache",
+        )
+
+        # Initial state - no note
+        assert not has_note(paper)
+
+        # Save note - should invalidate cache
+        save_note(paper, "Cached note")
+
+        # Should see the new note
+        assert has_note(paper)
+
+    def test_cached_notes_returns_same_dict(self, tmp_path, monkeypatch):
+        """Cached notes returns the same dict instance within TTL."""
+        monkeypatch.setenv("SCHOLAR_DATA_DIR", str(tmp_path))
+        invalidate_notes_cache()
+
+        paper = Paper(
+            title="Cache Test",
+            authors=["A"],
+            doi="10.1234/cache_test",
+        )
+        save_note(paper, "Test")
+
+        # Access cache twice
+        notes1 = _get_cached_notes()
+        notes2 = _get_cached_notes()
+
+        # Should be same instance (cached)
+        assert notes1 is notes2
+
+    def test_invalidate_cache_function(self, tmp_path, monkeypatch):
+        """invalidate_notes_cache clears the cache."""
+        monkeypatch.setenv("SCHOLAR_DATA_DIR", str(tmp_path))
+        invalidate_notes_cache()
+
+        paper = Paper(
+            title="Invalidation Test",
+            authors=["A"],
+            doi="10.1234/inv",
+        )
+        save_note(paper, "Test")
+
+        # Access cache
+        notes1 = _get_cached_notes()
+
+        # Invalidate
+        invalidate_notes_cache()
+
+        # Access again - should be different instance
+        notes2 = _get_cached_notes()
+        assert notes1 is not notes2
 @
 
 
