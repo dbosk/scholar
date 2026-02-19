@@ -802,6 +802,158 @@ def has_note(paper: Any) -> bool:
         return legacy_id in notes
 
     return False
+
+
+def search_notes(query: str, regex: bool = False) -> list[PaperNote]:
+    """Search notes by substring or regex match on title and content.
+
+    Args:
+        query: Search string (plain substring or regex pattern).
+        regex: If True, treat query as a regex pattern.
+
+    Returns:
+        Matching PaperNote objects sorted by updated_at ascending.
+    """
+    notes = _load_all_notes()
+    if regex:
+        import re
+        pattern = re.compile(query, re.IGNORECASE)
+        matches = [
+            n for n in notes.values()
+            if pattern.search(n.note)
+            or pattern.search(n.title or "")
+        ]
+    else:
+        query_lower = query.lower()
+        matches = [
+            n for n in notes.values()
+            if query_lower in n.note.lower()
+            or query_lower in (n.title or "").lower()
+        ]
+    return sorted(matches, key=lambda n: n.updated_at)
+@
+
+\subsection{Searching notes}
+
+A researcher with hundreds of annotated papers needs to find notes
+mentioning a specific concept---say, every paper where they wrote about
+``differential privacy.''
+Iterating manually through [[scholar notes list]] is impractical.
+
+The [[search_notes]] function provides full-text search over both the
+note body and the paper title.
+Substring matching suffices for most queries, but a regex mode is
+available for pattern-based searches (e.g.\ matching ``method'' or
+``methodology'' with [[method(s|ology)]]).
+
+Results are sorted oldest-first, matching the convention used by
+[[list_papers_with_notes]], so the most recent match appears at the
+bottom of terminal output.
+
+\subsection{Testing note search}
+
+We verify both substring and regex modes, including case-insensitive
+matching and the sort order of results:
+
+<<test functions>>=
+class TestSearchNotes:
+    """Tests for the search_notes function."""
+
+    def test_substring_match_in_note(self, tmp_path, monkeypatch):
+        """Finds notes containing a substring in the note body."""
+        monkeypatch.setenv("SCHOLAR_DATA_DIR", str(tmp_path))
+
+        paper = Paper(
+            title="Privacy in ML",
+            authors=["Alice"],
+            doi="10.1234/priv",
+        )
+        save_note(paper, "Discusses differential privacy methodology.")
+
+        results = search_notes("methodology")
+        assert len(results) == 1
+        assert results[0].paper_id == get_paper_id(paper)
+
+    def test_substring_match_in_title(self, tmp_path, monkeypatch):
+        """Finds notes where the title matches."""
+        monkeypatch.setenv("SCHOLAR_DATA_DIR", str(tmp_path))
+
+        paper = Paper(
+            title="Federated Learning Survey",
+            authors=["Bob"],
+            doi="10.1234/fed",
+        )
+        save_note(paper, "Good overview paper.")
+
+        results = search_notes("Federated")
+        assert len(results) == 1
+
+    def test_case_insensitive(self, tmp_path, monkeypatch):
+        """Substring search is case-insensitive."""
+        monkeypatch.setenv("SCHOLAR_DATA_DIR", str(tmp_path))
+
+        paper = Paper(
+            title="Test",
+            authors=[],
+            doi="10.1234/ci",
+        )
+        save_note(paper, "UPPER and lower case.")
+
+        assert len(search_notes("upper")) == 1
+        assert len(search_notes("LOWER")) == 1
+
+    def test_no_match_returns_empty(self, tmp_path, monkeypatch):
+        """Returns empty list when nothing matches."""
+        monkeypatch.setenv("SCHOLAR_DATA_DIR", str(tmp_path))
+
+        paper = Paper(
+            title="Test",
+            authors=[],
+            doi="10.1234/nm",
+        )
+        save_note(paper, "Some content.")
+
+        assert search_notes("nonexistent") == []
+
+    def test_regex_mode(self, tmp_path, monkeypatch):
+        """Regex mode matches patterns."""
+        monkeypatch.setenv("SCHOLAR_DATA_DIR", str(tmp_path))
+
+        p1 = Paper(title="A", authors=[], doi="10.1/a")
+        p2 = Paper(title="B", authors=[], doi="10.1/b")
+        save_note(p1, "Uses methods and methodology.")
+        save_note(p2, "No relevant content here.")
+
+        results = search_notes(r"method(s|ology)", regex=True)
+        assert len(results) == 1
+        assert results[0].paper_id == get_paper_id(p1)
+
+    def test_regex_match_in_title(self, tmp_path, monkeypatch):
+        """Regex mode searches titles too."""
+        monkeypatch.setenv("SCHOLAR_DATA_DIR", str(tmp_path))
+
+        paper = Paper(
+            title="Privacy-Preserving ML",
+            authors=[],
+            doi="10.1/pml",
+        )
+        save_note(paper, "Short note.")
+
+        results = search_notes(r"[Pp]rivacy", regex=True)
+        assert len(results) == 1
+
+    def test_sorted_by_updated_at(self, tmp_path, monkeypatch):
+        """Results are sorted oldest-first by updated_at."""
+        monkeypatch.setenv("SCHOLAR_DATA_DIR", str(tmp_path))
+
+        p1 = Paper(title="First", authors=[], doi="10.1/s1")
+        p2 = Paper(title="Second", authors=[], doi="10.1/s2")
+        save_note(p1, "Common keyword here.")
+        save_note(p2, "Common keyword there.")
+
+        results = search_notes("Common keyword")
+        assert len(results) == 2
+        assert results[0].updated_at <= results[1].updated_at
 @
 
 \subsection{Testing paper notes}
