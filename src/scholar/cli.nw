@@ -21,7 +21,8 @@ The CLI exposes every major Scholar capability as a subcommand:
   configuration status.
 \item[[scholar cache]] Inspect and clear the search result cache.
 \item[[scholar pdf]] Download and manage paper PDFs.
-\item[[scholar notes]] Access the notes database.
+\item[[scholar notes]] Access the notes database (list, search, export).
+\item[[scholar themes]] Explore themes across review sessions.
 \item[[scholar enrich]] Fetch missing abstracts for papers.
 \item[[scholar llm]] Run LLM-assisted classification.
 \end{description}
@@ -72,6 +73,7 @@ across bibliographic databases.
 <<cache command>>
 <<pdf command>>
 <<notes command>>
+<<themes command>>
 <<sessions command>>
 <<llm command helpers>>
 <<llm command>>
@@ -101,6 +103,7 @@ The test file collects all distributed test chunks:
 <<test [[cli.py]]>>=
 """Tests for the CLI module."""
 import pytest
+from datetime import datetime
 from unittest.mock import Mock
 from typer.testing import CliRunner
 
@@ -1897,6 +1900,7 @@ argument patterns:
 \begin{description}
 \item[notes] (no subcommand) Launch TUI for browsing papers with notes
 \item[notes list] List papers with notes (table or JSON output)
+\item[notes search] Search notes by content or title
 \item[notes show] Display a specific paper's notes
 \item[notes export] Save all notes to a JSON file for backup or sharing
 \item[notes import] Load notes from a JSON file, merging with existing
@@ -1992,6 +1996,89 @@ def notes_list(
 
         console.print(table)
         console.print(f"\n[dim]Total: {len(notes)} paper(s) with notes[/dim]")
+
+
+@notes_app.command("search")
+def notes_search(
+    query: Annotated[
+        str,
+        typer.Argument(help="Search string for note content."),
+    ],
+    regex: Annotated[
+        bool,
+        typer.Option(
+            "--regex", "-r",
+            help="Treat query as a regex pattern.",
+        ),
+    ] = False,
+    output_format: Annotated[
+        str,
+        typer.Option(
+            "--format", "-f",
+            help="Output format: table or json.",
+            autocompletion=complete_display_format,
+        ),
+    ] = "table",
+) -> None:
+    """
+    Search notes by content or title.
+
+    Searches both note text and paper titles for matching terms.
+    Use --regex for pattern matching (e.g. 'method(s|ology)').
+    """
+    from scholar.notes import search_notes
+
+    console = Console()
+    results = search_notes(query, regex=regex)
+
+    if not results:
+        console.print("[dim]No matching notes found.[/dim]")
+        return
+
+    if output_format == "json":
+        import json
+        output = [
+            {
+                "paper_id": n.paper_id,
+                "title": n.title,
+                "note": n.note,
+                "created_at": n.created_at.isoformat(),
+                "updated_at": n.updated_at.isoformat(),
+            }
+            for n in results
+        ]
+        print(json.dumps(output, indent=2))
+    else:
+        table = Table(
+            title=f"Notes matching '{query}'",
+            box=box.HORIZONTALS,
+        )
+        table.add_column(
+            "Title", style="cyan", no_wrap=False, max_width=50,
+        )
+        table.add_column(
+            "Note Preview", style="dim", max_width=30,
+        )
+        table.add_column("Updated", style="green")
+
+        for note in results:
+            preview = note.note[:50] + "..." \
+                if len(note.note) > 50 else note.note
+            preview = preview.replace("\n", " ")
+            table.add_row(
+                Text(
+                    (note.title or "")[:50]
+                    + ("..." if len(note.title or "") > 50
+                       else "")
+                ),
+                Text(preview),
+                Text(note.updated_at.strftime("%Y-%m-%d")),
+            )
+
+        console.print(table)
+        console.print(
+            f"\n[dim]{len(results)} matching note(s)[/dim]"
+        )
 
 
 @notes_app.command("show")
@@ -2124,6 +2211,358 @@ def notes_clear(
         notes_file.unlink()
 
     console.print(f"[green]Deleted {len(notes)} note(s).[/green]")
+@
+
+
+\section{Cross-Session Themes}
+\label{ch:themes-command}
+
+While individual sessions track themes for their kept papers, a
+researcher working across many sessions needs a bird's-eye view.
+The [[themes]] command group aggregates themes from all sessions,
+answering two questions:
+\begin{description}
+\item[themes list] What themes exist and how many papers use each?
+\item[themes show] Which papers belong to a particular theme?
+\end{description}
+
+These commands complement the per-session reports by providing a
+cross-cutting view that helps identify the dominant research areas in a
+review corpus.
+
+<<themes command>>=
+themes_app = typer.Typer(
+    name="themes",
+    help="Explore themes across review sessions.",
+    no_args_is_help=True,
+)
+app.add_typer(themes_app, name="themes")
+
+
+@themes_app.command("list")
+def themes_list(
+    output_format: Annotated[
+        str,
+        typer.Option(
+            "--format", "-f",
+            help="Output format: table or json.",
+            autocompletion=complete_display_format,
+        ),
+    ] = "table",
+) -> None:
+    """
+    List all themes across review sessions.
+
+    Shows each theme with the number of kept papers tagged with it.
+    """
+    from scholar.review import list_all_themes
+
+    console = Console()
+    themes = list_all_themes()
+
+    if not themes:
+        console.print(
+            "[dim]No themes found. Tag papers with themes "
+            "during review sessions.[/dim]"
+        )
+        return
+
+    if output_format == "json":
+        import json
+        print(json.dumps(themes, indent=2))
+    else:
+        table = Table(
+            title="Themes Across Sessions",
+            box=box.HORIZONTALS,
+        )
+        table.add_column("Theme", style="cyan")
+        table.add_column(
+            "Papers", style="green", justify="right",
+        )
+
+        for theme, count in themes.items():
+            table.add_row(theme, str(count))
+
+        console.print(table)
+        console.print(
+            f"\n[dim]{len(themes)} theme(s), "
+            f"{sum(themes.values())} total tag(s)[/dim]"
+        )
+
+
+@themes_app.command("show")
+def themes_show(
+    theme: Annotated[
+        str,
+        typer.Argument(help="Theme name to show papers for."),
+    ],
+    output_format: Annotated[
+        str,
+        typer.Option(
+            "--format", "-f",
+            help="Output format: table or json.",
+            autocompletion=complete_display_format,
+        ),
+    ] = "table",
+) -> None:
+    """
+    Show papers tagged with a specific theme.
+
+    Lists all kept papers across sessions that have the given theme tag.
+    """
+    from scholar.review import list_papers_for_theme
+
+    console = Console()
+    papers = list_papers_for_theme(theme)
+
+    if not papers:
+        console.print(
+            f"[dim]No papers found with theme "
+            f"'{escape(theme)}'.[/dim]"
+        )
+        return
+
+    if output_format == "json":
+        import json
+        print(json.dumps(papers, indent=2))
+    else:
+        table = Table(
+            title=f"Papers tagged '{theme}'",
+            box=box.HORIZONTALS,
+        )
+        table.add_column(
+            "Title", style="cyan",
+            no_wrap=False, max_width=40,
+        )
+        table.add_column("Authors", max_width=20)
+        table.add_column("Year", style="green")
+        table.add_column("Session", style="magenta")
+        table.add_column("Tags", style="dim")
+
+        for p in papers:
+            authors = ", ".join(p["authors"][:2])
+            if len(p["authors"]) > 2:
+                authors += " et al."
+            table.add_row(
+                Text((p["title"] or "")[:40]
+                     + ("..." if len(p["title"] or "") > 40
+                        else "")),
+                Text(authors),
+                str(p["year"] or ""),
+                Text(p["session_name"]),
+                Text(", ".join(p["tags"])),
+            )
+
+        console.print(table)
+        console.print(
+            f"\n[dim]{len(papers)} paper(s) with theme "
+            f"'{escape(theme)}'[/dim]"
+        )
+@
+
+\subsection{Testing theme commands}
+
+We test both the [[themes list]] and [[themes show]] commands by
+creating sessions with known themes and verifying the CLI output:
+
+<<test functions>>=
+class TestThemesCommand:
+    """Tests for the themes CLI commands."""
+
+    def _setup_sessions(self, tmp_path, monkeypatch):
+        """Create sessions with themes for testing."""
+        monkeypatch.setenv("SCHOLAR_DATA_DIR", str(tmp_path))
+        from scholar.review import (
+            ReviewSession, ReviewDecision, DecisionStatus,
+            save_session,
+        )
+
+        s1 = ReviewSession(
+            query="query1",
+            providers=["test"],
+            timestamp=datetime(2024, 1, 1),
+            name="session-1",
+        )
+        s1.decisions.append(
+            ReviewDecision(
+                paper=Paper(
+                    title="Privacy Paper",
+                    authors=["Alice"],
+                    year=2024,
+                ),
+                provider="test",
+                status=DecisionStatus.KEPT,
+                tags=["privacy", "ml"],
+            )
+        )
+        save_session(s1)
+
+        s2 = ReviewSession(
+            query="query2",
+            providers=["test"],
+            timestamp=datetime(2024, 1, 2),
+            name="session-2",
+        )
+        s2.decisions.append(
+            ReviewDecision(
+                paper=Paper(
+                    title="FL Paper",
+                    authors=["Bob"],
+                    year=2023,
+                ),
+                provider="test",
+                status=DecisionStatus.KEPT,
+                tags=["privacy", "federated"],
+            )
+        )
+        save_session(s2)
+
+    def test_themes_list_table(self, tmp_path, monkeypatch):
+        """themes list shows aggregated themes."""
+        self._setup_sessions(tmp_path, monkeypatch)
+        runner = CliRunner()
+        result = runner.invoke(app, ["themes", "list"])
+        assert result.exit_code == 0
+        assert "privacy" in result.output
+
+    def test_themes_list_json(self, tmp_path, monkeypatch):
+        """themes list --format json returns valid JSON."""
+        self._setup_sessions(tmp_path, monkeypatch)
+        runner = CliRunner()
+        result = runner.invoke(
+            app, ["themes", "list", "--format", "json"],
+        )
+        assert result.exit_code == 0
+        import json
+        data = json.loads(result.output)
+        assert data["privacy"] == 2
+
+    def test_themes_show_table(self, tmp_path, monkeypatch):
+        """themes show returns papers for a theme."""
+        self._setup_sessions(tmp_path, monkeypatch)
+        runner = CliRunner()
+        result = runner.invoke(app, ["themes", "show", "privacy"])
+        assert result.exit_code == 0
+        assert "Privacy Paper" in result.output
+        assert "FL Paper" in result.output
+
+    def test_themes_show_json(self, tmp_path, monkeypatch):
+        """themes show --format json returns valid JSON."""
+        self._setup_sessions(tmp_path, monkeypatch)
+        runner = CliRunner()
+        result = runner.invoke(
+            app,
+            ["themes", "show", "privacy", "--format", "json"],
+        )
+        assert result.exit_code == 0
+        import json
+        data = json.loads(result.output)
+        assert len(data) == 2
+
+    def test_themes_list_empty(self, tmp_path, monkeypatch):
+        """themes list with no sessions shows message."""
+        monkeypatch.setenv("SCHOLAR_DATA_DIR", str(tmp_path))
+        runner = CliRunner()
+        result = runner.invoke(app, ["themes", "list"])
+        assert result.exit_code == 0
+        assert "No themes found" in result.output
+
+    def test_themes_show_nonexistent(self, tmp_path, monkeypatch):
+        """themes show for unknown theme shows message."""
+        monkeypatch.setenv("SCHOLAR_DATA_DIR", str(tmp_path))
+        runner = CliRunner()
+        result = runner.invoke(
+            app, ["themes", "show", "nonexistent"],
+        )
+        assert result.exit_code == 0
+        assert "No papers found" in result.output
+@
+
+
+\subsection{Testing notes search command}
+
+<<test functions>>=
+class TestNotesSearchCommand:
+    """Tests for the notes search CLI command."""
+
+    def test_notes_search_finds_matching(
+        self, tmp_path, monkeypatch
+    ):
+        """notes search returns matching notes."""
+        monkeypatch.setenv("SCHOLAR_DATA_DIR", str(tmp_path))
+        from scholar.notes import save_note
+        save_note(
+            Paper(
+                title="Privacy Paper",
+                authors=["Alice"],
+                doi="10.1/test",
+            ),
+            "Discusses differential privacy.",
+        )
+
+        runner = CliRunner()
+        result = runner.invoke(
+            app, ["notes", "search", "privacy"],
+        )
+        assert result.exit_code == 0
+        assert "Privacy Paper" in result.output
+
+    def test_notes_search_no_results(
+        self, tmp_path, monkeypatch
+    ):
+        """notes search with no matches shows message."""
+        monkeypatch.setenv("SCHOLAR_DATA_DIR", str(tmp_path))
+        runner = CliRunner()
+        result = runner.invoke(
+            app, ["notes", "search", "nonexistent"],
+        )
+        assert result.exit_code == 0
+        assert "No matching notes" in result.output
+
+    def test_notes_search_json(self, tmp_path, monkeypatch):
+        """notes search --format json returns valid JSON."""
+        monkeypatch.setenv("SCHOLAR_DATA_DIR", str(tmp_path))
+        from scholar.notes import save_note
+        save_note(
+            Paper(
+                title="Test",
+                authors=[],
+                doi="10.1/j",
+            ),
+            "Some methodology note.",
+        )
+
+        runner = CliRunner()
+        result = runner.invoke(
+            app,
+            ["notes", "search", "methodology",
+             "--format", "json"],
+        )
+        assert result.exit_code == 0
+        import json
+        data = json.loads(result.output)
+        assert len(data) == 1
+
+    def test_notes_search_regex(self, tmp_path, monkeypatch):
+        """notes search --regex uses regex matching."""
+        monkeypatch.setenv("SCHOLAR_DATA_DIR", str(tmp_path))
+        from scholar.notes import save_note
+        save_note(
+            Paper(
+                title="Test",
+                authors=[],
+                doi="10.1/rx",
+            ),
+            "Uses methods and methodology.",
+        )
+
+        runner = CliRunner()
+        result = runner.invoke(
+            app,
+            ["notes", "search", "method(s|ology)", "--regex"],
+        )
+        assert result.exit_code == 0
+        assert "Test" in result.output
 @
 
 

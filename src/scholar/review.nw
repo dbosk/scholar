@@ -2120,6 +2120,198 @@ class TestSessionFunctions:
 @
 
 
+\section{Cross-Session Theme Aggregation}
+\label{sec:cross-session-themes}
+
+Individual review sessions track themes for their kept papers, but a
+researcher working across multiple sessions needs a consolidated view:
+which themes appear most often, and which papers belong to a given theme?
+
+Loading every session on demand is acceptable here because the number of
+sessions is typically small (tens, not thousands).
+We iterate over all sessions, collect their theme counts, and merge them
+into a single dictionary.
+
+<<review session functions>>=
+def list_all_themes() -> dict[str, int]:
+    """Aggregate theme counts across all sessions.
+
+    Counts only kept papers. A paper tagged with multiple themes
+    contributes to each theme's count independently.
+
+    Returns:
+        Dictionary mapping theme name to paper count,
+        sorted alphabetically by theme.
+    """
+    merged: dict[str, int] = {}
+    for meta in list_sessions():
+        session = load_session(meta["name"])
+        if session is None:
+            continue
+        for theme, count in session.theme_counts().items():
+            merged[theme] = merged.get(theme, 0) + count
+    return dict(sorted(merged.items()))
+@
+
+Given a theme name, [[list_papers_for_theme]] returns the matching papers
+from every session.
+Each result carries the session name so the caller can show which session
+a paper came from---useful when the same paper appears in multiple
+sessions with overlapping tags.
+
+<<review session functions>>=
+def list_papers_for_theme(theme: str) -> list[dict]:
+    """Return papers tagged with a given theme across all sessions.
+
+    Args:
+        theme: The theme tag to search for.
+
+    Returns:
+        List of dicts with keys: title, authors, year, doi,
+        session_name, tags.
+    """
+    results: list[dict] = []
+    for meta in list_sessions():
+        session = load_session(meta["name"])
+        if session is None:
+            continue
+        for decision in session.papers_with_tag(theme):
+            if decision.status != DecisionStatus.KEPT:
+                continue
+            results.append({
+                "title": decision.paper.title,
+                "authors": list(decision.paper.authors),
+                "year": decision.paper.year,
+                "doi": decision.paper.doi,
+                "session_name": meta["name"],
+                "tags": list(decision.tags),
+            })
+    return results
+@
+
+\subsection{Testing cross-session themes}
+
+We create two sessions with overlapping themes and verify that the
+aggregation merges counts correctly, and that filtering by theme
+returns the right papers:
+
+<<test functions>>=
+class TestCrossSessionThemes:
+    """Tests for cross-session theme aggregation."""
+
+    def _make_session(self, name, decisions_data, tmp_path):
+        """Helper: create and save a session with given decisions."""
+        session = ReviewSession(
+            query=name,
+            providers=["test"],
+            timestamp=datetime.now(),
+            name=name,
+        )
+        for title, status, tags in decisions_data:
+            session.decisions.append(
+                ReviewDecision(
+                    paper=Paper(
+                        title=title,
+                        authors=["Author"],
+                        year=2024,
+                    ),
+                    provider="test",
+                    status=status,
+                    tags=tags,
+                )
+            )
+        save_session(session)
+        return session
+
+    def test_list_all_themes_empty(self, tmp_path, monkeypatch):
+        """No sessions means no themes."""
+        monkeypatch.setenv("SCHOLAR_DATA_DIR", str(tmp_path))
+        assert list_all_themes() == {}
+
+    def test_list_all_themes_single_session(
+        self, tmp_path, monkeypatch
+    ):
+        """Themes from a single session are listed."""
+        monkeypatch.setenv("SCHOLAR_DATA_DIR", str(tmp_path))
+        self._make_session("s1", [
+            ("Paper A", DecisionStatus.KEPT, ["privacy", "ml"]),
+            ("Paper B", DecisionStatus.KEPT, ["privacy"]),
+            ("Paper C", DecisionStatus.DISCARDED, ["off-topic"]),
+        ], tmp_path)
+
+        themes = list_all_themes()
+        assert themes["privacy"] == 2
+        assert themes["ml"] == 1
+        assert "off-topic" not in themes
+
+    def test_list_all_themes_merges_sessions(
+        self, tmp_path, monkeypatch
+    ):
+        """Themes from multiple sessions are merged."""
+        monkeypatch.setenv("SCHOLAR_DATA_DIR", str(tmp_path))
+        self._make_session("s1", [
+            ("Paper A", DecisionStatus.KEPT, ["privacy"]),
+        ], tmp_path)
+        self._make_session("s2", [
+            ("Paper B", DecisionStatus.KEPT, ["privacy", "fl"]),
+        ], tmp_path)
+
+        themes = list_all_themes()
+        assert themes["privacy"] == 2
+        assert themes["fl"] == 1
+
+    def test_list_papers_for_theme(self, tmp_path, monkeypatch):
+        """Returns papers matching a given theme."""
+        monkeypatch.setenv("SCHOLAR_DATA_DIR", str(tmp_path))
+        self._make_session("s1", [
+            ("Paper A", DecisionStatus.KEPT, ["privacy"]),
+            ("Paper B", DecisionStatus.KEPT, ["ml"]),
+        ], tmp_path)
+        self._make_session("s2", [
+            ("Paper C", DecisionStatus.KEPT, ["privacy"]),
+        ], tmp_path)
+
+        papers = list_papers_for_theme("privacy")
+        assert len(papers) == 2
+        titles = {p["title"] for p in papers}
+        assert titles == {"Paper A", "Paper C"}
+
+    def test_list_papers_for_theme_empty(
+        self, tmp_path, monkeypatch
+    ):
+        """Returns empty list for nonexistent theme."""
+        monkeypatch.setenv("SCHOLAR_DATA_DIR", str(tmp_path))
+        self._make_session("s1", [
+            ("Paper A", DecisionStatus.KEPT, ["ml"]),
+        ], tmp_path)
+
+        assert list_papers_for_theme("nonexistent") == []
+
+    def test_list_papers_for_theme_includes_session_name(
+        self, tmp_path, monkeypatch
+    ):
+        """Each result includes the session name."""
+        monkeypatch.setenv("SCHOLAR_DATA_DIR", str(tmp_path))
+        self._make_session("my-session", [
+            ("Paper A", DecisionStatus.KEPT, ["privacy"]),
+        ], tmp_path)
+
+        papers = list_papers_for_theme("privacy")
+        assert papers[0]["session_name"] == "my-session"
+
+    def test_list_papers_ignores_discarded(
+        self, tmp_path, monkeypatch
+    ):
+        """Discarded papers with matching tag are not returned."""
+        monkeypatch.setenv("SCHOLAR_DATA_DIR", str(tmp_path))
+        self._make_session("s1", [
+            ("Paper A", DecisionStatus.DISCARDED, ["privacy"]),
+        ], tmp_path)
+
+        assert list_papers_for_theme("privacy") == []
+@
+
+
 \section{Filtering Decisions}
 
 For convenience, we provide a function to filter a list of review decisions
