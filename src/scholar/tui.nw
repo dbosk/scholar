@@ -100,6 +100,7 @@ from simple widgets to complex screens, culminating in the main application:
 <<tui data structures>>
 <<tui pdf cache>>
 <<tui paper list widget>>
+<<tui abstract helpers>>
 <<tui abstract screen>>
 <<tui discard modal>>
 <<tui sort modal>>
@@ -394,6 +395,58 @@ the terminal back to the shell, allowing the user's preferred editor (from
 [[VISUAL]] or [[EDITOR]] environment variables) to run. This leverages
 familiar tools rather than implementing a text editor in the TUI.
 
+\subsection{Normalising the Abstract Text}
+
+Most providers store the abstract as a plain string.  However, some
+providers---most notably Web of Science---parse the abstract body from XML
+and may return a \emph{list} of paragraph strings when the abstract contains
+more than one paragraph.  Although this is a data-layer inconsistency (the
+[[Paper.abstract]] field is typed [[str | None]]), it can occur in practice
+whenever a cached or externally sourced paper carries a list value.
+
+Rather than crash at render time with a [[TypeError]], we normalise
+the value here in the view layer as a last line of defence.  Paragraphs are
+joined with a blank line ([[\n\n]]) so that the rendered text preserves the
+original paragraph breaks.
+
+<<tui abstract helpers>>=
+def normalize_abstract(abstract) -> str:
+    """Return abstract as a plain string, joining list paragraphs if needed.
+
+    Some providers return the abstract as a list of paragraph strings.
+    This helper joins them with blank lines so paragraph breaks are
+    preserved in the TUI display.
+    """
+    if isinstance(abstract, list):
+        return "\n\n".join(str(p) for p in abstract if p)
+    return abstract or ""
+@
+
+We can verify both cases without needing a running Textual application:
+
+<<test functions>>=
+class TestNormalizeAbstract:
+    """Tests for the normalize_abstract helper."""
+
+    def test_string_abstract_is_returned_unchanged(self):
+        """normalize_abstract() passes through a plain string."""
+        assert normalize_abstract("Just one paragraph.") == "Just one paragraph."
+
+    def test_list_abstract_is_joined_with_blank_lines(self):
+        """normalize_abstract() joins paragraphs with blank lines."""
+        result = normalize_abstract(["First.", "Second."])
+        assert result == "First.\n\nSecond."
+
+    def test_none_abstract_returns_empty_string(self):
+        """normalize_abstract() treats None as an empty string."""
+        assert normalize_abstract(None) == ""
+
+    def test_empty_paragraphs_are_skipped(self):
+        """normalize_abstract() ignores empty strings in the list."""
+        result = normalize_abstract(["First.", "", "Third."])
+        assert result == "First.\n\nThird."
+@
+
 <<tui abstract screen>>=
 class AbstractScreen(Screen[None]):
     """Full-screen view of a paper's abstract and details."""
@@ -454,7 +507,7 @@ class AbstractScreen(Screen[None]):
             yield Static("")
             yield Static("[bold]Abstract:[/bold]")
             if paper.abstract:
-                yield Static(escape(paper.abstract))
+                yield Static(escape(normalize_abstract(paper.abstract)))
             else:
                 if paper.pdf_url:
                     yield Static("[dim]No abstract available. Press [bold yellow]p[/bold yellow] to open PDF.[/dim]")

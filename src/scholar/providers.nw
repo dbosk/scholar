@@ -3071,6 +3071,13 @@ def _convert_starter_hit(self, hit: dict) -> Paper:
 The WoS Expanded API returns documents with a deeply nested structure that
 includes full metadata such as abstracts, affiliations, and citation counts.
 
+One subtlety: the abstract body is represented in WoS XML as one or more
+[[<p>]] elements.  When the abstract has multiple paragraphs, the
+XML-to-dict parser yields a \emph{list} of strings rather than a single
+string.  We must join them with blank lines so that paragraph breaks are
+preserved in the rendered output; simply joining on a space would collapse
+the paragraphs into a single undifferentiated block of text.
+
 <<wos convert expanded hit>>=
 def _convert_expanded_hit(self, rec: dict) -> Paper:
     """Convert a WoS Expanded API record to our Paper type."""
@@ -3126,6 +3133,8 @@ def _convert_expanded_hit(self, rec: dict) -> Paper:
     abstract = safe_get_nested(
         fullrecord, "abstracts", "abstract", "abstract_text", "p", default=None
     )
+    if isinstance(abstract, list):
+        abstract = "\n\n".join(str(p) for p in abstract if p) or None
 
     # Extract venue (source title)
     venue = None
@@ -3972,6 +3981,9 @@ Tests for the Expanded API search functionality.
 Like the Starter API, the Expanded API requires field tags in queries, so we
 verify that plain queries are wrapped with [[TS=()]] and that queries with
 existing field tags are preserved.
+We also verify that multi-paragraph abstracts (where the API returns [[<p>]]
+as a list) are joined with blank lines rather than collapsed into a single
+string.
 
 <<test functions>>=
 class TestWebOfScienceExpandedAPI:
@@ -4057,6 +4069,59 @@ class TestWebOfScienceExpandedAPI:
             assert paper.keywords == ["kw1", "kw2"]
             assert paper.tags == ["kp1"]
             assert paper.sources == ["wos"]
+
+    def test_search_joins_multi_paragraph_abstract_with_blank_lines(self):
+        """search() joins list of <p> elements with blank lines."""
+        provider = WebOfScienceProvider(
+            starter_api_key=None, expanded_api_key="test_key"
+        )
+
+        mock_response = Mock()
+        mock_response.json.return_value = {
+            "Data": {
+                "Records": {
+                    "records": {
+                        "REC": [{
+                            "UID": "WOS:000111222333",
+                            "static_data": {
+                                "summary": {
+                                    "titles": {
+                                        "title": [
+                                            {"type": "item", "content": "Multi-Para Paper"},
+                                        ]
+                                    },
+                                    "names": {"name": []},
+                                    "pub_info": {"pubyear": 2024},
+                                },
+                                "fullrecord_metadata": {
+                                    "abstracts": {
+                                        "abstract": {
+                                            "abstract_text": {
+                                                "p": [
+                                                    "First paragraph.",
+                                                    "Second paragraph.",
+                                                ]
+                                            }
+                                        }
+                                    },
+                                },
+                            },
+                            "dynamic_data": {"cluster_related": {}},
+                        }]
+                    }
+                }
+            },
+            "QueryResult": {"QueryID": 1, "RecordsFound": 1},
+        }
+        mock_response.raise_for_status = Mock()
+
+        with patch("requests.get") as mock_get:
+            mock_get.return_value = mock_response
+
+            results = provider.search("test query")
+
+            assert len(results) == 1
+            assert results[0].abstract == "First paragraph.\n\nSecond paragraph."
 
     def test_handles_malformed_nested_fields(self):
         """search() handles cases where nested fields are strings instead of dicts."""
