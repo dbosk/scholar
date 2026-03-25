@@ -2749,7 +2749,7 @@ def sessions_show(
                 con.print()
 
             # Show kept papers
-            kept = session.kept_papers
+            kept = session.kept_papers()
             if kept:
                 con.print(f"[green bold]Kept ({len(kept)}):[/green bold]")
                 for d in kept:
@@ -2762,7 +2762,7 @@ def sessions_show(
                 con.print()
 
             # Show discarded papers
-            discarded = session.discarded_papers
+            discarded = session.discarded_papers()
             if discarded:
                 con.print(
                     f"[red bold]Discarded ({len(discarded)}):[/red bold]"
@@ -2777,7 +2777,7 @@ def sessions_show(
                 con.print()
 
             # Show pending papers
-            pending = session.pending_papers
+            pending = session.pending_papers()
             if pending:
                 con.print(
                     f"[yellow bold]Pending ({len(pending)}):[/yellow bold]"
@@ -2951,6 +2951,82 @@ def sessions_resume(
 
     if report:
         prompt_for_report(session)
+@
+
+
+Let's verify that [[sessions show]] renders the computed decision lists without
+crashing, even though the session stores them behind cached methods rather than
+plain attributes:
+
+<<test functions>>=
+class TestSessionsCommand:
+    """Tests for the sessions CLI commands."""
+
+    def test_sessions_show_renders_decision_groups(
+        self, tmp_path, monkeypatch
+    ):
+        """sessions show lists kept, discarded, and pending papers."""
+        monkeypatch.setenv("SCHOLAR_DATA_DIR", str(tmp_path))
+        from scholar.review import (
+            ReviewDecision, ReviewSession, DecisionStatus, save_session,
+        )
+
+        session = ReviewSession(
+            query="ProgSnap2",
+            providers=["s2", "dblp", "openalex"],
+            timestamp=datetime(2026, 3, 25, 14, 49),
+            name="ProgSnap2",
+            query_provider_pairs=[
+                ("ProgSnap2", "s2"),
+                ("ProgSnap2", "dblp"),
+                ("ProgSnap2", "openalex"),
+            ],
+        )
+        session.decisions.extend(
+            [
+                ReviewDecision(
+                    paper=Paper(
+                        title="Kept Paper",
+                        authors=["Alice"],
+                        year=2024,
+                    ),
+                    provider="s2",
+                    status=DecisionStatus.KEPT,
+                    tags=["programming"],
+                ),
+                ReviewDecision(
+                    paper=Paper(
+                        title="Discarded Paper",
+                        authors=["Bob"],
+                        year=2023,
+                    ),
+                    provider="dblp",
+                    status=DecisionStatus.DISCARDED,
+                    tags=["out-of-scope"],
+                ),
+                ReviewDecision(
+                    paper=Paper(
+                        title="Pending Paper",
+                        authors=["Carol"],
+                        year=2022,
+                    ),
+                    provider="openalex",
+                    status=DecisionStatus.PENDING,
+                ),
+            ]
+        )
+        save_session(session)
+
+        runner = CliRunner()
+        result = runner.invoke(app, ["sessions", "show", "ProgSnap2"])
+
+        assert result.exit_code == 0
+        assert "Kept (1):" in result.output
+        assert "Discarded (1):" in result.output
+        assert "Pending (1):" in result.output
+        assert "Kept Paper" in result.output
+        assert "Discarded Paper" in result.output
+        assert "Pending Paper" in result.output
 @
 
 
