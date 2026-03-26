@@ -6074,7 +6074,7 @@ class ScopusProvider:
 
         all_papers: list[Paper] = []
         start = 0
-        page_size = 25
+        page_size = self.MAX_LIMIT
 
         try:
             while len(all_papers) < limit:
@@ -6303,11 +6303,12 @@ def _convert_entry(self, entry: dict) -> Paper:
 register_provider(ScopusProvider())
 @
 
-\subsection{Dependencies}
+\subsection{Constants}
 
 The Scopus provider uses only [[requests]] (already imported by the
 base module) and standard library modules, so no additional imports
 are needed.
+We define only the API endpoint URL:
 
 <<scopus constants>>=
 SCOPUS_API_URL = (
