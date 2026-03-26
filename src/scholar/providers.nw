@@ -24,7 +24,7 @@ This enables clean testing (mock objects just work), future extensibility
 (third-party providers need not depend on Scholar), and explicit contracts
 that static type checkers can verify.
 
-The chapter covers six providers:
+The chapter covers seven providers:
 \begin{description}
 \item[Semantic Scholar] AI-powered research database with 200M+ papers.
   Uses the official [[semanticscholar]] client library.
@@ -38,6 +38,8 @@ The chapter covers six providers:
   REST API requiring authentication.
 \item[arXiv] Open-access preprint server with 2M+ papers.
   Uses the [[arxiv]] client library.
+\item[Scopus] Elsevier's abstract and citation database.
+  REST API requiring authentication.
 \end{description}
 
 \section{Keyword metadata mapping}
@@ -62,6 +64,7 @@ We map provider fields to these concepts as follows:
   $\to$ [[tags]]
 \item[Web of Science (Expanded)] [[keywords]] $\to$ [[keywords]];
   [[keywords_plus]] $\to$ [[tags]]
+\item[Scopus] [[authkeywords]] $\to$ [[keywords]]
 \end{description}
 
 \section{Caching}
@@ -96,6 +99,7 @@ itself with the provider registry on import.
 <<wos provider>>
 <<ieee provider>>
 <<arxiv provider>>
+<<scopus provider>>
 @
 
 
@@ -5935,6 +5939,644 @@ class TestArxivIntegration:
 @
 
 
+\section{Scopus Provider}
+
+Scopus is Elsevier's abstract and citation database, covering over
+27\,000 journals across all disciplines.
+Unlike Semantic Scholar or OpenAlex, Scopus requires an API key
+obtained from \url{https://dev.elsevier.com/}.
+An optional institutional token extends access beyond the standard
+rate limits.
+
+The Scopus Search API differs from other providers in two notable ways:
+\begin{enumerate}
+\item Filters are embedded in the query string using Scopus's own syntax
+  (e.g.\ [[PUBYEAR = 2024]]) rather than passed as separate parameters.
+\item The API returns at most 25 results per page---significantly lower
+  than IEEE's 200 or DBLP's 1000---so pagination is essential even for
+  modest limits.
+\end{enumerate}
+
+A limitation of the Search API is that it only returns the first author
+([[dc:creator]]).
+Full author lists require a separate Abstract Retrieval API call, which
+we omit here to keep the provider simple and avoid extra API requests.
+
+\subsection{Error handling}
+
+The Scopus API uses standard HTTP status codes.
+We provide actionable messages for the most common failure modes:
+authentication errors (401), permission issues (403), and rate limiting
+(429).
+
+<<scopus handle response errors>>=
+if response.status_code != 200:
+    if response.status_code == 401:
+        logger.warning(
+            "scopus: Authentication failed (HTTP 401). "
+            "Check your SCOPUS_API_KEY at "
+            "https://dev.elsevier.com/"
+        )
+    elif response.status_code == 429:
+        logger.warning(
+            "scopus: Rate limited (HTTP 429). "
+            "Wait before making more requests."
+        )
+    elif response.status_code == 403:
+        logger.warning(
+            "scopus: Access denied (HTTP 403). "
+            "Your API key may lack Scopus Search "
+            "permissions."
+        )
+    else:
+        logger.warning(
+            "scopus: API error (HTTP %d): %s",
+            response.status_code,
+            response.text[:200],
+        )
+    response.raise_for_status()
+@
+
+\subsection{Provider implementation}
+
+Authentication uses HTTP headers rather than query parameters---the
+[[X-ELS-APIKey]] header carries the API key and [[X-ELS-Insttoken]]
+carries the optional institutional token.
+
+The pagination loop uses 0-indexed [[start]] and [[count]] parameters.
+Scopus signals empty results by returning an entry with
+[[@_fa]] set to [["false"]] rather than an empty array, so we check
+for this sentinel.
+
+<<scopus provider>>=
+class ScopusProvider:
+    """Search provider for Elsevier Scopus."""
+
+    name = "scopus"
+    MAX_LIMIT = 25  # Scopus returns max 25 per page
+
+    def __init__(
+        self,
+        api_key: str | None = None,
+        inst_token: str | None = None,
+    ):
+        """Initialize the Scopus provider.
+
+        Args:
+            api_key: API key for Scopus API. Falls back
+                to SCOPUS_API_KEY environment variable.
+            inst_token: Institutional token for extended
+                access. Falls back to SCOPUS_INST_TOKEN.
+        """
+        self.api_key = (
+            api_key or os.environ.get("SCOPUS_API_KEY")
+        )
+        self.inst_token = (
+            inst_token
+            or os.environ.get("SCOPUS_INST_TOKEN")
+        )
+        self._cache: dict = load_cache(self.name)
+        register_cache(self.name, self._cache)
+
+    def is_available(self) -> bool:
+        """Scopus requires an API key."""
+        return bool(self.api_key)
+
+    @cachedmethod(
+        lambda self: self._cache,
+        key=lambda self, query, limit=100, filters=None: (
+            query,
+            limit,
+            filters.cache_key() if filters else "",
+        ),
+    )
+    def search(
+        self,
+        query: str,
+        limit: int = 100,
+        filters: SearchFilters | None = None,
+    ) -> list[Paper]:
+        """Search Scopus for papers matching the query.
+
+        Fetches multiple pages when the requested limit
+        exceeds the per-request maximum of 25 results.
+        """
+        if not self.api_key:
+            return []
+
+        logger.debug(
+            "scopus: Searching for '%s' with limit=%d",
+            query, limit,
+        )
+
+        search_query = query
+        <<scopus apply filters>>
+
+        all_papers: list[Paper] = []
+        start = 0
+        page_size = self.MAX_LIMIT
+
+        try:
+            while len(all_papers) < limit:
+                remaining = limit - len(all_papers)
+                current_count = min(page_size, remaining)
+
+                headers = {
+                    "X-ELS-APIKey": self.api_key,
+                    "Accept": "application/json",
+                }
+                if self.inst_token:
+                    headers["X-ELS-Insttoken"] = (
+                        self.inst_token
+                    )
+
+                params = {
+                    "query": search_query,
+                    "start": start,
+                    "count": current_count,
+                }
+
+                response = requests.get(
+                    SCOPUS_API_URL,
+                    headers=headers,
+                    params=params,
+                    timeout=30,
+                )
+                <<scopus handle response errors>>
+                data = response.json()
+
+                results = data.get("search-results", {})
+                entries = results.get("entry", [])
+
+                if not entries or (
+                    len(entries) == 1
+                    and entries[0].get("@_fa") == "false"
+                ):
+                    break
+
+                all_papers.extend(
+                    self._convert_entry(entry)
+                    for entry in entries
+                    if entry.get("@_fa") != "false"
+                )
+                start += len(entries)
+
+                total = int(
+                    results.get(
+                        "opensearch:totalResults", 0
+                    )
+                )
+                if start >= total:
+                    break
+
+            logger.debug(
+                "scopus: Retrieved %d papers",
+                len(all_papers),
+            )
+            return all_papers
+        except requests.exceptions.HTTPError:
+            return all_papers
+        except Exception as e:
+            logger.warning("scopus: %s", e)
+            return all_papers
+@
+
+\subsection{Applying filters}
+
+Scopus supports rich query syntax where filters are appended to the
+search query as Boolean clauses.
+This contrasts with IEEE Xplore, which uses dedicated API parameters
+for each filter.
+
+The supported filter mappings:
+\begin{description}
+\item[year] [[PUBYEAR = 2020]] or
+  [[PUBYEAR > 2019 AND PUBYEAR < 2025]].
+\item[open access] [[OPENACCESS(1)]].
+\item[venue] [[SRCTITLE(journal name)]].
+\item[pub types] [[DOCTYPE(ar)]] for articles,
+  [[DOCTYPE(cp)]] for conference papers,
+  [[DOCTYPE(re)]] for reviews, [[DOCTYPE(bk)]] for books.
+\item[min citations] Not supported natively---we warn and
+  ignore.
+\end{description}
+
+<<scopus apply filters>>=
+if filters:
+    clauses = []
+
+    if filters.year:
+        start_year, end_year = filters.year_range()
+        if start_year and end_year:
+            if start_year == end_year:
+                clauses.append(
+                    f"PUBYEAR = {start_year}"
+                )
+            else:
+                clauses.append(
+                    f"PUBYEAR > {start_year - 1} "
+                    f"AND PUBYEAR < {end_year + 1}"
+                )
+        elif start_year:
+            clauses.append(
+                f"PUBYEAR > {start_year - 1}"
+            )
+        elif end_year:
+            clauses.append(
+                f"PUBYEAR < {end_year + 1}"
+            )
+
+    if filters.open_access:
+        clauses.append("OPENACCESS(1)")
+
+    if filters.venue:
+        clauses.append(f"SRCTITLE({filters.venue})")
+
+    if filters.pub_types:
+        type_mapping = {
+            "article": "ar",
+            "conference": "cp",
+            "review": "re",
+            "book": "bk",
+        }
+        doc_types = []
+        for pt in filters.pub_types:
+            mapped = type_mapping.get(pt.lower())
+            if mapped:
+                doc_types.append(mapped)
+            else:
+                logger.warning(
+                    "scopus: Publication type '%s' "
+                    "not supported, ignoring",
+                    pt,
+                )
+        if doc_types:
+            dtype_clause = " OR ".join(
+                f"DOCTYPE({dt})" for dt in doc_types
+            )
+            clauses.append(f"({dtype_clause})")
+
+    if filters.min_citations is not None:
+        logger.warning(
+            "scopus: Citation count filter "
+            "not supported, ignoring"
+        )
+
+    if clauses:
+        search_query = (
+            f"({query}) AND "
+            + " AND ".join(clauses)
+        )
+@
+
+\subsection{Converting entry format}
+
+The Scopus Search API returns entries with Dublin Core
+([[dc:]]) and PRISM ([[prism:]]) fields.
+Author keywords ([[authkeywords]]) are a pipe-delimited string that
+we split into our [[keywords]] field
+(see \cref{sec:providers-keyword-mapping}).
+
+<<convert scopus entry>>=
+def _convert_entry(self, entry: dict) -> Paper:
+    """Convert a Scopus search entry to a Paper."""
+    year = None
+    cover_date = entry.get("prism:coverDate")
+    if cover_date:
+        try:
+            year = int(cover_date[:4])
+        except (ValueError, TypeError):
+            pass
+
+    authors = []
+    creator = entry.get("dc:creator")
+    if creator:
+        authors.append(creator)
+
+    url = None
+    for link in entry.get("link", []):
+        if link.get("@ref") == "scopus":
+            url = link.get("@href")
+            break
+
+    keywords = None
+    auth_kw = entry.get("authkeywords")
+    if auth_kw and isinstance(auth_kw, str):
+        keywords = [
+            kw.strip()
+            for kw in auth_kw.split("|")
+            if kw.strip()
+        ]
+
+    citation_count = None
+    cited_by = entry.get("citedby-count")
+    if cited_by is not None:
+        try:
+            citation_count = int(cited_by)
+        except (ValueError, TypeError):
+            pass
+
+    return Paper(
+        title=entry.get("dc:title", "") or "",
+        authors=authors,
+        year=year,
+        doi=entry.get("prism:doi"),
+        abstract=entry.get("dc:description"),
+        venue=entry.get("prism:publicationName"),
+        url=url,
+        citation_count=citation_count,
+        keywords=keywords,
+        sources=[self.name],
+    )
+@
+
+<<scopus provider>>=
+
+    <<convert scopus entry>>
+
+@
+
+\subsection{Auto-registration}
+
+<<scopus provider>>=
+# Register the provider on module import
+register_provider(ScopusProvider())
+@
+
+\subsection{Constants}
+
+The Scopus provider uses only [[requests]] (already imported by the
+base module) and standard library modules, so no additional imports
+are needed.
+We define only the API endpoint URL:
+
+<<scopus constants>>=
+SCOPUS_API_URL = (
+    "https://api.elsevier.com/content/search/scopus"
+)
+@
+
+\subsection{Testing Scopus provider}
+
+We verify availability detection, result conversion, error handling,
+pagination, filter application, and institutional token support.
+
+<<test functions>>=
+class TestScopusProvider:
+    """Tests for the Scopus provider."""
+
+    def test_is_available_false_without_key(self):
+        """Scopus is unavailable without API key."""
+        provider = ScopusProvider(api_key=None)
+        provider.api_key = None
+        assert provider.is_available() is False
+
+    def test_is_available_true_with_key(self):
+        """Scopus is available with API key."""
+        provider = ScopusProvider(api_key="test_key")
+        assert provider.is_available() is True
+
+    def test_search_returns_empty_without_api_key(
+        self, monkeypatch,
+    ):
+        """Returns empty list when no API key."""
+        monkeypatch.delenv(
+            "SCOPUS_API_KEY", raising=False,
+        )
+        provider = ScopusProvider(api_key=None)
+        results = provider.search("test")
+        assert results == []
+
+    def test_search_returns_papers(self):
+        """Converts API response to Paper objects."""
+        provider = ScopusProvider(api_key="test_key")
+
+        mock_response = Mock()
+        mock_response.status_code = 200
+        mock_response.json.return_value = {
+            "search-results": {
+                "opensearch:totalResults": "1",
+                "opensearch:startIndex": "0",
+                "entry": [
+                    {
+                        "@_fa": "true",
+                        "dc:title": "Test Paper",
+                        "dc:creator": "Smith A.",
+                        "prism:coverDate": "2024-01-15",
+                        "prism:doi": "10.1000/test.123",
+                        "dc:description": "An abstract.",
+                        "prism:publicationName":
+                            "Test Journal",
+                        "citedby-count": "42",
+                        "authkeywords":
+                            "machine learning"
+                            " | deep learning",
+                        "link": [
+                            {
+                                "@ref": "scopus",
+                                "@href":
+                                    "https://scopus.com/1",
+                            },
+                        ],
+                    },
+                ],
+            },
+        }
+        mock_response.raise_for_status = Mock()
+
+        with patch("requests.get") as mock_get:
+            mock_get.return_value = mock_response
+            papers = provider.search(
+                "machine learning", limit=1,
+            )
+
+        assert len(papers) == 1
+        paper = papers[0]
+        assert paper.title == "Test Paper"
+        assert paper.authors == ["Smith A."]
+        assert paper.year == 2024
+        assert paper.doi == "10.1000/test.123"
+        assert paper.abstract == "An abstract."
+        assert paper.venue == "Test Journal"
+        assert paper.citation_count == 42
+        assert paper.keywords == [
+            "machine learning", "deep learning",
+        ]
+        assert paper.sources == ["scopus"]
+
+    def test_search_handles_api_error(self):
+        """Returns partial results on HTTP error."""
+        provider = ScopusProvider(api_key="test_key")
+
+        mock_response = Mock()
+        mock_response.status_code = 500
+        mock_response.text = "Internal Server Error"
+        mock_response.raise_for_status.side_effect = (
+            requests.exceptions.HTTPError()
+        )
+
+        with patch("requests.get") as mock_get:
+            mock_get.return_value = mock_response
+            papers = provider.search("test", limit=5)
+
+        assert papers == []
+
+    def test_search_pagination(self):
+        """Fetches multiple pages for large limits."""
+        provider = ScopusProvider(api_key="test_key")
+
+        def make_entry(i):
+            return {
+                "@_fa": "true",
+                "dc:title": f"Paper {i}",
+                "dc:creator": f"Author {i}",
+                "prism:coverDate": "2024-01-01",
+            }
+
+        page1 = Mock()
+        page1.status_code = 200
+        page1.json.return_value = {
+            "search-results": {
+                "opensearch:totalResults": "30",
+                "entry": [
+                    make_entry(i) for i in range(25)
+                ],
+            },
+        }
+        page1.raise_for_status = Mock()
+
+        page2 = Mock()
+        page2.status_code = 200
+        page2.json.return_value = {
+            "search-results": {
+                "opensearch:totalResults": "30",
+                "entry": [
+                    make_entry(25 + i)
+                    for i in range(5)
+                ],
+            },
+        }
+        page2.raise_for_status = Mock()
+
+        with patch("requests.get") as mock_get:
+            mock_get.side_effect = [page1, page2]
+            papers = provider.search("test", limit=30)
+
+        assert len(papers) == 30
+        assert mock_get.call_count == 2
+
+    def test_search_with_year_filter(self):
+        """Applies year filter to Scopus query."""
+        provider = ScopusProvider(api_key="test_key")
+
+        mock_response = Mock()
+        mock_response.status_code = 200
+        mock_response.json.return_value = {
+            "search-results": {
+                "opensearch:totalResults": "0",
+                "entry": [{"@_fa": "false"}],
+            },
+        }
+        mock_response.raise_for_status = Mock()
+
+        with patch("requests.get") as mock_get:
+            mock_get.return_value = mock_response
+            provider.search(
+                "test", limit=5,
+                filters=SearchFilters(year="2024"),
+            )
+
+        call_params = mock_get.call_args[1].get(
+            "params",
+        ) or mock_get.call_args[0]
+        query_sent = call_params.get("query", "")
+        assert "PUBYEAR" in query_sent
+
+    def test_search_sends_inst_token(self):
+        """Includes institutional token in headers."""
+        provider = ScopusProvider(
+            api_key="test_key",
+            inst_token="inst_token_123",
+        )
+
+        mock_response = Mock()
+        mock_response.status_code = 200
+        mock_response.json.return_value = {
+            "search-results": {
+                "opensearch:totalResults": "0",
+                "entry": [{"@_fa": "false"}],
+            },
+        }
+        mock_response.raise_for_status = Mock()
+
+        with patch("requests.get") as mock_get:
+            mock_get.return_value = mock_response
+            provider.search("test", limit=1)
+
+        headers_sent = mock_get.call_args[1].get(
+            "headers", {},
+        )
+        assert (
+            headers_sent.get("X-ELS-Insttoken")
+            == "inst_token_123"
+        )
+
+    def test_search_handles_empty_sentinel(self):
+        """Handles Scopus empty-result sentinel entry."""
+        provider = ScopusProvider(api_key="test_key")
+
+        mock_response = Mock()
+        mock_response.status_code = 200
+        mock_response.json.return_value = {
+            "search-results": {
+                "opensearch:totalResults": "0",
+                "entry": [
+                    {
+                        "@_fa": "false",
+                        "error": "Result set was empty",
+                    },
+                ],
+            },
+        }
+        mock_response.raise_for_status = Mock()
+
+        with patch("requests.get") as mock_get:
+            mock_get.return_value = mock_response
+            papers = provider.search(
+                "nonexistent query", limit=5,
+            )
+
+        assert papers == []
+@
+
+<<test functions>>=
+class TestScopusIntegration:
+    """Integration test for the Scopus provider."""
+
+    @pytest.mark.integration
+    @pytest.mark.skip(
+        reason="Skipped to avoid API calls",
+    )
+    def test_real_api_call(self):
+        """Make one real API call to verify."""
+        provider = ScopusProvider()
+
+        try:
+            papers = provider.search(
+                "machine learning", limit=1,
+            )
+            assert len(papers) >= 1
+            paper = papers[0]
+            assert isinstance(paper, Paper)
+            assert paper.title
+            assert paper.sources == ["scopus"]
+        except Exception as e:
+            pytest.skip(
+                f"Scopus API unavailable: {e}"
+            )
+@
+
+
 \section{Dependencies}
 
 We organize imports so each provider's dependencies are co-located with
@@ -5965,4 +6607,5 @@ DEFAULT_LIMIT = 100
 <<dblp constants>>
 <<wos constants>>
 <<ieee constants>>
+<<scopus constants>>
 @

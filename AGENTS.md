@@ -2,7 +2,7 @@
 
 ## Project Overview
 
-Scholar is a CLI tool for searching academic papers across multiple providers (Semantic Scholar, OpenAlex, DBLP, Web of Science, IEEE Xplore).
+Scholar is a CLI tool for searching academic papers across multiple providers (Semantic Scholar, OpenAlex, DBLP, Web of Science, IEEE Xplore, Scopus).
 
 ## Architecture
 
@@ -54,6 +54,7 @@ Providers self-register via `register_provider()` at module load time.
 | DBLP | `dblp` | REST API | None required |
 | Web of Science | `wos` | REST API | `WOS_API_KEY` (required) |
 | IEEE Xplore | `ieee` | REST API | `IEEE_API_KEY` (required) |
+| Scopus | `scopus` | REST API | `SCOPUS_API_KEY` (required) |
 
 ### Error Handling
 
