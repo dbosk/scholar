@@ -1552,7 +1552,7 @@ table.add_row("wos", "[green]✓[/]", "[green]✓[/]", "[green]✓[/]", "[green]
 table.add_row("ieee", "[green]✓[/]", "[green]✓[/]", "[green]✓[/]", "[green]✓[/]",
               "Must be UPPERCASE, supports ONEAR")
 table.add_row("scopus", "[green]✓[/]", "[green]✓[/]", "[green]✓[/]", "[green]✓[/]",
-              "Must be UPPERCASE, supports W/n NEAR proximity")
+              "Must be UPPERCASE, supports W/n PRE/n proximity")
 table.add_row("arxiv", "[green]✓[/]", "[green]✓[/]", "[green]✓[/]", "[green]✓[/]",
               "Use ANDNOT instead of NOT")
 
@@ -1577,7 +1577,7 @@ table2.add_row("wos", "[green]✓[/] * $ ?", '[green]✓[/] "..."', "[green]✓[
                "TS=topic, TI=title, AU=author")
 table2.add_row("ieee", "[green]✓[/] *", '[green]✓[/] "..."', "[green]✓[/]",
                "Max 5 wildcards per search")
-table2.add_row("scopus", "[green]✓[/] * ?", '[green]✓[/] {…}', "[green]✓[/] TITLE() AU-ID()",
+table2.add_row("scopus", "[green]✓[/] * ?", '[green]✓[/] "..."', "[green]✓[/] TITLE() AUTH()",
                "TITLE-ABS-KEY(), AUTH(), SRCTITLE()")
 table2.add_row("arxiv", "[red]✗[/]", '[green]✓[/] "..."', "[green]✓[/] ti: au: cat:",
                "ti:title, au:author, cat:category")
