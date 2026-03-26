@@ -3040,7 +3040,10 @@ package for unified access to various language models.
 The workflow is:
 \begin{enumerate}
 \item User reviews some papers manually, tagging them as examples
+  (or skips this step using [[--no-examples]] for zero-shot
+  classification)
 \item LLM classifies remaining papers based on examples
+  (or research context alone)
 \item User reviews LLM decisions, corrections become new examples
 \item Repeat until all papers are classified
 \end{enumerate}
