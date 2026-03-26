@@ -1444,6 +1444,11 @@ provider_info = {
         "env_var": "IEEE_API_KEY",
         "how_to_get": "developer.ieee.org",
     },
+    "scopus": {
+        "required": True,
+        "env_var": "SCOPUS_API_KEY",
+        "how_to_get": "dev.elsevier.com",
+    },
 }
 
 for provider in get_all_providers():
@@ -1493,6 +1498,7 @@ class TestProvidersCommand:
         assert "S2_API_KEY" in result.stdout
         assert "WOS_EXPANDED_API_KEY" in result.stdout
         assert "IEEE_API_KEY" in result.stdout
+        assert "SCOPUS_API_KEY" in result.stdout
 @
 
 
@@ -1545,6 +1551,8 @@ table.add_row("wos", "[green]✓[/]", "[green]✓[/]", "[green]✓[/]", "[green]
               "Must be UPPERCASE, supports NEAR/SAME")
 table.add_row("ieee", "[green]✓[/]", "[green]✓[/]", "[green]✓[/]", "[green]✓[/]",
               "Must be UPPERCASE, supports ONEAR")
+table.add_row("scopus", "[green]✓[/]", "[green]✓[/]", "[green]✓[/]", "[green]✓[/]",
+              "Must be UPPERCASE, supports W/n PRE/n proximity")
 table.add_row("arxiv", "[green]✓[/]", "[green]✓[/]", "[green]✓[/]", "[green]✓[/]",
               "Use ANDNOT instead of NOT")
 
@@ -1569,6 +1577,8 @@ table2.add_row("wos", "[green]✓[/] * $ ?", '[green]✓[/] "..."', "[green]✓[
                "TS=topic, TI=title, AU=author")
 table2.add_row("ieee", "[green]✓[/] *", '[green]✓[/] "..."', "[green]✓[/]",
                "Max 5 wildcards per search")
+table2.add_row("scopus", "[green]✓[/] * ?", '[green]✓[/] "..."', "[green]✓[/] TITLE() AUTH()",
+               "TITLE-ABS-KEY(), AUTH(), SRCTITLE()")
 table2.add_row("arxiv", "[red]✗[/]", '[green]✓[/] "..."', "[green]✓[/] ti: au: cat:",
                "ti:title, au:author, cat:category")
 
@@ -1583,6 +1593,7 @@ examples = [
     ("dblp", "machine learning privacy  [space = AND]"),
     ("wos", 'TS=("machine learning" AND privacy)'),
     ("ieee", '"machine learning" AND privacy NOT survey'),
+    ("scopus", 'TITLE-ABS-KEY("machine learning" AND privacy)'),
     ("arxiv", 'ti:"machine learning" AND cat:cs.AI'),
 ]
 for provider, example in examples:
@@ -1601,6 +1612,7 @@ docs = [
     ("dblp", "https://dblp.org/faq/How+to+use+the+dblp+search+API.html"),
     ("wos", "https://webofscience.help.clarivate.com/en-us/Content/search-rules.html"),
     ("ieee", "https://ieeexplore.ieee.org/Xplorehelp/searching-ieee-xplore/command-search"),
+    ("scopus", "https://dev.elsevier.com/sc_search_tips.html"),
     ("arxiv", "https://info.arxiv.org/help/api/user-manual.html#query_details"),
 ]
 for provider, url in docs:
@@ -1626,6 +1638,7 @@ class TestSyntaxCommand:
         assert "s2" in result.stdout
         assert "openalex" in result.stdout
         assert "dblp" in result.stdout
+        assert "scopus" in result.stdout
         assert "arxiv" in result.stdout
 
     def test_syntax_shows_operators(self):
