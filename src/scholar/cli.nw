@@ -3110,15 +3110,25 @@ def llm_classify(
             help="Skip automatic enrichment of papers without abstracts.",
         ),
     ] = False,
+    no_examples: Annotated[
+        bool,
+        typer.Option(
+            "--no-examples",
+            help="Run without requiring tagged examples (zero-shot).",
+        ),
+    ] = False,
 ) -> None:
     """
     Classify pending papers using LLM.
 
     Uses human-reviewed papers as training examples. Requires at least
-    5 tagged examples (minimum 1 kept, 1 discarded) before classification.
+    5 tagged examples (minimum 1 kept, 1 discarded) unless --no-examples
+    is given, which runs zero-shot classification using only the research
+    context.
 
     Example:
         scholar llm classify "my review" --count 20
+        scholar llm classify "my review" --no-examples
     """
     import scholar.review as review
     from scholar.review import save_session
@@ -3149,6 +3159,7 @@ def llm_classify(
             model_id=select_model_id(model_selection, "analytic"),
             enrich_missing=not no_enrich,
             dry_run=dry_run,
+            require_examples=not no_examples,
         )
 
         if dry_run:
