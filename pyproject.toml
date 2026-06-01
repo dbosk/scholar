@@ -6,7 +6,7 @@ authors = [{ name = "Daniel Bosk", email = "dbosk@kth.se" },
            { name = "Ric Glassey", email = "glassey@kth.se" }]
 readme = "README.md"
 license = "MIT"
-requires-python = ">= 3.12"
+requires-python = ">=3.12,<4.0"
 dependencies = [
     "requests>=2.32.5",
     "typer>=0.21.0",
@@ -38,6 +38,7 @@ dependencies = [
     "pyyaml>=6.0",
     "questionary>=2.0.0",
     "llm-github-copilot>=0.3.1",
+    "llm-mistral (>=0.15,<0.16)",
 ]
 
 [project.scripts]
