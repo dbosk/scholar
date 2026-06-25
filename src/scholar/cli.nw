@@ -871,6 +871,7 @@ if enrich and merged_results:
                 timestamp=result.timestamp,
                 papers=enriched,
                 filters=result.filters,
+                limit=result.limit,
             )
 @
 
@@ -1089,6 +1090,7 @@ for pname in provider_names:
             timestamp=timestamp,
             papers=papers,
             filters=filters.as_dict() if filters else None,
+            limit=effective_limit,
         )
     )
 

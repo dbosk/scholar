@@ -2074,6 +2074,25 @@ reconstructable:
             assert merged.limit is None
 @
 
+A single-provider search is routed through [[deduplicate]] rather than
+[[merge]], so that copy must carry the same metadata --- otherwise the most
+common search shape would silently lose its filters and limit for provenance:
+
+<<test functions>>=
+    def test_deduplicate_preserves_filters_and_limit(self):
+        """The single-result copy keeps its filters and limit."""
+        with isolated_registry():
+            result = SearchResult(
+                query="test", provider="dblp", timestamp="2024-01-01",
+                papers=[Paper(title="A", authors=["X"])],
+                filters={"year": "2020-2024"}, limit=50,
+            )
+
+            deduped = result.deduplicate()
+            assert deduped.filters == {"year": "2020-2024"}
+            assert deduped.limit == 50
+@
+
 
 \subsection{Search abstraction}
 
