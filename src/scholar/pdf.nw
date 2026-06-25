@@ -51,14 +51,19 @@ PDFs are cached separately from search results for several reasons:
 PDF download and caching for academic papers.
 
 Provides functions to download, cache, and open PDFs from paper URLs.
-The cache is content-addressed using SHA-256 hashes of URLs.
+The cache is content-addressed using SHA-256 hashes of URLs. The module
+also extracts candidate supporting passages from a cached PDF given a
+claim (see the Quote Extraction section).
 """
 <<pdf imports>>
+<<quote imports>>
 <<pdf constants>>
+<<quote extraction constants>>
 <<pdf cache functions>>
 <<doi resolution functions>>
 <<pdf download functions>>
 <<pdf open functions>>
+<<quote extraction functions>>
 @
 
 
@@ -898,6 +903,626 @@ class TestOpenPDF:
         
         with patch("scholar.pdf.subprocess.run", side_effect=Exception("Failed")):
             result = open_pdf(pdf_path)
-        
+
         assert result is False
+@
+
+
+\section{Quote Extraction}
+\label{sec:quote-extraction}
+
+Downloading a PDF is only the first step in verifying that a source actually
+supports a claim.
+The reviewer must still find the verbatim passage that backs the claim---the
+\texttt{QUOTE} recorded in a citation's provenance.
+This section turns a cached PDF and a claim into a short list of candidate
+supporting passages, each tagged with the page it came from.
+
+Crucially, the judgement stays with the human: we only \emph{propose} passages
+and their locations.
+The same machinery serves two callers---the [[scholar pdf quote]] command, and
+the LLM theme classifier, which uses a paper's full text (not just its
+abstract) to assign labels.
+So everything here is plain library code with no CLI or console dependency.
+
+\subsection{How the pieces fit together}
+
+Finding candidates is a pipeline of four steps, each its own function so that
+callers can recombine them:
+\begin{enumerate}
+\item \textbf{Extract} per-page text from the PDF ([[extract_pdf_pages]]).
+\item \textbf{Segment} that text into sentence-level passages
+  ([[segment_passages]]).
+\item \textbf{Rank} passages against the claim.  Two independent rankers are
+  available: a cheap lexical overlap score ([[rank_passages_lexical]]) and an
+  LLM re-ranker ([[rerank_passages_llm]]).
+\item \textbf{Orchestrate} the above behind one entry point
+  ([[find_quote_candidates]]), where the caller chooses lexical, LLM, or both.
+\end{enumerate}
+
+The two rankers are deliberately separable.
+A human reading CLI output benefits from the LLM's semantic judgement, so the
+command runs both by default.
+The classifier, by contrast, already makes one LLM call per batch to assign
+labels; paying for a second LLM call per paper just to order passages would be
+wasteful, so it runs the lexical ranker alone and lets the classification call
+do the judging.
+
+\subsection{Passage and candidate types}
+
+A [[Passage]] is a span of source text with the page it was found on; a
+[[QuoteCandidate]] adds the scores that ranking produces.
+We keep them as separate frozen types because a [[Passage]] is raw input to
+ranking, whereas a [[QuoteCandidate]] is a ranked result the caller consumes.
+Page numbers are 1-based throughout, matching how a reader cites \enquote{p.3}.
+
+<<quote imports>>=
+import json
+import re
+from dataclasses import dataclass
+@
+
+<<quote extraction functions>>=
+@dataclass(frozen=True)
+class Passage:
+    """A span of text from a PDF, tagged with its 1-based page number."""
+
+    page: int
+    text: str
+
+
+@dataclass(frozen=True)
+class QuoteCandidate:
+    """A passage proposed as support for a claim.
+
+    ``score`` is the lexical overlap score in [0, 1] (0.0 when the passage
+    was not lexically ranked). ``relevance`` is the LLM's judgement
+    ("high", "medium", or "low"), or ``None`` when no LLM rerank ran.
+    """
+
+    page: int
+    text: str
+    score: float = 0.0
+    relevance: str | None = None
+@
+
+\subsection{Extracting page text}
+
+We extract text with [[pypdfium2]], the same engine the snowball submodule
+uses for PDF parsing, so we add no new dependency.
+The import is deferred to call time: most [[scholar]] invocations never touch a
+PDF's text, and keeping the (heavy, native) binding out of module import means
+quote extraction can degrade to \enquote{no quotes} on a machine where it is
+missing rather than breaking the whole module.
+
+Returning one string per page---rather than one concatenated blob---is what
+lets us report the page a passage came from for free: the list index \emph{is}
+the page, minus one.
+
+<<quote extraction functions>>=
+def extract_pdf_pages(path: Path) -> list[str]:
+    """Return the text of each page of a PDF, one string per page.
+
+    The list is 0-indexed; entry ``n`` is printed page ``n + 1``.
+
+    Raises:
+        ImportError: If pypdfium2 is not installed.
+    """
+    import pypdfium2 as pdfium
+
+    pages: list[str] = []
+    document = pdfium.PdfDocument(str(path))
+    try:
+        for index in range(len(document)):
+            page = document[index]
+            textpage = page.get_textpage()
+            pages.append(textpage.get_text_range())
+            textpage.close()
+            page.close()
+    finally:
+        document.close()
+    return pages
+@
+
+\subsection{Segmenting passages}
+
+PDF text extraction preserves the visual layout: lines are broken where they
+wrapped on the page, and words are hyphenated across line breaks.
+Left as-is, this defeats both token matching (\enquote{authen-ticated} matches
+neither \enquote{authenticated} nor the claim) and the goal of a clean verbatim
+quote.
+We therefore reflow each page before splitting it, undoing line-break
+hyphenation first and then treating remaining newlines as soft wraps.
+
+Sentence-level granularity is the right unit for a supporting quote: it is long
+enough to be self-contained evidence yet short enough to cite directly.
+We drop passages below [[MIN_PASSAGE_CHARS]] because short fragments---page
+numbers, running heads, table cells---are noise, not quotable support.
+
+<<quote extraction constants>>=
+# Passages shorter than this are usually fragments (page numbers, headers,
+# table cells) that make poor verbatim quotes.
+MIN_PASSAGE_CHARS = 40
+@
+
+<<quote extraction functions>>=
+def segment_passages(pages: list[str]) -> list[Passage]:
+    """Split per-page text into sentence-level passages.
+
+    Line wrapping and end-of-line hyphenation from PDF layout are undone
+    first, so each passage reads as running prose. Fragments shorter than
+    ``MIN_PASSAGE_CHARS`` are dropped.
+
+    Args:
+        pages: Per-page text as returned by ``extract_pdf_pages``.
+
+    Returns:
+        Passages in reading order, each tagged with its 1-based page.
+    """
+    passages: list[Passage] = []
+    for page_index, page_text in enumerate(pages):
+        for sentence in _split_sentences(_reflow_text(page_text)):
+            sentence = sentence.strip()
+            if len(sentence) >= MIN_PASSAGE_CHARS:
+                passages.append(Passage(page=page_index + 1, text=sentence))
+    return passages
+@
+
+The reflow and sentence-splitting helpers are kept private: they encode
+heuristics specific to extracted PDF text and are not useful on their own.
+
+<<quote extraction constants>>=
+_SENTENCE_BOUNDARY = re.compile(r"(?<=[.!?])\s+")
+@
+
+<<quote extraction functions>>=
+def _reflow_text(text: str) -> str:
+    """Undo PDF line-wrapping: de-hyphenate, then collapse whitespace."""
+    # pypdfium2 marks a soft-hyphen line break it has already joined with
+    # U+FFFE; dropping it (and any literal soft hyphen) restores
+    # "optimiza<FFFE>tion" -> "optimization".
+    text = text.replace("\ufffe", "").replace("\u00ad", "")
+    # "authen-\nticated" -> "authenticated"
+    text = re.sub(r"-\n\s*", "", text)
+    # Remaining newlines are soft wraps within a paragraph.
+    text = re.sub(r"\s*\n\s*", " ", text)
+    return re.sub(r"\s{2,}", " ", text).strip()
+
+
+def _split_sentences(text: str) -> list[str]:
+    """Split running text into sentences on terminal punctuation."""
+    return _SENTENCE_BOUNDARY.split(text) if text else []
+@
+
+Let's verify segmentation rejoins hyphenated words, numbers pages from one,
+and discards short fragments:
+
+<<test functions>>=
+class TestSegmentPassages:
+    """Tests for passage segmentation."""
+
+    def test_dehyphenates_across_line_breaks(self):
+        pages = [
+            "An authen-\nticated encryption scheme provides privacy "
+            "and authenticity for every message it protects."
+        ]
+        passages = segment_passages(pages)
+        assert any("authenticated encryption" in p.text for p in passages)
+
+    def test_strips_pdfium_softhyphen_marker(self):
+        # pypdfium2 joins a soft-hyphen line break with a U+FFFE marker.
+        pages = [
+            "Proximal policy optimiza\ufffetion is simpler than the "
+            "trust region alternative in practice."
+        ]
+        passages = segment_passages(pages)
+        assert any("optimization is simpler" in p.text for p in passages)
+
+    def test_page_numbers_are_one_based(self):
+        pages = [
+            "This first page sentence is plainly long enough to keep.",
+            "A second page sentence that also clears the length bar.",
+        ]
+        passages = segment_passages(pages)
+        assert passages[0].page == 1
+        assert passages[-1].page == 2
+
+    def test_drops_short_fragments(self):
+        pages = [
+            "12",
+            "Header",
+            "This sentence is comfortably past the minimum length bar.",
+        ]
+        passages = segment_passages(pages)
+        assert len(passages) == 1
+        assert all(len(p.text) >= MIN_PASSAGE_CHARS for p in passages)
+@
+
+\subsection{Lexical ranking}
+
+The lexical ranker scores a passage by how much of the claim's vocabulary it
+contains.
+We tokenize both claim and passage into informative lowercase words---dropping
+stopwords and single characters, which carry no topical signal---and score by
+the fraction of the claim's tokens that the passage covers.
+
+This is a recall-oriented score on purpose: a passage that mentions most of the
+claim's terms should surface even when it phrases them differently, because the
+human (or the LLM re-ranker) makes the final call.
+It is also free and deterministic, which is exactly what the classifier wants
+for a cheap per-paper prefilter.
+
+<<quote extraction constants>>=
+# Function words carry no topical signal, so we ignore them when measuring
+# overlap between a claim and a passage.
+STOPWORDS = frozenset({
+    "the", "a", "an", "and", "or", "but", "if", "then", "of", "to", "in",
+    "on", "for", "with", "as", "by", "at", "from", "that", "this", "these",
+    "those", "is", "are", "was", "were", "be", "been", "being", "it", "its",
+    "we", "our", "they", "their", "can", "may", "also", "such", "which",
+    "than", "into", "via", "using", "used", "not", "no",
+})
+
+_WORD_RE = re.compile(r"[a-z0-9]+")
+@
+
+<<quote extraction functions>>=
+def _tokenize(text: str) -> set[str]:
+    """Return the set of informative lowercase word tokens in ``text``."""
+    return {
+        token
+        for token in _WORD_RE.findall(text.lower())
+        if len(token) > 1 and token not in STOPWORDS
+    }
+
+
+def rank_passages_lexical(
+    claim: str,
+    passages: list[Passage],
+    limit: int,
+) -> list[QuoteCandidate]:
+    """Rank passages by lexical overlap with the claim.
+
+    The score is the fraction of the claim's informative tokens present in
+    the passage, so passages covering more of the claim's vocabulary rank
+    higher. Passages with no overlap are dropped.
+
+    Args:
+        claim: The claim to find support for.
+        passages: Candidate passages.
+        limit: Maximum number of candidates to return.
+
+    Returns:
+        Up to ``limit`` candidates, highest score first.
+    """
+    claim_tokens = _tokenize(claim)
+    if not claim_tokens:
+        return []
+    scored: list[QuoteCandidate] = []
+    for passage in passages:
+        overlap = claim_tokens & _tokenize(passage.text)
+        if overlap:
+            scored.append(
+                QuoteCandidate(
+                    page=passage.page,
+                    text=passage.text,
+                    score=len(overlap) / len(claim_tokens),
+                )
+            )
+    scored.sort(key=lambda candidate: candidate.score, reverse=True)
+    return scored[:limit]
+@
+
+A claim-matching passage should outrank an unrelated one, and an all-stopword
+claim should yield nothing:
+
+<<test functions>>=
+class TestLexicalRanking:
+    """Tests for lexical passage ranking."""
+
+    def test_relevant_passage_outranks_unrelated(self):
+        passages = [
+            Passage(
+                page=2,
+                text="The weather in spring is mild and pleasant across "
+                "the northern coastal regions this year.",
+            ),
+            Passage(
+                page=3,
+                text="An authenticated encryption scheme provides both "
+                "confidentiality and integrity.",
+            ),
+        ]
+        ranked = rank_passages_lexical(
+            "authenticated encryption provides confidentiality and integrity",
+            passages,
+            limit=5,
+        )
+        assert ranked[0].page == 3
+
+    def test_empty_claim_returns_nothing(self):
+        passages = [
+            Passage(page=1, text="A sufficiently long passage of text here.")
+        ]
+        assert rank_passages_lexical("the a of to", passages, limit=5) == []
+@
+
+\subsection{LLM re-ranking}
+
+The lexical score cannot tell whether a passage \emph{asserts} the claim or
+merely shares its vocabulary.
+When semantic judgement matters, we hand the candidates to an LLM and ask it to
+order and label them.
+
+Two safeguards keep this honest.
+First, the model sees the passages but never supplies their text: we look the
+text back up from our own candidates by index, so quotes remain verbatim.
+Second, any failure---no model configured, a network error, unparseable
+output---returns [[None]] rather than raising, so the orchestrator can fall
+back to the lexical order and merely warn.
+We follow the [[llm]] usage pattern already established in [[llm_review]]:
+[[llm.get_model(model_id)]] when a model is named, else the user's default.
+
+<<quote extraction functions>>=
+def rerank_passages_llm(
+    claim: str,
+    candidates: list[QuoteCandidate],
+    model_id: str | None = None,
+) -> list[QuoteCandidate] | None:
+    """Re-rank candidate passages for relevance to the claim using an LLM.
+
+    The model receives the claim and the numbered candidates and returns a
+    JSON array of ``{"index": i, "relevance": "high|medium|low"}`` ordered
+    best first. Passage text is taken from ``candidates``, never the model,
+    so quotes stay verbatim.
+
+    Returns:
+        Re-ranked candidates with ``relevance`` set, or ``None`` if no model
+        is available or the call/parsing fails (so the caller can fall back
+        to the lexical order).
+    """
+    if not candidates:
+        return []
+    try:
+        import llm
+
+        model = llm.get_model(model_id) if model_id else llm.get_model()
+        prompt = _build_rerank_prompt(claim, candidates)
+        ranking = _parse_rerank_response(model.prompt(prompt).text())
+    except Exception as error:  # degrade to lexical order on any failure
+        logger.debug("LLM rerank failed, falling back to lexical: %s", error)
+        return None
+
+    reranked: list[QuoteCandidate] = []
+    seen: set[int] = set()
+    for index, relevance in ranking:
+        if 0 <= index < len(candidates) and index not in seen:
+            seen.add(index)
+            base = candidates[index]
+            reranked.append(
+                QuoteCandidate(
+                    page=base.page,
+                    text=base.text,
+                    score=base.score,
+                    relevance=relevance,
+                )
+            )
+    return reranked or None
+@
+
+The prompt and parser are private helpers.
+The parser is lenient: it extracts the first JSON array it finds and skips
+malformed entries, because we would rather drop one bad item than discard an
+otherwise usable ranking.
+
+<<quote extraction functions>>=
+def _build_rerank_prompt(
+    claim: str,
+    candidates: list[QuoteCandidate],
+) -> str:
+    """Build the LLM prompt asking it to rank candidates by relevance."""
+    lines = [
+        "You are helping verify whether a source supports a claim.",
+        "",
+        f"Claim: {claim}",
+        "",
+        "Candidate passages (verbatim from the source):",
+    ]
+    for index, candidate in enumerate(candidates):
+        lines.append(f"[{index}] (p.{candidate.page}) {candidate.text}")
+    lines.append("")
+    lines.append(
+        "Return ONLY a JSON array of the passages that could support the "
+        "claim, most relevant first, each as "
+        '{"index": <int>, "relevance": "high|medium|low"}. '
+        "Omit passages that are irrelevant."
+    )
+    return "\n".join(lines)
+
+
+def _parse_rerank_response(response_text: str) -> list[tuple[int, str | None]]:
+    """Parse the LLM's JSON ranking into (index, relevance) pairs."""
+    match = re.search(r"\[.*\]", response_text, re.DOTALL)
+    if not match:
+        return []
+    ranking: list[tuple[int, str | None]] = []
+    for item in json.loads(match.group(0)):
+        try:
+            index = int(item["index"])
+        except (KeyError, TypeError, ValueError):
+            continue
+        relevance = str(item.get("relevance", "")).lower() or None
+        ranking.append((index, relevance))
+    return ranking
+@
+
+\subsection{Finding quote candidates}
+
+[[find_quote_candidates]] is the single entry point both callers use.
+It accepts anything [[get_pdf]] accepts---a URL, a DOI, or a [[Paper]]
+object---so the CLI can pass a string and the classifier can pass the paper it
+already holds.
+
+The two ranking stages compose three ways.
+With both enabled (the default), the lexical ranker prefilters to [[prefilter]]
+candidates and the LLM re-ranks them---the lexical pass bounds how much the LLM
+must read.
+Lexical-only skips the LLM.
+LLM-only has no cheap prefilter, so we cap the passages handed to the model at
+[[max_llm_passages]] to bound cost, and announce the cap rather than silently
+truncating.
+
+Failure to obtain or parse the PDF returns an empty list, not an exception:
+a single paywalled or unreachable paper must not abort a classification batch.
+This mirrors the silent-degradation convention the search providers already
+follow.
+
+<<quote extraction functions>>=
+def find_quote_candidates(
+    source: Any,
+    claim: str,
+    *,
+    limit: int = 5,
+    prefilter: int = 20,
+    model_id: str | None = None,
+    use_lexical: bool = True,
+    use_llm: bool = True,
+    max_llm_passages: int = 100,
+    progress_callback: Callable[[str], None] | None = None,
+) -> list[QuoteCandidate]:
+    """Find passages in a source that may support a claim.
+
+    The ranking stages are independent: lexical only, LLM only, or both
+    (lexical prefilter then LLM rerank). Verification stays human---this
+    only proposes passages and their pages.
+
+    Args:
+        source: A Paper object, DOI, or URL accepted by ``get_pdf``.
+        claim: The claim to find support for.
+        limit: Maximum candidates to return.
+        prefilter: Lexical shortlist size before LLM rerank (both stages).
+        model_id: ``llm`` model id for reranking (llm default if None).
+        use_lexical: Run the lexical ranking stage.
+        use_llm: Run the LLM rerank stage.
+        max_llm_passages: Cap on passages sent to the LLM in LLM-only mode.
+        progress_callback: Optional callback for status messages.
+
+    Returns:
+        Up to ``limit`` candidates, best first. Empty if the PDF cannot be
+        fetched or parsed, or if nothing matches.
+
+    Raises:
+        ValueError: If both ranking stages are disabled.
+    """
+    if not use_lexical and not use_llm:
+        raise ValueError(
+            "At least one of lexical or LLM ranking must be enabled"
+        )
+
+    try:
+        path = get_pdf(source, progress_callback)
+        passages = segment_passages(extract_pdf_pages(path))
+    except PDFDownloadError as error:
+        logger.info("No PDF available for quote extraction: %s", error)
+        return []
+    except ImportError:
+        logger.warning(
+            "pypdfium2 is required for quote extraction; returning no quotes"
+        )
+        return []
+
+    if not passages:
+        return []
+
+    <<select candidate passages>>
+    <<optionally rerank with the LLM>>
+    return candidates[:limit]
+@
+
+When the lexical stage is on, it does double duty: as a prefilter (shortlist of
+[[prefilter]]) when the LLM follows, or as the final ranker (top [[limit]]) when
+it does not.
+When it is off, we take passages in reading order up to the LLM cap.
+
+<<select candidate passages>>=
+if use_lexical:
+    shortlist = prefilter if use_llm else limit
+    candidates = rank_passages_lexical(claim, passages, shortlist)
+else:
+    candidates = [
+        QuoteCandidate(page=p.page, text=p.text)
+        for p in passages[:max_llm_passages]
+    ]
+    if len(passages) > max_llm_passages and progress_callback:
+        progress_callback(
+            f"Considering first {max_llm_passages} of "
+            f"{len(passages)} passages for LLM ranking"
+        )
+@
+
+If the LLM rerank succeeds we adopt its order and relevance labels; if it
+returns [[None]] we keep the candidates we already have (lexical order, or
+reading order in LLM-only mode) and warn.
+
+<<optionally rerank with the LLM>>=
+if use_llm:
+    reranked = rerank_passages_llm(claim, candidates, model_id)
+    if reranked is None:
+        if progress_callback:
+            progress_callback("LLM ranking unavailable; using lexical order")
+    else:
+        candidates = reranked
+@
+
+Finally, let's verify the orchestrator: it refuses to run with no ranker,
+finds the supporting passage in lexical-only mode, and degrades to an empty
+list when the PDF cannot be fetched.  We monkeypatch the PDF-access functions
+so no network or real PDF is needed.
+
+<<test functions>>=
+class TestFindQuoteCandidates:
+    """Tests for the quote-extraction orchestrator."""
+
+    def test_requires_a_ranking_stage(self):
+        with pytest.raises(ValueError):
+            find_quote_candidates(
+                "https://example.com/p.pdf",
+                "claim",
+                use_lexical=False,
+                use_llm=False,
+            )
+
+    def test_lexical_only_finds_supporting_passage(
+        self, tmp_path, monkeypatch
+    ):
+        pdf_path = tmp_path / "paper.pdf"
+        pdf_path.write_bytes(b"%PDF-1.4")
+        monkeypatch.setattr(
+            "scholar.pdf.get_pdf", lambda *a, **k: pdf_path
+        )
+        monkeypatch.setattr(
+            "scholar.pdf.extract_pdf_pages",
+            lambda path: [
+                "Unrelated text about gardening and ripe tomatoes here.",
+                "An authenticated encryption scheme provides both "
+                "confidentiality and integrity for messages.",
+            ],
+        )
+        results = find_quote_candidates(
+            "https://example.com/p.pdf",
+            "authenticated encryption confidentiality integrity",
+            use_llm=False,
+        )
+        assert results
+        assert results[0].page == 2
+        assert "authenticated encryption" in results[0].text
+
+    def test_missing_pdf_returns_empty(self, monkeypatch):
+        def boom(*args, **kwargs):
+            raise PDFDownloadError("no pdf")
+
+        monkeypatch.setattr("scholar.pdf.get_pdf", boom)
+        assert (
+            find_quote_candidates("10.1234/x", "claim", use_llm=False) == []
+        )
 @

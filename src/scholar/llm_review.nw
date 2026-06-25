@@ -548,6 +548,12 @@ The prompt is critical for effective classification. We structure it to:
 \subsection{Formatting Examples}
 
 We format paper examples to show the key information the LLM should consider.
+For the papers being classified, [[_format_paper_to_classify]] can also append
+\emph{supporting passages} drawn from the paper's full text.
+The abstract alone often cannot settle whether a paper belongs to a theme; a
+sentence from the methodology or results can.
+When the caller supplies quotes (see \cref{sec:fulltext-classification}), the
+classifier therefore assigns labels on evidence the abstract never carried.
 
 <<llm review prompt construction>>=
 def _format_paper_for_prompt(
@@ -592,6 +598,7 @@ def _format_paper_for_prompt(
 def _format_paper_to_classify(
     decision: ReviewDecision,
     index: int,
+    quotes: list | None = None,
 ) -> str:
     """
     Format a paper for classification request.
@@ -599,6 +606,9 @@ def _format_paper_to_classify(
     Args:
         decision: The review decision containing the paper
         index: Zero-based index for reference in response
+        quotes: Optional supporting passages from the paper's full text
+            (QuoteCandidate objects with ``page`` and ``text``), shown so the
+            LLM can classify on evidence beyond the abstract
 
     Returns:
         Formatted string representation
@@ -624,6 +634,11 @@ def _format_paper_to_classify(
         lines.append(f"Abstract: {abstract}")
     else:
         lines.append("Abstract: [Not available]")
+
+    if quotes:
+        lines.append("Supporting passages (full text):")
+        for quote in quotes:
+            lines.append(f'- p.{quote.page}: "{quote.text}"')
 
     return "\n".join(lines)
 @
@@ -669,6 +684,7 @@ def build_classification_prompt(
     research_context: str | None = None,
     available_themes: set[str] | None = None,
     available_motivations: set[str] | None = None,
+    paper_quotes: list[list] | None = None,
 ) -> str:
     """
     Construct the LLM prompt for paper classification.
@@ -680,6 +696,9 @@ def build_classification_prompt(
         research_context: Description of the research focus
         available_themes: Tags used for kept papers
         available_motivations: Tags used for discarded papers
+        paper_quotes: Optional supporting passages per paper, aligned by
+            index with ``papers_to_classify``; entry ``i`` holds the quotes
+            for paper ``i`` (or is empty when none were found)
 
     Returns:
         Complete prompt string for the LLM
@@ -728,7 +747,8 @@ def build_classification_prompt(
     # Papers to classify
     sections.append("\n## Papers to Classify\n")
     for i, decision in enumerate(papers_to_classify):
-        sections.append(_format_paper_to_classify(decision, i))
+        quotes = paper_quotes[i] if paper_quotes and i < len(paper_quotes) else None
+        sections.append(_format_paper_to_classify(decision, i, quotes))
         sections.append("")
 
     # Instructions
@@ -765,6 +785,8 @@ Guidelines:
 - Confidence should reflect how certain you are (0.0 to 1.0)
 - Keep reasoning brief (1-2 sentences)
 - Every discarded paper MUST have at least one motivation tag
+- When "Supporting passages" are shown, base your tags on that full-text
+  evidence, not only the abstract
 """)
 
     return "\n".join(sections)
@@ -1035,6 +1057,8 @@ def classify_papers_with_llm(
     enrich_missing: bool = True,
     dry_run: bool = False,
     require_examples: bool = True,
+    use_fulltext: bool = False,
+    max_quotes: int = 3,
 ) -> LLMBatchResult | str:
     """
     Classify pending papers using LLM.
@@ -1043,8 +1067,9 @@ def classify_papers_with_llm(
     1. Optionally gathers training examples from human-reviewed papers
     2. Optionally validates minimum example requirements
     3. Optionally enriches papers lacking abstracts
-    4. Constructs a prompt with examples and papers to classify
-    5. Invokes the LLM and parses the response
+    4. Optionally extracts full-text supporting passages
+    5. Constructs a prompt with examples and papers to classify
+    6. Invokes the LLM and parses the response
 
     Args:
         session: The review session
@@ -1056,6 +1081,11 @@ def classify_papers_with_llm(
         require_examples: If True (default), require tagged example papers
             before classification. Set False for zero-shot classification
             using only the research context.
+        use_fulltext: If True, extract supporting passages from each paper's
+            full text (matched against the research context) and include them
+            in the prompt, so classification can use evidence beyond the
+            abstract. Requires the session to have a research context.
+        max_quotes: Maximum supporting passages per paper when use_fulltext.
 
     Returns:
         LLMBatchResult with decisions, or prompt string if dry_run=True
@@ -1118,6 +1148,13 @@ def classify_papers_with_llm(
                     "some papers may lack abstracts"
                 )
 
+    # Optionally extract full-text supporting passages for each paper.
+    paper_quotes = None
+    if use_fulltext and session.research_context:
+        paper_quotes = _gather_supporting_quotes(
+            to_classify, session.research_context, max_quotes
+        )
+
     # Collect available tags
     themes, motivations = _collect_available_tags(session)
 
@@ -1129,6 +1166,7 @@ def classify_papers_with_llm(
         research_context=session.research_context,
         available_themes=themes,
         available_motivations=motivations,
+        paper_quotes=paper_quotes,
     )
 
     if dry_run:
@@ -1177,6 +1215,117 @@ def classify_papers_with_llm(
         prompt_tokens=getattr(response, "prompt_tokens", None),
         completion_tokens=getattr(response, "completion_tokens", None),
     )
+@
+
+
+\subsection{Gathering Full-text Support}
+\label{sec:fulltext-classification}
+
+When [[use_fulltext]] is set, we look for passages in each paper's full text
+that support the research context, and feed them to the classifier alongside
+the abstract.
+This is the same quote-extraction machinery the [[scholar pdf quote]] command
+uses, reused as a library (\cref{sec:quote-extraction}).
+
+We run the \emph{lexical} ranker only, not the LLM re-ranker.
+The classifier already spends one LLM call per batch to assign labels; ordering
+each paper's passages with a second LLM call would multiply cost without adding
+much, since the classification call itself judges relevance.
+The cheap lexical prefilter simply surfaces the candidate sentences worth
+showing it.
+
+Quote extraction is best-effort per paper: a paper with no open-access PDF
+yields no quotes and falls back to abstract-only classification.
+[[find_quote_candidates]] already returns an empty list on download or parse
+failure, but we still guard each call so one unexpected error cannot abort the
+whole batch.
+
+<<llm review llm interaction>>=
+def _gather_supporting_quotes(
+    papers: list[ReviewDecision],
+    claim: str,
+    max_quotes: int,
+) -> list[list]:
+    """Find supporting passages for each paper, aligned by index.
+
+    Args:
+        papers: The review decisions being classified.
+        claim: The research context to match passages against.
+        max_quotes: Maximum passages to keep per paper.
+
+    Returns:
+        A list parallel to ``papers``; entry ``i`` holds the supporting
+        passages for paper ``i`` (empty when none were found).
+    """
+    from scholar.pdf import find_quote_candidates
+
+    quotes_by_paper: list[list] = []
+    for decision in papers:
+        try:
+            quotes = find_quote_candidates(
+                decision.paper,
+                claim,
+                limit=max_quotes,
+                use_lexical=True,
+                use_llm=False,
+            )
+        except Exception as error:  # one bad paper must not abort the batch
+            logger.warning(
+                "Quote extraction failed for '%s': %s",
+                decision.paper.title[:50],
+                error,
+            )
+            quotes = []
+        quotes_by_paper.append(quotes)
+    return quotes_by_paper
+@
+
+Let's verify that supplying quotes adds a supporting-passages block to the
+prompt, and that omitting them leaves it abstract-only:
+
+<<test functions>>=
+class TestFullTextClassification:
+    """Tests for full-text quote-grounded classification."""
+
+    def test_prompt_includes_supporting_passages(self):
+        from scholar.pdf import QuoteCandidate
+
+        paper = Paper(
+            title="AE paper",
+            authors=["A"],
+            year=2024,
+            abstract="An abstract.",
+        )
+        decision = ReviewDecision(
+            paper=paper, provider="test", status=DecisionStatus.PENDING
+        )
+        prompt = build_classification_prompt(
+            papers_to_classify=[decision],
+            kept_examples=[],
+            discarded_examples=[],
+            paper_quotes=[
+                [QuoteCandidate(page=3, text="AE provides integrity.")]
+            ],
+        )
+        assert "Supporting passages (full text):" in prompt
+        assert 'p.3: "AE provides integrity."' in prompt
+
+    def test_prompt_without_quotes_is_abstract_only(self):
+        paper = Paper(
+            title="AE paper",
+            authors=["A"],
+            year=2024,
+            abstract="An abstract.",
+        )
+        decision = ReviewDecision(
+            paper=paper, provider="test", status=DecisionStatus.PENDING
+        )
+        prompt = build_classification_prompt(
+            papers_to_classify=[decision],
+            kept_examples=[],
+            discarded_examples=[],
+        )
+        assert "Supporting passages (full text):" not in prompt
 @
 
 
