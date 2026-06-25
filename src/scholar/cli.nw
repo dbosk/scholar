@@ -513,8 +513,30 @@ enrich_providers: Annotated[
         ),
     ),
 ] = None,
+<<deduplication option>>
 <<report option>>
 <<search filter options>>
+@
+
+\subsection{Deduplication option}
+
+The same paper routinely appears more than once in a result set---returned by
+several providers, or repeated across a single provider's paginated pages.
+By default we collapse these into one record, keeping the copy with the most
+metadata (\cref{sec:doi-normalization} in the \texttt{scholar} module).
+The [[--no-dedup]] escape hatch disables this so a user can inspect the raw,
+per-provider results---useful when debugging a provider or auditing what each
+source actually returned:
+
+<<deduplication option>>=
+dedup: Annotated[
+    bool,
+    typer.Option(
+        "--dedup/--no-dedup",
+        help="Deduplicate papers in results, keeping the copy with the "
+             "most metadata. Use --no-dedup for raw per-provider results.",
+    ),
+] = True,
 @
 
 \subsection{Report option}
@@ -598,7 +620,7 @@ Large (or unlimited) searches may take time and consume API quotas, but the
 provider implementations handle paging and rate limiting automatically:
 
 <<execute search and display results>>=
-from scholar import Search, SearchFilters
+from scholar import Search, SearchFilters, SearchResult
 from scholar.providers import get_default_providers
 import sys
 
@@ -686,6 +708,71 @@ class TestSearchCommand:
 
         result = runner.invoke(app, ["search", "test query"])
         assert result.exit_code == 0
+
+    def _mock_duplicate_provider(self, monkeypatch):
+        """Install a provider that returns the same paper twice."""
+        from scholar import providers
+
+        def make_dup():
+            return Paper(title="Dup Paper", authors=["A"], doi="10.1/dup")
+
+        mock_provider = Mock()
+        mock_provider.name = "mock"
+        mock_provider.MAX_LIMIT = None
+        mock_provider.search.return_value = [make_dup(), make_dup()]
+        monkeypatch.setattr(providers, "PROVIDERS", {"mock": mock_provider})
+
+    def test_search_deduplicates_by_default(self, monkeypatch):
+        """A single provider returning a paper twice yields one row."""
+        self._mock_duplicate_provider(monkeypatch)
+        result = runner.invoke(app, ["search", "q", "--format", "csv"])
+        assert result.exit_code == 0
+        assert result.stdout.count("Dup Paper") == 1
+
+    def test_search_no_dedup_keeps_duplicates(self, monkeypatch):
+        """--no-dedup preserves duplicate papers from a provider."""
+        self._mock_duplicate_provider(monkeypatch)
+        result = runner.invoke(
+            app, ["search", "q", "--no-dedup", "--format", "csv"]
+        )
+        assert result.exit_code == 0
+        assert result.stdout.count("Dup Paper") == 2
+
+    def test_enrich_processes_every_result_set(self, monkeypatch):
+        """--enrich --no-dedup enriches each provider's result set, not just
+        the first."""
+        from scholar import providers
+        import scholar.enrich as enrich_mod
+
+        prov_a = Mock(name="a")
+        prov_a.name = "a"
+        prov_a.MAX_LIMIT = None
+        prov_a.search.return_value = [
+            Paper(title="Alpha", authors=["A"], doi="10.1/alpha")
+        ]
+        prov_b = Mock(name="b")
+        prov_b.name = "b"
+        prov_b.MAX_LIMIT = None
+        prov_b.search.return_value = [
+            Paper(title="Beta", authors=["B"], doi="10.1/beta")
+        ]
+        monkeypatch.setattr(providers, "PROVIDERS", {"a": prov_a, "b": prov_b})
+
+        seen = []
+
+        def fake_enrich(papers, **kwargs):
+            seen.extend(p.title for p in papers)
+            return list(papers)
+
+        monkeypatch.setattr(enrich_mod, "enrich_papers", fake_enrich)
+        monkeypatch.setattr(enrich_mod, "needs_enrichment", lambda p, f: True)
+
+        result = runner.invoke(
+            app, ["search", "q", "--no-dedup", "--enrich", "--format", "csv"]
+        )
+        assert result.exit_code == 0
+        # Both providers' result sets were sent through enrichment.
+        assert set(seen) == {"Alpha", "Beta"}
 @
 
 \subsection{Merging results from multiple providers}
@@ -699,15 +786,25 @@ For example, a paper found in both DBLP (no abstract) and Semantic Scholar
 (with abstract) will appear once with the abstract from Semantic Scholar.
 The [[source]] field tracks which providers found the paper.
 
+Cross-provider [[merge]] already deduplicates, but it only runs when more than
+one provider responds.
+A single provider can also return the same paper twice (across paginated
+pages), so when [[dedup]] is enabled we additionally call [[deduplicate]] on
+the lone result---guaranteeing a duplicate-free list in every case.
+With [[--no-dedup]] we skip all of this and hand back the raw per-provider
+results untouched, since merging is itself what removes duplicates.
+
 <<merge search results>>=
 from functools import reduce
 
-if len(results) > 1:
+if not dedup:
+    merged_results = results
+elif len(results) > 1:
     logger.info(f"Merging {len(results)} result sets")
     merged = reduce(lambda a, b: a.merge(b), results)
     merged_results = [merged]
 elif len(results) == 1:
-    merged_results = results
+    merged_results = [results[0].deduplicate()]
 else:
     logger.warning("No search results returned")
     merged_results = []
@@ -725,6 +822,10 @@ abstracts) alongside other providers.
 We show a progress indicator since enrichment requires API calls for each paper
 that is missing requested metadata.
 
+We enrich every result set rather than just the first.
+With [[--dedup]] (the default) there is a single merged set, but [[--no-dedup]]
+leaves one set per provider, and all of them deserve enrichment.
+
 The [[--enrich-providers]] option overrides which providers are tried and in
 which order.
 For example, to restrict enrichment to Semantic Scholar and OpenAlex:
@@ -735,26 +836,28 @@ if enrich and merged_results:
     from scholar.enrich import enrich_papers, needs_enrichment
     from rich.progress import Progress
 
-    # Count papers that need enrichment
-    papers = merged_results[0].papers
     enrich_fields = ["abstract", "pdf_url", "keywords"]
-    papers_to_enrich = [p for p in papers if needs_enrichment(p, enrich_fields)]
-
     providers_for_enrich = (
         [p.strip() for p in enrich_providers.split(",") if p.strip()]
         if enrich_providers
         else None
     )
 
-    if papers_to_enrich:
+    # Enrich every result set. With --dedup there is a single merged set;
+    # with --no-dedup there may be one per provider, all of which need it.
+    for i, result in enumerate(merged_results):
+        papers = result.papers
+        if not any(needs_enrichment(p, enrich_fields) for p in papers):
+            continue
+
         with Progress() as progress:
             task = progress.add_task(
                 "[cyan]Enriching papers...",
                 total=len(papers),
             )
 
-            def update_progress(current: int, total: int) -> None:
-                progress.update(task, completed=current)
+            def update_progress(current: int, total: int, _task=task) -> None:
+                progress.update(_task, completed=current)
 
             enriched = enrich_papers(
                 papers,
@@ -762,12 +865,12 @@ if enrich and merged_results:
                 providers=providers_for_enrich,
                 progress_callback=update_progress,
             )
-            merged_results[0] = SearchResult(
-                query=merged_results[0].query,
-                provider=merged_results[0].provider,
-                timestamp=merged_results[0].timestamp,
+            merged_results[i] = SearchResult(
+                query=result.query,
+                provider=result.provider,
+                timestamp=result.timestamp,
                 papers=enriched,
-                filters=merged_results[0].filters,
+                filters=result.filters,
             )
 @
 

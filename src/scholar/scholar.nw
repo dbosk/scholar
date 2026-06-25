@@ -74,7 +74,7 @@ Scholar package for structured literature searches.
 """
 
 from .scholar import Search, SearchResult, Paper, SearchFilters
-from .scholar import search, filter_papers
+from .scholar import search, filter_papers, deduplicate_papers
 from .scholar import get_registry, isolated_registry
 from .utils import safe_get_nested, ensure_list
 
@@ -85,6 +85,7 @@ __all__ = [
     "SearchFilters",
     "search",
     "filter_papers",
+    "deduplicate_papers",
     "get_registry",
     "isolated_registry",
     "safe_get_nested",
@@ -560,7 +561,8 @@ When merging results from multiple databases, we need to identify duplicate
 papers.
 We use a two-tier identity system:
 \begin{enumerate}
-\item If both papers have a DOI, compare DOIs (case-insensitive).
+\item If both papers have a DOI, compare their \emph{normalized} DOIs
+  (\cref{sec:doi-normalization}).
 \item Otherwise, compare normalized title combined with the first author's
   last name.
 \end{enumerate}
@@ -570,6 +572,43 @@ This matches the identity used by the Paper Registry, ensuring that
 
 The [[id]] property returns a stable string identifier for a paper.
 This is used as the key in the Paper Registry and for persistent storage.
+
+\subsubsection{Normalizing DOIs}
+\label{sec:doi-normalization}
+
+Providers report the same DOI in inconsistent forms: a bare
+[[10.1000/xyz]], a [[doi:]]-prefixed string, or a full
+[[https://doi.org/10.1000/xyz]] resolver URL.
+If we compared these verbatim, one paper indexed by two providers would land
+under different identities and slip past deduplication---defeating the very
+purpose of a DOI as a stable identifier.
+We therefore canonicalize a DOI before using it as identity: lowercase it,
+trim surrounding whitespace, and strip any resolver prefix so that all three
+spellings above collapse to the single key [[doi:10.1000/xyz]].
+
+<<paper methods>>=
+@staticmethod
+def _normalize_doi(doi: str) -> str:
+    """Return a canonical form of ``doi`` for identity comparison.
+
+    Lowercases, trims whitespace, and removes any resolver prefix
+    (e.g. ``https://doi.org/`` or ``doi:``) so that the same DOI in
+    different spellings compares equal.
+    """
+    normalized = doi.strip().lower()
+    for prefix in DOI_RESOLVER_PREFIXES:
+        if normalized.startswith(prefix):
+            return normalized[len(prefix):]
+    return normalized
+<<constants>>=
+DOI_RESOLVER_PREFIXES = (
+    "https://doi.org/",
+    "http://doi.org/",
+    "https://dx.doi.org/",
+    "http://dx.doi.org/",
+    "doi:",
+)
+@
 
 \paragraph{Performance optimization.}
 The [[id]] property computes a SHA256 hash from the paper's title and first
@@ -596,7 +635,7 @@ def id(self) -> str:
         A string identifier unique to this paper's identity.
     """
     if self.doi:
-        return f"doi:{self.doi.lower()}"
+        return f"doi:{self._normalize_doi(self.doi)}"
 
     # Normalize title
     title_normalized = self.title.lower().strip()
@@ -906,6 +945,66 @@ def merge_with(self, other: "Paper") -> "Paper":
     )
 @
 
+\subsubsection{Scoring metadata richness}
+
+[[merge_with]] is deliberately asymmetric: for [[authors]], [[references]],
+and [[citations]] it keeps [[self]]'s value \emph{wholesale} whenever [[self]]
+has one, rather than unioning.
+This is the right call for those fields---half an author list is worse than a
+complete one---but it means the \emph{order} in which two duplicates are
+merged decides which paper's author list survives.
+To honour \enquote{keep the one with the most metadata}, the caller must merge
+\emph{onto} the richer copy.
+[[metadata_score]] gives that ordering: it counts how many fields a paper has
+populated, weighting [[authors]] by length so a five-author record outscores a
+one-author stub of the same paper.
+The absolute value is meaningless; only the comparison between two duplicates
+matters.
+
+<<paper methods>>=
+@property
+def metadata_score(self) -> int:
+    """Return a rough count of populated metadata fields.
+
+    Used to decide which of two equal papers should be the base when
+    merging, so the richer copy's wholesale-preferred fields survive.
+    Higher means more complete; the absolute value is not meaningful.
+    """
+    score = len(self.authors)
+    for value in (
+        self.title, self.year, self.doi, self.abstract, self.venue,
+        self.url, self.pdf_url, self.citation_count, self.keywords,
+        self.tags, self.references, self.citations,
+    ):
+        if value:
+            score += 1
+    return score
+@
+
+Let's verify that a richer paper outscores a sparser duplicate:
+
+<<test functions>>=
+class TestPaperMetadataScore:
+    """Tests for Paper.metadata_score ordering."""
+
+    def test_richer_paper_scores_higher(self):
+        """A paper with more populated fields scores higher."""
+        with isolated_registry():
+            sparse = Paper(title="Test", authors=["A"], doi="10.1/test")
+            rich = Paper(
+                title="Test", authors=["A"], doi="10.1/test",
+                abstract="abstract", venue="Venue", year=2024,
+            )
+            assert rich.metadata_score > sparse.metadata_score
+
+    def test_more_authors_scores_higher(self):
+        """More authors raise the score for otherwise-equal papers."""
+        with isolated_registry():
+            few = Paper(title="Test", authors=["A"], doi="10.1/test")
+            many = Paper(title="Test", authors=["A", "B", "C"], doi="10.1/test")
+            assert many.metadata_score > few.metadata_score
+@
+
 \subsubsection{Testing paper equality}
 
 Let's verify that paper equality and hashing work correctly for deduplication.
@@ -955,6 +1054,15 @@ class TestPaper:
         with isolated_registry():
             paper = Paper(title="Test", authors=["A"], doi="10.1234/TEST")
             assert paper.id == "doi:10.1234/test"
+
+    def test_paper_id_strips_doi_resolver_prefix(self):
+        """DOIs with a resolver URL prefix normalize to the bare DOI."""
+        with isolated_registry():
+            bare = Paper(title="A", authors=["X"], doi="10.1234/test")
+            url = Paper(title="B", authors=["Y"], doi="https://doi.org/10.1234/TEST")
+            prefixed = Paper(title="C", authors=["Z"], doi=" DOI:10.1234/test ")
+            assert bare.id == url.id == prefixed.id == "doi:10.1234/test"
+            assert bare == url == prefixed
 
     def test_paper_id_without_doi(self):
         """Paper ID uses hash of title+author when no DOI."""
@@ -1696,43 +1804,103 @@ class SearchResult:
 The [[filters]] dictionary captures any provider-specific constraints (date
 ranges, document types, etc.) that were applied.
 
+\subsubsection{Consolidating a list of papers}
+
+Deduplication has the same shape whether the duplicates come from two
+different providers or from a single provider returning the same paper twice
+across paginated pages.
+We extract that shape into one function, [[deduplicate_papers]], so both the
+cross-provider [[merge]] and the single-result [[deduplicate]] share exactly
+one notion of identity and one tie-break rule---rather than drifting apart as
+the earlier code did, where merging deduplicated but a lone result did not.
+
+The function keys a dictionary by paper identity (\cref{sec:doi-normalization})
+so equal papers collapse onto one entry.
+On a collision it merges \emph{onto the richer copy}: the paper with the higher
+[[metadata_score]] becomes [[self]] in [[merge_with]], so its
+wholesale-preferred author list survives while the per-field union still fills
+any gaps from the other copy.
+This is what makes deduplication keep \enquote{the one with the most
+metadata} regardless of the order papers arrive in.
+
+<<functions>>=
+def deduplicate_papers(papers: list[Paper]) -> list[Paper]:
+    """Consolidate duplicate papers, keeping the richest copy of each.
+
+    Papers sharing an identity are merged into a single record. The copy
+    with the higher ``metadata_score`` is used as the merge base so its
+    wholesale-preferred fields (authors, references, citations) survive,
+    while other fields are unioned. Among copies with equal scores, the
+    first-seen value of any conflicting field is kept, mirroring
+    ``Paper.merge_with``. The returned list preserves first-seen order of
+    unique papers.
+    """
+    paper_map: dict[Paper, Paper] = {}
+    for paper in papers:
+        existing = paper_map.get(paper)
+        if existing is None:
+            paper_map[paper] = paper
+        elif paper.metadata_score > existing.metadata_score:
+            paper_map[paper] = paper.merge_with(existing)
+        else:
+            paper_map[paper] = existing.merge_with(paper)
+    return list(paper_map.values())
+@
+
 \subsubsection{Combining results}
 
-We can merge results from multiple searches, deduplicating and consolidating
-papers.
-When the same paper appears from multiple providers, we consolidate the data
-to get the most complete record (keeping abstracts, DOIs, etc.\ from whichever
-source has them).
+Merging two results concatenates their papers and consolidates the combined
+list.
+When the same paper appears from multiple providers, this yields the most
+complete record (keeping abstracts, DOIs, etc.\ from whichever source has
+them).
 
 <<search result methods>>=
 def merge(self, other: "SearchResult") -> "SearchResult":
     """Merge two search results, deduplicating and consolidating papers."""
-    logger.debug(f"Merging search results: {len(self.papers)} + {len(other.papers)} papers")
-    
-    # Use dict keyed by paper identity to enable consolidation
-    paper_map: dict[Paper, Paper] = {}
-
-    for paper in self.papers:
-        paper_map[paper] = paper
-
-    duplicates = 0
-    for paper in other.papers:
-        if paper in paper_map:
-            # Consolidate with existing paper
-            paper_map[paper] = paper_map[paper].merge_with(paper)
-            duplicates += 1
-        else:
-            paper_map[paper] = paper
-
-    merged_count = len(paper_map)
-    logger.info(f"Merged results: {merged_count} unique papers ({duplicates} duplicates removed)")
-
+    logger.debug(
+        f"Merging search results: {len(self.papers)} + "
+        f"{len(other.papers)} papers"
+    )
+    combined = self.papers + other.papers
+    deduped = deduplicate_papers(combined)
+    duplicates = len(combined) - len(deduped)
+    logger.info(
+        f"Merged results: {len(deduped)} unique papers "
+        f"({duplicates} duplicates removed)"
+    )
     return SearchResult(
         query=f"{self.query} | {other.query}",
         provider=f"{self.provider}, {other.provider}",
         timestamp=self.timestamp,
-        papers=list(paper_map.values()),
+        papers=deduped,
         filters=None,
+    )
+@
+
+\subsubsection{Deduplicating a single result}
+
+A single provider can also return the same paper more than once---most often
+when its results are paginated.
+[[deduplicate]] applies the same consolidation to one result's own papers, so
+the search command can guarantee a duplicate-free list even when only one
+provider responded (\cref{sec:doi-normalization}).
+
+<<search result methods>>=
+def deduplicate(self) -> "SearchResult":
+    """Return a copy with this result's own duplicate papers consolidated."""
+    deduped = deduplicate_papers(self.papers)
+    duplicates = len(self.papers) - len(deduped)
+    logger.info(
+        f"Deduplicated {self.provider}: {len(deduped)} unique papers "
+        f"({duplicates} duplicates removed)"
+    )
+    return SearchResult(
+        query=self.query,
+        provider=self.provider,
+        timestamp=self.timestamp,
+        papers=deduped,
+        filters=self.filters,
     )
 @
 
@@ -1797,6 +1965,55 @@ class TestSearchResult:
             # And combined sources
             assert "dblp" in merged.papers[0].sources
             assert "s2" in merged.papers[0].sources
+
+    def test_merge_keeps_richest_authors_regardless_of_order(self):
+        """The fuller author list survives no matter which side it is on."""
+        with isolated_registry():
+            sparse = Paper(title="P", authors=["Smith"], doi="10.1/p")
+            rich = Paper(
+                title="P", authors=["Jane Smith", "John Doe"], doi="10.1/p"
+            )
+            r_sparse = SearchResult(
+                query="q", provider="a", timestamp="t", papers=[sparse]
+            )
+            r_rich = SearchResult(
+                query="q", provider="b", timestamp="t", papers=[rich]
+            )
+            # Richer copy wins whether it is the left or right operand.
+            assert r_sparse.merge(r_rich).papers[0].authors == rich.authors
+            assert r_rich.merge(r_sparse).papers[0].authors == rich.authors
+
+    def test_deduplicate_consolidates_within_one_result(self):
+        """A single result with repeated papers is deduplicated."""
+        with isolated_registry():
+            # Same paper twice, each carrying complementary metadata.
+            first = Paper(
+                title="P", authors=["A"], doi="10.1/p", sources=["dblp"]
+            )
+            second = Paper(
+                title="P", authors=["A"], doi="10.1/p",
+                abstract="Abstract", sources=["s2"]
+            )
+            result = SearchResult(
+                query="q", provider="dblp",
+                timestamp="t", papers=[first, second]
+            )
+            deduped = result.deduplicate()
+            assert len(deduped.papers) == 1
+            assert deduped.papers[0].abstract == "Abstract"
+            assert set(deduped.papers[0].sources) == {"dblp", "s2"}
+
+    def test_deduplicate_keeps_unique_papers(self):
+        """Distinct papers are left untouched by deduplicate."""
+        with isolated_registry():
+            result = SearchResult(
+                query="q", provider="dblp", timestamp="t",
+                papers=[
+                    Paper(title="A", authors=["X"]),
+                    Paper(title="B", authors=["Y"]),
+                ],
+            )
+            assert len(result.deduplicate().papers) == 2
 @
 
 
