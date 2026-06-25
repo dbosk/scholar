@@ -4418,7 +4418,12 @@ expected header and metadata comments:
 
 \subsection{JSON formatter}
 
-For scripting, we provide JSON output that includes all paper metadata:
+For scripting, we provide JSON output that includes all paper metadata.
+We also surface the [[filters]] and [[limit]] that were applied, so a consumer
+reading the JSON has the same provenance the [[bibtex+prov]] export
+reconstructs --- the search is fully described by its query, providers,
+filters, and limit, and JSON is the natural place to expose all four to a
+machine reader.
 
 <<formatter classes>>=
 class JSONFormatter:
@@ -4432,6 +4437,8 @@ class JSONFormatter:
                 "query": result.query,
                 "provider": result.provider,
                 "timestamp": result.timestamp,
+                "filters": result.filters,
+                "limit": result.limit,
                 "papers": [
                     {
                         "title": p.title,
@@ -4449,7 +4456,7 @@ class JSONFormatter:
 @
 
 Let's verify the JSON formatter produces valid, parseable JSON with the correct
-structure:
+structure, including the search metadata:
 
 <<test functions>>=
     def test_json_formatter(self, sample_results, capsys):
@@ -4461,6 +4468,24 @@ structure:
         data = json.loads(captured.out)
         assert data[0]["query"] == "test"
         assert data[0]["papers"][0]["title"] == "Test Paper"
+        # Metadata keys are always present (None when unset)
+        assert data[0]["filters"] is None
+        assert data[0]["limit"] is None
+
+    def test_json_formatter_exposes_filters_and_limit(self, capsys):
+        """Active filters and limit appear in the JSON output."""
+        results = [
+            SearchResult(
+                query="test", provider="dblp",
+                timestamp="2024-01-01T00:00:00", papers=[],
+                filters={"year": "2020-2024"}, limit=50,
+            )
+        ]
+        JSONFormatter().format(results)
+        import json
+        data = json.loads(capsys.readouterr().out)
+        assert data[0]["filters"] == {"year": "2020-2024"}
+        assert data[0]["limit"] == 50
 @
 
 

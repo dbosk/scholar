@@ -2257,6 +2257,24 @@ class TestSearch:
             assert len(results) > 0
 @
 
+Each result must record the per-provider limit it was run with, since that
+value is what later reconstructs the [[--limit]] of the original search:
+
+<<test functions>>=
+    def test_execute_records_limit(self, monkeypatch):
+        """Search.execute stores the applied limit on each result."""
+        with isolated_registry():
+            from scholar import providers
+
+            mock_provider = Mock()
+            mock_provider.name = "mock"
+            mock_provider.search.return_value = []
+            monkeypatch.setattr(providers, "PROVIDERS", {"mock": mock_provider})
+
+            results = Search("test").execute(providers=["mock"], limit=42)
+            assert results[0].limit == 42
+@
+
 
 \section{Dependencies}
 
