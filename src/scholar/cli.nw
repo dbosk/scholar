@@ -376,7 +376,7 @@ We complete from the valid action names:
 
 <<completion functions>>=
 CACHE_ACTIONS = ["clear", "info", "path"]
-PDF_ACTIONS = ["open", "info", "clear", "path"]
+PDF_ACTIONS = ["open", "info", "clear", "path", "quote"]
 
 
 def complete_cache_action(incomplete: str) -> list[str]:
@@ -863,6 +863,14 @@ def rq(
             help="Skip automatic enrichment of papers without abstracts.",
         ),
     ] = False,
+    full_text: Annotated[
+        bool,
+        typer.Option(
+            "--full-text",
+            help="Label using supporting passages from each paper's full "
+            "text, not just the abstract.",
+        ),
+    ] = False,
     <<search filter options>>
 ) -> None:
     """
@@ -1007,6 +1015,7 @@ try:
         model_id=select_model_id(model_selection, "analytic"),
         enrich_missing=not no_enrich,
         require_examples=False,
+        use_fulltext=full_text,
     )
     updated = apply_llm_decisions(session, batch)
 except ValueError as e:
@@ -1802,11 +1811,24 @@ URL parameter:
 \item[pdf info] Show PDF cache statistics
 \item[pdf clear] Delete all cached PDFs
 \item[pdf path] Print the PDF cache directory path
+\item[ pdf quote <url> [[--claim]] <claim> ] Surface candidate supporting
+  passages for a claim
 \end{description}
 
 The [[open]] action is the primary use case---it handles the full workflow
 of checking the cache, downloading if necessary, and opening in the system
 viewer.
+
+The [[quote]] action supports the verification step of citing a source: given a
+claim, it prints candidate passages and the page each came from, leaving the
+judgement to the reader (see \cref{sec:quote-extraction}).
+Its options ([[--claim]], [[--limit]], [[--model]], [[--json]], and the
+[[--lexical]]/[[--llm]] stage toggles) apply only to this action;
+they sit on the shared [[pdf]] command because, like [[cache]], it dispatches on
+a single action argument rather than splitting into sub-commands.
+We print results with the builtin [[print]] so a reader can pipe the passages
+into other tools, and route progress and warnings to a stderr console so they
+never contaminate that output.
 
 <<pdf command>>=
 @app.command()
@@ -1814,32 +1836,37 @@ def pdf(
     action: Annotated[
         str,
         typer.Argument(
-            help="Action: open, info, clear, or path",
+            help="Action: open, info, clear, path, or quote",
             autocompletion=complete_pdf_action,
         ),
     ],
     url: Annotated[
         Optional[str],
-        typer.Argument(help="PDF URL (required for 'open' action)"),
+        typer.Argument(help="PDF URL (required for 'open' and 'quote')"),
     ] = None,
+    <<pdf quote options>>
 ) -> None:
     """
     Manage PDF downloads and cache.
 
     Actions:
-        open <url>  - Download (if needed) and open a PDF
-        info        - Show PDF cache statistics
-        clear       - Delete all cached PDFs
-        path        - Print the PDF cache directory path
-    
+        open <url>   - Download (if needed) and open a PDF
+        info         - Show PDF cache statistics
+        clear        - Delete all cached PDFs
+        path         - Print the PDF cache directory path
+        quote <url>  - Surface candidate passages supporting --claim
+
     Examples:
         scholar pdf open "https://arxiv.org/pdf/2301.00001.pdf"
         scholar pdf info
         scholar pdf clear
+        scholar pdf quote "https://arxiv.org/pdf/2301.00001.pdf" \\
+            --claim "AE provides confidentiality and integrity"
     """
     from scholar.pdf import (
         PDFDownloadError,
         clear_pdf_cache,
+        find_quote_candidates,
         get_pdf,
         get_pdf_cache_dir,
         get_pdf_cache_info,
@@ -1892,10 +1919,222 @@ def pdf(
     elif action == "path":
         print(get_pdf_cache_dir())
 
+    elif action == "quote":
+        <<pdf quote action>>
+
     else:
         console.print(f"[red]Unknown action: {escape(action)}[/red]")
-        console.print("Valid actions: open, info, clear, path")
+        console.print("Valid actions: open, info, clear, path, quote")
         raise typer.Exit(1)
+@
+
+\subsection{The quote action}
+
+The options that drive [[quote]] are deferred to a placeholder in the command
+signature so the shared parts of [[pdf]] stay readable.
+The two stage toggles use Typer's [[--flag/--no-flag]] form so each defaults to
+on yet can be turned off independently.
+
+<<pdf quote options>>=
+claim: Annotated[
+    Optional[str],
+    typer.Option(
+        "--claim",
+        help="Claim to find supporting passages for (required for 'quote').",
+    ),
+] = None,
+quote_limit: Annotated[
+    int,
+    typer.Option(
+        "--limit", "-n",
+        help="Number of candidate passages to show (quote).",
+    ),
+] = 5,
+quote_model: Annotated[
+    Optional[str],
+    typer.Option(
+        "--model", "-m",
+        help="LLM model for reranking quotes (uses llm default if unset).",
+        autocompletion=complete_model,
+    ),
+] = None,
+use_lexical: Annotated[
+    bool,
+    typer.Option(
+        "--lexical/--no-lexical",
+        help="Toggle the lexical ranking stage (quote).",
+    ),
+] = True,
+use_llm: Annotated[
+    bool,
+    typer.Option(
+        "--llm/--no-llm",
+        help="Toggle the LLM rerank stage (quote).",
+    ),
+] = True,
+json_output: Annotated[
+    bool,
+    typer.Option(
+        "--json",
+        help="Emit candidates as a JSON array (quote).",
+    ),
+] = False,
+@
+
+We validate the same way the [[open]] action does---a missing URL or claim is a
+usage error---and additionally reject disabling both ranking stages, since then
+there is nothing to rank.
+
+<<pdf quote action>>=
+if not url:
+    console.print("[red]Error: URL required for 'quote' action[/red]")
+    console.print('Usage: scholar pdf quote <url> --claim "..."')
+    raise typer.Exit(1)
+if not claim:
+    console.print("[red]Error: --claim required for 'quote' action[/red]")
+    raise typer.Exit(1)
+if not use_lexical and not use_llm:
+    console.print(
+        "[red]Error: enable at least one of --lexical / --llm[/red]"
+    )
+    raise typer.Exit(1)
+
+err_console = Console(stderr=True)
+try:
+    candidates = find_quote_candidates(
+        url,
+        claim,
+        limit=quote_limit,
+        model_id=quote_model,
+        use_lexical=use_lexical,
+        use_llm=use_llm,
+        progress_callback=lambda msg: err_console.print(
+            f"[dim]{escape(msg)}[/dim]"
+        ),
+    )
+except PDFDownloadError as e:
+    console.print(f"[red]Download failed: {escape(str(e))}[/red]")
+    raise typer.Exit(1)
+
+<<output quote candidates>>
+@
+
+The default output is one human-readable line per candidate.
+A [[--json]] array is offered for programmatic consumers---notably the
+[[backing-claims]] skill, which records a citation's provenance and wants the
+page, score, and relevance as structured fields rather than parsing prose.
+In JSON mode an empty result is a valid empty array (not a message), so a
+caller can consume it unconditionally; the human mode instead prints a notice
+to stderr.
+This composes with the earlier decision to route all progress and warnings to a
+stderr console: together they keep stdout pure JSON, so a consumer can pipe the
+command straight into a JSON parser without filtering out diagnostics or
+special-casing the no-results case.
+
+<<output quote candidates>>=
+if json_output:
+    import json as _json
+    from dataclasses import asdict
+
+    print(
+        _json.dumps(
+            [asdict(candidate) for candidate in candidates],
+            ensure_ascii=False,
+            indent=2,
+        )
+    )
+    return
+
+if not candidates:
+    err_console.print("[yellow]No candidate passages found.[/yellow]")
+    return
+
+for candidate in candidates:
+    <<print a quote candidate>>
+@
+
+Each line gives the page, an optional relevance label when the LLM ranked it,
+and the verbatim passage in quotes---close to the sketch in the issue.
+
+<<print a quote candidate>>=
+location = f"p.{candidate.page}"
+if candidate.relevance:
+    print(f'{location}  [{candidate.relevance}]  "{candidate.text}"')
+else:
+    print(f'{location}  "{candidate.text}"')
+@
+
+Let's verify the action rejects a missing claim and, with the PDF-access
+functions stubbed, prints the supporting passage and its page:
+
+<<test functions>>=
+class TestPdfQuoteCommand:
+    """Tests for the 'pdf quote' action."""
+
+    def test_quote_requires_claim(self):
+        runner = CliRunner()
+        result = runner.invoke(app, ["pdf", "quote", "https://x/p.pdf"])
+        assert result.exit_code == 1
+
+    def test_quote_lists_supporting_passage(self, tmp_path, monkeypatch):
+        pdf_path = tmp_path / "p.pdf"
+        pdf_path.write_bytes(b"%PDF-1.4")
+        monkeypatch.setattr("scholar.pdf.get_pdf", lambda *a, **k: pdf_path)
+        monkeypatch.setattr(
+            "scholar.pdf.extract_pdf_pages",
+            lambda path: [
+                "An authenticated encryption scheme provides both "
+                "confidentiality and integrity for messages."
+            ],
+        )
+        runner = CliRunner()
+        result = runner.invoke(
+            app,
+            [
+                "pdf",
+                "quote",
+                "https://x/p.pdf",
+                "--claim",
+                "authenticated encryption confidentiality integrity",
+                "--no-llm",
+            ],
+        )
+        assert result.exit_code == 0
+        assert "p.1" in result.stdout
+        assert "authenticated encryption" in result.stdout
+
+    def test_quote_json_output(self, tmp_path, monkeypatch):
+        import json
+
+        pdf_path = tmp_path / "p.pdf"
+        pdf_path.write_bytes(b"%PDF-1.4")
+        monkeypatch.setattr("scholar.pdf.get_pdf", lambda *a, **k: pdf_path)
+        monkeypatch.setattr(
+            "scholar.pdf.extract_pdf_pages",
+            lambda path: [
+                "An authenticated encryption scheme provides both "
+                "confidentiality and integrity for messages."
+            ],
+        )
+        runner = CliRunner()
+        result = runner.invoke(
+            app,
+            [
+                "pdf",
+                "quote",
+                "https://x/p.pdf",
+                "--claim",
+                "authenticated encryption confidentiality integrity",
+                "--no-llm",
+                "--json",
+            ],
+        )
+        assert result.exit_code == 0
+        payload = json.loads(result.stdout)
+        assert payload[0]["page"] == 1
+        assert "authenticated encryption" in payload[0]["text"]
+        assert "score" in payload[0]
+        assert payload[0]["relevance"] is None
 @
 
 
@@ -3133,6 +3372,14 @@ def llm_classify(
             help="Run without requiring tagged examples (zero-shot).",
         ),
     ] = False,
+    full_text: Annotated[
+        bool,
+        typer.Option(
+            "--full-text",
+            help="Classify using supporting passages from each paper's full "
+            "text, not just the abstract (needs a research context).",
+        ),
+    ] = False,
 ) -> None:
     """
     Classify pending papers using LLM.
@@ -3142,9 +3389,14 @@ def llm_classify(
     is given, which runs zero-shot classification using only the research
     context.
 
+    With --full-text, supporting passages from each paper's PDF (matched
+    against the research context) are added to the prompt, so classification
+    can go beyond the abstract.
+
     Example:
         scholar llm classify "my review" --count 20
         scholar llm classify "my review" --no-examples
+        scholar llm classify "my review" --full-text
     """
     import scholar.review as review
     from scholar.review import save_session
@@ -3176,6 +3428,7 @@ def llm_classify(
             enrich_missing=not no_enrich,
             dry_run=dry_run,
             require_examples=not no_examples,
+            use_fulltext=full_text,
         )
 
         if dry_run:
