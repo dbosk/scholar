@@ -19,16 +19,20 @@ all: ${DOC}
 
 scholar.pdf: scholar.tex preamble.tex
 scholar.pdf: ${SRC_TEX}
+# The woven .tex ask minted to load noweb's custom lexer; noweb.mk provides the
+# rule that copies it here from noweb's library directory.
+scholar.pdf: noweb_lexer.py
 
 # Build .tex files in src/scholar if they don't exist or are outdated
 ../src/scholar/%.tex::
 	${MAKE} -C ../src/scholar $(notdir $@)
 
 INCLUDE_MAKEFILES=../makefiles
-include ${INCLUDE_MAKEFILES}/tex.mk
+include ${INCLUDE_MAKEFILES}/noweb.mk
 
 clean:
 	${RM} ${DOC}
+	${RM} noweb_lexer.py
 	${MAKE} -C ../src/scholar clean
 
 distclean:
