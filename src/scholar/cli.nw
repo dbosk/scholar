@@ -67,7 +67,9 @@ across bibliographic databases.
 <<completion functions>>
 <<search command>>
 <<rq command>>
+<<currency reporting helpers>>
 <<enrich command>>
+<<verify command>>
 <<providers command>>
 <<syntax command>>
 <<cache command>>
@@ -104,7 +106,7 @@ The test file collects all distributed test chunks:
 """Tests for the CLI module."""
 import pytest
 from datetime import datetime
-from unittest.mock import Mock
+from unittest.mock import Mock, patch
 from typer.testing import CliRunner
 
 from scholar.cli import *
@@ -1383,6 +1385,88 @@ class TestRQCommand:
         assert data["decisions"][0]["source"] == "llm"
 @
 
+\section{Reporting currency issues}
+\label{sec:currency-reporting}
+
+Both [[enrich]] and [[verify]] need to render a paper's currency problem the
+same way---red for retractions, yellow for the milder corrections and
+supersessions---so we factor the rendering into one helper rather than letting
+the two commands drift apart.  The colour mapping keys off the status word from
+[[currency_status]] (\cref{crossref-module}), so severity is decided in exactly
+one place across the whole system.
+
+We build a Rich [[Text]] object rather than a markup string because paper titles
+and DOIs are untrusted data: appending them as plain segments means a title
+containing [[[/red]]] cannot accidentally close our styling or inject markup.
+
+The helper returns [[None]] for papers without a problem (clean, unchecked, or
+DOI-less).  Returning a sentinel rather than printing lets each caller decide
+what to do with the silent majority: [[enrich]] drops them, while [[verify]]
+still lists them as \enquote{ok} or \enquote{unknown}.
+
+<<currency reporting helpers>>=
+from scholar.crossref import currency_status
+
+CURRENCY_PROBLEM_STYLES = {
+    "retracted": "bold red",
+    "corrected": "yellow",
+    "superseded": "yellow",
+}
+
+
+def format_currency_warning(paper) -> Optional[Text]:
+    """Return a Rich Text warning for a paper with a currency issue.
+
+    Returns None for papers that are ok, unchecked, or lack a DOI, so callers
+    can skip the silent majority.
+    """
+    status = currency_status(paper)
+    style = CURRENCY_PROBLEM_STYLES.get(status)
+    if style is None:
+        return None
+    if status == "superseded":
+        links = [v.get("doi") for v in (paper.newer_versions or [])]
+    else:
+        links = [n.get("doi") for n in (paper.updated_by or [])]
+    links_str = ", ".join(doi for doi in links if doi) or "?"
+
+    text = Text()
+    text.append(f"[{status.upper()}] ", style=style)
+    text.append(paper.title_preview())
+    text.append(f"  -> {links_str}", style="dim")
+    return text
+@
+
+Let's verify the helper styles and skips correctly:
+
+<<test functions>>=
+class TestFormatCurrencyWarning:
+    """Tests for the shared currency-warning renderer."""
+
+    def test_clean_paper_returns_none(self):
+        """A checked-clean paper produces no warning."""
+        from scholar.cli import format_currency_warning
+        from scholar import Paper
+
+        paper = Paper(title="T", authors=["a"], updated_by=[], newer_versions=[])
+        assert format_currency_warning(paper) is None
+
+    def test_retracted_paper_warns_with_link(self):
+        """A retracted paper yields a Text mentioning the notice DOI."""
+        from scholar.cli import format_currency_warning
+        from scholar import Paper
+
+        paper = Paper(
+            title="Bad study",
+            authors=["a"],
+            updated_by=[{"doi": "10.1/notice", "type": "retraction"}],
+        )
+        text = format_currency_warning(paper)
+        assert text is not None
+        assert "RETRACTED" in text.plain
+        assert "10.1/notice" in text.plain
+@
+
 \section{Enriching Papers}
 
 The [[enrich]] command fetches missing abstracts/metadata for papers in a review session.
@@ -1474,6 +1558,9 @@ with Progress() as progress:
 # Update decisions with enriched papers (preserve order)
 for decision, enriched in zip(session_data.decisions, enriched_papers):
     decision.paper = enriched
+
+<<warn on currency issues during enrich>>
+
 save_session(session_data)
 
 # Count how many were actually enriched
@@ -1484,6 +1571,260 @@ enriched_count = sum(
 console.print(f"[green]Enriched {enriched_count} papers.[/green]")
 @
 
+Enrichment is also the natural moment to check currency: we already hold the
+session's papers and are about to write them back, so a retraction check costs
+one extra pass and saves its results in the same [[save_session]].  We check
+\emph{every} paper, not just those that needed metadata enrichment---a paper can
+be complete yet retracted---so this runs over all decisions rather than the
+[[papers_to_enrich]] subset.
+
+We only surface problems here (a warning per retracted, corrected, or
+superseded paper); the clean and unchecked majority stay silent.  Users who want
+the full per-paper picture run [[scholar verify]] instead.
+
+<<warn on currency issues during enrich>>=
+from scholar.crossref import annotate_papers
+
+console.print(
+    "[cyan]Checking Crossref for retractions/corrections...[/cyan]"
+)
+checked = annotate_papers([d.paper for d in session_data.decisions])
+for decision, paper in zip(session_data.decisions, checked):
+    decision.paper = paper
+
+warnings = [
+    text
+    for paper in checked
+    if (text := format_currency_warning(paper)) is not None
+]
+if warnings:
+    console.print(f"[red]Found {len(warnings)} currency issue(s):[/red]")
+    for text in warnings:
+        console.print(text)
+else:
+    console.print("[green]No retractions or corrections found.[/green]")
+@
+
+
+\section{Verifying currency}
+\label{sec:verify-command}
+
+Where [[enrich]] checks currency as a side effect, [[verify]] makes it the
+point: it reports the status of \emph{every} paper in a session, not just the
+problem ones, and offers a [[--json]] mode so the [[backing-claims]] skill can
+consume the result programmatically.  It shares [[enrich]]'s argument shape (a
+session name with the same completion) so the two commands feel like a pair.
+
+<<verify command>>=
+@app.command()
+def verify(
+    session: Annotated[
+        str,
+        typer.Argument(
+            help="Name of the review session to check.",
+            autocompletion=complete_session_name,
+        ),
+    ],
+    json_output: Annotated[
+        bool,
+        typer.Option(
+            "--json",
+            help="Emit the currency report as a JSON array.",
+        ),
+    ] = False,
+) -> None:
+    """
+    Check a session's papers for retractions, corrections, and newer versions.
+
+    Looks up each paper's DOI in Crossref and reports whether it has been
+    retracted or corrected, or has a superseding version. The discovered
+    status is saved back to the session.
+
+    Example:
+        scholar verify "machine learning"
+    """
+    <<verify session currency>>
+@
+
+We borrow the stderr-console discipline introduced for [[pdf quote]]
+(\cref{ch:pdf-cli}): all progress and diagnostics go to [[err_console]], so
+in [[--json]] mode standard output carries nothing but the JSON array and a
+consumer can pipe it straight into a parser.  A missing session is therefore an
+error on stderr plus a non-zero exit, never a stray line on stdout.
+
+<<verify session currency>>=
+from scholar.review import load_session, save_session
+from scholar.crossref import annotate_papers, currency_status
+from rich.progress import Progress
+
+console = Console()
+err_console = Console(stderr=True)
+
+session_data = load_session(session)
+if session_data is None:
+    err_console.print(f"[red]Session not found:[/red] {escape(session)}")
+    raise typer.Exit(1)
+
+papers = [decision.paper for decision in session_data.decisions]
+<<run the currency check with a progress bar>>
+
+# Persist the discovered status back to the session.
+for decision, paper in zip(session_data.decisions, checked):
+    decision.paper = paper
+save_session(session_data)
+
+<<output the currency report>>
+@
+
+The progress bar is attached to [[err_console]] for the same reason: a Rich
+progress display writes escape sequences that must not contaminate JSON output.
+The per-paper callback drives it as Crossref is queried one DOI at a time.
+
+<<run the currency check with a progress bar>>=
+with Progress(console=err_console) as progress:
+    task = progress.add_task(
+        "[cyan]Checking Crossref...", total=len(papers)
+    )
+
+    def update_progress(done: int, total: int) -> None:
+        progress.update(task, completed=done)
+
+    checked = annotate_papers(papers, progress_callback=update_progress)
+@
+
+The JSON shape mirrors what a verification checklist needs: the DOI and title to
+identify the paper, the one-word [[status]], and the raw notice and
+newer-version lists so a caller can show the linking DOIs without a second
+lookup.  An empty session is a valid empty array, not a message.
+
+<<output the currency report>>=
+if json_output:
+    report = [
+        {
+            "doi": paper.doi,
+            "title": paper.title,
+            "status": currency_status(paper),
+            "updated_by": paper.updated_by,
+            "newer_versions": paper.newer_versions,
+        }
+        for paper in checked
+    ]
+    print(json.dumps(report, ensure_ascii=False, indent=2))
+    return
+
+<<print the human currency report>>
+@
+
+In human mode we lead with the problems---each rendered by the shared
+[[format_currency_warning]] helper---and close with a one-line tally of every
+status so the reader can see the clean and unchecked counts too.
+
+<<print the human currency report>>=
+from collections import Counter
+
+problems = [
+    text
+    for paper in checked
+    if (text := format_currency_warning(paper)) is not None
+]
+if problems:
+    for text in problems:
+        console.print(text)
+else:
+    console.print(
+        "[green]No retractions, corrections, or newer versions found.[/green]"
+    )
+
+counts = Counter(currency_status(paper) for paper in checked)
+console.print(
+    f"[bold]{len(checked)} papers[/bold]: "
+    f"{counts.get('retracted', 0)} retracted, "
+    f"{counts.get('corrected', 0)} corrected, "
+    f"{counts.get('superseded', 0)} superseded, "
+    f"{counts.get('ok', 0)} ok, "
+    f"{counts.get('unknown', 0)} unknown"
+)
+@
+
+Let's verify the command end to end: the human report, the JSON mode, and the
+missing-session error.  We build a small session on disk and stub the Crossref
+lookup so no network is touched---the stub marks one paper retracted and leaves
+the other clean.
+
+<<test functions>>=
+class TestVerifyCommand:
+    """Tests for the verify command."""
+
+    def _make_session(self, tmp_path, monkeypatch):
+        """Create a two-paper session on disk and return its name."""
+        from dataclasses import replace as _replace  # noqa: F401
+
+        from scholar import Paper, SearchResult
+        from scholar.review import create_review_session, save_session
+
+        monkeypatch.setenv("SCHOLAR_DATA_DIR", str(tmp_path))
+        papers = [
+            Paper(title="Bad", authors=["a"], doi="10.1/bad", sources=["m"]),
+            Paper(title="Good", authors=["b"], doi="10.1/good", sources=["m"]),
+        ]
+        result = SearchResult(
+            query="q", provider="m", timestamp="t", papers=papers
+        )
+        session = create_review_session([result], "q", session_name="vtest")
+        save_session(session)
+        return "vtest"
+
+    @staticmethod
+    def _fake_annotate(papers, progress_callback=None):
+        """Mark the 10.1/bad paper retracted, others checked-clean."""
+        from dataclasses import replace
+
+        out = []
+        for paper in papers:
+            if paper.doi == "10.1/bad":
+                out.append(
+                    replace(
+                        paper,
+                        updated_by=[{"doi": "10.1/n", "type": "retraction"}],
+                        newer_versions=[],
+                    )
+                )
+            else:
+                out.append(replace(paper, updated_by=[], newer_versions=[]))
+        return out
+
+    def test_human_report_flags_retraction(self, tmp_path, monkeypatch):
+        """The human report names the retracted paper and a tally."""
+        name = self._make_session(tmp_path, monkeypatch)
+        with patch(
+            "scholar.crossref.annotate_papers", side_effect=self._fake_annotate
+        ):
+            result = runner.invoke(app, ["verify", name])
+        assert result.exit_code == 0
+        assert "RETRACTED" in result.stdout
+        assert "1 retracted" in result.stdout
+
+    def test_json_output_is_pure_json(self, tmp_path, monkeypatch):
+        """--json emits a parseable array with per-paper status."""
+        import json as _json
+
+        name = self._make_session(tmp_path, monkeypatch)
+        with patch(
+            "scholar.crossref.annotate_papers", side_effect=self._fake_annotate
+        ):
+            result = runner.invoke(app, ["verify", name, "--json"])
+        assert result.exit_code == 0
+        report = _json.loads(result.stdout)
+        by_doi = {entry["doi"]: entry["status"] for entry in report}
+        assert by_doi["10.1/bad"] == "retracted"
+        assert by_doi["10.1/good"] == "ok"
+
+    def test_missing_session_exits_nonzero(self, tmp_path, monkeypatch):
+        """An unknown session name exits with a non-zero code."""
+        monkeypatch.setenv("SCHOLAR_DATA_DIR", str(tmp_path))
+        result = runner.invoke(app, ["verify", "no-such-session"])
+        assert result.exit_code == 1
+@
 
 \section{Listing Available Providers}
 

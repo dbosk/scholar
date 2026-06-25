@@ -5,6 +5,7 @@ SRC_TEX+=	../src/scholar/utils.tex
 SRC_TEX+=	../src/scholar/cache.tex
 SRC_TEX+=	../src/scholar/providers.tex
 SRC_TEX+=	../src/scholar/enrich.tex
+SRC_TEX+=	../src/scholar/crossref.tex
 SRC_TEX+=	../src/scholar/pdf.tex
 SRC_TEX+=	../src/scholar/notes.tex
 SRC_TEX+=	../src/scholar/review.tex
