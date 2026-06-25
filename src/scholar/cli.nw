@@ -490,7 +490,7 @@ limit: Annotated[
         help="Maximum results per provider (default: 1000). "
              "Use 0 for unlimited (fetch all pages).",
     ),
-] = 1000,
+] = DEFAULT_SEARCH_LIMIT,
 enrich: Annotated[
     bool,
     typer.Option(
@@ -823,7 +823,7 @@ def rq(
             "-l",
             help="Maximum results per provider (default: 1000). Use 0 for unlimited.",
         ),
-    ] = 1000,
+    ] = DEFAULT_SEARCH_LIMIT,
     count: Annotated[
         int,
         typer.Option(
@@ -4445,35 +4445,69 @@ through [[SearchResult.merge]], which joins the per-provider queries with
 [[" | "]] (every segment is identical, since one query is sent to all
 providers) and joins the provider names with [[", "]].  To rebuild a command
 the reader can actually run, we undo both joins: collapse the duplicated query
-segments back to one query and re-emit a single [[-p]] flag per provider.  A
-backslash or double quote inside the query is escaped first, so the
-surrounding double quotes stay balanced rather than being closed early by a
-quote in the query text.
+segments back to one query and re-emit a single [[-p]] flag per provider.
 
-Filters such as [[--year]] or [[--limit]] are \emph{not} reconstructed: they
-are dropped when results merge, so the [[FOUND-VIA]] command captures the
-query and providers but not the exact filtered set.  Since the author
-completes the remaining provenance fields by hand anyway, a runnable starting
-command --- rather than a byte-exact replay of the original search --- is the
-right target.
+Free-text arguments --- the query and the [[--venue]] value --- may contain a
+space, double quote, or backslash, so we wrap them in double quotes and escape
+the quote and backslash.  Both arguments share one [[_quote_arg]] helper rather
+than re-deriving the escaping, since a quote that closes the wrapper early
+would corrupt either field the same way.
+
+<<formatter classes>>=
+def _quote_arg(value: str) -> str:
+    """Return ``value`` double-quoted with backslashes and quotes escaped."""
+    escaped = value.replace("\\", "\\\\").replace('"', '\\"')
+    return f'"{escaped}"'
+@
+
+The filters and limit travel on the result (preserved through [[merge]]), so we
+turn them back into the flags that produced them.  The [[--limit]] is shown
+only when it differs from the default, and the unlimited sentinel maps back to
+the [[0]] the user actually typed rather than the large internal cap.  Output
+and enrichment options such as [[--enrich]] are deliberately omitted: they
+change how results are displayed or augmented, not \emph{which} papers match,
+so they are irrelevant to reproducing the found set.
+
+<<formatter classes>>=
+def _search_flags(result) -> list[str]:
+    """Reconstruct the filter and limit flags applied to a result."""
+    flags = []
+    filters = result.filters or {}
+    if filters.get("year"):
+        flags.append(f"--year {filters['year']}")
+    if filters.get("open_access"):
+        flags.append("--open-access")
+    if filters.get("venue"):
+        flags.append(f"--venue {_quote_arg(filters['venue'])}")
+    if filters.get("min_citations") is not None:
+        flags.append(f"--min-citations {filters['min_citations']}")
+    for pub_type in filters.get("pub_types") or []:
+        flags.append(f"--type {pub_type}")
+    limit = result.limit
+    if limit is not None and limit != DEFAULT_SEARCH_LIMIT:
+        shown = 0 if limit >= UNLIMITED_PROVIDER_LIMIT else limit
+        flags.append(f"--limit {shown}")
+    return flags
+@
+
+With the helpers in place, [[_found_via]] is just the query, the [[-p]] flags,
+and the reconstructed filter flags joined into one command:
 
 <<formatter classes>>=
 def _found_via(result) -> str:
     """Reconstruct the ``scholar search`` command behind a result.
 
     Undoes the ``" | "`` query join and ``", "`` provider join introduced
-    by ``SearchResult.merge`` so the emitted command is runnable.  Embedded
-    backslashes and double quotes in the query are escaped so the
-    surrounding double quotes stay balanced.
+    by ``SearchResult.merge``, then re-emits the filter and limit flags, so
+    the command reproduces the original search.
     """
     queries = list(dict.fromkeys(result.query.split(" | ")))
     query = " | ".join(queries)
-    safe_query = query.replace("\\", "\\\\").replace('"', '\\"')
     providers = [p.strip() for p in result.provider.split(",") if p.strip()]
-    command = f'scholar search "{safe_query}"'
-    if providers:
-        command += " " + " ".join(f"-p {p}" for p in providers)
-    return command
+    parts = [f"scholar search {_quote_arg(query)}"]
+    parts += [f"-p {p}" for p in providers]
+    parts += _search_flags(result)
+    return " ".join(parts)
 @
 
 Each paper is preceded by the comment block and then the reused entry.  The
@@ -4579,6 +4613,72 @@ crashing on an empty surname:
         out = capsys.readouterr().out
         assert "% === provenance: unknown2024 ===" in out
         assert "@article{unknown2024," in out
+@
+
+The filters and limit carried on the result must reappear as flags, in a
+fixed order, so the [[FOUND-VIA]] command reproduces the original search.  A
+[[--venue]] containing a space is quoted by the shared [[_quote_arg]] helper:
+
+<<test functions>>=
+    def test_found_via_reconstructs_filters_and_limit(self, capsys):
+        """Active filters and a non-default limit become CLI flags."""
+        results = [
+            SearchResult(
+                query="deep learning",
+                provider="dblp",
+                timestamp="2024-01-01T00:00:00",
+                papers=[Paper(title="P", authors=["Alice"], year=2024)],
+                filters={
+                    "year": "2020-2024",
+                    "open_access": True,
+                    "venue": "NeurIPS 2020",
+                    "min_citations": 50,
+                    "pub_types": ["article", "conference"],
+                },
+                limit=50,
+            )
+        ]
+        BibTeXProvFormatter().format(results)
+        out = capsys.readouterr().out
+        expected = (
+            '% FOUND-VIA: scholar search "deep learning" -p dblp '
+            "--year 2020-2024 --open-access "
+            '--venue "NeurIPS 2020" --min-citations 50 '
+            "--type article --type conference --limit 50"
+        )
+        assert expected in out
+@
+
+The default limit is implicit and so omitted, while the unlimited search maps
+back to the [[0]] the user typed rather than the internal cap:
+
+<<test functions>>=
+    def test_found_via_omits_default_limit(self, capsys):
+        """The default per-provider limit is not emitted."""
+        results = [
+            SearchResult(
+                query="q", provider="dblp", timestamp="t",
+                papers=[Paper(title="P", authors=["Alice"])],
+                limit=DEFAULT_SEARCH_LIMIT,
+            )
+        ]
+        BibTeXProvFormatter().format(results)
+        out = capsys.readouterr().out
+        assert '% FOUND-VIA: scholar search "q" -p dblp\n' in out
+        assert "--limit" not in out
+
+    def test_found_via_maps_unlimited_to_zero(self, capsys):
+        """The unlimited sentinel reconstructs as ``--limit 0``."""
+        results = [
+            SearchResult(
+                query="q", provider="dblp", timestamp="t",
+                papers=[Paper(title="P", authors=["Alice"])],
+                limit=UNLIMITED_PROVIDER_LIMIT,
+            )
+        ]
+        BibTeXProvFormatter().format(results)
+        out = capsys.readouterr().out
+        assert '% FOUND-VIA: scholar search "q" -p dblp --limit 0' in out
 @
 
 
@@ -4755,5 +4855,8 @@ from rich.text import Text
 <<constants>>=
 logger = logging.getLogger(__name__)
 
+# The default per-provider cap, shared by the --limit option default and the
+# FOUND-VIA reconstruction so the two cannot drift; 0 maps to the sentinel.
+DEFAULT_SEARCH_LIMIT = 1000
 UNLIMITED_PROVIDER_LIMIT = 10**9
 @
