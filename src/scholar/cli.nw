@@ -4435,8 +4435,9 @@ package for unified access to various language models.
 The workflow is:
 \begin{enumerate}
 \item User reviews some papers manually, tagging them as examples
-  (or skips this step using [[--no-examples]] for zero-shot
-  classification)
+  (recommended but optional; classification still runs without them,
+  warning that quality may suffer, and [[--no-examples]] skips them
+  outright for zero-shot classification)
 \item LLM classifies remaining papers based on examples
   (or research context alone)
 \item User reviews LLM decisions, corrections become new examples
@@ -4512,7 +4513,8 @@ def llm_classify(
         bool,
         typer.Option(
             "--no-examples",
-            help="Run without requiring tagged examples (zero-shot).",
+            help="Skip examples entirely for zero-shot classification, "
+            "even if some exist.",
         ),
     ] = False,
     full_text: Annotated[
@@ -4527,10 +4529,12 @@ def llm_classify(
     """
     Classify pending papers using LLM.
 
-    Uses human-reviewed papers as training examples. Requires at least
-    5 tagged examples (minimum 1 kept, 1 discarded) unless --no-examples
-    is given, which runs zero-shot classification using only the research
-    context.
+    Uses human-reviewed papers as training examples when available. Tagged
+    examples are recommended (ideally 5+, with at least 1 kept and 1
+    discarded) but no longer required: if too few exist, a warning is shown
+    and classification proceeds with whatever examples are present. Pass
+    --no-examples to skip examples entirely and run zero-shot classification
+    using only the research context, even when examples are available.
 
     With --full-text, supporting passages from each paper's PDF (matched
     against the research context) are added to the prompt, so classification
