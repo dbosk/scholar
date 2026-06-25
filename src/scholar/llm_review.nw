@@ -87,6 +87,7 @@ implementation section they verify.
 <<test [[llm_review.py]]>>=
 """Tests for the LLM review module."""
 import json
+import logging
 import pytest
 from datetime import datetime
 from unittest.mock import Mock, patch, MagicMock
@@ -324,10 +325,13 @@ def get_example_decisions(
 @
 
 
-\subsection{Validating Example Requirements}
+\subsection{Computing the Recommended Example Minimum}
 
-We require a minimum number of examples before allowing LLM classification.
-This ensures the LLM has enough context to make reasonable decisions.
+A small set of examples gives the LLM enough context to make reasonable
+decisions, so we compute a recommended minimum. This check is advisory, not a
+gate: [[classify_papers_with_llm]] uses a failed check to warn the user rather
+than to block classification, so a review with too few (or no) examples still
+runs.
 
 <<llm review example gathering>>=
 def validate_examples(
@@ -1040,11 +1044,18 @@ def get_papers_needing_enrichment(
 This is the primary entry point for LLM classification. It coordinates
 example gathering, prompt construction, LLM invocation, and response parsing.
 
-By default, we require a small set of human-reviewed example papers to ground
-the LLM and increase consistency.
-For early-stage workflows (e.g., research-question driven searches) there may
-be no examples yet; in that case, we support \enquote{zero-shot} classification by
-setting [[require_examples=False]], relying only on the session's research
+By default, we ground the LLM with a small set of human-reviewed example
+papers, which increases consistency. These examples are a help, not a
+precondition: early-stage workflows (e.g., research-question driven searches)
+often have nothing tagged yet, and forcing the user to hand-label a quota
+before any automation can run defeats the purpose of the automation. So when
+the available examples fall below the threshold in [[validate_examples]] we
+emit a warning and proceed with whatever examples exist, degrading smoothly
+from few-shot to zero-shot rather than refusing to run.
+
+Setting [[require_examples=False]] is the stronger, explicit form: it skips
+example gathering entirely for pure \enquote{zero-shot} classification, even
+when curated examples are available, relying only on the session's research
 context.
 
 <<llm review llm interaction>>=
@@ -1065,7 +1076,8 @@ def classify_papers_with_llm(
 
     This is the main entry point for LLM-assisted classification. It:
     1. Optionally gathers training examples from human-reviewed papers
-    2. Optionally validates minimum example requirements
+    2. Warns (but does not fail) if examples fall below the recommended
+       minimum, then proceeds with whatever examples exist
     3. Optionally enriches papers lacking abstracts
     4. Optionally extracts full-text supporting passages
     5. Constructs a prompt with examples and papers to classify
@@ -1078,9 +1090,11 @@ def classify_papers_with_llm(
         model_id: Deprecated compatibility alias for selecting the analytic model
         enrich_missing: Whether to auto-enrich papers without abstracts
         dry_run: If True, return the prompt without calling LLM
-        require_examples: If True (default), require tagged example papers
-            before classification. Set False for zero-shot classification
-            using only the research context.
+        require_examples: If True (default), gather tagged example papers
+            and use them to ground the LLM. Insufficient or missing examples
+            produce a warning, not an error. Set False to skip example
+            gathering entirely for zero-shot classification using only the
+            research context.
         use_fulltext: If True, extract supporting passages from each paper's
             full text (matched against the research context) and include them
             in the prompt, so classification can use evidence beyond the
@@ -1091,18 +1105,22 @@ def classify_papers_with_llm(
         LLMBatchResult with decisions, or prompt string if dry_run=True
 
     Raises:
-        ValueError: If there are no papers to classify, or if
-            require_examples=True and there are insufficient examples
+        ValueError: If there are no pending papers to classify
         ImportError: If llm package is not installed
     """
     # Gather examples (optional)
     if require_examples:
         kept_examples, discarded_examples = get_example_decisions(session)
 
-        # Validate
+        # Below-threshold examples are a quality concern, not a hard stop:
+        # warn and continue with whatever was gathered (possibly none) so
+        # classification still runs early in a review.
         is_valid, error = validate_examples(kept_examples, discarded_examples)
         if not is_valid:
-            raise ValueError(error)
+            logger.warning(
+                f"{error} Proceeding with the available examples; "
+                "classification quality may be reduced."
+            )
     else:
         kept_examples = []
         discarded_examples = []
@@ -1370,6 +1388,49 @@ class TestZeroShotClassification:
 
         assert "Research Context" in prompt
         assert "Papers to Classify" in prompt
+@
+
+\subsection{Degrading Gracefully Without Examples}
+
+The default path ([[require_examples=True]]) must not hard-fail when too few
+examples are tagged. We verify that a session with no examples still builds a
+prompt and that the user is warned, so the warning is observable rather than
+silent.
+
+<<test functions>>=
+class TestExamplesOptional:
+    """Default classification tolerates missing/insufficient examples."""
+
+    def test_classify_insufficient_examples_warns_not_raises(self, caplog):
+        """Below-threshold examples warn and still build a prompt."""
+        session = ReviewSession(
+            query="test",
+            providers=["test"],
+            timestamp=datetime.now(),
+            research_context="I am studying X.",
+        )
+        session.decisions.append(
+            ReviewDecision(
+                paper=Paper(
+                    title="Pending",
+                    authors=["A"],
+                    year=2024,
+                    abstract="Abstract.",
+                ),
+                provider="test",
+                status=DecisionStatus.PENDING,
+            )
+        )
+
+        with caplog.at_level(logging.WARNING):
+            prompt = classify_papers_with_llm(
+                session=session,
+                count=1,
+                dry_run=True,
+            )
+
+        assert "Papers to Classify" in prompt
+        assert "Proceeding with the available examples" in caplog.text
 @
 
 \subsection{Testing LLM Interaction}
