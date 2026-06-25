@@ -1822,8 +1822,9 @@ viewer.
 The [[quote]] action supports the verification step of citing a source: given a
 claim, it prints candidate passages and the page each came from, leaving the
 judgement to the reader (see \cref{sec:quote-extraction}).
-Its options (\texttt{--claim}, \texttt{--limit}, \texttt{--model}, and the
-\texttt{--lexical}/\texttt{--llm} stage toggles) apply only to this action;
+Its options (\texttt{--claim}, \texttt{--limit}, \texttt{--model},
+\texttt{--json}, and the \texttt{--lexical}/\texttt{--llm} stage toggles) apply
+only to this action;
 they sit on the shared [[pdf]] command because, like [[cache]], it dispatches on
 a single action argument rather than splitting into sub-commands.
 We print results with the builtin [[print]] so a reader can pipe the passages
@@ -1972,6 +1973,13 @@ use_llm: Annotated[
         help="Toggle the LLM rerank stage (quote).",
     ),
 ] = True,
+json_output: Annotated[
+    bool,
+    typer.Option(
+        "--json",
+        help="Emit candidates as a JSON array (quote).",
+    ),
+] = False,
 @
 
 We validate the same way the [[open]] action does---a missing URL or claim is a
@@ -2008,6 +2016,31 @@ try:
 except PDFDownloadError as e:
     console.print(f"[red]Download failed: {escape(str(e))}[/red]")
     raise typer.Exit(1)
+
+<<output quote candidates>>
+@
+
+The default output is one human-readable line per candidate.
+A [[--json]] array is offered for programmatic consumers---notably the
+[[backing-claims]] skill, which records a citation's provenance and wants the
+page, score, and relevance as structured fields rather than parsing prose.
+In JSON mode an empty result is a valid empty array (not a message), so a
+caller can consume it unconditionally; the human mode instead prints a notice
+to stderr.
+
+<<output quote candidates>>=
+if json_output:
+    import json as _json
+    from dataclasses import asdict
+
+    print(
+        _json.dumps(
+            [asdict(candidate) for candidate in candidates],
+            ensure_ascii=False,
+            indent=2,
+        )
+    )
+    return
 
 if not candidates:
     err_console.print("[yellow]No candidate passages found.[/yellow]")
@@ -2066,6 +2099,39 @@ class TestPdfQuoteCommand:
         assert result.exit_code == 0
         assert "p.1" in result.stdout
         assert "authenticated encryption" in result.stdout
+
+    def test_quote_json_output(self, tmp_path, monkeypatch):
+        import json
+
+        pdf_path = tmp_path / "p.pdf"
+        pdf_path.write_bytes(b"%PDF-1.4")
+        monkeypatch.setattr("scholar.pdf.get_pdf", lambda *a, **k: pdf_path)
+        monkeypatch.setattr(
+            "scholar.pdf.extract_pdf_pages",
+            lambda path: [
+                "An authenticated encryption scheme provides both "
+                "confidentiality and integrity for messages."
+            ],
+        )
+        runner = CliRunner()
+        result = runner.invoke(
+            app,
+            [
+                "pdf",
+                "quote",
+                "https://x/p.pdf",
+                "--claim",
+                "authenticated encryption confidentiality integrity",
+                "--no-llm",
+                "--json",
+            ],
+        )
+        assert result.exit_code == 0
+        payload = json.loads(result.stdout)
+        assert payload[0]["page"] == 1
+        assert "authenticated encryption" in payload[0]["text"]
+        assert "score" in payload[0]
+        assert payload[0]["relevance"] is None
 @
 
 
