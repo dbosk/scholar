@@ -94,7 +94,7 @@ __all__ = [
 
 
 \section{Testing}
-\label{sec:testing}
+\label{sec:scholar-testing}
 
 Tests are distributed throughout this document, appearing after each
 implementation section they verify.
