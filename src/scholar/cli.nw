@@ -2027,6 +2027,10 @@ page, score, and relevance as structured fields rather than parsing prose.
 In JSON mode an empty result is a valid empty array (not a message), so a
 caller can consume it unconditionally; the human mode instead prints a notice
 to stderr.
+This composes with the earlier decision to route all progress and warnings to a
+stderr console: together they keep stdout pure JSON, so a consumer can pipe the
+command straight into a JSON parser without filtering out diagnostics or
+special-casing the no-results case.
 
 <<output quote candidates>>=
 if json_output:
