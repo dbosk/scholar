@@ -1418,7 +1418,10 @@ class TestRQCommand:
 
         data = json.loads(session_file.read_text(encoding="utf-8"))
         assert data["research_context"] == rq_text
-        assert ("test query", "mock") in [tuple(x) for x in data["query_provider_pairs"]]
+        assert any(
+            r["query"] == "test query" and r["provider"] == "mock"
+            for r in data["search_records"]
+        )
         assert data["decisions"][0]["source"] == "llm"
 @
 
@@ -3378,10 +3381,11 @@ def sessions_list(
 \paragraph{The [[sessions show]] command}
 
 The [[sessions show]] command displays detailed information about a specific
-review session. We always display the query used for each provider, since
-different providers may receive different queries (for example, when using
-[[scholar rq]] with provider-specific query optimization). Before listing
-papers, we show a summary of themes (tags from kept papers) with counts,
+review session. We always display the query used for each provider---together
+with any filters and limit, reconstructed as the CLI flags that produced
+them---since different providers may receive different queries (for example,
+when using [[scholar rq]] with provider-specific query optimization). Before
+listing papers, we show a summary of themes (tags from kept papers) with counts,
 giving users a quick overview of what topics the session covers. Each paper
 also shows which provider returned it, helping users understand where results
 originated.
@@ -3431,6 +3435,15 @@ def sessions_show(
             "query": session.query,
             "providers": session.providers,
             "query_provider_pairs": session.query_provider_pairs,
+            "search_records": [
+                {
+                    "query": r.query,
+                    "provider": r.provider,
+                    "filters": r.filters,
+                    "limit": r.limit,
+                }
+                for r in session.search_records
+            ],
             "timestamp": session.timestamp.isoformat(),
             "themes": dict(session.theme_counts()),
             "decisions": [
@@ -3456,12 +3469,15 @@ def sessions_show(
                 f"{session.timestamp.strftime('%Y-%m-%d %H:%M')}[/dim]"
             )
 
-            # Always show query per provider
-            if session.query_provider_pairs:
+            # Always show query (with any filters) per provider
+            if session.search_records:
                 con.print("[dim]Queries by provider:[/dim]")
-                for query, provider in session.query_provider_pairs:
+                for record in session.search_records:
+                    flags = _search_flags(record.filters, record.limit)
+                    suffix = (" " + " ".join(flags)) if flags else ""
                     con.print(
-                        f"[dim]  {provider}: {escape(query)}[/dim]"
+                        f"[dim]  {record.provider}: "
+                        f"{escape(record.query + suffix)}[/dim]"
                     )
             else:
                 # Fallback: show providers with session query
@@ -3703,7 +3719,8 @@ class TestSessionsCommand:
         """sessions show lists kept, discarded, and pending papers."""
         monkeypatch.setenv("SCHOLAR_DATA_DIR", str(tmp_path))
         from scholar.review import (
-            ReviewDecision, ReviewSession, DecisionStatus, save_session,
+            ReviewDecision, ReviewSession, DecisionStatus, SearchRecord,
+            save_session,
         )
 
         session = ReviewSession(
@@ -3711,10 +3728,10 @@ class TestSessionsCommand:
             providers=["s2", "dblp", "openalex"],
             timestamp=datetime(2026, 3, 25, 14, 49),
             name="ProgSnap2",
-            query_provider_pairs=[
-                ("ProgSnap2", "s2"),
-                ("ProgSnap2", "dblp"),
-                ("ProgSnap2", "openalex"),
+            search_records=[
+                SearchRecord("ProgSnap2", "s2"),
+                SearchRecord("ProgSnap2", "dblp"),
+                SearchRecord("ProgSnap2", "openalex"),
             ],
         )
         session.decisions.extend(
@@ -3762,6 +3779,42 @@ class TestSessionsCommand:
         assert "Kept Paper" in result.output
         assert "Discarded Paper" in result.output
         assert "Pending Paper" in result.output
+
+    def test_sessions_show_displays_search_filters(
+        self, tmp_path, monkeypatch
+    ):
+        """sessions show renders each provider's query with its filters."""
+        monkeypatch.setenv("SCHOLAR_DATA_DIR", str(tmp_path))
+        from scholar.review import (
+            ReviewSession, SearchRecord, save_session,
+        )
+
+        session = ReviewSession(
+            query="q",
+            providers=["dblp"],
+            timestamp=datetime(2026, 3, 25, 14, 49),
+            name="filters-show",
+            search_records=[
+                SearchRecord(
+                    "deep learning", "dblp", {"year": "2020-2024"}, 50
+                ),
+            ],
+        )
+        save_session(session)
+
+        result = runner.invoke(app, ["sessions", "show", "filters-show"])
+        assert result.exit_code == 0
+        assert (
+            "dblp: deep learning --year 2020-2024 --limit 50"
+            in result.output
+        )
+
+        as_json = runner.invoke(
+            app, ["sessions", "show", "filters-show", "-f", "json"]
+        )
+        data = json.loads(as_json.output)
+        assert data["search_records"][0]["filters"] == {"year": "2020-2024"}
+        assert data["search_records"][0]["limit"] == 50
 @
 
 
@@ -3811,11 +3864,13 @@ app.add_typer(prov_app, name="prov")
 The record for one paper in one session pins the command to the single provider
 that actually returned the paper ([[decision.provider]]): re-running every
 provider's query would reproduce the whole session, not the one result we are
-citing.  We look that provider's query up in the session's stored pairs via
-[[queries_for_provider]] and take the first---a provider is normally searched
-once per session.  Sessions saved before per-provider pairs existed have none,
-so we fall back to the session's overall [[query]], which was the query sent to
-every provider in that older format.
+citing.  We look that provider's whole search up via [[search_record_for]],
+which gives back the query along with the filters and limit that were applied;
+those become the same flags the [[bibtex+prov]] formatter emits, via the shared
+[[_search_flags]] helper, so the command reproduces the \emph{exact} search and
+not a broader one.  Sessions saved before per-provider records existed have
+none, so we fall back to the session's overall [[query]] with no filters, which
+is the best the older format can offer.
 
 The research question travels along as [[research_context]] for the human
 reader, but it never shapes the command.  We deliberately do \emph{not} key the
@@ -3823,31 +3878,30 @@ command on whether [[research_context]] is set: it can be filled in on any
 session to drive automated classification, so it is not a marker of how the
 session was built.
 
-One limitation is worth stating plainly: the session does not persist the
-per-search filters (year, venue, open-access, and so on), only the query
-strings, so the reconstructed command carries the query and provider but not
-those flags.  The stored query is the reproducible core; the flags are a known
-gap rather than an oversight.
-
 <<prov command>>=
 def _found_via_record(session, decision) -> dict:
-    """Build the reproducible provenance record for one kept paper.
+    """Build the reproducible provenance record for one paper.
 
-    The command re-sends the exact provider query stored for the paper's
-    provider, reproducing the search without re-invoking the language model
-    that ``scholar rq`` used to generate that query.
+    The command re-sends the exact provider query, filters, and limit stored
+    for the paper's provider, reproducing the search without re-invoking the
+    language model that ``scholar rq`` used to generate that query.
     """
     provider = decision.provider
-    queries = session.queries_for_provider(provider)
-    provider_query = queries[0] if queries else session.query
-    command = f"scholar search {_quote_arg(provider_query)} -p {provider}"
+    record = session.search_record_for(provider)
+    provider_query = record.query if record else session.query
+    filters = record.filters if record else None
+    limit = record.limit if record else None
+    parts = [f"scholar search {_quote_arg(provider_query)} -p {provider}"]
+    parts += _search_flags(filters, limit)
     return {
         "paper_id": decision.paper.id,
         "title": decision.paper.title,
         "session": session.name or session.query,
-        "command": command,
+        "command": " ".join(parts),
         "provider": provider,
         "provider_query": provider_query,
+        "filters": filters,
+        "limit": limit,
         "research_context": session.research_context,
         "timestamp": session.timestamp.isoformat(),
     }
@@ -4004,16 +4058,19 @@ class TestProvCommand:
 The tests share one fixture builder that saves a session containing a single
 paper under a chosen provider.  Its decision status defaults to kept but is
 overridable, so a test can check that provenance is reported regardless of the
-keep/discard decision:
+keep/discard decision; the optional [[filters]]/[[limit]] are applied to each
+search record so a test can check that the reconstructed command carries the
+flags:
 
 <<prov test methods>>=
 def _make_session(
     self, *, name, providers, pairs, paper, provider,
-    research_context=None, status="kept",
+    research_context=None, status="kept", filters=None, limit=None,
 ):
     """Persist a session containing ``paper`` found via ``provider``."""
     from scholar.review import (
-        ReviewDecision, ReviewSession, DecisionStatus, save_session,
+        ReviewDecision, ReviewSession, DecisionStatus, SearchRecord,
+        save_session,
     )
     session = ReviewSession(
         query=name,
@@ -4021,7 +4078,9 @@ def _make_session(
         timestamp=datetime(2026, 3, 25, 14, 49),
         name=name,
         research_context=research_context,
-        query_provider_pairs=pairs,
+        search_records=[
+            SearchRecord(q, p, filters, limit) for q, p in pairs
+        ],
     )
     session.decisions.append(
         ReviewDecision(
@@ -4329,6 +4388,40 @@ def test_found_via_ambiguous_substring_errors(
     assert "Ambiguous" in result.output
     assert "doi:10.1/1" in result.output
     assert "doi:10.1/2" in result.output
+@
+
+The whole point of \#61: the stored filters and limit reappear as flags so the
+command reproduces the exact search, and the JSON carries them as structured
+data:
+
+<<prov test methods>>=
+def test_found_via_includes_filter_flags(self, tmp_path, monkeypatch):
+    """The reconstructed command carries the stored filters and limit."""
+    monkeypatch.setenv("SCHOLAR_DATA_DIR", str(tmp_path))
+    paper = Paper(title="P", authors=["Alice"], year=2024, doi="10.1/flt")
+    self._make_session(
+        name="s", providers=["dblp"], pairs=[("q", "dblp")],
+        paper=paper, provider="dblp",
+        filters={
+            "year": "2020-2024", "venue": "NeurIPS", "open_access": True,
+        },
+        limit=50,
+    )
+
+    result = runner.invoke(app, ["prov", "found-via", paper.id])
+    assert result.exit_code == 0
+    assert "--year 2020-2024" in result.output
+    assert "--open-access" in result.output
+    assert "--venue NeurIPS" in result.output
+    assert "--limit 50" in result.output
+
+    as_json = runner.invoke(
+        app, ["prov", "found-via", paper.id, "-f", "json"]
+    )
+    record = json.loads(as_json.output)[0]
+    assert record["filters"]["venue"] == "NeurIPS"
+    assert record["limit"] == 50
+    assert "--venue NeurIPS" in record["command"]
 @
 
 
@@ -5539,19 +5632,22 @@ def _quote_arg(value: str) -> str:
     return shlex.quote(value)
 @
 
-The filters and limit travel on the result (preserved through [[merge]]), so we
-turn them back into the flags that produced them.  The [[--limit]] is shown
-only when it differs from the default, and the unlimited sentinel maps back to
-the [[0]] the user actually typed rather than the large internal cap.  Output
-and enrichment options such as [[--enrich]] are deliberately omitted: they
-change how results are displayed or augmented, not \emph{which} papers match,
-so they are irrelevant to reproducing the found set.
+The filters and limit turn back into the flags that produced them.  We take
+them as a plain dict and an integer rather than off a result object, because two
+callers reconstruct flags from different sources: the [[bibtex+prov]] formatter
+reads them off a live [[SearchResult]], while [[prov found-via]] reads them off
+a stored [[SearchRecord]].  The [[--limit]] is shown only when it differs from
+the default, and the unlimited sentinel maps back to the [[0]] the user actually
+typed rather than the large internal cap.  Output and enrichment options such as
+[[--enrich]] are deliberately omitted: they change how results are displayed or
+augmented, not \emph{which} papers match, so they are irrelevant to reproducing
+the found set.
 
 <<formatter classes>>=
-def _search_flags(result) -> list[str]:
-    """Reconstruct the filter and limit flags applied to a result."""
+def _search_flags(filters: dict | None, limit: int | None) -> list[str]:
+    """Reconstruct the filter and limit CLI flags from a filters dict."""
     flags = []
-    filters = result.filters or {}
+    filters = filters or {}
     if filters.get("year"):
         flags.append(f"--year {filters['year']}")
     if filters.get("open_access"):
@@ -5562,7 +5658,6 @@ def _search_flags(result) -> list[str]:
         flags.append(f"--min-citations {filters['min_citations']}")
     for pub_type in filters.get("pub_types") or []:
         flags.append(f"--type {pub_type}")
-    limit = result.limit
     if limit is not None and limit != DEFAULT_SEARCH_LIMIT:
         shown = 0 if limit >= UNLIMITED_PROVIDER_LIMIT else limit
         flags.append(f"--limit {shown}")
@@ -5585,7 +5680,7 @@ def _found_via(result) -> str:
     providers = [p.strip() for p in result.provider.split(",") if p.strip()]
     parts = [f"scholar search {_quote_arg(query)}"]
     parts += [f"-p {p}" for p in providers]
-    parts += _search_flags(result)
+    parts += _search_flags(result.filters, result.limit)
     return " ".join(parts)
 @
 

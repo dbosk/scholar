@@ -360,16 +360,46 @@ class SnowballRound:
 @
 
 
+\subsection{Search Record}
+
+To reconstruct the exact [[scholar search]] that surfaced a paper, a session
+must remember not just the query sent to each provider but the \emph{filters}
+and \emph{limit} applied alongside it.  These belong to the individual search,
+not the session as a whole: a session accumulates searches across [[rq]]
+re-runs and snowball rounds, and those can carry different filters, so a single
+session-level filter set would misattribute one search's constraints to
+another.  We therefore record one [[SearchRecord]] per [[(query, provider)]]
+search.
+
+<<review data structures>>=
+@dataclass
+class SearchRecord:
+    """One provider search: its query, filters, and limit.
+
+    ``filters`` is the dict form of the ``SearchFilters`` that were applied
+    (``None`` when none were, or when the record predates filter
+    persistence); ``limit`` is the per-provider result cap.
+    """
+    query: str
+    provider: str
+    filters: dict | None = None
+    limit: int | None = None
+@
+
+
 \subsection{Review Session}
 
 A [[ReviewSession]] contains all decisions for a review, along with metadata
 about the search and analysis methods.
 
-The session tracks which query was used with which provider through the
-[[query_provider_pairs]] field. This enables using different query syntaxes for
-different providers---for example, natural language queries for OpenAlex and
-Boolean syntax for Web of Science. The [[query]] and [[providers]] fields are
-retained for backward compatibility with older session files.
+The session tracks which query---with which filters and limit---was used with
+which provider through the [[search_records]] field. This enables using
+different query syntaxes for different providers---for example, natural language
+queries for OpenAlex and Boolean syntax for Web of Science---and reconstructing
+the exact search later. The derived [[query_provider_pairs]] property exposes
+just the [[(query, provider)]] pairs for the many readers that do not need the
+filters. The [[query]] and [[providers]] fields are retained for backward
+compatibility with older session files.
 
 The [[snowball_rounds]] field tracks manual snowballing operations, recording
 which papers were used as sources and how many new papers were discovered.
@@ -416,7 +446,7 @@ class ReviewSession:
     decisions: list[ReviewDecision] = field(default_factory=list)
     name: str | None = None  # Optional session name for persistence
     research_context: str | None = None  # Research goals for LLM review
-    query_provider_pairs: list[tuple[str, str]] = field(default_factory=list)
+    search_records: list[SearchRecord] = field(default_factory=list)
     snowball_rounds: list[SnowballRound] = field(default_factory=list)
     # Internal cache for computed properties (not persisted)
     _cache: dict = field(default_factory=dict, repr=False, compare=False)
@@ -563,24 +593,43 @@ education}. When building a review session across multiple providers, we need to
 track which query was used with which provider so that reports accurately
 reflect the search methodology.
 
-We provide helper methods for managing these pairs. The
-[[add_query_provider_pair]] method adds a pair only if it doesn't already exist,
-preventing duplicates when appending results to an existing session. The
-[[queries_for_provider]] method retrieves all queries used with a specific
-provider.
+We provide helper methods for managing these records. The
+[[add_query_provider_pair]] method records a search only if its
+query-provider pair is not already present, preventing duplicates when
+appending results to an existing session; its [[filters]] and [[limit]]
+arguments default to [[None]] so older callers that only know the query and
+provider keep working. The [[query_provider_pairs]] property derives the
+[[(query, provider)]] pairs from the records, so every reader written against
+the old field is unaffected. The [[queries_for_provider]] method retrieves all
+queries used with a specific provider, and [[search_record_for]] retrieves the
+first whole record for a provider---query, filters, and limit---which is what
+[[found-via]] needs to rebuild the search.
 
 <<query-provider pair methods>>=
-def add_query_provider_pair(self, query: str, provider: str) -> None:
+def add_query_provider_pair(
+    self,
+    query: str,
+    provider: str,
+    filters: dict | None = None,
+    limit: int | None = None,
+) -> None:
     """
-    Add a query-provider pair if not already present.
+    Record a search if its query-provider pair is not already present.
 
     This tracks which query was used with which provider, enabling
     different queries for different providers (e.g., natural language
-    for OpenAlex, Boolean syntax for Web of Science).
+    for OpenAlex, Boolean syntax for Web of Science), together with the
+    filters and limit applied so the search can be reproduced exactly.
     """
-    pair = (query, provider)
-    if pair not in self.query_provider_pairs:
-        self.query_provider_pairs.append(pair)
+    if (query, provider) not in self.query_provider_pairs:
+        self.search_records.append(
+            SearchRecord(query, provider, filters, limit)
+        )
+
+@property
+def query_provider_pairs(self) -> list[tuple[str, str]]:
+    """The ``(query, provider)`` pairs, derived from the search records."""
+    return [(r.query, r.provider) for r in self.search_records]
 
 def queries_for_provider(self, provider: str) -> list[str]:
     """
@@ -588,7 +637,19 @@ def queries_for_provider(self, provider: str) -> list[str]:
 
     Returns a list of queries that were used to search the given provider.
     """
-    return [q for q, p in self.query_provider_pairs if p == provider]
+    return [r.query for r in self.search_records if r.provider == provider]
+
+def search_record_for(self, provider: str) -> SearchRecord | None:
+    """
+    Get the first recorded search for a provider, or ``None``.
+
+    Returns the whole record---query, filters, and limit---so callers can
+    reproduce the exact search that surfaced a paper from that provider.
+    """
+    for record in self.search_records:
+        if record.provider == provider:
+            return record
+    return None
 @
 
 \subsubsection{Snowballing Methods}
@@ -1138,14 +1199,18 @@ def create_review_session(
     if previous_session and previous_session.research_context:
         session.research_context = previous_session.research_context
     
-    # Build query-provider pairs from results
+    # Build search records (query, provider, filters, limit) from results
     for result in results:
-        session.add_query_provider_pair(result.query, result.provider)
-    
-    # Merge with previous session's query-provider pairs (if any)
+        session.add_query_provider_pair(
+            result.query, result.provider, result.filters, result.limit
+        )
+
+    # Merge with previous session's searches (if any), preserving their filters
     if previous_session:
-        for pair_query, pair_provider in previous_session.query_provider_pairs:
-            session.add_query_provider_pair(pair_query, pair_provider)
+        for record in previous_session.search_records:
+            session.add_query_provider_pair(
+                record.query, record.provider, record.filters, record.limit
+            )
     
     # Collect paper IDs from current search results
     current_paper_ids = set()
@@ -1380,10 +1445,12 @@ def create_notes_session() -> ReviewSession:
 \subsection{Session Persistence}
 
 Sessions can be saved and loaded for interrupted workflows. The session file
-includes [[query_provider_pairs]] to track which queries were used with which
-providers. For backward compatibility, when loading old session files without
-this field, we reconstruct the pairs by pairing the single [[query]] with each
-provider in [[providers]].
+includes [[search_records]] to track which query, filters, and limit were used
+with which provider. Loading walks a backward-compatibility ladder: newest files
+carry [[search_records]]; files from before filters were persisted carry only a
+[[query_provider_pairs]] list, which we load with empty filters; and the oldest
+files carry neither, so we reconstruct one record per provider by pairing the
+single [[query]] with each provider in [[providers]].
 
 <<review session functions>>=
 def _get_sessions_dir() -> Path:
@@ -1429,7 +1496,15 @@ def save_session(session: ReviewSession) -> Path:
         "providers": session.providers,
         "timestamp": session.timestamp.isoformat(),
         "research_context": session.research_context,
-        "query_provider_pairs": session.query_provider_pairs,
+        "search_records": [
+            {
+                "query": r.query,
+                "provider": r.provider,
+                "filters": r.filters,
+                "limit": r.limit,
+            }
+            for r in session.search_records
+        ],
         "snowball_rounds": [
             {
                 "timestamp": r.timestamp.isoformat(),
@@ -1499,11 +1574,23 @@ def load_session(name_or_query: str) -> ReviewSession | None:
             research_context=data.get("research_context"),
         )
         
-        # Load query_provider_pairs with backward compatibility
-        if "query_provider_pairs" in data:
-            session.query_provider_pairs = [
-                tuple(pair) for pair in data["query_provider_pairs"]
+        # Load search records with backward compatibility. Newest files store
+        # full records; files from before filter persistence store only
+        # (query, provider) pairs; the oldest store neither, so we rebuild
+        # from the session query and provider list.
+        if "search_records" in data:
+            session.search_records = [
+                SearchRecord(
+                    query=rec["query"],
+                    provider=rec["provider"],
+                    filters=rec.get("filters"),
+                    limit=rec.get("limit"),
+                )
+                for rec in data["search_records"]
             ]
+        elif "query_provider_pairs" in data:
+            for pair in data["query_provider_pairs"]:
+                session.add_query_provider_pair(pair[0], pair[1])
         else:
             # Reconstruct from query and providers for old sessions
             for provider in data["providers"]:
@@ -1589,6 +1676,58 @@ class TestQueryProviderPairsPersistence:
         assert len(loaded.query_provider_pairs) == 2
         assert ("natural language", "openalex") in loaded.query_provider_pairs
         assert ("boolean AND query", "wos") in loaded.query_provider_pairs
+
+    def test_save_and_load_search_filters(self, tmp_path, monkeypatch):
+        """Per-search filters and limit survive a save/load round-trip."""
+        monkeypatch.setenv("SCHOLAR_DATA_DIR", str(tmp_path))
+
+        session = ReviewSession(
+            query="test query",
+            providers=["openalex"],
+            timestamp=datetime.now(),
+            name="filters-session",
+        )
+        session.add_query_provider_pair(
+            "natural language", "openalex",
+            filters={"year": "2020-2024", "open_access": True},
+            limit=50,
+        )
+
+        save_session(session)
+        loaded = load_session("filters-session")
+
+        assert loaded is not None
+        record = loaded.search_record_for("openalex")
+        assert record is not None
+        assert record.query == "natural language"
+        assert record.filters == {"year": "2020-2024", "open_access": True}
+        assert record.limit == 50
+
+    def test_load_pairs_only_session_has_no_filters(
+        self, tmp_path, monkeypatch
+    ):
+        """A pre-filters file (pairs, no records) loads with filters None."""
+        monkeypatch.setenv("SCHOLAR_DATA_DIR", str(tmp_path))
+        sessions_dir = tmp_path / "review_sessions"
+        sessions_dir.mkdir(parents=True)
+        (sessions_dir / "legacy.json").write_text(
+            json.dumps({
+                "query": "q",
+                "name": "legacy",
+                "providers": ["openalex"],
+                "timestamp": datetime.now().isoformat(),
+                "query_provider_pairs": [["natural language", "openalex"]],
+                "decisions": [],
+            }),
+            encoding="utf-8",
+        )
+
+        loaded = load_session("legacy")
+
+        assert loaded is not None
+        assert loaded.query_provider_pairs == [("natural language", "openalex")]
+        record = loaded.search_record_for("openalex")
+        assert record is not None and record.filters is None
 
     def test_save_and_load_references_citations(self, tmp_path, monkeypatch):
         """References and citations are persisted with the session."""
