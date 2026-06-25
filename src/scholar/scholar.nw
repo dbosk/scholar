@@ -469,8 +469,137 @@ class Paper:
     sources: list[str] = field(default_factory=list)
     references: list["Paper"] | None = None
     citations: list["Paper"] | None = None
+    updated_by: list[dict] | None = None
+    newer_versions: list[dict] | None = None
 
     <<paper methods>>
+@
+
+The last two fields record the result of a \emph{currency check} against
+Crossref (\cref{crossref-module}): [[updated_by]] lists retraction and
+correction notices that point at this paper, and [[newer_versions]] lists
+superseding-version relations (e.g.\ a preprint's published version).
+We keep these out of the equality and hash logic below on purpose---a paper's
+identity is its work, not whether we have checked its currency yet, so a checked
+and an unchecked copy of the same DOI must still deduplicate to one registry
+entry.
+
+For the same reason we do \emph{not} coerce these fields in [[__post_init__]].
+The other list fields treat [[None]] and [[[]]] as equivalent, but here the
+distinction carries meaning: [[None]] means \enquote{never checked} while an
+empty list means \enquote{checked, no notices found}.  Collapsing them would
+make a clean paper indistinguishable from an unchecked one, which the
+[[verify]] report needs to tell apart.
+
+\subsubsection{Classifying currency notices}
+
+Callers should not have to know Crossref's update-type vocabulary to ask the
+two questions that matter for citing: \enquote{has this been withdrawn?} and
+\enquote{has this been amended?}.  We expose three predicates that answer them.
+
+The split between the two classes is a judgement call about severity.  A
+retraction, withdrawal, or removal means the work should no longer be relied
+on, so those clearly belong in the retracted class.  We also put
+\emph{expression of concern} there rather than with corrections: although it is
+not a formal withdrawal, it signals the literature itself doubts the work, and
+for a claim-backing workflow it is safer to surface that as a strong warning
+than to bury it among routine errata.  Everything else Crossref reports as an
+update (correction, erratum, addendum, corrigendum, \dots) is an amendment that
+leaves the work citable, so it falls in the corrected class.
+
+We classify by membership in an explicit retracted-class set rather than
+enumerating the open-ended correction vocabulary, so an unfamiliar future
+update type defaults to the milder \enquote{corrected} rather than being
+dropped silently.
+
+<<constants>>=
+# Crossref update types that mean a work should no longer be relied upon.
+# Everything else Crossref reports as an update is treated as a correction.
+RETRACTION_TYPES = frozenset(
+    {
+        "retraction",
+        "partial_retraction",
+        "withdrawal",
+        "removal",
+        "expression_of_concern",
+    }
+)
+@
+
+<<paper methods>>=
+@property
+def is_retracted(self) -> bool:
+    """Whether a retraction-class notice points at this paper."""
+    return any(
+        notice.get("type") in RETRACTION_TYPES
+        for notice in (self.updated_by or [])
+    )
+
+@property
+def is_corrected(self) -> bool:
+    """Whether a correction-class (non-retraction) notice points here."""
+    return any(
+        notice.get("type") not in RETRACTION_TYPES
+        for notice in (self.updated_by or [])
+    )
+
+@property
+def is_superseded(self) -> bool:
+    """Whether a newer/canonical version of this work exists."""
+    return bool(self.newer_versions)
+@
+
+Let's verify the predicates classify each kind of notice and ignore the
+unchecked case:
+
+<<test functions>>=
+class TestPaperCurrencyPredicates:
+    """Tests for is_retracted/is_corrected/is_superseded."""
+
+    def test_unchecked_paper_is_neither(self):
+        """None fields (never checked) yield all-False predicates."""
+        paper = Paper(title="T", authors=["A"], doi="10.1/x")
+        assert not paper.is_retracted
+        assert not paper.is_corrected
+        assert not paper.is_superseded
+
+    def test_retraction_notice_is_retracted(self):
+        """A retraction-type notice sets is_retracted, not is_corrected."""
+        paper = Paper(
+            title="T",
+            authors=["A"],
+            updated_by=[{"doi": "10.1/r", "type": "retraction"}],
+        )
+        assert paper.is_retracted
+        assert not paper.is_corrected
+
+    def test_expression_of_concern_is_retracted_class(self):
+        """Expression of concern is treated as a strong warning."""
+        paper = Paper(
+            title="T",
+            authors=["A"],
+            updated_by=[{"type": "expression_of_concern"}],
+        )
+        assert paper.is_retracted
+
+    def test_correction_notice_is_corrected(self):
+        """An unknown/correction type falls in the corrected class."""
+        paper = Paper(
+            title="T",
+            authors=["A"],
+            updated_by=[{"type": "correction"}],
+        )
+        assert paper.is_corrected
+        assert not paper.is_retracted
+
+    def test_newer_version_is_superseded(self):
+        """A newer-version relation sets is_superseded."""
+        paper = Paper(
+            title="T",
+            authors=["A"],
+            newer_versions=[{"doi": "10.1/v2", "relation": "is-preprint-of"}],
+        )
+        assert paper.is_superseded
 @
 
 Session JSON files sometimes contain [[null]] for list fields like
@@ -644,6 +773,11 @@ when papers reference each other.
 When [[include_refs_cites=True]], we serialize them one level deep (the
 referenced papers themselves have their refs/cites excluded).
 
+The currency fields ([[updated_by]], [[newer_versions]]), by contrast, are
+always serialized.  They are small and they must survive a session
+save/reload, so that once [[scholar verify]] has checked a session the result
+is cached on disk rather than re-fetched every time the session is opened.
+
 <<paper methods>>=
 def to_dict(self, include_refs_cites: bool = False) -> dict:
     """
@@ -669,6 +803,8 @@ def to_dict(self, include_refs_cites: bool = False) -> dict:
         "keywords": self.keywords,
         "tags": self.tags,
         "sources": self.sources,
+        "updated_by": self.updated_by,
+        "newer_versions": self.newer_versions,
     }
 
     if include_refs_cites:
@@ -754,6 +890,8 @@ def _from_dict_without_registry(cls, data: dict) -> "Paper":
         sources=data.get("sources", []) or [],
         references=references,
         citations=citations,
+        updated_by=data.get("updated_by"),
+        newer_versions=data.get("newer_versions"),
     )
 @
 
@@ -794,6 +932,66 @@ class TestPaperFromDictNullFields:
             assert p.sources == []
 @
 
+The currency fields must round-trip through [[to_dict]]/[[from_dict]] so that a
+checked session reloads with its status intact, and a legacy session that
+predates the fields must reload as \enquote{unchecked} (i.e.\ [[None]], not an
+empty list) rather than crashing.
+
+<<test functions>>=
+class TestPaperCurrencyRoundTrip:
+    """Tests that updated_by/newer_versions survive serialization."""
+
+    def test_currency_round_trips(self):
+        """A checked paper reloads with its notices preserved."""
+        with isolated_registry():
+            paper = Paper(
+                title="T",
+                authors=["A"],
+                doi="10.1/x",
+                updated_by=[{"doi": "10.1/r", "type": "retraction"}],
+                newer_versions=[],
+            )
+            restored = Paper.from_dict(paper.to_dict(), use_registry=False)
+            assert restored.updated_by == [{"doi": "10.1/r", "type": "retraction"}]
+            assert restored.newer_versions == []
+
+    def test_legacy_dict_without_currency_is_unchecked(self):
+        """A dict lacking the keys yields None (unchecked), not []."""
+        with isolated_registry():
+            paper = Paper.from_dict(
+                {"title": "T", "authors": ["A"], "doi": "10.1/x"},
+                use_registry=False,
+            )
+            assert paper.updated_by is None
+            assert paper.newer_versions is None
+@
+
+When two copies of a paper merge, a checked-clean copy (empty list) must not be
+overwritten by an unchecked one ([[None]]); otherwise enrichment, which merges
+provider records, could erase a currency result.
+
+<<test functions>>=
+class TestPaperCurrencyMerge:
+    """Tests for currency-field precedence in merge_with."""
+
+    def test_checked_clean_survives_merge_with_unchecked(self):
+        """An empty list (checked) wins over None (unchecked)."""
+        checked = Paper(title="T", authors=["A"], doi="10.1/x", updated_by=[])
+        unchecked = Paper(title="T", authors=["A"], doi="10.1/x")
+        assert checked.merge_with(unchecked).updated_by == []
+
+    def test_unchecked_inherits_other_currency(self):
+        """None falls back to the other paper's checked value."""
+        unchecked = Paper(title="T", authors=["A"], doi="10.1/x")
+        checked = Paper(
+            title="T",
+            authors=["A"],
+            doi="10.1/x",
+            updated_by=[{"type": "retraction"}],
+        )
+        assert unchecked.merge_with(checked).updated_by == [{"type": "retraction"}]
+@
+
 \subsubsection{Title preview for display}
 
 When displaying papers in logs or UI elements with limited space, we need
@@ -831,6 +1029,12 @@ We prefer [[self]]'s values when both have data, since the caller controls
 the order of merging.
 The [[sources]] lists are combined as a union, preserving the order with
 [[self]]'s sources first.
+
+The currency fields use an [[is not None]] test rather than the [[or]] idiom
+used for scalars like [[abstract]].  An empty list there means \enquote{checked,
+no notices}, which is falsy; an [[or]] would discard that hard-won result and
+fall back to the other paper's [[None]], turning a checked-clean paper back into
+an unchecked one.  Testing for [[None]] keeps the checked status.
 
 <<paper methods>>=
 @staticmethod
@@ -903,6 +1107,12 @@ def merge_with(self, other: "Paper") -> "Paper":
         sources=combined_sources,
         references=self.references if self.references is not None else other.references,
         citations=self.citations if self.citations is not None else other.citations,
+        updated_by=self.updated_by if self.updated_by is not None else other.updated_by,
+        newer_versions=(
+            self.newer_versions
+            if self.newer_versions is not None
+            else other.newer_versions
+        ),
     )
 @
 
