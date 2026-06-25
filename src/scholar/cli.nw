@@ -1822,9 +1822,8 @@ viewer.
 The [[quote]] action supports the verification step of citing a source: given a
 claim, it prints candidate passages and the page each came from, leaving the
 judgement to the reader (see \cref{sec:quote-extraction}).
-Its options (\texttt{--claim}, \texttt{--limit}, \texttt{--model},
-\texttt{--json}, and the \texttt{--lexical}/\texttt{--llm} stage toggles) apply
-only to this action;
+Its options ([[--claim]], [[--limit]], [[--model]], [[--json]], and the
+[[--lexical]]/[[--llm]] stage toggles) apply only to this action;
 they sit on the shared [[pdf]] command because, like [[cache]], it dispatches on
 a single action argument rather than splitting into sub-commands.
 We print results with the builtin [[print]] so a reader can pipe the passages

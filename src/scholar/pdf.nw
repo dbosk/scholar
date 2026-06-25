@@ -1257,9 +1257,13 @@ order and label them.
 Two safeguards keep this honest.
 First, the model sees the passages but never supplies their text: we look the
 text back up from our own candidates by index, so quotes remain verbatim.
-Second, any failure---no model configured, a network error, unparseable
-output---returns [[None]] rather than raising, so the orchestrator can fall
-back to the lexical order and merely warn.
+Second, we distinguish failure from rejection.
+A genuine failure---no model configured, a network error, or output with no
+parseable JSON array---returns [[None]], so the orchestrator falls back to the
+prior order and warns.
+A model that ran and returned an \emph{empty} array has instead judged nothing
+relevant; we return an empty list and honour that, rather than misreporting it
+as a failure and showing passages the model rejected.
 We follow the [[llm]] usage pattern already established in [[llm_review]]:
 [[llm.get_model(model_id)]] when a model is named, else the user's default.
 
@@ -1277,9 +1281,10 @@ def rerank_passages_llm(
     so quotes stay verbatim.
 
     Returns:
-        Re-ranked candidates with ``relevance`` set, or ``None`` if no model
-        is available or the call/parsing fails (so the caller can fall back
-        to the lexical order).
+        Re-ranked candidates with ``relevance`` set; an empty list if the
+        model ran but judged none of the candidates relevant; or ``None`` if
+        no model is available or the response could not be parsed (so the
+        caller can fall back to the prior order).
     """
     if not candidates:
         return []
@@ -1289,8 +1294,12 @@ def rerank_passages_llm(
         model = llm.get_model(model_id) if model_id else llm.get_model()
         prompt = _build_rerank_prompt(claim, candidates)
         ranking = _parse_rerank_response(model.prompt(prompt).text())
-    except Exception as error:  # degrade to lexical order on any failure
-        logger.debug("LLM rerank failed, falling back to lexical: %s", error)
+    except Exception as error:  # treat any error as a failure to rank
+        logger.debug("LLM rerank failed, falling back: %s", error)
+        return None
+
+    if ranking is None:
+        logger.debug("LLM rerank returned no usable JSON; falling back")
         return None
 
     reranked: list[QuoteCandidate] = []
@@ -1307,13 +1316,15 @@ def rerank_passages_llm(
                     relevance=relevance,
                 )
             )
-    return reranked or None
+    return reranked
 @
 
 The prompt and parser are private helpers.
-The parser is lenient: it extracts the first JSON array it finds and skips
-malformed entries, because we would rather drop one bad item than discard an
-otherwise usable ranking.
+The parser is lenient about \emph{entries}---it skips a malformed item rather
+than discarding an otherwise usable ranking---but strict about
+\emph{structure}: if it finds no JSON array, or the array does not decode, it
+returns [[None]] so the caller can tell a parse failure apart from a
+legitimately empty result.
 
 <<quote extraction functions>>=
 def _build_rerank_prompt(
@@ -1340,13 +1351,26 @@ def _build_rerank_prompt(
     return "\n".join(lines)
 
 
-def _parse_rerank_response(response_text: str) -> list[tuple[int, str | None]]:
-    """Parse the LLM's JSON ranking into (index, relevance) pairs."""
+def _parse_rerank_response(
+    response_text: str,
+) -> list[tuple[int, str | None]] | None:
+    """Parse the LLM's JSON ranking into (index, relevance) pairs.
+
+    Returns ``None`` when no JSON array can be found or decoded---a failure
+    the caller treats as "no ranking". Returns an empty list when the model
+    returned a valid but empty array (it judged nothing relevant).
+    """
     match = re.search(r"\[.*\]", response_text, re.DOTALL)
     if not match:
-        return []
+        return None
+    try:
+        data = json.loads(match.group(0))
+    except json.JSONDecodeError:
+        return None
+    if not isinstance(data, list):
+        return None
     ranking: list[tuple[int, str | None]] = []
-    for item in json.loads(match.group(0)):
+    for item in data:
         try:
             index = int(item["index"])
         except (KeyError, TypeError, ValueError):
@@ -1354,6 +1378,47 @@ def _parse_rerank_response(response_text: str) -> list[tuple[int, str | None]]:
         relevance = str(item.get("relevance", "")).lower() or None
         ranking.append((index, relevance))
     return ranking
+@
+
+Let's verify the failure/rejection distinction: a model that returns an empty
+array yields an empty list (nothing relevant), unparseable output yields
+[[None]] so the orchestrator can fall back, and a valid ranking sets the order
+and relevance.  We monkeypatch [[llm.get_model]] so no real model is called.
+
+<<test functions>>=
+class TestRerankPassages:
+    """Tests for the LLM re-ranking stage."""
+
+    def _patch_model(self, monkeypatch, reply):
+        import llm
+
+        model = Mock()
+        model.prompt.return_value.text.return_value = reply
+        monkeypatch.setattr(llm, "get_model", lambda *a, **k: model)
+
+    def test_empty_array_means_nothing_relevant(self, monkeypatch):
+        self._patch_model(monkeypatch, "[]")
+        candidates = [QuoteCandidate(page=1, text="A passage of text here.")]
+        assert rerank_passages_llm("claim", candidates) == []
+
+    def test_unparseable_output_falls_back(self, monkeypatch):
+        self._patch_model(monkeypatch, "I cannot answer that.")
+        candidates = [QuoteCandidate(page=1, text="A passage of text here.")]
+        assert rerank_passages_llm("claim", candidates) is None
+
+    def test_ranking_sets_relevance_and_order(self, monkeypatch):
+        self._patch_model(
+            monkeypatch,
+            '[{"index": 1, "relevance": "high"}, '
+            '{"index": 0, "relevance": "low"}]',
+        )
+        candidates = [
+            QuoteCandidate(page=1, text="First passage of text here."),
+            QuoteCandidate(page=2, text="Second passage of text here."),
+        ]
+        ranked = rerank_passages_llm("claim", candidates)
+        assert [c.page for c in ranked] == [2, 1]
+        assert ranked[0].relevance == "high"
 @
 
 \subsection{Finding quote candidates}
@@ -1460,16 +1525,17 @@ else:
         )
 @
 
-If the LLM rerank succeeds we adopt its order and relevance labels; if it
-returns [[None]] we keep the candidates we already have (lexical order, or
-reading order in LLM-only mode) and warn.
+If the rerank returns a list---even an empty one---we adopt it: an empty list
+is the model saying nothing is relevant, which we honour.
+Only [[None]] (a failure) makes us keep the candidates we already have (lexical
+order, or reading order in LLM-only mode) and warn.
 
 <<optionally rerank with the LLM>>=
 if use_llm:
     reranked = rerank_passages_llm(claim, candidates, model_id)
     if reranked is None:
         if progress_callback:
-            progress_callback("LLM ranking unavailable; using lexical order")
+            progress_callback("LLM rerank unavailable; keeping prior order")
     else:
         candidates = reranked
 @
