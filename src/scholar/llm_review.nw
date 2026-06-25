@@ -325,10 +325,13 @@ def get_example_decisions(
 @
 
 
-\subsection{Validating Example Requirements}
+\subsection{Computing the Recommended Example Minimum}
 
-We require a minimum number of examples before allowing LLM classification.
-This ensures the LLM has enough context to make reasonable decisions.
+A small set of examples gives the LLM enough context to make reasonable
+decisions, so we compute a recommended minimum. This check is advisory, not a
+gate: [[classify_papers_with_llm]] uses a failed check to warn the user rather
+than to block classification, so a review with too few (or no) examples still
+runs.
 
 <<llm review example gathering>>=
 def validate_examples(
@@ -1427,9 +1430,7 @@ class TestExamplesOptional:
             )
 
         assert "Papers to Classify" in prompt
-        assert any(
-            record.levelno == logging.WARNING for record in caplog.records
-        )
+        assert "Proceeding with the available examples" in caplog.text
 @
 
 \subsection{Testing LLM Interaction}

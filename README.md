@@ -263,7 +263,7 @@ scholar llm classify "session-name" --count 10
 
 ### How It Works
 
-1. **Tag some papers manually** - The LLM needs examples to learn from. Review at least 5 papers with tags (themes for kept, motivations for discarded).
+1. **Tag some papers manually** (recommended) - Examples help the LLM learn your criteria. Tagging ~5 papers (themes for kept, motivations for discarded) improves quality, but classification will still run — with a warning — if you have fewer or none.
 
 2. **Set research context** (optional) - Describe your review's focus to help the LLM understand relevance criteria.
 
