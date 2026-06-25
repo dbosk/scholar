@@ -113,6 +113,16 @@ from typer.testing import CliRunner
 from scholar.cli import *
 from scholar import *
 
+# Internal provenance round-trip helpers are exercised directly; a star
+# import skips underscore-prefixed names, so we import them explicitly.
+from scholar.cli import (
+    _split_note_segments,
+    _render_note_segments,
+    _merge_prov,
+    _parse_bib_entries,
+    _rewrite_with_blocks,
+)
+
 
 <<test functions>>
 @
@@ -3780,14 +3790,17 @@ kept it, and an author may want the trail for a paper still under consideration.
 
 \subsection{The prov command group}
 
-We expose provenance export under its own [[prov]] command group, mirroring the
-[[sessions]] and [[notes]] groups, so that future provenance exporters have a
-natural home alongside [[found-via]].
+We expose provenance under its own [[prov]] command group, mirroring the
+[[sessions]] and [[notes]] groups.  This one group hosts both the read-only
+[[found-via]] export described next and the [[import]]/[[export]] round-trip
+between [[.bib]] files and notes built in \cref{sec:prov-roundtrip}; defining it
+here, before either set of subcommands, lets all of them attach to the same
+[[prov_app]].
 
 <<prov command>>=
 prov_app = typer.Typer(
     name="prov",
-    help="Export citation provenance.",
+    help="Export and round-trip citation provenance.",
     no_args_is_help=True,
 )
 app.add_typer(prov_app, name="prov")
@@ -5749,6 +5762,781 @@ back to the [[0]] the user typed rather than the internal cap:
 @
 
 
+\section{Round-Tripping Provenance to Notes}
+\label{sec:prov-roundtrip}
+
+The provenance block above a BibTeX entry is the \emph{authoritative} record of
+why a citation was chosen, but [[scholar notes]] keeps its own per-paper
+annotations.  Reconciling the two stores by hand is error-prone, so we
+round-trip them: [[scholar prov import]] reads the [[.bib]] comment blocks into
+notes, and [[scholar prov export]] writes the notes' blocks back above the
+entries.  This section builds that round-trip from the inside out --- the note
+representation first, then the [[.bib]] parser, then the two commands --- because
+each command is just glue over the layers below it.
+
+Three facts shape the design.  First, the two stores key papers differently:
+notes use [[Paper.id]] (a DOI, or a hash of title and first-author surname),
+while a [[.bib]] block is headed by a \emph{bibkey} (surname plus year).  We
+bridge them by reconstructing a [[Paper]] from each entry and letting the notes
+layer derive the id --- the DOI is the reliable join, the hash a best-effort
+fallback.  Second, one paper can back \emph{several} claims, so a note holds a
+\emph{list} of provenance blocks and [[import]] merges them by [[CLAIM]] text
+(re-importing never duplicates).  Third, a note also carries the user's own
+prose, which must never leak into the [[.bib]] nor be clobbered by an import; we
+make provenance blocks self-delimiting so everything else can be preserved
+verbatim.
+
+We parse the [[.bib]] ourselves rather than pulling in a BibTeX library: the
+provenance lines are \emph{comments} that any such library discards, so it would
+only help extract a handful of entry fields --- while the load-bearing work
+(associating each comment region with its entry and tracking line spans so an
+in-place rewrite does not reformat the file) is ours regardless.  The input is
+the format we emit, so a small line scanner is both sufficient and clearer.
+
+\subsection{Recognising a provenance block}
+
+A note is parsed into a sequence of \emph{segments}: opaque personal text, or a
+provenance block.  A block is announced by a sentinel header
+[[=== provenance: key ===]] and continues through its recognised
+[[FIELD: value]] lines; the first line that is neither ends the block.  Anchoring
+recognition on the sentinel (rather than guessing from field-like text) is what
+lets us treat everything outside a block as personal and keep it untouched.
+
+<<constants>>=
+PROV_FIELD_NAMES = {
+    "CLAIM", "FOUND-VIA", "PICKED", "QUOTE", "VERIFIED", "DATE",
+}
+PROV_HEADER_RE = re.compile(r"^\s*===\s*provenance:\s*(.*?)\s*===\s*$")
+BIB_ENTRY_RE = re.compile(r"^\s*@\w+\s*\{\s*([^,\s]+)\s*,")
+@
+
+A field line is recognised by the token before its first colon, so a value that
+itself contains a colon (a [[FOUND-VIA]] command, say) does not confuse the
+match.  The [[QUOTE (<loc>)]] field keeps its location in the name, so we compare
+only the first whitespace-delimited token against the known set.
+
+<<formatter classes>>=
+def _is_prov_field_line(line: str) -> bool:
+    """Return True if ``line`` is a recognised ``FIELD: value`` line."""
+    name, sep, _ = line.partition(":")
+    if not sep:
+        return False
+    token = name.strip().split(" ", 1)[0]
+    return token in PROV_FIELD_NAMES
+@
+
+When the blocks arrive from a [[.bib]] they are prefixed with a comment marker.
+We strip a leading [[%]] and at most one following space so the inner text
+matches the note representation exactly.
+
+<<formatter classes>>=
+def _strip_comment_prefix(line: str) -> str:
+    """Strip a leading ``%`` (and one space) from a comment line."""
+    return re.sub(r"^\s*%\s?", "", line)
+@
+
+\subsection{Splitting a note into segments}
+
+The splitter walks the note line by line, accumulating personal lines until a
+sentinel header opens a block, then collecting that block's field lines until a
+non-field line closes it.  Keeping personal runs as one opaque string (rather
+than per-line) means we can re-emit them byte-for-byte, which is the guarantee
+that an import never disturbs the user's prose.
+
+<<formatter classes>>=
+def _split_note_segments(note_body: str) -> list:
+    """Split a note body into ordered personal/provenance segments.
+
+    Returns a list of ``("personal", text)`` and ``("prov", (key, fields))``
+    tuples, in document order.
+    """
+    segments: list = []
+    personal: list = []
+    fields = None
+    key = None
+
+    def flush_personal():
+        if personal:
+            segments.append(("personal", "\n".join(personal)))
+            personal.clear()
+
+    def flush_block():
+        nonlocal fields, key
+        if fields is not None:
+            segments.append(("prov", (key, fields)))
+            fields = None
+            key = None
+
+    for line in note_body.split("\n"):
+        header = PROV_HEADER_RE.match(line)
+        if header:
+            flush_personal()
+            flush_block()
+            fields = {}
+            key = header.group(1)
+        elif fields is not None and _is_prov_field_line(line):
+            name, _, value = line.partition(":")
+            fields[name.strip()] = value.strip()
+        else:
+            flush_block()
+            personal.append(line)
+
+    flush_personal()
+    flush_block()
+    return segments
+@
+
+The inverse re-serialises segments back to a note body.  Personal segments are
+emitted verbatim; a block becomes its header followed by its fields in stored
+order.  Splitting then rendering is the identity on a canonically-formatted note
+--- which is what makes a note-to-note round-trip lossless --- modulo two
+normalisations: a field value is stripped of surrounding whitespace, and because
+a block's fields are a [[dict]], two lines with the \emph{same} field name
+collapse to the last (so multiple quotes from one source must carry distinct
+locations, as in [[QUOTE (p.3)]] versus [[QUOTE (p.7)]]).
+
+<<formatter classes>>=
+def _render_note_segments(segments: list) -> str:
+    """Re-serialise note segments into a note body (inverse of split)."""
+    parts = []
+    for kind, payload in segments:
+        if kind == "personal":
+            parts.append(payload)
+        else:
+            key, fields = payload
+            lines = [f"=== provenance: {key} ==="]
+            lines += [f"{name}: {value}" for name, value in fields.items()]
+            parts.append("\n".join(lines))
+    return "\n".join(parts)
+@
+
+Let's verify a note mixing personal prose with a block round-trips unchanged,
+and that the parts are recovered as expected:
+
+<<test functions>>=
+class TestProvSegments:
+    """Tests for note segment parsing and rendering."""
+
+    def test_round_trips_personal_and_block(self):
+        """Splitting then rendering reproduces the note verbatim."""
+        body = (
+            "Cited in chapter 3.\n"
+            "=== provenance: alice2024 ===\n"
+            "CLAIM: foo\n"
+            "DATE: 2026-06-25"
+        )
+        segments = _split_note_segments(body)
+        assert segments[0] == ("personal", "Cited in chapter 3.")
+        assert segments[1][0] == "prov"
+        assert segments[1][1][0] == "alice2024"
+        assert segments[1][1][1]["CLAIM"] == "foo"
+        assert _render_note_segments(segments) == body
+
+    def test_personal_text_without_block(self):
+        """A note with no block is a single personal segment."""
+        segments = _split_note_segments("just a thought")
+        assert segments == [("personal", "just a thought")]
+@
+
+\subsection{Merging provenance blocks by claim}
+
+Importing must add new claims without duplicating ones already stored and
+without touching personal segments.  We key blocks by their [[CLAIM]] text: an
+incoming block whose claim matches an existing block replaces it in place;
+otherwise it is appended.  Matching by claim (not by position) is what makes
+repeated imports idempotent even as the [[.bib]] grows.
+
+<<formatter classes>>=
+def _merge_prov(segments: list, incoming: list) -> list:
+    """Merge incoming ``(key, fields)`` blocks into ``segments`` by CLAIM."""
+    merged = list(segments)
+    for key, fields in incoming:
+        claim = (fields.get("CLAIM") or "").strip()
+        for index, (kind, payload) in enumerate(merged):
+            if kind != "prov":
+                continue
+            if (payload[1].get("CLAIM") or "").strip() == claim:
+                merged[index] = ("prov", (key, fields))
+                break
+        else:
+            merged.append(("prov", (key, fields)))
+    return merged
+@
+
+We verify that a new claim is appended while a matching claim is updated in
+place, leaving personal text alone:
+
+<<test functions>>=
+class TestProvMerge:
+    """Tests for claim-keyed provenance merging."""
+
+    def test_appends_new_claim_keeps_personal(self):
+        """A new claim is appended; personal segments survive."""
+        segments = [("personal", "my note")]
+        merged = _merge_prov(segments, [("k", {"CLAIM": "new"})])
+        assert merged[0] == ("personal", "my note")
+        assert merged[1] == ("prov", ("k", {"CLAIM": "new"}))
+
+    def test_updates_matching_claim_in_place(self):
+        """A block with a known claim replaces the stored one."""
+        segments = [("prov", ("old", {"CLAIM": "c", "DATE": "1"}))]
+        merged = _merge_prov(segments, [("new", {"CLAIM": "c", "DATE": "2"})])
+        assert len(merged) == 1
+        assert merged[0][1][1]["DATE"] == "2"
+@
+
+\subsection{Parsing a BibTeX file}
+
+We scan the file once, remembering the start of any contiguous run of comment
+lines so that when an entry begins we can attach the block(s) directly above it.
+A blank or non-comment line resets that memory, so only comments \emph{immediately}
+above an entry count as its provenance --- which matches how the formatter emits
+them.  The entry's extent is found by brace depth.
+
+<<formatter classes>>=
+@dataclass
+class ProvEntry:
+    """A parsed BibTeX entry with its provenance comment blocks."""
+
+    key: str
+    fields: dict
+    prov_blocks: list
+    comment_start: "int | None"
+    entry_start: int
+    entry_end: int
+@
+
+An entry ends on the line where its brace depth returns to zero.  We only start
+counting once a brace has been seen, so a header line such as
+[[@article{key,]] is handled the same as a multi-line body.
+
+<<formatter classes>>=
+def _entry_end(lines: list, start: int) -> int:
+    """Return the index of the line that closes the entry at ``start``."""
+    depth = 0
+    seen = False
+    for index in range(start, len(lines)):
+        depth += lines[index].count("{") - lines[index].count("}")
+        if "{" in lines[index]:
+            seen = True
+        if seen and depth <= 0:
+            return index
+    return len(lines) - 1
+@
+
+Field extraction is deliberately narrow: we only need the four fields that
+identify a paper, and our own entries write one [[name = {value}]] (or quoted)
+field per line.  A line-oriented match avoids mistaking an [[=]] inside a value
+for a field assignment.  It assumes each field value is balanced and on one
+line --- which the formatter guarantees --- so a value spanning lines or a
+literal unbalanced brace is out of scope.
+
+We strip the remaining [[{]] and [[}]] from each value before storing it.  A
+[[.bib]] often brace-protects capitalisation, as in [[title = {The {LaTeX}
+Companion}]]; left in, those braces would make the title hash to a different
+[[Paper.id]] than the brace-free title every provider stores, so an [[import]]
+would orphan the paper into a fresh note instead of updating its existing one.
+Unwrapping the braces is what lets the no-DOI hash key line up with notes
+created elsewhere.
+
+<<formatter classes>>=
+def _extract_bib_fields(entry_text: str) -> dict:
+    """Pull ``name = {value}`` / ``name = "value"`` fields from an entry."""
+    brace = re.compile(r'^\s*(\w+)\s*=\s*\{(.*)\}\s*,?\s*$')
+    quote = re.compile(r'^\s*(\w+)\s*=\s*"(.*)"\s*,?\s*$')
+    fields = {}
+    for line in entry_text.split("\n"):
+        match = brace.match(line) or quote.match(line)
+        if match:
+            value = match.group(2).replace("{", "").replace("}", "")
+            fields[match.group(1).lower()] = value
+    return fields
+@
+
+BibTeX author fields use [[Last, First]] order joined by [[ and ]].  We
+normalise each name to [[First Last]] so the reconstructed [[Paper]] hashes to
+the same id the rest of the tool would compute for it.
+
+<<formatter classes>>=
+def _split_bib_authors(field: str) -> list:
+    """Split a BibTeX ``author`` field into ``First Last`` names."""
+    authors = []
+    for raw in field.split(" and "):
+        raw = raw.strip()
+        if not raw:
+            continue
+        if "," in raw:
+            last, first = raw.split(",", 1)
+            authors.append(f"{first.strip()} {last.strip()}".strip())
+        else:
+            authors.append(raw)
+    return authors
+@
+
+From the fields we build a minimal [[Paper]] --- enough for the notes layer to
+derive its id.  We import [[Paper]] lazily so this module keeps its existing
+import graph.
+
+<<formatter classes>>=
+def _paper_from_entry(fields: dict):
+    """Build a minimal Paper from entry fields, for note keying only."""
+    from scholar.scholar import Paper
+
+    year_raw = fields.get("year", "")
+    year = int(year_raw) if year_raw.isdigit() else None
+    return Paper(
+        title=fields.get("title", ""),
+        authors=_split_bib_authors(fields.get("author", "")),
+        year=year,
+        doi=fields.get("doi"),
+    )
+@
+
+A comment region may stack several blocks.  We strip the comment markers and
+reuse the note splitter, keeping only its provenance segments --- so any stray
+non-provenance comment is simply ignored.
+
+<<formatter classes>>=
+def _comment_prov_blocks(comment_lines: list) -> list:
+    """Extract provenance ``(key, fields)`` blocks from comment lines."""
+    stripped = "\n".join(
+        _strip_comment_prefix(line) for line in comment_lines
+    )
+    return [
+        payload
+        for kind, payload in _split_note_segments(stripped)
+        if kind == "prov"
+    ]
+@
+
+The export rewriter needs the complement: the comment lines that are \emph{not}
+part of a provenance block.  A user may keep an ordinary [[%]] note above an
+entry, and replacing the provenance region must not take that with it.  We
+re-walk the run at the raw-line level --- dropping a header and its field lines,
+keeping everything else --- so a personal comment survives an export.
+
+<<formatter classes>>=
+def _kept_comment_lines(comment_lines: list) -> list:
+    """Return the comment lines that are not part of a provenance block."""
+    kept = []
+    in_block = False
+    for line in comment_lines:
+        stripped = _strip_comment_prefix(line)
+        if PROV_HEADER_RE.match(stripped):
+            in_block = True
+            continue
+        if in_block and _is_prov_field_line(stripped):
+            continue
+        in_block = False
+        kept.append(line)
+    return kept
+@
+
+The scanner ties these together: it tracks the pending comment run, and on each
+entry records the bibkey, the identifying fields, the attached blocks, and the
+line spans the rewriter will need.
+
+<<formatter classes>>=
+def _parse_bib_entries(text: str) -> list:
+    """Parse a ``.bib`` into entries with their provenance comment blocks."""
+    lines = text.split("\n")
+    entries = []
+    comment_start = None
+    index = 0
+    while index < len(lines):
+        line = lines[index]
+        if line.strip().startswith("%"):
+            if comment_start is None:
+                comment_start = index
+            index += 1
+            continue
+        match = BIB_ENTRY_RE.match(line)
+        if match:
+            entry_end = _entry_end(lines, index)
+            entry_text = "\n".join(lines[index:entry_end + 1])
+            blocks = (
+                _comment_prov_blocks(lines[comment_start:index])
+                if comment_start is not None else []
+            )
+            entries.append(ProvEntry(
+                key=match.group(1),
+                fields=_extract_bib_fields(entry_text),
+                prov_blocks=blocks,
+                comment_start=comment_start,
+                entry_start=index,
+                entry_end=entry_end,
+            ))
+            comment_start = None
+            index = entry_end + 1
+            continue
+        comment_start = None
+        index += 1
+    return entries
+@
+
+Let's verify the scanner attaches a stacked pair of blocks to the entry below
+them and recovers the entry's fields:
+
+<<test functions>>=
+class TestProvBibParse:
+    """Tests for parsing provenance blocks out of a .bib file."""
+
+    def test_parses_stacked_blocks_and_fields(self):
+        """Two blocks above one entry are both attached to it."""
+        text = (
+            "% === provenance: alice2024 ===\n"
+            "% CLAIM: first\n"
+            "% === provenance: alice2024 ===\n"
+            "% CLAIM: second\n"
+            "@article{alice2024,\n"
+            "  title = {A Paper},\n"
+            "  author = {Alice Smith},\n"
+            "  doi = {10.1/x},\n"
+            "}\n"
+        )
+        entries = _parse_bib_entries(text)
+        assert len(entries) == 1
+        claims = [b[1]["CLAIM"] for b in entries[0].prov_blocks]
+        assert claims == ["first", "second"]
+        assert entries[0].fields["doi"] == "10.1/x"
+        assert entries[0].fields["author"] == "Alice Smith"
+
+    def test_blank_line_detaches_comment(self):
+        """A blank line between comment and entry detaches it."""
+        text = (
+            "% === provenance: x ===\n"
+            "% CLAIM: stray\n"
+            "\n"
+            "@article{bob2020,\n"
+            "  title = {T},\n"
+            "}\n"
+        )
+        entries = _parse_bib_entries(text)
+        assert entries[0].prov_blocks == []
+@
+
+\subsection{Rendering provenance blocks for a [[.bib]]}
+
+Going the other way, we render a paper's stored blocks as comment lines headed by
+the \emph{entry's} bibkey --- not the key remembered in the note --- so every
+emitted block agrees with the entry it sits above even if the two were ever
+keyed differently.
+
+<<formatter classes>>=
+def _render_prov_blocks(key: str, blocks: list) -> str:
+    """Render provenance ``(key, fields)`` blocks as ``%`` comment lines."""
+    rendered = []
+    for _, fields in blocks:
+        lines = [f"% === provenance: {key} ==="]
+        lines += [f"% {name}: {value}" for name, value in fields.items()]
+        rendered.append("\n".join(lines))
+    return "\n".join(rendered)
+@
+
+The rewriter walks the entries in order, copying untouched text verbatim.  When
+a paper has stored blocks it rewrites the entry's provenance region: it keeps
+any non-provenance comment lines (via [[_kept_comment_lines]]), drops the old
+blocks, and emits the regenerated ones just above the entry.  When a paper has
+no blocks the entry --- and any comment already there --- is left exactly as
+found, so export never destroys a block it cannot replace.
+
+<<formatter classes>>=
+def _rewrite_with_blocks(text: str, entries: list, blocks_for) -> tuple:
+    """Rewrite ``text`` so each entry is preceded by ``blocks_for(entry)``.
+
+    Returns ``(new_text, count)`` where ``count`` is the number of entries
+    whose provenance region was written.  Entries with no blocks are left
+    untouched, as are any non-provenance comments above an entry.
+    """
+    lines = text.split("\n")
+    out: list = []
+    cursor = 0
+    count = 0
+    for entry in entries:
+        blocks = blocks_for(entry)
+        if blocks:
+            region = (
+                entry.comment_start
+                if entry.comment_start is not None else entry.entry_start
+            )
+            out.extend(lines[cursor:region])
+            if entry.comment_start is not None:
+                out.extend(_kept_comment_lines(
+                    lines[entry.comment_start:entry.entry_start]
+                ))
+            out.append(_render_prov_blocks(entry.key, blocks))
+            out.extend(lines[entry.entry_start:entry.entry_end + 1])
+            count += 1
+        else:
+            out.extend(lines[cursor:entry.entry_end + 1])
+        cursor = entry.entry_end + 1
+    out.extend(lines[cursor:])
+    return "\n".join(out), count
+@
+
+We verify that a stored block is inserted above an entry that had none, and that
+an entry whose paper has no block is passed through untouched:
+
+<<test functions>>=
+class TestProvRewrite:
+    """Tests for rewriting a .bib with stored provenance blocks."""
+
+    def test_inserts_block_above_entry(self):
+        """A paper's block is inserted above its bare entry."""
+        text = "@article{a2024,\n  title = {T},\n}\n"
+        entries = _parse_bib_entries(text)
+        blocks = [("ignored", {"CLAIM": "c"})]
+        new_text, count = _rewrite_with_blocks(
+            text, entries, lambda e: blocks
+        )
+        assert count == 1
+        assert "% === provenance: a2024 ===" in new_text
+        assert "% CLAIM: c" in new_text
+        assert new_text.index("% CLAIM") < new_text.index("@article")
+
+    def test_passes_through_when_no_blocks(self):
+        """An entry with no stored block is left unchanged."""
+        text = "@article{a2024,\n  title = {T},\n}\n"
+        entries = _parse_bib_entries(text)
+        new_text, count = _rewrite_with_blocks(text, entries, lambda e: [])
+        assert count == 0
+        assert new_text == text
+
+    def test_preserves_non_provenance_comment(self):
+        """A plain comment above an entry survives a block rewrite."""
+        text = (
+            "% TODO: double-check this reference\n"
+            "% === provenance: a2024 ===\n"
+            "% CLAIM: old\n"
+            "@article{a2024,\n  title = {T},\n}\n"
+        )
+        entries = _parse_bib_entries(text)
+        blocks = [("a2024", {"CLAIM": "new"})]
+        new_text, count = _rewrite_with_blocks(
+            text, entries, lambda e: blocks
+        )
+        assert "% TODO: double-check this reference" in new_text
+        assert "% CLAIM: new" in new_text
+        assert "% CLAIM: old" not in new_text
+        # The kept comment stays above the regenerated block.
+        assert new_text.index("% TODO") < new_text.index("% CLAIM: new")
+@
+
+We also confirm that brace-protected fields are unwrapped, so a paper without a
+DOI keys to the same id as its brace-free form:
+
+<<test functions>>=
+class TestProvFieldExtraction:
+    """Tests for BibTeX field extraction and keying."""
+
+    def test_strips_protective_braces(self):
+        """Inner braces are removed so titles key consistently."""
+        text = (
+            "@article{x,\n"
+            "  title = {The {LaTeX} Companion},\n"
+            "  author = {Carol Doe},\n"
+            "}\n"
+        )
+        entry = _parse_bib_entries(text)[0]
+        assert entry.fields["title"] == "The LaTeX Companion"
+@
+
+\section{The Provenance Round-Trip Commands}
+
+With the layers in place, the commands are thin.  They attach to the [[prov]]
+group introduced in \cref{sec:prov-commands} rather than defining a second
+one---a single [[prov_app]] keeps [[found-via]], [[import]], and [[export]]
+under one application.
+
+\subsection{Importing blocks into notes}
+
+[[import]] reads each entry's blocks, merges them into the paper's note by
+claim, and saves the result.  Reading the existing note first --- and merging
+rather than overwriting --- is what preserves both prior claims and the user's
+own prose.  Entries without a block are skipped so we never create an empty
+note.
+
+<<prov command>>=
+@prov_app.command("import")
+def prov_import(
+    bib_file: Annotated[
+        Path,
+        typer.Argument(help="BibTeX file to read provenance blocks from."),
+    ],
+) -> None:
+    """
+    Import provenance comment blocks from a .bib file into notes.
+
+    Each entry's block(s) are merged into that paper's note, keyed by
+    CLAIM so re-importing never duplicates. Personal note text is kept.
+    """
+    from scholar.notes import get_note, save_note
+
+    console = Console()
+    if not bib_file.exists():
+        console.print(f"[red]File not found: {escape(str(bib_file))}[/red]")
+        raise typer.Exit(1)
+
+    entries = _parse_bib_entries(bib_file.read_text(encoding="utf-8"))
+    count = 0
+    for entry in entries:
+        if not entry.prov_blocks:
+            continue
+        paper = _paper_from_entry(entry.fields)
+        existing = get_note(paper)
+        segments = (
+            _split_note_segments(existing.note) if existing else []
+        )
+        merged = _merge_prov(segments, entry.prov_blocks)
+        save_note(paper, _render_note_segments(merged))
+        count += 1
+
+    noun = "entry" if count == 1 else "entries"
+    console.print(
+        f"[green]Imported provenance for {count} {noun}[/green]"
+    )
+@
+
+Let's verify an import creates a note keyed by the entry's DOI and carrying the
+claim:
+
+<<test functions>>=
+class TestProvImportCommand:
+    """Tests for the prov import CLI command."""
+
+    def test_import_creates_note(self, tmp_path, monkeypatch):
+        """prov import stores a paper's block as its note."""
+        monkeypatch.setenv("SCHOLAR_DATA_DIR", str(tmp_path))
+        bib = tmp_path / "refs.bib"
+        bib.write_text(
+            "% === provenance: alice2024 ===\n"
+            "% CLAIM: privacy matters\n"
+            "@article{alice2024,\n"
+            "  title = {A Paper},\n"
+            "  author = {Alice Smith},\n"
+            "  doi = {10.1/x},\n"
+            "}\n",
+            encoding="utf-8",
+        )
+        runner = CliRunner()
+        result = runner.invoke(app, ["prov", "import", str(bib)])
+        assert result.exit_code == 0
+
+        from scholar.notes import get_note
+        from scholar import Paper
+        note = get_note(Paper(
+            title="A Paper", authors=["Alice Smith"], doi="10.1/x",
+        ))
+        assert note is not None
+        assert "CLAIM: privacy matters" in note.note
+@
+
+\subsection{Exporting notes back to the [[.bib]]}
+
+[[export]] looks up each entry's note, keeps only its provenance segments, and
+rewrites the file.  Discarding personal segments here is what keeps private
+prose out of the bibliography.  By default it prints to standard output so the
+result can be inspected or piped; [[--in-place]] overwrites the file instead,
+and the count goes to standard error so it never corrupts piped output.
+
+<<prov command>>=
+@prov_app.command("export")
+def prov_export(
+    bib_file: Annotated[
+        Path,
+        typer.Argument(help="BibTeX file to write provenance blocks into."),
+    ],
+    in_place: Annotated[
+        bool,
+        typer.Option(
+            "--in-place", "-i",
+            help="Overwrite the file instead of printing to stdout.",
+        ),
+    ] = False,
+) -> None:
+    """
+    Export notes' provenance blocks into a .bib file.
+
+    For each entry, the paper's stored block(s) are written above it.
+    Personal note text is never emitted. Prints to stdout unless
+    --in-place is given.
+    """
+    from scholar.notes import get_note
+
+    console = Console()
+    if not bib_file.exists():
+        console.print(f"[red]File not found: {escape(str(bib_file))}[/red]")
+        raise typer.Exit(1)
+
+    text = bib_file.read_text(encoding="utf-8")
+    entries = _parse_bib_entries(text)
+
+    def blocks_for(entry):
+        note = get_note(_paper_from_entry(entry.fields))
+        if note is None:
+            return []
+        return [
+            payload
+            for kind, payload in _split_note_segments(note.note)
+            if kind == "prov"
+        ]
+
+    new_text, count = _rewrite_with_blocks(text, entries, blocks_for)
+    noun = "entry" if count == 1 else "entries"
+
+    if in_place:
+        bib_file.write_text(new_text, encoding="utf-8")
+        console.print(
+            f"[green]Annotated {count} {noun} in "
+            f"{escape(str(bib_file))}[/green]"
+        )
+    else:
+        print(new_text, end="")
+        Console(stderr=True).print(
+            f"[green]Annotated {count} {noun}[/green]"
+        )
+@
+
+Finally we verify the full loop: a block imported into a note is re-emitted
+above its entry on export, with personal prose left behind:
+
+<<test functions>>=
+class TestProvExportCommand:
+    """Tests for the prov export CLI command."""
+
+    def test_export_round_trips_block_not_personal(
+        self, tmp_path, monkeypatch
+    ):
+        """Export emits the stored block but not personal note text."""
+        monkeypatch.setenv("SCHOLAR_DATA_DIR", str(tmp_path))
+        from scholar.notes import save_note
+        from scholar import Paper
+        save_note(
+            Paper(
+                title="A Paper", authors=["Alice Smith"], doi="10.1/x",
+            ),
+            "private thoughts\n"
+            "=== provenance: alice2024 ===\n"
+            "CLAIM: privacy matters",
+        )
+        bib = tmp_path / "refs.bib"
+        bib.write_text(
+            "@article{alice2024,\n"
+            "  title = {A Paper},\n"
+            "  author = {Alice Smith},\n"
+            "  doi = {10.1/x},\n"
+            "}\n",
+            encoding="utf-8",
+        )
+        runner = CliRunner()
+        result = runner.invoke(app, ["prov", "export", str(bib)])
+        assert result.exit_code == 0
+        assert "% === provenance: alice2024 ===" in result.output
+        assert "% CLAIM: privacy matters" in result.output
+        assert "private thoughts" not in result.output
+@
+
+
 \section{Submodule Registration}
 
 To support future extensions like snowball and tuxedo, we provide a mechanism
@@ -5908,8 +6696,10 @@ We collect the imports used throughout the module:
 from typing import Optional
 from typing_extensions import Annotated
 from pathlib import Path
+from dataclasses import dataclass
 import json
 import logging
+import re
 import shlex
 
 import typer
