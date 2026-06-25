@@ -77,6 +77,26 @@ superseded, using Crossref's `updated-by` (Retraction-Watch-backed) and
   `scholar enrich "<session>"` warns on issues as a side effect. Both
   persist the findings back to the session.
 
+### Provenance Round-Trip
+
+The `bibtex+prov` export format wraps each entry in a provenance comment
+block (`% === provenance: <key> ===` + `CLAIM`/`FOUND-VIA`/`PICKED`/`QUOTE`/
+`VERIFIED`/`DATE`). `scholar prov` keeps those blocks in sync with `scholar
+notes`:
+
+- `scholar prov import refs.bib` parses each entry's block(s) into that
+  paper's note, **merging by `CLAIM`** (idempotent — re-importing never
+  duplicates) and preserving any personal note prose.
+- `scholar prov export refs.bib` writes a paper's stored block(s) back above
+  its entry; personal prose is never emitted. Prints to stdout (count on
+  stderr) by default; `--in-place/-i` overwrites the file.
+
+A note is parsed into ordered segments — `personal` (verbatim) or `prov`
+(a parsed block) — by `_split_note_segments`. Entries are keyed by
+reconstructing a `Paper` from the `.bib` fields and reusing `Paper.id`
+(DOI, else title+author hash). All round-trip code lives in `cli.nw`'s
+`<<formatter classes>>` and `<<prov command>>` chunks.
+
 ## Testing
 
 ```bash
