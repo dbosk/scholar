@@ -2007,12 +2007,16 @@ class SearchResult:
     timestamp: str
     papers: list[Paper]
     filters: dict | None = None
+    limit: int | None = None
 
     <<search result methods>>
 @
 
 The [[filters]] dictionary captures any provider-specific constraints (date
-ranges, document types, etc.) that were applied.
+ranges, document types, etc.) that were applied.  The [[limit]] records the
+per-provider result cap that was in effect, alongside the filters, so that
+provenance tooling can reconstruct the exact [[--limit]] of the original
+search and not just its query.
 
 \subsubsection{Consolidating a list of papers}
 
@@ -2065,6 +2069,14 @@ When the same paper appears from multiple providers, this yields the most
 complete record (keeping abstracts, DOIs, etc.\ from whichever source has
 them).
 
+A single search applies the \emph{same} query, filters, and limit to every
+provider, so the merged result can keep them: we carry [[filters]] and
+[[limit]] forward when both inputs agree, and fall back to [[None]] only when
+they differ --- in which case no single set of values describes the merge.
+This mirrors the query field, which records each input's query; keeping the
+filters and limit lets provenance tooling rebuild the original command rather
+than just its query.
+
 <<search result methods>>=
 def merge(self, other: "SearchResult") -> "SearchResult":
     """Merge two search results, deduplicating and consolidating papers."""
@@ -2084,7 +2096,8 @@ def merge(self, other: "SearchResult") -> "SearchResult":
         provider=f"{self.provider}, {other.provider}",
         timestamp=self.timestamp,
         papers=deduped,
-        filters=None,
+        filters=self.filters if self.filters == other.filters else None,
+        limit=self.limit if self.limit == other.limit else None,
     )
 @
 
@@ -2095,6 +2108,9 @@ when its results are paginated.
 [[deduplicate]] applies the same consolidation to one result's own papers, so
 the search command can guarantee a duplicate-free list even when only one
 provider responded (\cref{sec:doi-normalization}).
+Because a single-provider search is routed through this method, the copy
+preserves the result's [[filters]] and [[limit]] so that the search metadata
+survives for provenance reconstruction.
 
 <<search result methods>>=
 def deduplicate(self) -> "SearchResult":
@@ -2111,6 +2127,7 @@ def deduplicate(self) -> "SearchResult":
         timestamp=self.timestamp,
         papers=deduped,
         filters=self.filters,
+        limit=self.limit,
     )
 @
 
@@ -2224,6 +2241,66 @@ class TestSearchResult:
                 ],
             )
             assert len(result.deduplicate().papers) == 2
+@
+
+When both inputs share the same filters and limit --- as every provider in one
+search does --- the merged result keeps them so the original command stays
+reconstructable:
+
+<<test functions>>=
+    def test_merge_preserves_shared_filters_and_limit(self):
+        """Equal filters and limit survive a merge."""
+        with isolated_registry():
+            filters = {"year": "2020-2024"}
+            r1 = SearchResult(
+                query="test", provider="dblp", timestamp="2024-01-01",
+                papers=[Paper(title="A", authors=["X"])],
+                filters=filters, limit=50,
+            )
+            r2 = SearchResult(
+                query="test", provider="s2", timestamp="2024-01-01",
+                papers=[Paper(title="B", authors=["Y"])],
+                filters=filters, limit=50,
+            )
+
+            merged = r1.merge(r2)
+            assert merged.filters == {"year": "2020-2024"}
+            assert merged.limit == 50
+
+    def test_merge_drops_conflicting_filters_and_limit(self):
+        """Differing filters or limit cannot describe one command, so drop."""
+        with isolated_registry():
+            r1 = SearchResult(
+                query="test", provider="dblp", timestamp="2024-01-01",
+                papers=[], filters={"year": "2020"}, limit=50,
+            )
+            r2 = SearchResult(
+                query="test", provider="s2", timestamp="2024-01-01",
+                papers=[], filters={"year": "2021"}, limit=10,
+            )
+
+            merged = r1.merge(r2)
+            assert merged.filters is None
+            assert merged.limit is None
+@
+
+A single-provider search is routed through [[deduplicate]] rather than
+[[merge]], so that copy must carry the same metadata --- otherwise the most
+common search shape would silently lose its filters and limit for provenance:
+
+<<test functions>>=
+    def test_deduplicate_preserves_filters_and_limit(self):
+        """The single-result copy keeps its filters and limit."""
+        with isolated_registry():
+            result = SearchResult(
+                query="test", provider="dblp", timestamp="2024-01-01",
+                papers=[Paper(title="A", authors=["X"])],
+                filters={"year": "2020-2024"}, limit=50,
+            )
+
+            deduped = result.deduplicate()
+            assert deduped.filters == {"year": "2020-2024"}
+            assert deduped.limit == 50
 @
 
 
@@ -2342,6 +2419,7 @@ def execute(
             timestamp=timestamp,
             papers=papers,
             filters=filters.as_dict() if filters else None,
+            limit=limit,
         )
         self.results.append(result)
 
@@ -2387,6 +2465,24 @@ class TestSearch:
             # Explicitly specify the mock provider since "mock" is not a default
             results = s.execute(providers=["mock"])
             assert len(results) > 0
+@
+
+Each result must record the per-provider limit it was run with, since that
+value is what later reconstructs the [[--limit]] of the original search:
+
+<<test functions>>=
+    def test_execute_records_limit(self, monkeypatch):
+        """Search.execute stores the applied limit on each result."""
+        with isolated_registry():
+            from scholar import providers
+
+            mock_provider = Mock()
+            mock_provider.name = "mock"
+            mock_provider.search.return_value = []
+            monkeypatch.setattr(providers, "PROVIDERS", {"mock": mock_provider})
+
+            results = Search("test").execute(providers=["mock"], limit=42)
+            assert results[0].limit == 42
 @
 
 

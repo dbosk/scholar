@@ -346,7 +346,7 @@ Several commands accept a [[--format]] option.
 We define completers for each set of valid formats:
 
 <<completion functions>>=
-SEARCH_FORMATS = ["auto", "table", "csv", "json", "bibtex"]
+SEARCH_FORMATS = ["auto", "table", "csv", "json", "bibtex", "bibtex+prov"]
 DISPLAY_FORMATS = ["table", "json"]
 EXPORT_FORMATS = ["csv", "latex", "all"]
 SYNTHESIS_FORMATS = ["markdown", "latex"]
@@ -465,8 +465,8 @@ output_format: Annotated[
     str,
     typer.Option(
         "--format", "-f",
-        help="Output format: auto, table, csv, json, or bibtex. "
-             "Auto selects table for TTY, csv otherwise.",
+        help="Output format: auto, table, csv, json, bibtex, or "
+             "bibtex+prov. Auto selects table for TTY, csv otherwise.",
         autocompletion=complete_search_format,
     ),
 ] = "auto",
@@ -492,7 +492,7 @@ limit: Annotated[
         help="Maximum results per provider (default: 1000). "
              "Use 0 for unlimited (fetch all pages).",
     ),
-] = 1000,
+] = DEFAULT_SEARCH_LIMIT,
 enrich: Annotated[
     bool,
     typer.Option(
@@ -873,6 +873,7 @@ if enrich and merged_results:
                 timestamp=result.timestamp,
                 papers=enriched,
                 filters=result.filters,
+                limit=result.limit,
             )
 @
 
@@ -928,7 +929,7 @@ def rq(
             "-l",
             help="Maximum results per provider (default: 1000). Use 0 for unlimited.",
         ),
-    ] = 1000,
+    ] = DEFAULT_SEARCH_LIMIT,
     count: Annotated[
         int,
         typer.Option(
@@ -1091,6 +1092,7 @@ for pname in provider_names:
             timestamp=timestamp,
             papers=papers,
             filters=filters.as_dict() if filters else None,
+            limit=effective_limit,
         )
     )
 
@@ -4604,6 +4606,7 @@ FORMATTERS: dict[str, type] = {
     "csv": CSVFormatter,
     "json": JSONFormatter,
     "bibtex": BibTeXFormatter,
+    "bibtex+prov": BibTeXProvFormatter,
 }
 
 
@@ -4613,7 +4616,8 @@ def display_results(results: list, output_format: str = "table") -> None:
 
     Args:
         results: List of SearchResult objects to display.
-        output_format: One of 'table', 'csv', 'json', or 'bibtex'.
+        output_format: One of 'table', 'csv', 'json', 'bibtex', or
+            'bibtex+prov'.
     """
     formatter_class = FORMATTERS.get(output_format, TableFormatter)
     formatter = formatter_class()
@@ -4755,7 +4759,12 @@ expected header and metadata comments:
 
 \subsection{JSON formatter}
 
-For scripting, we provide JSON output that includes all paper metadata:
+For scripting, we provide JSON output that includes all paper metadata.
+We also surface the [[filters]] and [[limit]] that were applied, so a consumer
+reading the JSON has the same provenance the [[bibtex+prov]] export
+reconstructs --- the search is fully described by its query, providers,
+filters, and limit, and JSON is the natural place to expose all four to a
+machine reader.
 
 <<formatter classes>>=
 class JSONFormatter:
@@ -4769,6 +4778,8 @@ class JSONFormatter:
                 "query": result.query,
                 "provider": result.provider,
                 "timestamp": result.timestamp,
+                "filters": result.filters,
+                "limit": result.limit,
                 "papers": [
                     {
                         "title": p.title,
@@ -4786,7 +4797,7 @@ class JSONFormatter:
 @
 
 Let's verify the JSON formatter produces valid, parseable JSON with the correct
-structure:
+structure, including the search metadata:
 
 <<test functions>>=
     def test_json_formatter(self, sample_results, capsys):
@@ -4798,13 +4809,54 @@ structure:
         data = json.loads(captured.out)
         assert data[0]["query"] == "test"
         assert data[0]["papers"][0]["title"] == "Test Paper"
+        # Metadata keys are always present (None when unset)
+        assert data[0]["filters"] is None
+        assert data[0]["limit"] is None
+
+    def test_json_formatter_exposes_filters_and_limit(self, capsys):
+        """Active filters and limit appear in the JSON output."""
+        results = [
+            SearchResult(
+                query="test", provider="dblp",
+                timestamp="2024-01-01T00:00:00", papers=[],
+                filters={"year": "2020-2024"}, limit=50,
+            )
+        ]
+        JSONFormatter().format(results)
+        import json
+        data = json.loads(capsys.readouterr().out)
+        assert data[0]["filters"] == {"year": "2020-2024"}
+        assert data[0]["limit"] == 50
 @
 
 
 \subsection{BibTeX formatter}
 
 For \LaTeX{} users, we generate BibTeX entries that can be added to a
-[[.bib]] file:
+[[.bib]] file.
+
+The citation key is the first author's surname glued to the year.  We compute
+it in a free function rather than inside the entry builder because the
+provenance-stub formatter below needs the same key for its comment header
+\emph{before} the entry itself is rendered --- sharing one function guarantees
+the header and the entry never disagree.  A missing \emph{or blank} author
+list falls back to [[unknown]] and a missing year to [[nd]], so a key always
+exists: we take the surname from the split parts only when there is a part to
+take, since a blank author string splits to nothing.
+
+<<formatter classes>>=
+def _bibtex_key(paper) -> str:
+    """Return the citation key for a paper (first surname plus year)."""
+    parts = paper.authors[0].split() if paper.authors else []
+    first_author = parts[-1] if parts else "unknown"
+    year = paper.year or "nd"
+    return f"{first_author.lower()}{year}"
+@
+
+The entry builder returns the [[@article]] block as a string instead of
+printing it line by line.  A returned string is what lets the provenance-stub
+formatter wrap the very same entry in a comment block without re-implementing
+any field formatting.
 
 <<formatter classes>>=
 class BibTeXFormatter:
@@ -4814,27 +4866,24 @@ class BibTeXFormatter:
         """Output results as BibTeX."""
         for result in results:
             for paper in result.papers:
-                self._format_paper(paper)
+                print(self._format_paper(paper))
+                print()
 
-    def _format_paper(self, paper) -> None:
-        """Format a single paper as BibTeX."""
-        first_author = (
-            paper.authors[0].split()[-1] if paper.authors else "unknown"
-        )
-        year = paper.year or "nd"
-        key = f"{first_author.lower()}{year}"
-
-        print(f"@article{{{key},")
-        print(f"  title = {{{paper.title}}},")
-        print(f"  author = {{{' and '.join(paper.authors)}}},")
+    def _format_paper(self, paper) -> str:
+        """Return a single paper rendered as a BibTeX entry string."""
+        lines = [
+            f"@article{{{_bibtex_key(paper)},",
+            f"  title = {{{paper.title}}},",
+            f"  author = {{{' and '.join(paper.authors)}}},",
+        ]
         if paper.year:
-            print(f"  year = {{{paper.year}}},")
+            lines.append(f"  year = {{{paper.year}}},")
         if paper.doi:
-            print(f"  doi = {{{paper.doi}}},")
+            lines.append(f"  doi = {{{paper.doi}}},")
         if paper.venue:
-            print(f"  journal = {{{paper.venue}}},")
-        print("}")
-        print()
+            lines.append(f"  journal = {{{paper.venue}}},")
+        lines.append("}")
+        return "\n".join(lines)
 @
 
 Let's verify the BibTeX formatter produces valid entries with the correct
@@ -4848,6 +4897,259 @@ structure:
         captured = capsys.readouterr()
         assert "@article{" in captured.out
         assert "title = {Test Paper}" in captured.out
+@
+
+
+\subsection{Provenance-stub BibTeX formatter}
+
+When a written claim is backed by a reference, the citation should travel with
+a record of \emph{how it was found}, \emph{why it was picked}, and the
+\emph{verbatim quote} that supports the claim.  The most error-prone part of
+that record is the [[FOUND-VIA]] line --- a reproducible [[scholar search]]
+command --- and that is exactly the part the tool already knows.  This
+formatter emits each entry wrapped in a provenance comment block with
+[[FOUND-VIA]] pre-filled and the judgement fields left as [[TODO]]
+placeholders for the author to complete.
+
+The wrinkle is that by the time results reach a formatter they have passed
+through [[SearchResult.merge]], which joins the per-provider queries with
+[[" | "]] (every segment is identical, since one query is sent to all
+providers) and joins the provider names with [[", "]].  To rebuild a command
+the reader can actually run, we undo both joins: collapse the duplicated query
+segments back to one query and re-emit a single [[-p]] flag per provider.
+
+Free-text arguments --- the query and the [[--venue]] value --- may contain a
+space, double quote, or backslash, so we wrap them in double quotes and escape
+the quote and backslash.  Both arguments share one [[_quote_arg]] helper rather
+than re-deriving the escaping, since a quote that closes the wrapper early
+would corrupt either field the same way.
+
+<<formatter classes>>=
+def _quote_arg(value: str) -> str:
+    """Return ``value`` double-quoted with backslashes and quotes escaped."""
+    escaped = value.replace("\\", "\\\\").replace('"', '\\"')
+    return f'"{escaped}"'
+@
+
+The filters and limit travel on the result (preserved through [[merge]]), so we
+turn them back into the flags that produced them.  The [[--limit]] is shown
+only when it differs from the default, and the unlimited sentinel maps back to
+the [[0]] the user actually typed rather than the large internal cap.  Output
+and enrichment options such as [[--enrich]] are deliberately omitted: they
+change how results are displayed or augmented, not \emph{which} papers match,
+so they are irrelevant to reproducing the found set.
+
+<<formatter classes>>=
+def _search_flags(result) -> list[str]:
+    """Reconstruct the filter and limit flags applied to a result."""
+    flags = []
+    filters = result.filters or {}
+    if filters.get("year"):
+        flags.append(f"--year {filters['year']}")
+    if filters.get("open_access"):
+        flags.append("--open-access")
+    if filters.get("venue"):
+        flags.append(f"--venue {_quote_arg(filters['venue'])}")
+    if filters.get("min_citations") is not None:
+        flags.append(f"--min-citations {filters['min_citations']}")
+    for pub_type in filters.get("pub_types") or []:
+        flags.append(f"--type {pub_type}")
+    limit = result.limit
+    if limit is not None and limit != DEFAULT_SEARCH_LIMIT:
+        shown = 0 if limit >= UNLIMITED_PROVIDER_LIMIT else limit
+        flags.append(f"--limit {shown}")
+    return flags
+@
+
+With the helpers in place, [[_found_via]] is just the query, the [[-p]] flags,
+and the reconstructed filter flags joined into one command:
+
+<<formatter classes>>=
+def _found_via(result) -> str:
+    """Reconstruct the ``scholar search`` command behind a result.
+
+    Undoes the ``" | "`` query join and ``", "`` provider join introduced
+    by ``SearchResult.merge``, then re-emits the filter and limit flags, so
+    the command reproduces the original search.
+    """
+    queries = list(dict.fromkeys(result.query.split(" | ")))
+    query = " | ".join(queries)
+    providers = [p.strip() for p in result.provider.split(",") if p.strip()]
+    parts = [f"scholar search {_quote_arg(query)}"]
+    parts += [f"-p {p}" for p in providers]
+    parts += _search_flags(result)
+    return " ".join(parts)
+@
+
+Each paper is preceded by the comment block and then the reused entry.  The
+[[DATE]] comes from the search timestamp already carried on the result rather
+than the wall clock: it records when the search that surfaced the paper
+actually ran, and it keeps the output deterministic under test.
+
+<<formatter classes>>=
+class BibTeXProvFormatter(BibTeXFormatter):
+    """Output BibTeX entries wrapped in a provenance comment block."""
+
+    def format(self, results: list) -> None:
+        """Output results as provenance-stub BibTeX."""
+        for result in results:
+            found_via = _found_via(result)
+            date = result.timestamp.split("T")[0] if result.timestamp else ""
+            for paper in result.papers:
+                print(f"% === provenance: {_bibtex_key(paper)} ===")
+                print("% CLAIM: TODO")
+                print(f"% FOUND-VIA: {found_via}")
+                print("% PICKED: TODO")
+                print("% QUOTE (<loc>): TODO")
+                print("% VERIFIED: TODO")
+                print(f"% DATE: {date}")
+                print(self._format_paper(paper))
+                print()
+@
+
+Let's verify the stub carries the pre-filled command, the placeholder fields,
+and the entry itself:
+
+<<test functions>>=
+    def test_bibtex_prov_formatter(self, sample_results, capsys):
+        """BibTeXProvFormatter wraps entries in a provenance block."""
+        formatter = BibTeXProvFormatter()
+        formatter.format(sample_results)
+        out = capsys.readouterr().out
+        assert "% === provenance: alice2024 ===" in out
+        assert '% FOUND-VIA: scholar search "test" -p test_provider' in out
+        assert "% CLAIM: TODO" in out
+        assert "% QUOTE (<loc>): TODO" in out
+        assert "% DATE: 2024-01-01" in out
+        assert "@article{alice2024," in out
+@
+
+A merged result joins queries and providers; the [[FOUND-VIA]] line must
+collapse those joins back into one runnable command:
+
+<<test functions>>=
+    def test_bibtex_prov_formatter_undoes_merge_joins(self, capsys):
+        """FOUND-VIA collapses merged query/provider joins."""
+        results = [
+            SearchResult(
+                query="test | test",
+                provider="semantic_scholar, dblp",
+                timestamp="2024-01-01T00:00:00",
+                papers=[Paper(title="P", authors=["Alice"], year=2024)],
+            )
+        ]
+        formatter = BibTeXProvFormatter()
+        formatter.format(results)
+        out = capsys.readouterr().out
+        assert (
+            '% FOUND-VIA: scholar search "test" '
+            "-p semantic_scholar -p dblp" in out
+        )
+@
+
+A double quote in the query must not close the surrounding quotes early; it
+is escaped so the command stays balanced:
+
+<<test functions>>=
+    def test_bibtex_prov_formatter_escapes_query_quotes(self, capsys):
+        """A quote in the query is escaped so FOUND-VIA stays balanced."""
+        results = [
+            SearchResult(
+                query='say "hi"',
+                provider="dblp",
+                timestamp="2024-01-01T00:00:00",
+                papers=[Paper(title="P", authors=["Alice"], year=2024)],
+            )
+        ]
+        BibTeXProvFormatter().format(results)
+        out = capsys.readouterr().out
+        assert r'% FOUND-VIA: scholar search "say \"hi\"" -p dblp' in out
+@
+
+A paper whose first author is blank must still yield a key rather than
+crashing on an empty surname:
+
+<<test functions>>=
+    def test_bibtex_prov_formatter_handles_blank_author(self, capsys):
+        """A blank first author falls back to the 'unknown' key."""
+        results = [
+            SearchResult(
+                query="test",
+                provider="dblp",
+                timestamp="2024-01-01T00:00:00",
+                papers=[Paper(title="P", authors=[""], year=2024)],
+            )
+        ]
+        BibTeXProvFormatter().format(results)
+        out = capsys.readouterr().out
+        assert "% === provenance: unknown2024 ===" in out
+        assert "@article{unknown2024," in out
+@
+
+The filters and limit carried on the result must reappear as flags, in a
+fixed order, so the [[FOUND-VIA]] command reproduces the original search.  A
+[[--venue]] containing a space is quoted by the shared [[_quote_arg]] helper:
+
+<<test functions>>=
+    def test_found_via_reconstructs_filters_and_limit(self, capsys):
+        """Active filters and a non-default limit become CLI flags."""
+        results = [
+            SearchResult(
+                query="deep learning",
+                provider="dblp",
+                timestamp="2024-01-01T00:00:00",
+                papers=[Paper(title="P", authors=["Alice"], year=2024)],
+                filters={
+                    "year": "2020-2024",
+                    "open_access": True,
+                    "venue": "NeurIPS 2020",
+                    "min_citations": 50,
+                    "pub_types": ["article", "conference"],
+                },
+                limit=50,
+            )
+        ]
+        BibTeXProvFormatter().format(results)
+        out = capsys.readouterr().out
+        expected = (
+            '% FOUND-VIA: scholar search "deep learning" -p dblp '
+            "--year 2020-2024 --open-access "
+            '--venue "NeurIPS 2020" --min-citations 50 '
+            "--type article --type conference --limit 50"
+        )
+        assert expected in out
+@
+
+The default limit is implicit and so omitted, while the unlimited search maps
+back to the [[0]] the user typed rather than the internal cap:
+
+<<test functions>>=
+    def test_found_via_omits_default_limit(self, capsys):
+        """The default per-provider limit is not emitted."""
+        results = [
+            SearchResult(
+                query="q", provider="dblp", timestamp="t",
+                papers=[Paper(title="P", authors=["Alice"])],
+                limit=DEFAULT_SEARCH_LIMIT,
+            )
+        ]
+        BibTeXProvFormatter().format(results)
+        out = capsys.readouterr().out
+        assert '% FOUND-VIA: scholar search "q" -p dblp\n' in out
+        assert "--limit" not in out
+
+    def test_found_via_maps_unlimited_to_zero(self, capsys):
+        """The unlimited sentinel reconstructs as ``--limit 0``."""
+        results = [
+            SearchResult(
+                query="q", provider="dblp", timestamp="t",
+                papers=[Paper(title="P", authors=["Alice"])],
+                limit=UNLIMITED_PROVIDER_LIMIT,
+            )
+        ]
+        BibTeXProvFormatter().format(results)
+        out = capsys.readouterr().out
+        assert '% FOUND-VIA: scholar search "q" -p dblp --limit 0' in out
 @
 
 
@@ -5024,5 +5326,8 @@ from rich.text import Text
 <<constants>>=
 logger = logging.getLogger(__name__)
 
+# The default per-provider cap, shared by the --limit option default and the
+# FOUND-VIA reconstruction so the two cannot drift; 0 maps to the sentinel.
+DEFAULT_SEARCH_LIMIT = 1000
 UNLIMITED_PROVIDER_LIMIT = 10**9
 @
