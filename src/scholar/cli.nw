@@ -77,6 +77,7 @@ across bibliographic databases.
 <<notes command>>
 <<themes command>>
 <<sessions command>>
+<<prov command>>
 <<llm command helpers>>
 <<llm command>>
 <<submodule registration>>
@@ -445,6 +446,32 @@ def complete_paper_id(incomplete: str) -> list[str]:
         return [n.paper_id for n in notes if n.paper_id.startswith(incomplete)]
     except Exception:
         return []
+@
+
+The [[prov found-via]] command traces papers through saved review sessions
+rather than through standalone notes, so its completion draws paper IDs from
+the sessions instead.  A paper can appear in several sessions, so we deduplicate
+as we go and swallow any load error---completion must never raise:
+
+<<completion functions>>=
+def complete_session_paper_id(incomplete: str) -> list[str]:
+    """Provide shell completion for paper IDs in saved sessions."""
+    from scholar.review import list_sessions, load_session
+    results: list[str] = []
+    seen: set[str] = set()
+    try:
+        for meta in list_sessions():
+            session = load_session(meta["name"])
+            if session is None:
+                continue
+            for decision in session.decisions:
+                pid = decision.paper.id
+                if pid not in seen and pid.startswith(incomplete):
+                    seen.add(pid)
+                    results.append(pid)
+    except Exception:
+        return []
+    return results
 @
 
 \subsection{Command options}
@@ -3725,6 +3752,407 @@ class TestSessionsCommand:
         assert "Kept Paper" in result.output
         assert "Discarded Paper" in result.output
         assert "Pending Paper" in result.output
+@
+
+
+\section{Citation Provenance}
+\label{sec:prov-commands}
+
+When a citation is backed by a paper, its provenance record needs a
+[[FOUND-VIA]] line: a command that reproduces the search which surfaced the
+paper.  A [[scholar rq]] session already records, per provider, the query it
+sent to each database (in [[query_provider_pairs]]).  But [[rq]] generates those
+queries with a language model, so re-running [[scholar rq]] on the same research
+question is \emph{not} reproducible---a later run may phrase the queries
+differently and return a different set.  The artifact that \emph{is}
+reproducible is the exact query that was actually sent, which the session has
+already persisted.  So [[found-via]] rebuilds a [[scholar search]] command from
+that stored query rather than re-deriving it through the model, and demotes the
+research question to human-readable context.
+
+The lookup runs backwards from the one piece of information the author has at
+citation time---a paper ID.  There is no index from a paper back to the sessions
+that contain it, so [[found-via]] scans the saved sessions and reports every one
+that kept the paper (a paper may have been found in more than one search).
+
+\subsection{The prov command group}
+
+We expose provenance export under its own [[prov]] command group, mirroring the
+[[sessions]] and [[notes]] groups, so that future provenance exporters have a
+natural home alongside [[found-via]].
+
+<<prov command>>=
+prov_app = typer.Typer(
+    name="prov",
+    help="Export citation provenance.",
+    no_args_is_help=True,
+)
+app.add_typer(prov_app, name="prov")
+@
+
+\subsection{Reconstructing a reproducible search}
+
+The record for one paper in one session pins the command to the single provider
+that actually returned the paper ([[decision.provider]]): re-running every
+provider's query would reproduce the whole session, not the one result we are
+citing.  We look that provider's query up in the session's stored pairs via
+[[queries_for_provider]] and take the first---a provider is normally searched
+once per session.  Sessions saved before per-provider pairs existed have none,
+so we fall back to the session's overall [[query]], which was the query sent to
+every provider in that older format.
+
+The research question travels along as [[research_context]] for the human
+reader, but it never shapes the command.  We deliberately do \emph{not} key the
+command on whether [[research_context]] is set: it can be filled in on any
+session to drive automated classification, so it is not a marker of how the
+session was built.
+
+One limitation is worth stating plainly: the session does not persist the
+per-search filters (year, venue, open-access, and so on), only the query
+strings, so the reconstructed command carries the query and provider but not
+those flags.  The stored query is the reproducible core; the flags are a known
+gap rather than an oversight.
+
+<<prov command>>=
+def _found_via_record(session, decision) -> dict:
+    """Build the reproducible provenance record for one kept paper.
+
+    The command re-sends the exact provider query stored for the paper's
+    provider, reproducing the search without re-invoking the language model
+    that ``scholar rq`` used to generate that query.
+    """
+    provider = decision.provider
+    queries = session.queries_for_provider(provider)
+    provider_query = queries[0] if queries else session.query
+    command = f"scholar search {_quote_arg(provider_query)} -p {provider}"
+    return {
+        "paper_id": decision.paper.id,
+        "title": decision.paper.title,
+        "session": session.name or session.query,
+        "command": command,
+        "provider": provider,
+        "provider_query": provider_query,
+        "research_context": session.research_context,
+        "timestamp": session.timestamp.isoformat(),
+    }
+@
+
+\subsection{The found-via command}
+
+The command resolves a paper ID the same way [[notes show]] does---exact match,
+or substring so a bare DOI matches the [[doi:]]-prefixed ID---and follows the
+sub-app [[--format]] convention so tooling can ask for JSON.  We walk the
+sessions newest-first (the natural reading order for provenance: the most recent
+search comes first) and collect a record for every session that kept the paper.
+
+<<prov command>>=
+@prov_app.command("found-via")
+def prov_found_via(
+    paper_id: Annotated[
+        str,
+        typer.Argument(
+            help="Paper ID (DOI or hash) to trace.",
+            autocompletion=complete_session_paper_id,
+        ),
+    ],
+    output_format: Annotated[
+        str,
+        typer.Option(
+            "--format", "-f",
+            help="Output format: table or json.",
+            autocompletion=complete_display_format,
+        ),
+    ] = "table",
+) -> None:
+    """
+    Print a reproducible FOUND-VIA provenance line for a paper.
+
+    Scans saved review sessions for the paper and, for each session that
+    kept it, prints the 'scholar search' command that reproduces the search
+    which surfaced it. Use '-f json' for machine-readable output.
+    """
+    from scholar.review import list_sessions, load_session
+
+    console = Console()
+    <<collect FOUND-VIA records for the paper>>
+
+    if not records:
+        console.print(
+            f"[red]No saved session contains paper ID: "
+            f"{escape(paper_id)}[/red]"
+        )
+        raise typer.Exit(1)
+
+    if output_format == "json":
+        print(json.dumps(records, indent=2))
+    else:
+        <<print FOUND-VIA blocks>>
+@
+
+The scan loads each session by name and matches every decision's paper.  A
+session that fails to load is skipped rather than fatal, so one corrupt file
+does not hide the provenance held in the others.
+
+<<collect FOUND-VIA records for the paper>>=
+records = []
+for meta in reversed(list_sessions()):
+    session = load_session(meta["name"])
+    if session is None:
+        continue
+    for decision in session.decisions:
+        pid = decision.paper.id
+        if pid == paper_id or paper_id in pid:
+            records.append(_found_via_record(session, decision))
+@
+
+Each block prints the reproducible command on the first line and the session
+plus research-question context on a second, indented to line up under the
+command.  We collapse any internal whitespace in the research question so a
+question entered across several lines still renders as one context line, and we
+omit the question entirely when the session never recorded one.
+
+<<print FOUND-VIA blocks>>=
+blocks = []
+for record in records:
+    context = f'(session "{record["session"]}"'
+    research = record["research_context"]
+    if research:
+        question = " ".join(research.split())
+        context += f'; research question: "{question}"'
+    context += ")"
+    blocks.append(
+        f"{FOUND_VIA_PREFIX}{record['command']}\n"
+        f"{' ' * len(FOUND_VIA_PREFIX)}{context}"
+    )
+print("\n\n".join(blocks))
+<<constants>>=
+FOUND_VIA_PREFIX = "FOUND-VIA: "
+@
+
+Let's verify the heart of the command: that the [[FOUND-VIA]] line carries the
+exact stored provider query for the provider that surfaced the paper, as a
+[[scholar search]] command and never as a [[scholar rq]] one.
+
+<<test functions>>=
+class TestProvCommand:
+    """Tests for the prov found-via command."""
+
+    <<prov test methods>>
+@
+
+The tests share one fixture builder that saves a session keeping a single paper
+under a chosen provider:
+
+<<prov test methods>>=
+def _make_session(
+    self, *, name, providers, pairs, paper, provider,
+    research_context=None,
+):
+    """Persist a session that keeps ``paper`` found via ``provider``."""
+    from scholar.review import (
+        ReviewDecision, ReviewSession, DecisionStatus, save_session,
+    )
+    session = ReviewSession(
+        query=name,
+        providers=providers,
+        timestamp=datetime(2026, 3, 25, 14, 49),
+        name=name,
+        research_context=research_context,
+        query_provider_pairs=pairs,
+    )
+    session.decisions.append(
+        ReviewDecision(
+            paper=paper,
+            provider=provider,
+            status=DecisionStatus.KEPT,
+            tags=["theme"],
+        )
+    )
+    save_session(session)
+@
+
+<<prov test methods>>=
+def test_found_via_uses_stored_provider_query(
+    self, tmp_path, monkeypatch
+):
+    """FOUND-VIA reproduces the search, not the LLM-driven rq command."""
+    monkeypatch.setenv("SCHOLAR_DATA_DIR", str(tmp_path))
+    paper = Paper(
+        title="Novice LLMs", authors=["Alice"], year=2024, doi="10.1/llm"
+    )
+    self._make_session(
+        name="llm-novice-programming",
+        providers=["openalex", "dblp"],
+        pairs=[
+            ('"large language models" novice', "openalex"),
+            ("llm novice programming", "dblp"),
+        ],
+        paper=paper,
+        provider="openalex",
+        research_context="How do LLMs support novice programming?",
+    )
+
+    result = runner.invoke(app, ["prov", "found-via", paper.id])
+
+    assert result.exit_code == 0
+    assert (
+        'FOUND-VIA: scholar search '
+        '"\\"large language models\\" novice" -p openalex'
+    ) in result.output
+    assert "scholar rq" not in result.output
+    assert "-p dblp" not in result.output
+@
+
+The research question rides along as context when present, and the context line
+drops it cleanly when the session never recorded one:
+
+<<prov test methods>>=
+def test_found_via_shows_research_question_as_context(
+    self, tmp_path, monkeypatch
+):
+    """The context line carries the session and research question."""
+    monkeypatch.setenv("SCHOLAR_DATA_DIR", str(tmp_path))
+    paper = Paper(title="P", authors=["Alice"], year=2024, doi="10.1/ctx")
+    self._make_session(
+        name="llm-novice-programming",
+        providers=["openalex"],
+        pairs=[("llm novice", "openalex")],
+        paper=paper,
+        provider="openalex",
+        research_context="How do LLMs support novice programming?",
+    )
+
+    result = runner.invoke(app, ["prov", "found-via", paper.id])
+
+    assert (
+        '(session "llm-novice-programming"; research question: '
+        '"How do LLMs support novice programming?")'
+    ) in result.output
+
+def test_found_via_omits_absent_research_question(
+    self, tmp_path, monkeypatch
+):
+    """With no research context, the context line shows only the session."""
+    monkeypatch.setenv("SCHOLAR_DATA_DIR", str(tmp_path))
+    paper = Paper(title="P", authors=["Alice"], year=2024, doi="10.1/noctx")
+    self._make_session(
+        name="manual-session",
+        providers=["dblp"],
+        pairs=[("manual query", "dblp")],
+        paper=paper,
+        provider="dblp",
+    )
+
+    result = runner.invoke(app, ["prov", "found-via", paper.id])
+
+    assert '(session "manual-session")' in result.output
+    assert "research question" not in result.output
+@
+
+The JSON form returns a list of self-contained records so tooling can consume
+the command and its parts directly:
+
+<<prov test methods>>=
+def test_found_via_json_output(self, tmp_path, monkeypatch):
+    """-f json emits a list with the command and its parts."""
+    monkeypatch.setenv("SCHOLAR_DATA_DIR", str(tmp_path))
+    paper = Paper(
+        title="Novice LLMs", authors=["Alice"], year=2024, doi="10.1/json"
+    )
+    self._make_session(
+        name="llm-novice-programming",
+        providers=["openalex"],
+        pairs=[('"large language models" novice', "openalex")],
+        paper=paper,
+        provider="openalex",
+        research_context="How do LLMs support novice programming?",
+    )
+
+    result = runner.invoke(
+        app, ["prov", "found-via", paper.id, "-f", "json"]
+    )
+
+    data = json.loads(result.output)
+    assert isinstance(data, list) and len(data) == 1
+    record = data[0]
+    assert record["command"] == (
+        'scholar search "\\"large language models\\" novice" -p openalex'
+    )
+    assert record["provider"] == "openalex"
+    assert record["provider_query"] == '"large language models" novice'
+    assert (
+        record["research_context"]
+        == "How do LLMs support novice programming?"
+    )
+@
+
+A paper found in several searches gets one block per session, so the author
+sees every provenance trail:
+
+<<prov test methods>>=
+def test_found_via_lists_all_matching_sessions(
+    self, tmp_path, monkeypatch
+):
+    """Every session that kept the paper produces its own record."""
+    monkeypatch.setenv("SCHOLAR_DATA_DIR", str(tmp_path))
+    paper = Paper(
+        title="Shared", authors=["Alice"], year=2024, doi="10.1/shared"
+    )
+    self._make_session(
+        name="session-a", providers=["openalex"],
+        pairs=[("query a", "openalex")], paper=paper, provider="openalex",
+    )
+    self._make_session(
+        name="session-b", providers=["dblp"],
+        pairs=[("query b", "dblp")], paper=paper, provider="dblp",
+    )
+
+    result = runner.invoke(app, ["prov", "found-via", paper.id])
+    assert result.exit_code == 0
+    assert 'session "session-a"' in result.output
+    assert 'session "session-b"' in result.output
+
+    as_json = runner.invoke(
+        app, ["prov", "found-via", paper.id, "-f", "json"]
+    )
+    assert len(json.loads(as_json.output)) == 2
+@
+
+An unknown paper ID is an error, not silent empty output, so a mistyped ID is
+caught rather than mistaken for "no provenance":
+
+<<prov test methods>>=
+def test_found_via_unknown_paper_errors(self, tmp_path, monkeypatch):
+    """A paper in no session exits non-zero with a message."""
+    monkeypatch.setenv("SCHOLAR_DATA_DIR", str(tmp_path))
+
+    result = runner.invoke(app, ["prov", "found-via", "doi:nope"])
+
+    assert result.exit_code == 1
+    assert "No saved session" in result.output
+@
+
+Finally, a bare DOI matches the [[doi:]]-prefixed ID by substring, so the author
+need not remember the prefix:
+
+<<prov test methods>>=
+def test_found_via_matches_paper_id_substring(
+    self, tmp_path, monkeypatch
+):
+    """A substring of the paper ID resolves the paper."""
+    monkeypatch.setenv("SCHOLAR_DATA_DIR", str(tmp_path))
+    paper = Paper(
+        title="P", authors=["Alice"], year=2024, doi="10.1/substr"
+    )
+    self._make_session(
+        name="s", providers=["dblp"], pairs=[("q", "dblp")],
+        paper=paper, provider="dblp",
+    )
+
+    result = runner.invoke(app, ["prov", "found-via", "10.1/substr"])
+
+    assert result.exit_code == 0
+    assert "FOUND-VIA:" in result.output
 @
 
 
