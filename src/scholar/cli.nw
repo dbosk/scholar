@@ -5290,8 +5290,12 @@ def _split_note_segments(note_body: str) -> list:
 
 The inverse re-serialises segments back to a note body.  Personal segments are
 emitted verbatim; a block becomes its header followed by its fields in stored
-order.  Splitting and rendering are exact inverses for well-formed notes, which
-is what makes a note-to-note round-trip lossless.
+order.  Splitting then rendering is the identity on a canonically-formatted note
+--- which is what makes a note-to-note round-trip lossless --- modulo two
+normalisations: a field value is stripped of surrounding whitespace, and because
+a block's fields are a [[dict]], two lines with the \emph{same} field name
+collapse to the last (so multiple quotes from one source must carry distinct
+locations, as in [[QUOTE (p.3)]] versus [[QUOTE (p.7)]]).
 
 <<formatter classes>>=
 def _render_note_segments(segments: list) -> str:
@@ -5425,7 +5429,17 @@ def _entry_end(lines: list, start: int) -> int:
 Field extraction is deliberately narrow: we only need the four fields that
 identify a paper, and our own entries write one [[name = {value}]] (or quoted)
 field per line.  A line-oriented match avoids mistaking an [[=]] inside a value
-for a field assignment.
+for a field assignment.  It assumes each field value is balanced and on one
+line --- which the formatter guarantees --- so a value spanning lines or a
+literal unbalanced brace is out of scope.
+
+We strip the remaining [[{]] and [[}]] from each value before storing it.  A
+[[.bib]] often brace-protects capitalisation, as in [[title = {The {LaTeX}
+Companion}]]; left in, those braces would make the title hash to a different
+[[Paper.id]] than the brace-free title every provider stores, so an [[import]]
+would orphan the paper into a fresh note instead of updating its existing one.
+Unwrapping the braces is what lets the no-DOI hash key line up with notes
+created elsewhere.
 
 <<formatter classes>>=
 def _extract_bib_fields(entry_text: str) -> dict:
@@ -5436,7 +5450,8 @@ def _extract_bib_fields(entry_text: str) -> dict:
     for line in entry_text.split("\n"):
         match = brace.match(line) or quote.match(line)
         if match:
-            fields[match.group(1).lower()] = match.group(2)
+            value = match.group(2).replace("{", "").replace("}", "")
+            fields[match.group(1).lower()] = value
     return fields
 @
 
@@ -5494,6 +5509,29 @@ def _comment_prov_blocks(comment_lines: list) -> list:
         for kind, payload in _split_note_segments(stripped)
         if kind == "prov"
     ]
+@
+
+The export rewriter needs the complement: the comment lines that are \emph{not}
+part of a provenance block.  A user may keep an ordinary [[%]] note above an
+entry, and replacing the provenance region must not take that with it.  We
+re-walk the run at the raw-line level --- dropping a header and its field lines,
+keeping everything else --- so a personal comment survives an export.
+
+<<formatter classes>>=
+def _kept_comment_lines(comment_lines: list) -> list:
+    """Return the comment lines that are not part of a provenance block."""
+    kept = []
+    in_block = False
+    for line in comment_lines:
+        stripped = _strip_comment_prefix(line)
+        if PROV_HEADER_RE.match(stripped):
+            in_block = True
+            continue
+        if in_block and _is_prov_field_line(stripped):
+            continue
+        in_block = False
+        kept.append(line)
+    return kept
 @
 
 The scanner ties these together: it tracks the pending comment run, and on each
@@ -5598,10 +5636,11 @@ def _render_prov_blocks(key: str, blocks: list) -> str:
 @
 
 The rewriter walks the entries in order, copying untouched text verbatim.  When
-a paper has stored blocks it replaces the entry's existing comment region (or
-inserts one if absent); when it has none, the entry --- and any comment already
-there --- is left exactly as found, so export never destroys a block it cannot
-replace.
+a paper has stored blocks it rewrites the entry's provenance region: it keeps
+any non-provenance comment lines (via [[_kept_comment_lines]]), drops the old
+blocks, and emits the regenerated ones just above the entry.  When a paper has
+no blocks the entry --- and any comment already there --- is left exactly as
+found, so export never destroys a block it cannot replace.
 
 <<formatter classes>>=
 def _rewrite_with_blocks(text: str, entries: list, blocks_for) -> tuple:
@@ -5609,7 +5648,7 @@ def _rewrite_with_blocks(text: str, entries: list, blocks_for) -> tuple:
 
     Returns ``(new_text, count)`` where ``count`` is the number of entries
     whose provenance region was written.  Entries with no blocks are left
-    untouched.
+    untouched, as are any non-provenance comments above an entry.
     """
     lines = text.split("\n")
     out: list = []
@@ -5623,6 +5662,10 @@ def _rewrite_with_blocks(text: str, entries: list, blocks_for) -> tuple:
                 if entry.comment_start is not None else entry.entry_start
             )
             out.extend(lines[cursor:region])
+            if entry.comment_start is not None:
+                out.extend(_kept_comment_lines(
+                    lines[entry.comment_start:entry.entry_start]
+                ))
             out.append(_render_prov_blocks(entry.key, blocks))
             out.extend(lines[entry.entry_start:entry.entry_end + 1])
             count += 1
@@ -5660,6 +5703,44 @@ class TestProvRewrite:
         new_text, count = _rewrite_with_blocks(text, entries, lambda e: [])
         assert count == 0
         assert new_text == text
+
+    def test_preserves_non_provenance_comment(self):
+        """A plain comment above an entry survives a block rewrite."""
+        text = (
+            "% TODO: double-check this reference\n"
+            "% === provenance: a2024 ===\n"
+            "% CLAIM: old\n"
+            "@article{a2024,\n  title = {T},\n}\n"
+        )
+        entries = _parse_bib_entries(text)
+        blocks = [("a2024", {"CLAIM": "new"})]
+        new_text, count = _rewrite_with_blocks(
+            text, entries, lambda e: blocks
+        )
+        assert "% TODO: double-check this reference" in new_text
+        assert "% CLAIM: new" in new_text
+        assert "% CLAIM: old" not in new_text
+        # The kept comment stays above the regenerated block.
+        assert new_text.index("% TODO") < new_text.index("% CLAIM: new")
+@
+
+We also confirm that brace-protected fields are unwrapped, so a paper without a
+DOI keys to the same id as its brace-free form:
+
+<<test functions>>=
+class TestProvFieldExtraction:
+    """Tests for BibTeX field extraction and keying."""
+
+    def test_strips_protective_braces(self):
+        """Inner braces are removed so titles key consistently."""
+        text = (
+            "@article{x,\n"
+            "  title = {The {LaTeX} Companion},\n"
+            "  author = {Carol Doe},\n"
+            "}\n"
+        )
+        entry = _parse_bib_entries(text)[0]
+        assert entry.fields["title"] == "The LaTeX Companion"
 @
 
 \section{The Provenance Command}
