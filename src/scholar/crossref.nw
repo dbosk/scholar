@@ -1,0 +1,638 @@
+\chapter{Currency and retraction checks}
+\label{crossref-module}
+
+A citation can decay after it is made.  The cited work may be retracted, a
+correction or erratum may change its conclusions, or---common for
+preprints---a peer-reviewed version may supersede the copy that was found.
+A claim-backing workflow must not rest on withdrawn or stale work, so we need a
+way to ask, for a paper we already hold, \enquote{is this still safe to cite?}
+
+This chapter answers that question against Crossref.  When a publisher issues a
+retraction or correction, the affected work's Crossref record gains an
+[[update-by]] (rendered [[updated-by]] in the JSON) entry pointing at the notice;
+and Crossref has, since ingesting the Retraction~Watch database, populated these
+for tens of thousands of works regardless of publisher participation.  A single
+metadata lookup per DOI therefore covers both the issue's core ask (retractions
+and corrections) and the optional Retraction~Watch cross-check, with no API key.
+
+\section{Design overview}
+
+The check is one HTTP request per paper: [[GET https://api.crossref.org/works/
+{doi}]].  Two parts of the returned [[message]] interest us:
+\begin{description}
+\item[ [[updated-by]] ] A list of retraction/correction notices that target
+  this work.  Each entry carries the notice's DOI, an update [[type]]
+  (\enquote{retraction}, \enquote{correction}, \enquote{erratum}, \dots), a
+  human label, a [[source]] (e.g.\ \enquote{retraction-watch}), and a date.
+\item[ [[relation]] ] A map of typed relationships to other works.  We read the
+  ones that imply a newer canonical version exists, so a superseded preprint can
+  be flagged.
+\end{description}
+
+We deliberately query the work \emph{itself} rather than searching Crossref for
+notices that reference it.  The [[updated-by]] back-link is already present on
+the work's own record, so the direct lookup is both simpler and exact---no
+query parsing, no ranking, no risk of matching the wrong work.
+
+Two design choices mirror the existing providers (\cref{cache-module} and the
+provider chapter) so this module behaves like the rest of the system:
+\begin{description}
+\item[Caching] Results are cached per DOI through the shared cache layer, so
+  re-verifying a session or re-opening it costs nothing.
+\item[Silent failure] Network and parse errors are logged and turned into a
+  \enquote{could not determine} result rather than an exception, matching the
+  provider contract that callers never have to wrap lookups in [[try]].
+\end{description}
+
+A subtle but important consequence of silent failure is that we must
+distinguish \enquote{checked, found nothing} from \enquote{could not check}.
+Only an HTTP~200 response means we actually saw the work's record; a 404
+(DOI not in Crossref), a rate-limit, or a transport error tells us nothing about
+its currency.  We return a result dictionary only for the former and [[None]]
+for the latter, so a transient failure never masquerades as a clean bill of
+health.
+
+<<[[crossref.py]]>>=
+"""
+Currency and retraction checks against Crossref.
+
+Looks up a paper's DOI in the Crossref REST API and reports retraction or
+correction notices ("updated-by") and superseding-version relations. Used by
+``scholar verify`` and ``scholar enrich`` to warn against citing withdrawn or
+stale work. Results are cached per DOI; no API key is required.
+"""
+
+<<imports>>
+<<constants>>
+<<the crossref client>>
+<<currency normalization helpers>>
+<<module-level currency interface>>
+@
+
+
+\section{Testing}
+\label{sec:crossref-testing}
+
+Tests are distributed through this chapter, each following the code it
+verifies.  The Crossref client holds a shared cache and a rate-limit clock, so
+before every test we reset both---otherwise a cached DOI from one test would
+satisfy the next test's lookup without hitting our mock.
+
+<<test [[crossref.py]]>>=
+"""Tests for the crossref currency-check module."""
+from unittest.mock import Mock, patch
+
+import pytest
+
+from scholar.crossref import *
+from scholar.crossref import (
+    _client,
+    _format_notice_date,
+    _normalize_newer_versions,
+    _normalize_updated_by,
+)
+from scholar import Paper
+
+
+@pytest.fixture(autouse=True)
+def _clean_client():
+    """Reset the shared client's cache and rate-limit clock per test."""
+    _client._cache.clear()
+    _client._last_request_time = 0.0
+    yield
+    _client._cache.clear()
+
+
+def _mock_response(status=200, message=None):
+    """Build a fake requests response wrapping a Crossref message."""
+    response = Mock()
+    response.status_code = status
+    response.json.return_value = {"message": message or {}}
+    response.raise_for_status = Mock()
+    return response
+
+
+<<test functions>>
+@
+
+
+\section{The Crossref client}
+
+The client encapsulates the HTTP session, the polite-pool identity, the
+per-DOI cache, and proactive rate limiting.  We model it on
+[[SemanticScholarProvider]] so that a reader who knows one knows the other; the
+shared [[load_cache]]/[[register_cache]] calls even let it reuse the same
+on-disk cache machinery.
+
+The polite identity comes from an email address: Crossref offers a faster,
+more reliable \enquote{polite} request pool to clients that identify themselves
+with a [[mailto]].  We reuse [[OPENALEX_EMAIL]] (already configured for the
+OpenAlex provider's identical polite pool) as a fallback so users need not set a
+second variable, while still allowing a dedicated [[CROSSREF_MAILTO]] override.
+
+<<the crossref client>>=
+class CrossrefClient:
+    """Looks up retraction/currency metadata for DOIs via Crossref."""
+
+    name = "crossref"
+
+    def __init__(self) -> None:
+        self._cache: dict = load_cache(self.name)
+        register_cache(self.name, self._cache)
+        self._last_request_time: float = 0.0
+        self._session = self._create_session()
+        self._mailto = (
+            os.environ.get("CROSSREF_MAILTO")
+            or os.environ.get("OPENALEX_EMAIL")
+        )
+
+    <<crossref client methods>>
+@
+
+The session carries the same exponential back-off as the other providers: a
+retraction check that trips a transient 429 or 5xx should retry quietly rather
+than report a false \enquote{could not check}.
+
+<<crossref client methods>>=
+def _create_session(self) -> requests.Session:
+    """Create a session with exponential back-off retry logic."""
+    session = requests.Session()
+    retry = Retry(
+        total=3,
+        backoff_factor=1,  # 1s, 2s, 4s delays
+        status_forcelist=[429, 500, 502, 503, 504],
+        allowed_methods=["GET"],
+    )
+    session.mount("https://", HTTPAdapter(max_retries=retry))
+    return session
+@
+
+Crossref's public pool is lenient, but issuing one request per paper in a large
+session can still amount to a burst.  A short minimum interval keeps us a polite
+neighbour without making verification of a few dozen papers feel slow.
+
+<<crossref client methods>>=
+def _wait_for_rate_limit(self) -> None:
+    """Ensure a minimum interval between Crossref requests."""
+    elapsed = time.time() - self._last_request_time
+    if elapsed < CROSSREF_MIN_INTERVAL:
+        time.sleep(CROSSREF_MIN_INTERVAL - elapsed)
+    self._last_request_time = time.time()
+@
+
+<<constants>>=
+# Crossref REST endpoint for single-work lookups, and request tuning.
+CROSSREF_WORKS_URL = "https://api.crossref.org/works"
+CROSSREF_TIMEOUT = 30
+CROSSREF_MIN_INTERVAL = 0.1  # seconds between requests (polite pacing)
+CROSSREF_USER_AGENT = "scholarcli (https://github.com/dbosk/scholar)"
+@
+
+\subsection{Fetching a work's currency metadata}
+
+The lookup is the heart of the module.  The DOI must be URL-encoded before it is
+spliced into the path: DOIs routinely contain slashes (and occasionally spaces
+or other reserved characters), which would otherwise be read as extra path
+segments and produce a spurious 404.
+
+The return contract is the checked/unknown distinction from the overview: a
+dictionary with [[updated_by]] and [[newer_versions]] lists when Crossref served
+the record (HTTP~200), and [[None]] when it did not (missing DOI, 404, 429, or
+error).  A 404 is cached as [[None]] so an unregistered DOI is not retried every
+run; a 429 or transport error is left uncached so a later run can try again.
+
+<<crossref client methods>>=
+def fetch_currency(self, doi: str | None) -> dict | None:
+    """Return currency metadata for ``doi``, or ``None`` if undetermined.
+
+    On an HTTP 200 response, returns a dict with ``updated_by`` and
+    ``newer_versions`` lists (each possibly empty). Returns ``None`` when the
+    DOI is missing, not found, rate-limited, or the request fails.
+    """
+    if not doi:
+        return None
+
+    cache_key = ("currency", doi)
+    if cache_key in self._cache:
+        logger.debug("crossref: cache hit for DOI %s", doi)
+        return self._cache[cache_key]
+
+    try:
+        self._wait_for_rate_limit()
+        url = f"{CROSSREF_WORKS_URL}/{quote(doi, safe='')}"
+        params = {"mailto": self._mailto} if self._mailto else {}
+        response = self._session.get(
+            url,
+            params=params,
+            headers={"User-Agent": CROSSREF_USER_AGENT},
+            timeout=CROSSREF_TIMEOUT,
+        )
+
+        if response.status_code == 404:
+            # DOI unknown to Crossref: cache the miss to avoid re-lookups.
+            self._cache[cache_key] = None
+            return None
+        if response.status_code == 429:
+            logger.warning("crossref: rate limited for DOI %s", doi)
+            return None
+
+        response.raise_for_status()
+        message = response.json().get("message", {})
+        result = {
+            "updated_by": _normalize_updated_by(message),
+            "newer_versions": _normalize_newer_versions(message),
+        }
+        self._cache[cache_key] = result
+        return result
+
+    except requests.exceptions.HTTPError as e:
+        logger.warning("crossref: lookup error for %s: %s", doi, e)
+        return None
+    except Exception as e:
+        logger.warning("crossref: lookup failed for %s: %s", doi, e)
+        return None
+@
+
+Let's verify the happy path, the encoding requirement, and each
+\enquote{undetermined} branch.  We mock the session's [[get]] so no network is
+touched.
+
+<<test functions>>=
+class TestFetchCurrency:
+    """Tests for CrossrefClient.fetch_currency via the shared client."""
+
+    def test_no_doi_makes_no_request(self):
+        """A missing DOI returns None without calling the API."""
+        with patch.object(_client._session, "get") as mock_get:
+            assert fetch_currency(None) is None
+            mock_get.assert_not_called()
+
+    def test_retracted_work_returns_notices(self):
+        """An updated-by entry is normalized onto the result."""
+        message = {
+            "updated-by": [
+                {
+                    "DOI": "10.1/retraction",
+                    "type": "retraction",
+                    "label": "Retraction",
+                    "source": "retraction-watch",
+                    "updated": {"date-parts": [[2010, 2, 6]]},
+                }
+            ]
+        }
+        with patch.object(
+            _client._session, "get", return_value=_mock_response(200, message)
+        ):
+            result = fetch_currency("10.1/work")
+        assert result["updated_by"] == [
+            {
+                "doi": "10.1/retraction",
+                "type": "retraction",
+                "label": "Retraction",
+                "date": "2010-02-06",
+                "source": "retraction-watch",
+            }
+        ]
+        assert result["newer_versions"] == []
+
+    def test_clean_work_returns_empty_lists(self):
+        """A 200 with no notices is 'checked, clean' (empty lists)."""
+        with patch.object(
+            _client._session, "get", return_value=_mock_response(200, {})
+        ):
+            result = fetch_currency("10.1/clean")
+        assert result == {"updated_by": [], "newer_versions": []}
+
+    def test_doi_is_url_encoded(self):
+        """The DOI's slashes/spaces are percent-encoded in the path."""
+        captured = {}
+
+        def fake_get(url, **kwargs):
+            captured["url"] = url
+            return _mock_response(200, {})
+
+        with patch.object(_client._session, "get", side_effect=fake_get):
+            fetch_currency("10.1/a b")
+        assert "10.1%2Fa%20b" in captured["url"]
+
+    def test_not_found_returns_none(self):
+        """A 404 yields None (undetermined), not an empty result."""
+        with patch.object(
+            _client._session, "get", return_value=_mock_response(404)
+        ):
+            assert fetch_currency("10.1/missing") is None
+
+    def test_transport_error_returns_none(self):
+        """A raised exception is swallowed into None."""
+        with patch.object(
+            _client._session, "get", side_effect=Exception("boom")
+        ):
+            assert fetch_currency("10.1/broken") is None
+
+    def test_result_is_cached(self):
+        """A second lookup of the same DOI does not hit the network."""
+        with patch.object(
+            _client._session, "get", return_value=_mock_response(200, {})
+        ) as mock_get:
+            fetch_currency("10.1/cached")
+            fetch_currency("10.1/cached")
+        assert mock_get.call_count == 1
+@
+
+
+\section{Normalizing Crossref metadata}
+
+The raw Crossref shapes are awkward to consume directly---capitalized [[DOI]]
+keys, nested date-part arrays, a relation map keyed by relationship name---so we
+flatten them into the small, stable dictionaries stored on the [[Paper]] model.
+Keeping this translation in one place means the rest of the system never has to
+know Crossref's wire format.
+
+\subsection{Formatting notice dates}
+
+Crossref expresses dates as nested \enquote{date-parts} arrays that may be
+truncated to just a year, or a year and month, when the full date is unknown.
+We render whatever precision is available into an ISO-style string, and treat an
+absent or empty date as simply \enquote{no date} rather than failing---the date
+is informational, and a missing one must not abort a retraction check.
+
+<<currency normalization helpers>>=
+def _format_notice_date(updated: dict | None) -> str | None:
+    """Render a Crossref date-parts structure as an ISO-style string."""
+    if not updated:
+        return None
+    parts = updated.get("date-parts") or []
+    if not parts or not parts[0]:
+        return None
+    nums = [n for n in parts[0] if n is not None]
+    if not nums:
+        return None
+    # Year is left as-is; month/day are zero-padded to two digits.
+    return "-".join(
+        str(n) if i == 0 else f"{n:02d}" for i, n in enumerate(nums)
+    )
+@
+
+<<test functions>>=
+class TestFormatNoticeDate:
+    """Tests for _format_notice_date precision handling."""
+
+    def test_full_date(self):
+        assert _format_notice_date({"date-parts": [[2010, 2, 6]]}) == "2010-02-06"
+
+    def test_year_only(self):
+        assert _format_notice_date({"date-parts": [[2010]]}) == "2010"
+
+    def test_missing_is_none(self):
+        assert _format_notice_date(None) is None
+        assert _format_notice_date({"date-parts": [[]]}) is None
+@
+
+\subsection{Normalizing update notices}
+
+Each [[updated-by]] entry becomes a flat dictionary with the fields the CLI and
+the [[Paper]] predicates need.  We default a missing [[type]] to
+\enquote{update} rather than dropping the entry: a notice with no stated type is
+still a notice, and silently discarding it could hide a real retraction.
+
+<<currency normalization helpers>>=
+def _normalize_updated_by(message: dict) -> list[dict]:
+    """Flatten a Crossref message's update notices into simple dicts."""
+    notices = []
+    for entry in message.get("updated-by") or []:
+        notices.append(
+            {
+                "doi": entry.get("DOI"),
+                "type": entry.get("type") or "update",
+                "label": entry.get("label"),
+                "date": _format_notice_date(entry.get("updated")),
+                "source": entry.get("source"),
+            }
+        )
+    return notices
+@
+
+<<test functions>>=
+class TestNormalizeUpdatedBy:
+    """Tests for _normalize_updated_by."""
+
+    def test_missing_type_defaults_to_update(self):
+        """An entry without a type is kept, typed as 'update'."""
+        notices = _normalize_updated_by({"updated-by": [{"DOI": "10.1/n"}]})
+        assert notices == [
+            {
+                "doi": "10.1/n",
+                "type": "update",
+                "label": None,
+                "date": None,
+                "source": None,
+            }
+        ]
+
+    def test_no_updates_is_empty(self):
+        assert _normalize_updated_by({}) == []
+@
+
+\subsection{Normalizing superseding-version relations}
+
+Crossref's [[relation]] map can express many relationship types; we only care
+about those that mean a newer, more canonical version of this work exists.  The
+clearest is [[is-preprint-of]] (this preprint has a published version);
+[[is-version-of]] captures the more general case of a work that is a particular
+version of a canonical record.  We read only relations whose identifier is a
+DOI, since a bare DOI is what makes the newer version actionable for the reader.
+
+<<constants>>=
+# Crossref relation types that mean a newer/canonical version exists.
+SUPERSEDING_RELATIONS = ("is-preprint-of", "is-version-of")
+@
+
+<<currency normalization helpers>>=
+def _normalize_newer_versions(message: dict) -> list[dict]:
+    """Extract DOIs of newer/canonical versions from the relation map."""
+    relation = message.get("relation") or {}
+    versions = []
+    for rel_type in SUPERSEDING_RELATIONS:
+        for entry in relation.get(rel_type) or []:
+            if entry.get("id-type") == "doi" and entry.get("id"):
+                versions.append({"doi": entry["id"], "relation": rel_type})
+    return versions
+@
+
+<<test functions>>=
+class TestNormalizeNewerVersions:
+    """Tests for _normalize_newer_versions."""
+
+    def test_preprint_relation_is_extracted(self):
+        message = {
+            "relation": {
+                "is-preprint-of": [{"id-type": "doi", "id": "10.1/published"}]
+            }
+        }
+        assert _normalize_newer_versions(message) == [
+            {"doi": "10.1/published", "relation": "is-preprint-of"}
+        ]
+
+    def test_non_doi_relation_is_ignored(self):
+        message = {
+            "relation": {
+                "is-preprint-of": [{"id-type": "url", "id": "http://x"}]
+            }
+        }
+        assert _normalize_newer_versions(message) == []
+
+    def test_no_relation_is_empty(self):
+        assert _normalize_newer_versions({}) == []
+@
+
+
+\section{The module-level interface}
+
+Callers want three convenient verbs over a single shared client: look up one
+DOI, annotate a batch of papers, and reduce a paper to a one-word status.  We
+instantiate the client once at import time so its cache and session are shared
+across the whole process.
+
+<<module-level currency interface>>=
+_client = CrossrefClient()
+
+
+def fetch_currency(doi: str | None) -> dict | None:
+    """Look up currency metadata for a single DOI (see CrossrefClient)."""
+    return _client.fetch_currency(doi)
+@
+
+\subsection{Annotating a batch of papers}
+
+The batch annotator is what the CLI commands call.  It writes the fetched
+currency onto each paper via [[replace]] (the papers are otherwise immutable in
+the enrichment style), and---crucially---leaves a paper untouched when the
+lookup is undetermined.  That way a paper without a DOI stays unchecked, and a
+transient failure never overwrites a currency result a previous run had already
+established.
+
+<<module-level currency interface>>=
+def annotate_papers(
+    papers: list[Paper], progress_callback=None
+) -> list[Paper]:
+    """Return copies of ``papers`` annotated with Crossref currency data.
+
+    Papers whose DOI cannot be resolved (missing, not found, or a failed
+    request) are returned unchanged, preserving any prior currency status.
+    ``progress_callback(done, total)`` is invoked after each paper if given.
+    """
+    annotated = []
+    total = len(papers)
+    for index, paper in enumerate(papers):
+        result = _client.fetch_currency(paper.doi)
+        if result is None:
+            annotated.append(paper)
+        else:
+            annotated.append(
+                replace(
+                    paper,
+                    updated_by=result["updated_by"],
+                    newer_versions=result["newer_versions"],
+                )
+            )
+        if progress_callback:
+            progress_callback(index + 1, total)
+    return annotated
+@
+
+<<test functions>>=
+class TestAnnotatePapers:
+    """Tests for annotate_papers."""
+
+    def test_annotates_checked_paper_and_skips_no_doi(self):
+        """A DOI paper gets currency; a DOI-less paper is left unchecked."""
+        with_doi = Paper(title="A", authors=["x"], doi="10.1/a")
+        without_doi = Paper(title="B", authors=["y"])
+        with patch.object(
+            _client._session, "get", return_value=_mock_response(200, {})
+        ):
+            out = annotate_papers([with_doi, without_doi])
+        assert out[0].updated_by == []  # checked, clean
+        assert out[1].updated_by is None  # never checked
+@
+
+\subsection{Reducing a paper to a status}
+
+Both the [[verify]] report and the [[enrich]] warnings need the same one-word
+summary of a paper's currency, so we define it once here rather than in the CLI.
+The order of the checks encodes severity: a retraction outranks a correction,
+which outranks mere supersession.  Only once those are ruled out do we
+distinguish a checked-clean paper (\enquote{ok}) from one we never managed to
+check (\enquote{unknown}), using the [[None]]-versus-empty distinction the
+[[Paper]] model preserves for exactly this purpose.
+
+<<module-level currency interface>>=
+def currency_status(paper: Paper) -> str:
+    """Summarize a paper's currency as one of five status words.
+
+    Returns ``"retracted"``, ``"corrected"``, ``"superseded"``, ``"ok"``
+    (checked, no issues), or ``"unknown"`` (never successfully checked).
+    """
+    if paper.is_retracted:
+        return "retracted"
+    if paper.is_corrected:
+        return "corrected"
+    if paper.is_superseded:
+        return "superseded"
+    if paper.updated_by is None and paper.newer_versions is None:
+        return "unknown"
+    return "ok"
+@
+
+<<test functions>>=
+class TestCurrencyStatus:
+    """Tests for currency_status precedence and the ok/unknown split."""
+
+    def test_retraction_outranks_correction(self):
+        paper = Paper(
+            title="T",
+            authors=["a"],
+            updated_by=[{"type": "retraction"}, {"type": "correction"}],
+        )
+        assert currency_status(paper) == "retracted"
+
+    def test_checked_clean_is_ok(self):
+        paper = Paper(title="T", authors=["a"], updated_by=[], newer_versions=[])
+        assert currency_status(paper) == "ok"
+
+    def test_unchecked_is_unknown(self):
+        paper = Paper(title="T", authors=["a"])
+        assert currency_status(paper) == "unknown"
+
+    def test_superseded_when_only_newer_versions(self):
+        paper = Paper(
+            title="T",
+            authors=["a"],
+            updated_by=[],
+            newer_versions=[{"doi": "10.1/v2", "relation": "is-preprint-of"}],
+        )
+        assert currency_status(paper) == "superseded"
+@
+
+
+\section{Imports}
+
+The module needs the HTTP stack the other providers use, the shared cache
+helpers, [[replace]] for immutable annotation, and [[quote]] for DOI encoding.
+
+<<imports>>=
+import logging
+import os
+import time
+from dataclasses import replace
+from urllib.parse import quote
+
+import requests
+from requests.adapters import HTTPAdapter
+from urllib3.util.retry import Retry
+
+from scholar import Paper
+from scholar.cache import load_cache, register_cache
+
+logger = logging.getLogger(__name__)
+@

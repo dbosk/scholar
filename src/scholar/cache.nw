@@ -64,7 +64,7 @@ Cache is stored as pickled dictionaries, one per provider.
 
 
 \section{Testing}
-\label{sec:testing}
+\label{sec:cache-testing}
 
 Tests are distributed throughout this document, appearing after each
 implementation section they verify.

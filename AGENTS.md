@@ -25,6 +25,8 @@ Providers self-register via `register_provider()` at module load time.
 | `src/scholar/providers.py` | All provider implementations |
 | `src/scholar/providers.nw` | Literate programming source for providers |
 | `src/scholar/scholar.py` | Core data models (Paper, SearchResult) |
+| `src/scholar/crossref.py` | Crossref currency/retraction checks |
+| `src/scholar/crossref.nw` | Literate source for currency checks |
 | `src/scholar/cli.py` | CLI commands and output formatters |
 | `src/scholar/cli.nw` | Literate programming source for CLI |
 
@@ -59,6 +61,21 @@ Providers self-register via `register_provider()` at module load time.
 ### Error Handling
 
 All providers silently return empty `list[Paper]` on errors. No exceptions propagate to CLI.
+
+### Currency / Retraction Checks
+
+`crossref.py` checks whether a paper has been retracted, corrected, or
+superseded, using Crossref's `updated-by` (Retraction-Watch-backed) and
+`relation` metadata. Results are cached per DOI via the shared cache layer.
+
+- `Paper.updated_by` / `Paper.newer_versions` hold the findings;
+  `None` means "never checked", `[]` means "checked, clean".
+- `Paper.is_retracted` / `is_corrected` / `is_superseded` are convenience
+  predicates; `crossref.currency_status(paper)` reduces these to one word
+  (`retracted`/`corrected`/`superseded`/`ok`/`unknown`).
+- `scholar verify "<session>"` reports per-paper status (with `--json`);
+  `scholar enrich "<session>"` warns on issues as a side effect. Both
+  persist the findings back to the session.
 
 ## Testing
 
