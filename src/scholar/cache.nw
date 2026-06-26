@@ -432,3 +432,41 @@ def isolate_cache(tmp_path, monkeypatch):
     cache_dir.mkdir()
     monkeypatch.setenv("SCHOLAR_CACHE_DIR", str(cache_dir))
 @
+
+\subsection{Gating live API tests}
+
+Each provider ships an [[@pytest.mark.integration]] test that hits the real
+API.  These are invaluable for catching breakage that mocks cannot---an expired
+API key, a provider changing its response shape---but they are slow, flaky, and
+sometimes require credentials, so they must stay \emph{off} during an ordinary
+[[pytest]] run.
+
+Rather than hard-[[@pytest.mark.skip]] each one (which makes them impossible to
+run at all without editing source), we gate them behind a [[--run-live]] flag.
+When the flag is absent we attach a skip marker to every [[integration]]-marked
+item during collection; passing [[--run-live]] lets them through.  This keeps
+the default run fully mocked and offline while making the live suite a single
+flag away: [[pytest --run-live -m integration]].
+
+<<[[conftest.py]]>>=
+def pytest_addoption(parser):
+    """Register the ``--run-live`` flag that enables integration tests."""
+    parser.addoption(
+        "--run-live",
+        action="store_true",
+        default=False,
+        help="run integration tests that make real API calls",
+    )
+
+
+def pytest_collection_modifyitems(config, items):
+    """Skip integration tests unless ``--run-live`` was passed."""
+    if config.getoption("--run-live"):
+        return
+    skip_live = pytest.mark.skip(
+        reason="needs --run-live (makes real API calls)"
+    )
+    for item in items:
+        if "integration" in item.keywords:
+            item.add_marker(skip_live)
+@

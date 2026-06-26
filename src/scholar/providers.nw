@@ -690,6 +690,7 @@ class SemanticScholarProvider:
         self._cache: dict = load_cache(self.name)
         register_cache(self.name, self._cache)
         self._last_request_time: float = 0.0
+        self._key_rejected: bool = False
         self._session = self._create_session()
 
     def is_available(self) -> bool:
@@ -697,6 +698,7 @@ class SemanticScholarProvider:
         return True
 
     <<semantic scholar rate limiting>>
+    <<semantic scholar request helper>>
     <<semantic scholar search method>>
     <<semantic scholar get paper by doi>>
     <<semantic scholar get citations and references>>
@@ -718,7 +720,7 @@ We implement two layers of rate limiting:
 @property
 def _min_request_interval(self) -> float:
     """Return minimum interval based on whether API key is set."""
-    if self.api_key:
+    if self.api_key and not self._key_rejected:
         return self.RATE_LIMIT_WITH_KEY
     return self.RATE_LIMIT_WITHOUT_KEY
 
@@ -743,6 +745,69 @@ def _wait_for_rate_limit(self) -> None:
     self._last_request_time = time.time()
 @
 
+\subsubsection{Requests and the stale-key fallback}
+
+All three endpoints (search, DOI lookup, citations/references) share the same
+request preamble: wait for the rate limit, then attach the API key as an
+[[x-api-key]] header.  We centralise that here so the three call sites do not
+drift apart, and so a single place owns the policy for a \emph{rejected} key.
+
+The motivating failure: an expired or revoked [[S2_API_KEY]] makes the server
+answer every request with \texttt{403 Forbidden}.  This is distinct from
+\texttt{429 Too Many Requests} (rate limiting): a 403 will never recover by
+waiting or retrying with the same header, because the credential itself is the
+problem.  Anonymous access, on the other hand, still works.  So the right
+recovery is not back-off but \emph{dropping the key}: on the first 403 we warn
+once, set [[_key_rejected]], and re-issue the very same request without the
+header so the caller still gets data on this call.  [[_build_headers]] then
+omits the key for the rest of the session, which also shifts us to the slower
+anonymous rate limit (see [[_min_request_interval]] above).
+
+If the anonymous retry \emph{also} returns 403 something more unusual is wrong
+(an IP block, an outage).  We cannot recover, but we must not crash the user's
+search either, so we log at [[error]] level and hand the 403 response back to
+the caller, which treats it as an empty result.
+
+<<semantic scholar request helper>>=
+def _build_headers(self) -> dict:
+    """Return request headers, omitting the API key once it was rejected."""
+    headers = {}
+    if self.api_key and not self._key_rejected:
+        headers["x-api-key"] = self.api_key
+    return headers
+
+def _request(self, url: str, params: dict) -> requests.Response:
+    """GET ``url`` with rate limiting and stale-key fallback.
+
+    On a 403 while authenticated, warn once, stop sending the key for the
+    rest of the session, and retry the same request anonymously. A 403 that
+    persists without a key is logged at error level; the response is returned
+    so the caller degrades to an empty result rather than raising.
+    """
+    self._wait_for_rate_limit()
+    headers = self._build_headers()
+    response = self._session.get(url, params=params, headers=headers, timeout=30)
+
+    if response.status_code == 403 and "x-api-key" in headers:
+        logger.warning(
+            "s2: API key rejected (403) -- check or replace S2_API_KEY; "
+            "falling back to anonymous access"
+        )
+        self._key_rejected = True
+        self._wait_for_rate_limit()
+        response = self._session.get(
+            url, params=params, headers=self._build_headers(), timeout=30
+        )
+
+    if response.status_code == 403:
+        logger.error(
+            "s2: Forbidden (403) even without an API key; "
+            "returning no results for this request"
+        )
+
+    return response
+@
+
 \subsubsection{Search method}
 
 The search method calls the API with rate limiting and handles errors.
@@ -755,8 +820,16 @@ results they want, and the provider handles the underlying paging.
 The loop terminates when we have fetched enough results, when the API returns
 no more data, or when we reach the total number of available results.
 
+As with DBLP, [[search]] caches only \emph{trustworthy} results.  A rate
+limit, a rejected key, or an HTTP/parse error can cut a search short, and the
+persistent pickle cache would otherwise freeze that partial or empty result for
+every later call with the same arguments.  We therefore split the work: the
+inner [[_search_uncached]] reports a [[cacheable]] flag alongside its papers,
+and the thin [[search]] wrapper writes to the cache only when that flag is
+true.  Partial results are still \emph{returned} to the caller---the user sees
+what we managed to fetch---they are just not cached.
+
 <<semantic scholar search method>>=
-@cachedmethod(lambda self: self._cache, key=lambda self, query, limit=100, filters=None: (query, limit, filters.cache_key() if filters else ""))
 def search(
     self,
     query: str,
@@ -769,19 +842,33 @@ def search(
     Automatically fetches multiple pages if the requested limit exceeds
     the API's per-request maximum (100 results per page).
     """
+    cache_key = (query, limit, filters.cache_key() if filters else "")
+    if cache_key in self._cache:
+        return self._cache[cache_key]
+
+    papers, cacheable = self._search_uncached(query, limit, filters)
+    if cacheable:
+        self._cache[cache_key] = papers
+    return papers
+
+def _search_uncached(
+    self,
+    query: str,
+    limit: int,
+    filters: SearchFilters | None,
+) -> tuple[list[Paper], bool]:
+    """Run the paged search, returning ``(papers, cacheable)``.
+
+    ``cacheable`` is False when a transient failure (rate limit, rejected
+    key, HTTP or parse error) truncated the search, so the caller can avoid
+    freezing a partial or empty result into the cache.
+    """
     all_papers: list[Paper] = []
     offset = 0
     page_size = min(limit, 100)  # S2 API returns max 100 per request
 
     try:
         while len(all_papers) < limit:
-            self._wait_for_rate_limit()
-
-            headers = {}
-            if self.api_key:
-                headers["x-api-key"] = self.api_key
-                logger.debug("semantic_scholar: Using API key")
-
             # Calculate how many results we still need
             remaining = limit - len(all_papers)
             current_page_size = min(page_size, remaining)
@@ -796,12 +883,7 @@ def search(
             # Apply filters (Semantic Scholar supports most filters natively)
             <<semantic scholar apply filters>>
 
-            response = self._session.get(
-                self.API_URL,
-                params=params,
-                headers=headers,
-                timeout=30,
-            )
+            response = self._request(self.API_URL, params)
 
             if response.status_code == 429:
                 logger.warning(
@@ -810,7 +892,12 @@ def search(
                     "https://www.semanticscholar.org/product/api#api-key-form "
                     "and set S2_API_KEY environment variable."
                 )
-                break
+                return all_papers, False
+
+            if response.status_code == 403:
+                # Key rejected and anonymous access also forbidden; the
+                # helper already logged the error. Don't cache the empty.
+                return all_papers, False
 
             response.raise_for_status()
             data = response.json()
@@ -829,7 +916,7 @@ def search(
                 break
 
         logger.debug(f"semantic_scholar: Retrieved {len(all_papers)} papers")
-        return all_papers
+        return all_papers, True
     except requests.exceptions.RetryError:
         logger.warning(
             "s2: Rate limited after retries. "
@@ -837,13 +924,13 @@ def search(
             "https://www.semanticscholar.org/product/api#api-key-form "
             "and set S2_API_KEY environment variable."
         )
-        return all_papers
+        return all_papers, False
     except requests.exceptions.HTTPError as e:
         logger.warning("s2: HTTP error: %s", e)
-        return all_papers
+        return all_papers, False
     except Exception as e:
         logger.warning("s2: %s", e)
-        return all_papers
+        return all_papers, False
 @
 
 \subsubsection{Applying filters}
@@ -944,21 +1031,13 @@ def get_paper_by_doi(self, doi: str | None) -> Paper | None:
     logger.info(f"semantic_scholar: Cache miss for DOI {doi}, fetching from API")
 
     try:
-        self._wait_for_rate_limit()
-
-        headers = {}
-        if self.api_key:
-            headers["x-api-key"] = self.api_key
-
         # Use the paper endpoint with DOI: prefix
         url = f"https://api.semanticscholar.org/graph/v1/paper/DOI:{doi}"
-        response = self._session.get(
+        response = self._request(
             url,
-            params={
+            {
                 "fields": "title,authors,year,abstract,venue,externalIds,url,openAccessPdf,fieldsOfStudy",
             },
-            headers=headers,
-            timeout=30,
         )
 
         if response.status_code == 404:
@@ -968,6 +1047,11 @@ def get_paper_by_doi(self, doi: str | None) -> Paper | None:
 
         if response.status_code == 429:
             logger.warning("s2: Rate limited during DOI lookup")
+            return None
+
+        if response.status_code == 403:
+            # Key rejected and anonymous access also forbidden (logged by
+            # the helper). Do not cache; a later call may succeed.
             return None
 
         response.raise_for_status()
@@ -1075,22 +1159,14 @@ def _get_related_papers(
 
     try:
         while len(all_papers) < limit:
-            self._wait_for_rate_limit()
-
-            headers = {}
-            if self.api_key:
-                headers["x-api-key"] = self.api_key
-
             url = f"https://api.semanticscholar.org/graph/v1/paper/{paper_id}/{relation}"
-            response = self._session.get(
+            response = self._request(
                 url,
-                params={
+                {
                     "fields": "title,authors,year,abstract,venue,externalIds,url,openAccessPdf,fieldsOfStudy",
                     "limit": page_size,
                     "offset": offset,
                 },
-                headers=headers,
-                timeout=30,
             )
 
             if response.status_code == 404:
@@ -1099,6 +1175,11 @@ def _get_related_papers(
 
             if response.status_code == 429:
                 logger.warning("s2: Rate limited during %s fetch", relation)
+                break
+
+            if response.status_code == 403:
+                # Key rejected and anonymous access also forbidden (logged
+                # by the helper). Stop with what we have.
                 break
 
             response.raise_for_status()
@@ -1296,6 +1377,57 @@ class TestSemanticScholarProvider:
             results = provider.search("test")
             assert results == []
 
+    def test_search_caches_successful_results(self):
+        """A successful search is cached; the second call skips the API."""
+        provider = SemanticScholarProvider()
+
+        mock_response = Mock()
+        mock_response.status_code = 200
+        mock_response.json.return_value = {
+            "total": 1,
+            "data": [{"title": "Cached Paper", "authors": []}],
+        }
+
+        with patch.object(
+            provider._session, "get", return_value=mock_response
+        ) as mock_get:
+            first = provider.search("test")
+            second = provider.search("test")
+
+            assert len(first) == 1
+            assert len(second) == 1
+            assert mock_get.call_count == 1  # second call served from cache
+
+    def test_rate_limited_result_is_not_cached(self):
+        """A 429 returns empty without caching, so a later call retries.
+
+        Unlike a successful search, a rate-limited (transient) result must
+        not be frozen into the persistent cache, or every later call with the
+        same query would replay the empty result until the cache is cleared.
+        """
+        provider = SemanticScholarProvider()
+
+        throttled = Mock()
+        throttled.status_code = 429
+
+        recovered = Mock()
+        recovered.status_code = 200
+        recovered.json.return_value = {
+            "total": 1,
+            "data": [{"title": "Recovered Paper", "authors": []}],
+        }
+
+        with patch.object(
+            provider._session, "get", side_effect=[throttled, recovered]
+        ) as mock_get:
+            first = provider.search("test")
+            assert first == []
+
+            second = provider.search("test")
+            assert len(second) == 1
+            assert second[0].title == "Recovered Paper"
+            assert mock_get.call_count == 2  # not served from cache
+
     def test_rate_limiting_with_api_key(self):
         """Provider uses faster rate limit when API key is set."""
         provider = SemanticScholarProvider(api_key="test-key")
@@ -1479,20 +1611,27 @@ class TestSemanticScholarIntegration:
     """Integration test for the SemanticScholar provider."""
 
     @pytest.mark.integration
-    @pytest.mark.skip(reason="Skipped by default due to API rate limits")
     def test_real_api_call(self):
-        """Make one real API call to verify the provider works."""
-        try:
-            provider = SemanticScholarProvider()
-            papers = provider.search("machine learning", limit=1)
-            assert len(papers) >= 1, "Provider returned no results"
+        """Anonymous search returns real results.
 
-            paper = papers[0]
-            assert isinstance(paper, Paper)
-            assert paper.title
-            assert paper.sources == ["s2"]
+        We force the key off *after* construction (the constructor falls back
+        to the ``S2_API_KEY`` environment variable, so ``api_key=None`` alone
+        would still pick up a stale key). This exercises the pure anonymous
+        path in one request, unmasked by any environment key. An empty result
+        fails the test rather than skipping, so a regression is visible.
+        """
+        provider = SemanticScholarProvider(api_key=None)
+        provider.api_key = None  # ignore any S2_API_KEY in the environment
+        try:
+            papers = provider.search("machine learning", limit=1)
         except Exception as e:
             pytest.skip(f"Semantic Scholar API unavailable: {e}")
+
+        assert len(papers) >= 1, "Provider returned no results"
+        paper = papers[0]
+        assert isinstance(paper, Paper)
+        assert paper.title
+        assert paper.sources == ["s2"]
 @
 
 
@@ -2074,22 +2213,20 @@ class TestOpenAlexIntegration:
     """Integration test for the OpenAlex provider."""
 
     @pytest.mark.integration
-    @pytest.mark.skip(reason="Skipped by default to avoid API calls")
     def test_real_api_call(self):
         """Make one real API call to verify the provider works."""
         provider = OpenAlexProvider()
 
         try:
             papers = provider.search("machine learning", limit=1)
-
-            assert len(papers) >= 1, "Provider returned no results"
-
-            paper = papers[0]
-            assert isinstance(paper, Paper)
-            assert paper.title
-            assert paper.sources == ["openalex"]
         except Exception as e:
             pytest.skip(f"OpenAlex API unavailable: {e}")
+
+        assert len(papers) >= 1, "Provider returned no results"
+        paper = papers[0]
+        assert isinstance(paper, Paper)
+        assert paper.title
+        assert paper.sources == ["openalex"]
 @
 
 
@@ -2131,7 +2268,31 @@ pages.
 
 \subsection{Provider implementation}
 
+DBLP's public API is generous but brittle in two ways that the previous
+implementation did not survive.  First, DBLP serialises its XML result set to
+JSON by collapsing repeated elements: [[result.hits.hit]] is a \emph{list} when
+several papers match, but a bare \emph{object} when exactly one matches (and
+absent when none match).  Iterating a bare object walks its string keys, so a
+single-result query used to crash---and because the crash was swallowed and the
+empty result cached, that query stayed broken.  Second, DBLP throttles
+aggressively and, under load, answers with a non-JSON body that breaks
+[[response.json()]].
+
+We address both by normalising every hit list through [[ensure_list]] (the same
+technique the Scopus provider uses for its identifier lists) and by separating
+\emph{transient} failures from genuine empty results: a transient failure
+raises [[_DBLPUnavailable]] and returns an uncached empty list, so a later call
+can retry, whereas a real zero-hit answer is cached normally.
+
 <<dblp provider>>=
+class _DBLPUnavailable(Exception):
+    """Raised internally when a DBLP request fails transiently.
+
+    Used to distinguish a throttled or malformed response (do not cache, allow
+    a retry later) from a genuine zero-result answer (safe to cache).
+    """
+
+
 class DBLPProvider:
     """Search provider for DBLP."""
 
@@ -2147,72 +2308,188 @@ class DBLPProvider:
         """DBLP is always available (no API key needed)."""
         return True
 
-    @cachedmethod(lambda self: self._cache, key=lambda self, query, limit=100, filters=None: (query, limit, filters.cache_key() if filters else ""))
-    def search(
-        self,
-        query: str,
-        limit: int = 100,
-        filters: SearchFilters | None = None,
-    ) -> list[Paper]:
-        """
-        Search DBLP for papers matching the query.
+    <<dblp search method>>
+    <<dblp fetch pages>>
+    <<dblp fetch one page>>
+    <<convert dblp hit>>
+@
 
-        Automatically fetches multiple pages if the requested limit exceeds
-        the API's per-request maximum (1000 results per page).
-        """
-        all_papers: list[Paper] = []
-        offset = 0
-        page_size = min(limit, 1000)  # DBLP API caps at 1000 per request
+\subsubsection{Search entry point}
+
+The public method owns caching so it can cache \emph{only} trustworthy results.
+We manage the cache by hand instead of via [[@cachedmethod]] because the
+decorator caches whatever the method returns---including the empty list a
+swallowed error produces---which would freeze a transient outage into a
+permanently empty cache entry.  Here, a transient failure returns an empty list
+\emph{without} writing it to the cache.
+
+<<dblp search method>>=
+def search(
+    self,
+    query: str,
+    limit: int = 100,
+    filters: SearchFilters | None = None,
+) -> list[Paper]:
+    """
+    Search DBLP for papers matching the query.
+
+    Automatically fetches multiple pages if the requested limit exceeds
+    the API's per-request maximum (1000 results per page).
+    """
+    cache_key = (query, limit, filters.cache_key() if filters else "")
+    if cache_key in self._cache:
+        return self._cache[cache_key]
+
+    try:
+        papers = self._fetch_pages(query, limit, filters)
+    except Exception as e:
+        # Transient API failure (throttling, malformed body, HTTP error) or
+        # an unexpected parsing error: return empty but do NOT cache, so a
+        # later call can retry instead of replaying a frozen empty result.
+        logger.warning("dblp: %s", e)
+        return []
+
+    self._cache[cache_key] = papers
+    return papers
+@
+
+\subsubsection{Paging through results}
+
+Paging is unchanged in spirit---walk forward by [[offset]] until we have enough
+papers or have consumed all [[@total]] hits---but the per-request work now lives
+in [[_fetch_one_page]], which guarantees [[hits]] is a list.  That lets the loop
+stay simple: an empty page means exhaustion, full stop.
+
+<<dblp fetch pages>>=
+def _fetch_pages(
+    self,
+    query: str,
+    limit: int,
+    filters: SearchFilters | None,
+) -> list[Paper]:
+    """Fetch successive pages until the limit or the result set is exhausted.
+
+    Raises ``_DBLPUnavailable`` on a transient API failure so the caller can
+    avoid caching an incomplete result.
+    """
+    effective_query = query
+    <<dblp apply filters>>
+
+    logger.debug(f"dblp: Searching for '{query}' with limit={limit}")
+
+    all_papers: list[Paper] = []
+    offset = 0
+    page_size = min(limit, self.MAX_LIMIT)
+
+    while len(all_papers) < limit:
+        remaining = limit - len(all_papers)
+        current_page_size = min(page_size, remaining)
+
+        hits, total = self._fetch_one_page(
+            effective_query, current_page_size, offset
+        )
+        if not hits:
+            # No more results available
+            break
+
+        all_papers.extend(self._convert_hit(hit) for hit in hits)
+        offset += len(hits)
+
+        if offset >= total:
+            break
+
+    logger.debug(f"dblp: Retrieved {len(all_papers)} papers")
+    return all_papers
+@
+
+\subsubsection{Fetching and normalising a single page}
+
+This is where the two robustness fixes live.  We send a descriptive
+[[User-Agent]]---DBLP throttles anonymous default-agent traffic more
+readily---and we treat HTTP 429 as recoverable: we honour a [[Retry-After]]
+header when present, otherwise back off exponentially, and give up only after
+[[DBLP_MAX_RETRIES]] attempts.  A body that will not parse as JSON, or a
+429 we never escape, is reported as [[_DBLPUnavailable]] so the result is not
+cached.
+
+The returned [[hits]] is always a list: [[safe_get_nested]] tolerates missing
+intermediate keys, and [[ensure_list]] wraps DBLP's single-result bare object
+into a one-element list so the caller never iterates a dict's keys.
+
+<<dblp fetch one page>>=
+def _fetch_one_page(
+    self,
+    effective_query: str,
+    page_size: int,
+    offset: int,
+) -> tuple[list, int]:
+    """Fetch one page of hits, returning ``(hits, total)``.
+
+    ``hits`` is always a list, even when DBLP collapses a single result into a
+    bare object. Raises ``_DBLPUnavailable`` on a non-JSON body or after
+    exhausting HTTP 429 retries.
+    """
+    for attempt in range(DBLP_MAX_RETRIES + 1):
+        response = requests.get(
+            DBLP_API_URL,
+            params={
+                "q": effective_query,
+                "format": "json",
+                "h": page_size,
+                "f": offset,
+            },
+            headers={"User-Agent": DBLP_USER_AGENT},
+            timeout=30,
+        )
+
+        if response.status_code == 429:
+            <<dblp wait out throttling or give up>>
+            continue
+
+        response.raise_for_status()
 
         try:
-            # Build query with embedded filters
-            effective_query = query
-            <<dblp apply filters>>
+            data = response.json()
+        except ValueError as e:
+            raise _DBLPUnavailable(
+                f"non-JSON response (HTTP {response.status_code})"
+            ) from e
 
-            logger.debug(f"dblp: Searching for '{query}' with limit={limit}")
+        hits = ensure_list(
+            safe_get_nested(data, "result", "hits", "hit", default=[])
+        )
+        total = self._parse_total(data)
+        return hits, total
 
-            while len(all_papers) < limit:
-                # Calculate how many results we still need
-                remaining = limit - len(all_papers)
-                current_page_size = min(page_size, remaining)
+    raise _DBLPUnavailable("rate limited (HTTP 429) after retries")
 
-                response = requests.get(
-                    DBLP_API_URL,
-                    params={
-                        "q": effective_query,
-                        "format": "json",
-                        "h": current_page_size,
-                        "f": offset,
-                    },
-                    timeout=30,
-                )
-                response.raise_for_status()
-                data = response.json()
+def _parse_total(self, data: dict) -> int:
+    """Return the ``@total`` hit count, or 0 when absent or unparseable."""
+    total_str = safe_get_nested(
+        data, "result", "hits", "@total", default="0"
+    )
+    try:
+        return int(total_str)
+    except (ValueError, TypeError):
+        return 0
+@
 
-                hits = data.get("result", {}).get("hits", {}).get("hit", [])
-                if not hits:
-                    # No more results available
-                    break
+On the final attempt we stop retrying and fall through to the
+[[_DBLPUnavailable]] raise below the loop; otherwise we wait---preferring
+DBLP's own [[Retry-After]] hint over our exponential default---and try again.
 
-                all_papers.extend(self._convert_hit(hit) for hit in hits)
-                offset += len(hits)
-
-                # Check if we've fetched all available results
-                total_str = data.get("result", {}).get("hits", {}).get("@total", "0")
-                try:
-                    total = int(total_str)
-                except (ValueError, TypeError):
-                    total = 0
-                if offset >= total:
-                    break
-
-            logger.debug(f"dblp: Retrieved {len(all_papers)} papers")
-            return all_papers
-        except Exception as e:
-            logger.warning("dblp: %s", e)
-            return all_papers
-
-    <<convert dblp hit>>
+<<dblp wait out throttling or give up>>=
+if attempt >= DBLP_MAX_RETRIES:
+    break
+delay = DBLP_RETRY_BACKOFF * (2 ** attempt)
+retry_after = response.headers.get("Retry-After")
+if retry_after:
+    try:
+        delay = max(delay, float(retry_after))
+    except ValueError:
+        pass
+logger.warning("dblp: rate limited (429), retrying in %.1fs", delay)
+time.sleep(delay)
 @
 
 \subsubsection{Applying filters}
@@ -2342,6 +2619,9 @@ import requests
 
 <<dblp constants>>=
 DBLP_API_URL = "https://dblp.org/search/publ/api"
+DBLP_USER_AGENT = "scholarcli (https://github.com/dbosk/scholar)"
+DBLP_MAX_RETRIES = 3       # extra attempts on HTTP 429 before giving up
+DBLP_RETRY_BACKOFF = 2.0   # base seconds for the exponential 429 back-off
 @
 
 \subsection{Testing DBLP provider}
@@ -2430,6 +2710,39 @@ class TestDBLPProvider:
             assert len(results) == 1
             assert results[0].authors == ["Solo Author"]
 
+    def test_search_handles_single_hit_as_dict(self):
+        """search() handles a lone hit returned as a dict, not a list.
+
+        DBLP collapses ``result.hits.hit`` to a bare object when exactly one
+        paper matches. Iterating that object used to crash and silently cache
+        an empty result; ``ensure_list`` must wrap it into a one-element list.
+        """
+        provider = DBLPProvider()
+
+        mock_response = Mock()
+        mock_response.json.return_value = {
+            "result": {
+                "hits": {
+                    "@total": "1",
+                    "hit": {
+                        "info": {
+                            "title": "The Only Match",
+                            "year": "2024",
+                        }
+                    },
+                }
+            }
+        }
+        mock_response.raise_for_status = Mock()
+
+        with patch("requests.get") as mock_get:
+            mock_get.return_value = mock_response
+
+            results = provider.search("very specific query")
+
+            assert len(results) == 1
+            assert results[0].title == "The Only Match"
+
     def test_search_handles_empty_results(self):
         """search() returns empty list when no results."""
         provider = DBLPProvider()
@@ -2455,6 +2768,94 @@ class TestDBLPProvider:
 
             results = provider.search("test")
             assert results == []
+
+    def test_search_sends_user_agent(self):
+        """search() identifies itself with a descriptive User-Agent.
+
+        DBLP throttles anonymous default-agent traffic more readily, so we
+        always send our own User-Agent header.
+        """
+        provider = DBLPProvider()
+
+        mock_response = Mock()
+        mock_response.json.return_value = {
+            "result": {"hits": {"hit": [], "@total": "0"}}
+        }
+        mock_response.raise_for_status = Mock()
+
+        with patch("requests.get") as mock_get:
+            mock_get.return_value = mock_response
+
+            provider.search("test")
+
+            headers = mock_get.call_args[1]["headers"]
+            assert headers["User-Agent"] == DBLP_USER_AGENT
+
+    def test_transient_failure_is_not_cached(self):
+        """A non-JSON (throttled) body returns empty without caching it.
+
+        Caching a transient outage would freeze the query into a permanently
+        empty result. The second call must therefore reach the API again, and
+        once it succeeds the real results come through.
+        """
+        provider = DBLPProvider()
+
+        bad_response = Mock()
+        bad_response.status_code = 200
+        bad_response.raise_for_status = Mock()
+        bad_response.json.side_effect = ValueError("Expecting value")
+
+        good_response = Mock()
+        good_response.status_code = 200
+        good_response.raise_for_status = Mock()
+        good_response.json.return_value = {
+            "result": {
+                "hits": {
+                    "@total": "1",
+                    "hit": [{"info": {"title": "Recovered Paper"}}],
+                }
+            }
+        }
+
+        with patch(
+            "requests.get", side_effect=[bad_response, good_response]
+        ) as mock_get:
+            first = provider.search("test")
+            assert first == []
+
+            second = provider.search("test")
+            assert len(second) == 1
+            assert second[0].title == "Recovered Paper"
+            assert mock_get.call_count == 2
+
+    def test_retries_on_rate_limit(self):
+        """search() retries after an HTTP 429 before succeeding."""
+        provider = DBLPProvider()
+
+        throttled = Mock()
+        throttled.status_code = 429
+        throttled.headers = {}
+
+        ok = Mock()
+        ok.status_code = 200
+        ok.raise_for_status = Mock()
+        ok.json.return_value = {
+            "result": {
+                "hits": {
+                    "@total": "1",
+                    "hit": [{"info": {"title": "After Backoff"}}],
+                }
+            }
+        }
+
+        with patch("requests.get", side_effect=[throttled, ok]) as mock_get:
+            with patch("time.sleep") as mock_sleep:
+                results = provider.search("test")
+
+            assert len(results) == 1
+            assert results[0].title == "After Backoff"
+            assert mock_get.call_count == 2
+            mock_sleep.assert_called_once()
 
     def test_handles_missing_fields(self):
         """search() handles publications with missing optional fields."""
@@ -2566,22 +2967,44 @@ class TestDBLPIntegration:
     """Integration test for the DBLP provider."""
 
     @pytest.mark.integration
-    @pytest.mark.skip(reason="Skipped by default to avoid API calls")
     def test_real_api_call(self):
         """Make one real API call to verify the provider works."""
         provider = DBLPProvider()
 
         try:
             papers = provider.search("machine learning", limit=1)
-
-            assert len(papers) >= 1, "Provider returned no results"
-
-            paper = papers[0]
-            assert isinstance(paper, Paper)
-            assert paper.title
-            assert paper.sources == ["dblp"]
         except Exception as e:
             pytest.skip(f"DBLP API unavailable: {e}")
+
+        assert len(papers) >= 1, "Provider returned no results"
+        paper = papers[0]
+        assert isinstance(paper, Paper)
+        assert paper.title
+        assert paper.sources == ["dblp"]
+
+    @pytest.mark.integration
+    def test_real_specific_query(self):
+        """A long, specific multi-term query still returns results.
+
+        Narrow queries that match only a handful of papers are exactly the
+        case that used to break: DBLP returns a lone hit as a bare object, and
+        the swallowed crash cached an empty result. This guards that the
+        ``ensure_list`` normalisation survives a real near-single-hit response.
+        (The exact bare-object case is covered deterministically by
+        ``test_search_handles_single_hit_as_dict``.)
+        """
+        provider = DBLPProvider()
+
+        title = (
+            "Dynamic Searchable Encryption in Very-Large Databases: "
+            "Data Structures and Implementation"
+        )
+        try:
+            papers = provider.search(title, limit=30)
+        except Exception as e:
+            pytest.skip(f"DBLP API unavailable: {e}")
+
+        assert len(papers) >= 1, "specific query returned no results"
 @
 
 
@@ -4545,7 +4968,6 @@ class TestWebOfScienceIntegration:
     """Integration test for the Web of Science provider."""
 
     @pytest.mark.integration
-    @pytest.mark.skip(reason="Skipped by default; requires WOS API key")
     def test_real_api_call(self):
         """Make one real API call to verify the provider works."""
         import os
@@ -4565,15 +4987,14 @@ class TestWebOfScienceIntegration:
 
         try:
             papers = provider.search("machine learning", limit=1)
-
-            assert len(papers) >= 1, "Provider returned no results"
-
-            paper = papers[0]
-            assert isinstance(paper, Paper)
-            assert paper.title
-            assert paper.sources == ["wos"]
         except Exception as e:
             pytest.skip(f"Web of Science API unavailable: {e}")
+
+        assert len(papers) >= 1, "Provider returned no results"
+        paper = papers[0]
+        assert isinstance(paper, Paper)
+        assert paper.title
+        assert paper.sources == ["wos"]
 @
 
 
@@ -5305,7 +5726,6 @@ class TestIEEEXploreIntegration:
     """Integration test for the IEEE Xplore provider."""
 
     @pytest.mark.integration
-    @pytest.mark.skip(reason="Skipped by default; requires IEEE_API_KEY")
     def test_real_api_call(self):
         """Make one real API call to verify the provider works."""
         import os
@@ -5318,15 +5738,14 @@ class TestIEEEXploreIntegration:
 
         try:
             papers = provider.search("machine learning", limit=1)
-
-            assert len(papers) >= 1, "Provider returned no results"
-
-            paper = papers[0]
-            assert isinstance(paper, Paper)
-            assert paper.title
-            assert paper.sources == ["ieee"]
         except Exception as e:
             pytest.skip(f"IEEE Xplore API unavailable: {e}")
+
+        assert len(papers) >= 1, "Provider returned no results"
+        paper = papers[0]
+        assert isinstance(paper, Paper)
+        assert paper.title
+        assert paper.sources == ["ieee"]
 @
 
 
@@ -5920,22 +6339,20 @@ class TestArxivIntegration:
     """Integration test for the arXiv provider."""
 
     @pytest.mark.integration
-    @pytest.mark.skip(reason="Skipped by default to avoid API calls")
     def test_real_api_call(self):
         """Make one real API call to verify the provider works."""
         provider = ArxivProvider()
 
         try:
             papers = provider.search("machine learning", limit=1)
-
-            assert len(papers) >= 1, "Provider returned no results"
-
-            paper = papers[0]
-            assert isinstance(paper, Paper)
-            assert paper.title
-            assert paper.sources == ["arxiv"]
         except Exception as e:
             pytest.skip(f"arXiv API unavailable: {e}")
+
+        assert len(papers) >= 1, "Provider returned no results"
+        paper = papers[0]
+        assert isinstance(paper, Paper)
+        assert paper.title
+        assert paper.sources == ["arxiv"]
 @
 
 
@@ -6554,26 +6971,29 @@ class TestScopusIntegration:
     """Integration test for the Scopus provider."""
 
     @pytest.mark.integration
-    @pytest.mark.skip(
-        reason="Skipped to avoid API calls",
-    )
     def test_real_api_call(self):
         """Make one real API call to verify."""
+        import os
+
+        if not os.environ.get("SCOPUS_API_KEY"):
+            pytest.skip("SCOPUS_API_KEY environment variable not set")
+
         provider = ScopusProvider()
 
         try:
             papers = provider.search(
                 "machine learning", limit=1,
             )
-            assert len(papers) >= 1
-            paper = papers[0]
-            assert isinstance(paper, Paper)
-            assert paper.title
-            assert paper.sources == ["scopus"]
         except Exception as e:
             pytest.skip(
                 f"Scopus API unavailable: {e}"
             )
+
+        assert len(papers) >= 1
+        paper = papers[0]
+        assert isinstance(paper, Paper)
+        assert paper.title
+        assert paper.sources == ["scopus"]
 @
 
 
