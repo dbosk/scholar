@@ -820,8 +820,16 @@ results they want, and the provider handles the underlying paging.
 The loop terminates when we have fetched enough results, when the API returns
 no more data, or when we reach the total number of available results.
 
+As with DBLP, [[search]] caches only \emph{trustworthy} results.  A rate
+limit, a rejected key, or an HTTP/parse error can cut a search short, and the
+persistent pickle cache would otherwise freeze that partial or empty result for
+every later call with the same arguments.  We therefore split the work: the
+inner [[_search_uncached]] reports a [[cacheable]] flag alongside its papers,
+and the thin [[search]] wrapper writes to the cache only when that flag is
+true.  Partial results are still \emph{returned} to the caller---the user sees
+what we managed to fetch---they are just not cached.
+
 <<semantic scholar search method>>=
-@cachedmethod(lambda self: self._cache, key=lambda self, query, limit=100, filters=None: (query, limit, filters.cache_key() if filters else ""))
 def search(
     self,
     query: str,
@@ -833,6 +841,27 @@ def search(
 
     Automatically fetches multiple pages if the requested limit exceeds
     the API's per-request maximum (100 results per page).
+    """
+    cache_key = (query, limit, filters.cache_key() if filters else "")
+    if cache_key in self._cache:
+        return self._cache[cache_key]
+
+    papers, cacheable = self._search_uncached(query, limit, filters)
+    if cacheable:
+        self._cache[cache_key] = papers
+    return papers
+
+def _search_uncached(
+    self,
+    query: str,
+    limit: int,
+    filters: SearchFilters | None,
+) -> tuple[list[Paper], bool]:
+    """Run the paged search, returning ``(papers, cacheable)``.
+
+    ``cacheable`` is False when a transient failure (rate limit, rejected
+    key, HTTP or parse error) truncated the search, so the caller can avoid
+    freezing a partial or empty result into the cache.
     """
     all_papers: list[Paper] = []
     offset = 0
@@ -863,12 +892,12 @@ def search(
                     "https://www.semanticscholar.org/product/api#api-key-form "
                     "and set S2_API_KEY environment variable."
                 )
-                break
+                return all_papers, False
 
             if response.status_code == 403:
                 # Key rejected and anonymous access also forbidden; the
-                # helper already logged the error. Stop with what we have.
-                break
+                # helper already logged the error. Don't cache the empty.
+                return all_papers, False
 
             response.raise_for_status()
             data = response.json()
@@ -887,7 +916,7 @@ def search(
                 break
 
         logger.debug(f"semantic_scholar: Retrieved {len(all_papers)} papers")
-        return all_papers
+        return all_papers, True
     except requests.exceptions.RetryError:
         logger.warning(
             "s2: Rate limited after retries. "
@@ -895,13 +924,13 @@ def search(
             "https://www.semanticscholar.org/product/api#api-key-form "
             "and set S2_API_KEY environment variable."
         )
-        return all_papers
+        return all_papers, False
     except requests.exceptions.HTTPError as e:
         logger.warning("s2: HTTP error: %s", e)
-        return all_papers
+        return all_papers, False
     except Exception as e:
         logger.warning("s2: %s", e)
-        return all_papers
+        return all_papers, False
 @
 
 \subsubsection{Applying filters}
@@ -1348,6 +1377,57 @@ class TestSemanticScholarProvider:
             results = provider.search("test")
             assert results == []
 
+    def test_search_caches_successful_results(self):
+        """A successful search is cached; the second call skips the API."""
+        provider = SemanticScholarProvider()
+
+        mock_response = Mock()
+        mock_response.status_code = 200
+        mock_response.json.return_value = {
+            "total": 1,
+            "data": [{"title": "Cached Paper", "authors": []}],
+        }
+
+        with patch.object(
+            provider._session, "get", return_value=mock_response
+        ) as mock_get:
+            first = provider.search("test")
+            second = provider.search("test")
+
+            assert len(first) == 1
+            assert len(second) == 1
+            assert mock_get.call_count == 1  # second call served from cache
+
+    def test_rate_limited_result_is_not_cached(self):
+        """A 429 returns empty without caching, so a later call retries.
+
+        Unlike a successful search, a rate-limited (transient) result must
+        not be frozen into the persistent cache, or every later call with the
+        same query would replay the empty result until the cache is cleared.
+        """
+        provider = SemanticScholarProvider()
+
+        throttled = Mock()
+        throttled.status_code = 429
+
+        recovered = Mock()
+        recovered.status_code = 200
+        recovered.json.return_value = {
+            "total": 1,
+            "data": [{"title": "Recovered Paper", "authors": []}],
+        }
+
+        with patch.object(
+            provider._session, "get", side_effect=[throttled, recovered]
+        ) as mock_get:
+            first = provider.search("test")
+            assert first == []
+
+            second = provider.search("test")
+            assert len(second) == 1
+            assert second[0].title == "Recovered Paper"
+            assert mock_get.call_count == 2  # not served from cache
+
     def test_rate_limiting_with_api_key(self):
         """Provider uses faster rate limit when API key is set."""
         provider = SemanticScholarProvider(api_key="test-key")
@@ -1534,12 +1614,14 @@ class TestSemanticScholarIntegration:
     def test_real_api_call(self):
         """Anonymous search returns real results.
 
-        We force ``api_key=None`` so a stale ``S2_API_KEY`` in the environment
-        cannot mask a failure: this test exercises the anonymous path that the
-        403 fallback relies on. An empty result fails the test rather than
-        skipping, so a regression here is visible.
+        We force the key off *after* construction (the constructor falls back
+        to the ``S2_API_KEY`` environment variable, so ``api_key=None`` alone
+        would still pick up a stale key). This exercises the pure anonymous
+        path in one request, unmasked by any environment key. An empty result
+        fails the test rather than skipping, so a regression is visible.
         """
         provider = SemanticScholarProvider(api_key=None)
+        provider.api_key = None  # ignore any S2_API_KEY in the environment
         try:
             papers = provider.search("machine learning", limit=1)
         except Exception as e:
