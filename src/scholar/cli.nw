@@ -524,8 +524,10 @@ name: Annotated[
     Optional[str],
     typer.Option(
         "--name", "-n",
-        help="Session name for review. Use same name to append results from "
-             "multiple searches. Defaults to query string.",
+        help="Session name. Persists the search to this review session, "
+             "with or without --review. Use same name to append results "
+             "from multiple searches. In review mode defaults to the "
+             "query string.",
     ),
 ] = None,
 limit: Annotated[
@@ -717,12 +719,146 @@ if review:
     )
     return
 
+# An explicit -n without --review still records the search
+if name:
+    <<persist search to named session>>
+
 # Auto-detect format based on TTY
 actual_format = output_format
 if output_format == "auto":
     actual_format = "table" if sys.stdout.isatty() else "csv"
 
 display_results(merged_results, actual_format)
+@
+
+\subsection{Persisting named sessions without review}
+\label{sec:search-session-persist}
+
+An explicit [[-n]] always persists the search to the named review session,
+whether or not the TUI runs.  Before this, [[-n]] without [[--review]] was
+silently ignored: a scripted systematic review that ran [[scholar search -n
+vt-terminal-systematic -f json]] per query got its output, but [[sessions
+list]] showed nothing and [[sessions export]] failed---the audit trail
+existed only for TUI users, and scripted runs had to reassemble the session
+JSON by hand (\url{https://github.com/dbosk/scholar/issues/66}).
+
+We reuse [[create_review_session]], the same factory the TUI and [[rq]] use:
+it loads any previous session with the same name, merges the accumulated
+search records (query, provider, filters, limit per search), and preserves
+earlier decisions while adding new papers as pending.  Repeating [[-n]] over
+several searches therefore appends, exactly as the flag's help text always
+promised, and decisions simply stay pending until made in the TUI, by the
+LLM, or with [[sessions decide]] (\cref{sec:sessions-decide}).
+
+We persist \emph{before} displaying: the session record is the point of
+[[-n]], so if saving fails the command must fail loudly rather than emit
+results that were never recorded.  The confirmation goes to stderr because
+stdout may be machine-read ([[-f json]]/[[-f bibtex]] in pipelines) and must
+stay pure.
+
+<<persist search to named session>>=
+from scholar.review import create_review_session, save_session
+
+session = create_review_session(merged_results, query, session_name=name)
+session_path = save_session(session)
+Console(stderr=True).print(
+    f"[green]Saved session:[/green] {escape(str(session_path))} "
+    f"({len(session.decisions)} papers, "
+    f"{len(session.pending_papers())} pending)"
+)
+@
+
+Let's verify the flag actually persists: a fresh [[-n]] search creates a
+loadable session with the papers pending, a repeated one appends instead of
+duplicating, stdout stays pure JSON, and a search \emph{without} [[-n]]
+still saves nothing:
+
+<<test functions>>=
+class TestSearchSessionPersist:
+    """Tests for search -n persisting a session without --review."""
+
+    def _mock_provider(self, monkeypatch, papers):
+        from scholar import providers
+
+        mock_provider = Mock()
+        mock_provider.name = "mock"
+        mock_provider.MAX_LIMIT = None
+        mock_provider.search.return_value = papers
+        monkeypatch.setattr(
+            providers, "PROVIDERS", {"mock": mock_provider}
+        )
+
+    def test_name_persists_session(self, tmp_path, monkeypatch):
+        """search -n saves a session with all papers pending."""
+        from scholar.review import load_session
+
+        monkeypatch.setenv("SCHOLAR_DATA_DIR", str(tmp_path))
+        self._mock_provider(monkeypatch, [
+            Paper(title="Persisted", authors=["A"], doi="10.1/p"),
+        ])
+
+        result = runner.invoke(
+            app, ["search", "q1", "-n", "my-review", "-f", "json"]
+        )
+        assert result.exit_code == 0
+
+        session = load_session("my-review")
+        assert session is not None
+        assert len(session.decisions) == 1
+        assert len(session.pending_papers()) == 1
+        assert session.search_records[0].provider == "mock"
+
+    def test_repeated_name_appends(self, tmp_path, monkeypatch):
+        """A second search with the same -n appends, not duplicates."""
+        from scholar.review import load_session
+
+        monkeypatch.setenv("SCHOLAR_DATA_DIR", str(tmp_path))
+        self._mock_provider(monkeypatch, [
+            Paper(title="First", authors=["A"], doi="10.1/first"),
+        ])
+        runner.invoke(app, ["search", "q1", "-n", "acc", "-f", "json"])
+
+        self._mock_provider(monkeypatch, [
+            Paper(title="First", authors=["A"], doi="10.1/first"),
+            Paper(title="Second", authors=["B"], doi="10.1/second"),
+        ])
+        result = runner.invoke(
+            app, ["search", "q2", "-n", "acc", "-f", "json"]
+        )
+        assert result.exit_code == 0
+
+        session = load_session("acc")
+        assert len(session.decisions) == 2
+        queries = {r.query for r in session.search_records}
+        assert queries == {"q1", "q2"}
+
+    def test_stdout_stays_pure_json(self, tmp_path, monkeypatch):
+        """The save confirmation must not corrupt -f json output."""
+        import json as _json
+
+        monkeypatch.setenv("SCHOLAR_DATA_DIR", str(tmp_path))
+        self._mock_provider(monkeypatch, [
+            Paper(title="Pure", authors=["A"], doi="10.1/pure"),
+        ])
+
+        result = runner.invoke(
+            app, ["search", "q", "-n", "pure-test", "-f", "json"]
+        )
+        assert result.exit_code == 0
+        _json.loads(result.stdout)  # must parse cleanly
+
+    def test_no_name_saves_nothing(self, tmp_path, monkeypatch):
+        """Without -n, no session is created (unchanged behaviour)."""
+        from scholar.review import list_sessions
+
+        monkeypatch.setenv("SCHOLAR_DATA_DIR", str(tmp_path))
+        self._mock_provider(monkeypatch, [
+            Paper(title="Ephemeral", authors=["A"], doi="10.1/e"),
+        ])
+
+        result = runner.invoke(app, ["search", "q", "-f", "json"])
+        assert result.exit_code == 0
+        assert list_sessions() == []
 @
 
 \subsection{Testing the search command}
@@ -3509,6 +3645,7 @@ launching the full TUI. Users can:
 query-provider pairs when multiple queries were used
 \item[sessions export] Generate reports (CSV, \LaTeX{}) from a saved session
 \item[sessions resume] Continue reviewing a saved session in the TUI
+\item[sessions decide] Record keep/discard decisions non-interactively
 \end{description}
 
 This enables scripted workflows and integration with other tools.
@@ -3896,6 +4033,281 @@ def sessions_resume(
 
     if report:
         prompt_for_report(session)
+@
+
+\subsection{Deciding non-interactively}
+\label{sec:sessions-decide}
+
+With [[search -n]] persisting sessions headlessly
+(\cref{sec:search-session-persist}), the one remaining step that forced the
+TUI open was recording the keep/discard decisions themselves.  [[sessions
+decide]] closes that gap so the full review loop---search, screen, decide,
+export---can run scripted or agent-driven
+(\url{https://github.com/dbosk/scholar/issues/66}).
+
+Papers are selected by DOI or by the session's paper id (the same id
+[[sessions show --format json]] and the provenance tooling expose; it falls
+back to a title-author hash when a paper has no DOI, so every paper is
+addressable).  Both selectors are repeatable and can be mixed, and DOIs
+compare case-insensitively since registries treat them so.
+
+Two invariants mirror the TUI rather than trusting the caller:
+\begin{description}
+\item[Discarding requires a motivation] [[ReviewDecision.is_valid]] demands
+  at least one tag on a discarded paper, so we refuse [[--discard]] without
+  [[--tag]] up front instead of saving a session the TUI would consider
+  invalid.
+\item[All or nothing] If \emph{any} selector matches no paper in the
+  session, nothing is saved and the exit code is nonzero.  A typo in one DOI
+  of a batch must not leave the session half-updated---scripts can fix the
+  selector and simply rerun.
+\end{description}
+Tags accumulate via [[add_tag]] (idempotent), so redeciding a paper refines
+rather than clobbers its tags; the status change itself is an overwrite,
+which is what redeciding means.
+
+<<sessions command>>=
+@sessions_app.command("decide")
+def sessions_decide(
+    name: Annotated[
+        str,
+        typer.Argument(
+            help="Session name or query to record decisions in.",
+            autocompletion=complete_session_name,
+        ),
+    ],
+    keep: Annotated[
+        bool,
+        typer.Option("--keep", help="Mark the selected papers as kept."),
+    ] = False,
+    discard: Annotated[
+        bool,
+        typer.Option(
+            "--discard",
+            help="Mark the selected papers as discarded (requires --tag).",
+        ),
+    ] = False,
+    doi: Annotated[
+        Optional[list[str]],
+        typer.Option(
+            "--doi",
+            help="Select a paper by DOI (case-insensitive). Repeatable.",
+        ),
+    ] = None,
+    paper_id: Annotated[
+        Optional[list[str]],
+        typer.Option(
+            "--paper-id",
+            help="Select a paper by its session paper id. Repeatable.",
+            autocompletion=complete_session_paper_id,
+        ),
+    ] = None,
+    tag: Annotated[
+        Optional[list[str]],
+        typer.Option(
+            "--tag", "-t",
+            help="Tag to attach: theme (kept) or motivation (discarded). "
+                 "Repeatable.",
+        ),
+    ] = None,
+) -> None:
+    """
+    Record keep/discard decisions in a saved session, without the TUI.
+
+    Select papers by --doi and/or --paper-id (both repeatable). Discarding
+    requires at least one --tag as motivation. If any selector matches
+    nothing, no changes are saved and the exit code is nonzero.
+
+    Example:
+        scholar sessions decide my-review --keep --doi 10.1145/3568813 \\
+            --tag misconceptions
+    """
+    from scholar.review import (
+        DecisionStatus, ReviewSource, load_session, save_session,
+    )
+
+    console = Console()
+    <<validate decide options>>
+
+    session = load_session(name)
+    if session is None:
+        console.print(f"[red]Session not found: {escape(name)}[/red]")
+        raise typer.Exit(1)
+
+    <<select decisions by doi and paper id>>
+
+    status = DecisionStatus.KEPT if keep else DecisionStatus.DISCARDED
+    for decision in selected.values():
+        decision.status = status
+        decision.source = ReviewSource.HUMAN
+        for t in tag or []:
+            decision.add_tag(t)
+
+    save_session(session)
+    word = "kept" if keep else "discarded"
+    console.print(
+        f"[green]{len(selected)} paper(s) marked {word}[/green] "
+        f"in session '{escape(name)}'"
+    )
+@
+
+The option validation happens before the session is even loaded, so a
+malformed invocation cannot depend on session state:
+
+<<validate decide options>>=
+if keep == discard:
+    console.print("[red]Specify exactly one of --keep or --discard.[/red]")
+    raise typer.Exit(1)
+if not doi and not paper_id:
+    console.print(
+        "[red]Select at least one paper with --doi or --paper-id.[/red]"
+    )
+    raise typer.Exit(1)
+if discard and not tag:
+    console.print(
+        "[red]--discard requires at least one --tag (motivation).[/red]"
+    )
+    raise typer.Exit(1)
+@
+
+Selection collects matches into a dict keyed by paper id, which both
+deduplicates (the same paper may be named by DOI \emph{and} id) and gives a
+stable count for the summary.  Unmatched selectors are gathered rather than
+failing fast so one run reports \emph{all} typos:
+
+<<select decisions by doi and paper id>>=
+by_doi = {
+    d.paper.doi.strip().lower(): d
+    for d in session.decisions
+    if d.paper.doi
+}
+by_id = {d.paper.id: d for d in session.decisions}
+
+selected = {}
+missing = []
+for value in doi or []:
+    decision = by_doi.get(value.strip().lower())
+    if decision is None:
+        missing.append(f"DOI {value}")
+    else:
+        selected[decision.paper.id] = decision
+for value in paper_id or []:
+    decision = by_id.get(value)
+    if decision is None:
+        missing.append(f"paper id {value}")
+    else:
+        selected[decision.paper.id] = decision
+
+if missing:
+    for entry in missing:
+        console.print(f"[red]Not in session: {escape(entry)}[/red]")
+    console.print("[yellow]No changes saved.[/yellow]")
+    raise typer.Exit(1)
+@
+
+Let's verify the loop closes headlessly: decisions land in the saved
+session, discarding without motivation is refused, and one bad selector
+leaves the session untouched:
+
+<<test functions>>=
+class TestSessionsDecideCommand:
+    """Tests for the sessions decide command."""
+
+    def _make_session(self, tmp_path, monkeypatch):
+        monkeypatch.setenv("SCHOLAR_DATA_DIR", str(tmp_path))
+        from scholar.review import (
+            ReviewDecision, ReviewSession, save_session,
+        )
+
+        session = ReviewSession(
+            query="q",
+            providers=["mock"],
+            timestamp=datetime(2026, 7, 19, 12, 0),
+            name="headless",
+        )
+        session.decisions.extend([
+            ReviewDecision(
+                paper=Paper(
+                    title="With DOI", authors=["A"], doi="10.1/WithDoi"
+                ),
+                provider="mock",
+            ),
+            ReviewDecision(
+                paper=Paper(title="No DOI", authors=["B"]),
+                provider="mock",
+            ),
+        ])
+        save_session(session)
+        return session
+
+    def test_keep_by_doi(self, tmp_path, monkeypatch):
+        """--keep --doi records the decision (case-insensitively)."""
+        from scholar.review import load_session
+
+        self._make_session(tmp_path, monkeypatch)
+        result = runner.invoke(app, [
+            "sessions", "decide", "headless",
+            "--keep", "--doi", "10.1/withdoi", "--tag", "core",
+        ])
+        assert result.exit_code == 0
+
+        session = load_session("headless")
+        kept = session.kept_papers()
+        assert len(kept) == 1
+        assert kept[0].paper.doi == "10.1/WithDoi"
+        assert kept[0].tags == ["core"]
+
+    def test_discard_by_paper_id(self, tmp_path, monkeypatch):
+        """--discard --paper-id works for papers without a DOI."""
+        from scholar.review import load_session
+
+        session = self._make_session(tmp_path, monkeypatch)
+        no_doi_id = session.decisions[1].paper.id
+        result = runner.invoke(app, [
+            "sessions", "decide", "headless",
+            "--discard", "--paper-id", no_doi_id,
+            "--tag", "out-of-scope",
+        ])
+        assert result.exit_code == 0
+
+        session = load_session("headless")
+        discarded = session.discarded_papers()
+        assert len(discarded) == 1
+        assert discarded[0].tags == ["out-of-scope"]
+
+    def test_discard_without_tag_refused(self, tmp_path, monkeypatch):
+        """--discard without --tag is rejected before loading."""
+        self._make_session(tmp_path, monkeypatch)
+        result = runner.invoke(app, [
+            "sessions", "decide", "headless",
+            "--discard", "--doi", "10.1/withdoi",
+        ])
+        assert result.exit_code == 1
+        assert "motivation" in result.output
+
+    def test_unknown_selector_saves_nothing(self, tmp_path, monkeypatch):
+        """One bad DOI aborts the whole batch unsaved."""
+        from scholar.review import load_session
+
+        self._make_session(tmp_path, monkeypatch)
+        result = runner.invoke(app, [
+            "sessions", "decide", "headless", "--keep",
+            "--doi", "10.1/withdoi", "--doi", "10.1/typo",
+        ])
+        assert result.exit_code == 1
+        assert "10.1/typo" in result.output
+
+        session = load_session("headless")
+        assert session.kept_papers() == []
+
+    def test_keep_and_discard_rejected(self, tmp_path, monkeypatch):
+        """Asking for both statuses at once is an error."""
+        self._make_session(tmp_path, monkeypatch)
+        result = runner.invoke(app, [
+            "sessions", "decide", "headless",
+            "--keep", "--discard", "--doi", "10.1/withdoi",
+        ])
+        assert result.exit_code == 1
 @
 
 

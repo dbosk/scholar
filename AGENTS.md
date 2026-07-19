@@ -95,6 +95,19 @@ superseded, using Crossref's `updated-by` (Retraction-Watch-backed) and
   `scholar enrich "<session>"` warns on issues as a side effect. Both
   persist the findings back to the session.
 
+### Headless Review Sessions
+
+`scholar search -n <name>` persists the search to the named review session
+even without `--review`: it creates or appends (same
+`create_review_session()` merge the TUI uses — search records accumulate,
+prior decisions are preserved, new papers land pending). The save
+confirmation goes to stderr so `-f json`/`-f bibtex` stdout stays pure.
+`scholar sessions decide <name> --keep|--discard --doi ...|--paper-id ...
+--tag ...` records decisions non-interactively; discarding requires a tag
+(motivation), and if any selector matches nothing the batch aborts unsaved.
+Together these let scripted/agent-driven systematic reviews produce the same
+session record and `sessions export` audit trail as TUI reviews.
+
 ### Provenance Round-Trip
 
 The `bibtex+prov` export format wraps each entry in a provenance comment
