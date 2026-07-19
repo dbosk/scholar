@@ -62,6 +62,24 @@ Providers self-register via `register_provider()` at module load time.
 
 All providers silently return empty `list[Paper]` on errors. No exceptions propagate to CLI.
 
+### Provider Health Checks
+
+Because search errors degrade silently, `scholar providers check` probes each
+provider with a one-result request and reports
+`ok`/`key rejected`/`rate limited`/`http error`/`network error`/`not
+configured`. Exit code is 1 iff a *configured* provider fails — usable as a
+pre-flight gate before a big search. `--offline` skips the network probes.
+Implemented as `check_provider()`/`classify_check_response()` plus a
+per-provider optional `check()` method in `providers.py`.
+
+### DBLP Query Sanitization
+
+DBLP has no boolean syntax (space = implicit AND; uppercase `AND`/`OR`/`NOT`
+become literal search terms). `DBLPProvider` strips operators, parentheses,
+and quotes before sending (warning shows the sent query) and warns when a
+query of ≥4 terms yields zero hits. Queries are never auto-relaxed — results
+stay traceable to the recorded query.
+
 ### Currency / Retraction Checks
 
 `crossref.py` checks whether a paper has been retracted, corrected, or
