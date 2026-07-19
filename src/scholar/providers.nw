@@ -93,6 +93,7 @@ itself with the provider registry on import.
 <<constants>>
 <<provider protocol>>
 <<provider registry>>
+<<provider health>>
 <<semantic scholar provider>>
 <<openalex provider>>
 <<dblp provider>>
@@ -112,6 +113,8 @@ The test file collects all distributed test chunks:
 
 <<test [[providers.py]]>>=
 """Tests for the providers module."""
+import logging
+
 import pytest
 import requests
 from unittest.mock import Mock, patch
@@ -155,6 +158,13 @@ A provider must have:
 \item[[[is_available]]] A method that returns [[True]] if the provider can be
   used (either requires no API key, or has its API key configured).
 \end{description}
+
+Beyond this core, some capabilities are probed with [[hasattr]] at runtime
+rather than assumed: citation retrieval ([[get_paper_citations]],
+[[get_paper_references]]) and the health probe ([[check]], see
+\cref{sec:provider-health}).  All bundled providers implement [[check]], but
+a provider without it still satisfies the protocol---it is simply reported as
+unchecked rather than broken.
 
 <<provider protocol>>=
 class SearchProvider(Protocol):
@@ -621,6 +631,247 @@ class TestDefaultProviders:
 @
 
 
+\section{Provider Health Checks}
+\label{sec:provider-health}
+
+Every provider deliberately degrades to an empty result list on error
+(\cref{sec:semantic-scholar} explains why).  That is the right behaviour
+\emph{during} a search---one broken provider must not sink the others---but it
+is exactly the wrong behaviour \emph{before} one: an expired API key looks
+identical to \enquote{no papers matched}, and a whole review can run to
+completion with a silently dead provider.  This happened in practice: an
+expired [[S2_API_KEY]] made Semantic Scholar answer 403 for an entire
+systematic literature review, and nobody noticed until the retrieved set was
+analysed (\url{https://github.com/dbosk/vt-prog-misconceptions/issues/3}).
+
+The health check is the pre-flight counterpart: it probes each provider with a
+deliberately cheap one-result request and \emph{surfaces} what the search path
+hides.  Each bundled provider implements a [[check]] method returning a
+[[(status, message)]] pair; [[check_provider]] wraps it with the
+cross-provider logic (configuration, opt-out, network errors).  A provider
+without a [[check]] method is reported as unchecked, not broken, so
+third-party providers keep working.
+
+The probe must \emph{not} reuse the provider's hardened request paths.  Those
+paths exist to maximise the chance of getting data---the Semantic Scholar
+provider, for instance, silently drops a rejected key and retries anonymously,
+and its retrying session turns a 429 into a [[RetryError]] after several
+delays.  Both behaviours would mask precisely the condition the health check
+exists to report.  Each [[check]] method therefore issues one raw request with
+the provider's real credentials and classifies the raw status code.
+
+The classification distinguishes the cases a user acts on differently:
+\begin{description}
+\item[key rejected] 401/403 while sending a credential.  The credential is
+  the problem; rotate or remove it.  This is the expired-key case.
+\item[rate limited] 429.  Transient; the search path already handles this
+  with back-off, so nothing is misconfigured.
+\item[http error / network error] The service is unreachable or unhappy for
+  reasons unrelated to credentials.
+\item[ok] The probe returned data.
+\end{description}
+A 401/403 \emph{without} a credential cannot be a key problem, so it
+classifies as an HTTP error (an IP block or outage).
+
+<<imports>>=
+import dataclasses
+@
+
+<<provider health>>=
+HEALTH_OK = "ok"
+HEALTH_NOT_CONFIGURED = "not configured"
+HEALTH_NOT_CHECKED = "not checked"
+HEALTH_KEY_REJECTED = "key rejected"
+HEALTH_RATE_LIMITED = "rate limited"
+HEALTH_HTTP_ERROR = "http error"
+HEALTH_NETWORK_ERROR = "network error"
+
+
+@dataclasses.dataclass
+class ProviderHealth:
+    """Outcome of probing one provider's configuration and connectivity."""
+
+    name: str
+    configured: bool
+    status: str
+    message: str = ""
+
+
+def classify_check_response(
+    response,
+    *,
+    authenticated: bool,
+    key_hint: str = "",
+) -> tuple[str, str]:
+    """Classify a health-probe HTTP response into a (status, message) pair.
+
+    A 401/403 counts as a rejected key only when a credential was actually
+    sent (`authenticated`); `key_hint` names the environment variable to
+    check in that case.
+    """
+    if response.status_code in (401, 403) and authenticated:
+        return HEALTH_KEY_REJECTED, (
+            f"HTTP {response.status_code} -- check or replace {key_hint}"
+        )
+    if response.status_code == 429:
+        return HEALTH_RATE_LIMITED, "HTTP 429 (transient; try again later)"
+    if response.ok:
+        return HEALTH_OK, ""
+    return HEALTH_HTTP_ERROR, f"HTTP {response.status_code}"
+
+
+def check_provider(
+    provider: SearchProvider,
+    live: bool = True,
+) -> ProviderHealth:
+    """Check one provider's configuration and, if `live`, its connectivity.
+
+    An unconfigured provider is never probed. A provider without a `check`
+    method (or with `live=False`) reports "not checked".
+    """
+    if not provider.is_available():
+        return ProviderHealth(
+            provider.name, False, HEALTH_NOT_CONFIGURED,
+            "required API key missing",
+        )
+    if not live or not hasattr(provider, "check"):
+        return ProviderHealth(provider.name, True, HEALTH_NOT_CHECKED)
+    try:
+        status, message = provider.check()
+    except requests.RequestException as e:
+        return ProviderHealth(
+            provider.name, True, HEALTH_NETWORK_ERROR, str(e)
+        )
+    return ProviderHealth(provider.name, True, status, message)
+@
+
+Let's verify the cross-provider logic: unconfigured providers are never
+probed, offline mode skips the network entirely, and the classifier maps raw
+responses to the right statuses.  The stale-key case uses the real Semantic
+Scholar provider, since surfacing that exact failure is why this machinery
+exists:
+
+<<test functions>>=
+class TestProviderHealth:
+    """Tests for check_provider and classify_check_response."""
+
+    @staticmethod
+    def _response(status_code):
+        response = Mock()
+        response.status_code = status_code
+        response.ok = 200 <= status_code < 300
+        return response
+
+    def test_not_configured_skips_probe(self, monkeypatch):
+        """An unconfigured provider reports so without any HTTP request."""
+        monkeypatch.delenv("IEEE_API_KEY", raising=False)
+        provider = IEEEXploreProvider(api_key=None)
+
+        with patch("requests.get") as mock_get:
+            health = check_provider(provider)
+
+            mock_get.assert_not_called()
+        assert health.configured is False
+        assert health.status == HEALTH_NOT_CONFIGURED
+
+    def test_offline_skips_probe(self):
+        """live=False reports "not checked" without any HTTP request."""
+        provider = DBLPProvider()
+
+        with patch("requests.get") as mock_get:
+            health = check_provider(provider, live=False)
+
+            mock_get.assert_not_called()
+        assert health.status == HEALTH_NOT_CHECKED
+
+    def test_provider_without_check_is_not_probed(self):
+        """A provider lacking a check method reports "not checked"."""
+        class MinimalProvider:
+            name = "minimal"
+
+            def is_available(self):
+                return True
+
+            def search(self, query, limit=100, filters=None):
+                return []
+
+        health = check_provider(MinimalProvider())
+        assert health.status == HEALTH_NOT_CHECKED
+
+    def test_s2_stale_key_reported(self):
+        """An expired S2_API_KEY is reported, not silently dropped.
+
+        This is the regression test for the expired key that silently
+        removed Semantic Scholar from an entire literature review.
+        """
+        provider = SemanticScholarProvider(api_key="expired-key")
+
+        with patch("requests.get", return_value=self._response(403)):
+            with patch("time.sleep"):
+                health = check_provider(provider)
+
+        assert health.status == HEALTH_KEY_REJECTED
+        assert "S2_API_KEY" in health.message
+
+    def test_s2_anonymous_403_is_http_error(self, monkeypatch):
+        """A 403 without a key cannot be a key problem."""
+        monkeypatch.delenv("S2_API_KEY", raising=False)
+        provider = SemanticScholarProvider(api_key=None)
+
+        with patch("requests.get", return_value=self._response(403)):
+            with patch("time.sleep"):
+                health = check_provider(provider)
+
+        assert health.status == HEALTH_HTTP_ERROR
+
+    def test_rate_limited(self):
+        """A 429 is transient, not a configuration problem."""
+        provider = DBLPProvider()
+
+        with patch("requests.get", return_value=self._response(429)):
+            health = check_provider(provider)
+
+        assert health.status == HEALTH_RATE_LIMITED
+
+    def test_ok(self):
+        """A 2xx probe reports ok."""
+        provider = DBLPProvider()
+
+        with patch("requests.get", return_value=self._response(200)):
+            health = check_provider(provider)
+
+        assert health.status == HEALTH_OK
+
+    def test_network_error(self):
+        """A connection failure reports a network error, not a crash."""
+        provider = DBLPProvider()
+
+        with patch(
+            "requests.get",
+            side_effect=requests.ConnectionError("no route to host"),
+        ):
+            health = check_provider(provider)
+
+        assert health.status == HEALTH_NETWORK_ERROR
+
+
+class TestProviderHealthIntegration:
+    """Live health checks against the keyless providers."""
+
+    @pytest.mark.integration
+    def test_dblp_live_check(self):
+        """DBLP answers the probe (ok, or 429 under load)."""
+        health = check_provider(DBLPProvider())
+        assert health.status in (HEALTH_OK, HEALTH_RATE_LIMITED)
+
+    @pytest.mark.integration
+    def test_openalex_live_check(self):
+        """OpenAlex answers the probe (ok, or 429 under load)."""
+        health = check_provider(OpenAlexProvider())
+        assert health.status in (HEALTH_OK, HEALTH_RATE_LIMITED)
+@
+
+
 \section{Semantic Scholar Provider}
 \label{sec:semantic-scholar}
 
@@ -699,6 +950,7 @@ class SemanticScholarProvider:
 
     <<semantic scholar rate limiting>>
     <<semantic scholar request helper>>
+    <<semantic scholar check method>>
     <<semantic scholar search method>>
     <<semantic scholar get paper by doi>>
     <<semantic scholar get citations and references>>
@@ -806,6 +1058,39 @@ def _request(self, url: str, params: dict) -> requests.Response:
         )
 
     return response
+@
+
+\subsubsection{Health check}
+
+The health probe must bypass both resilience layers above.  [[_request]]'s
+stale-key fallback silently drops a rejected key and retries
+anonymously---exactly the condition the health check exists to surface---and
+[[_session]]'s [[Retry]] turns a 429 into a [[RetryError]] after several
+delays, which would misreport plain rate limiting as a network error.  So the
+probe issues one raw [[requests.get]] with the configured key attached and
+lets [[classify_check_response]] read the raw status code
+(\cref{sec:provider-health}).
+
+<<semantic scholar check method>>=
+def check(self) -> tuple[str, str]:
+    """Probe the search endpoint with a one-result query.
+
+    Sends the configured API key (if any) so a stale key is surfaced
+    rather than silently dropped.
+    """
+    self._wait_for_rate_limit()
+    headers = {"x-api-key": self.api_key} if self.api_key else {}
+    response = requests.get(
+        self.API_URL,
+        params={"query": "test", "limit": 1},
+        headers=headers,
+        timeout=30,
+    )
+    return classify_check_response(
+        response,
+        authenticated=bool(self.api_key),
+        key_hint="S2_API_KEY",
+    )
 @
 
 \subsubsection{Search method}
@@ -1756,8 +2041,33 @@ class OpenAlexProvider:
             logger.warning("openalex: %s", e)
             return []
 
+    <<openalex check method>>
     <<openalex get paper by doi>>
     <<convert openalex work>>
+@
+
+\subsubsection{Health check}
+
+[[pyalex]] hides HTTP status codes behind its own exceptions, so the probe
+goes straight to the REST endpoint with [[requests]].  The email is not a
+credential---OpenAlex accepts requests without one---so a 403 here is never a
+\enquote{key rejected}; we pass [[authenticated=False]].  We do forward the
+configured [[mailto]] so the probe exercises the same (polite) request pool
+as real searches.
+
+<<openalex check method>>=
+def check(self) -> tuple[str, str]:
+    """Probe the works endpoint with a one-result query."""
+    self._wait_for_rate_limit()
+    params = {"search": "test", "per-page": 1}
+    if pyalex.config.email:
+        params["mailto"] = pyalex.config.email
+    response = requests.get(
+        OPENALEX_API_URL, params=params, timeout=30
+    )
+    return classify_check_response(response, authenticated=False)
+<<openalex constants>>=
+OPENALEX_API_URL = "https://api.openalex.org/works"
 @
 
 \subsubsection{Applying filters}
@@ -2309,8 +2619,11 @@ class DBLPProvider:
         return True
 
     <<dblp search method>>
+    <<dblp sanitize query>>
+    <<dblp zero-hit warning>>
     <<dblp fetch pages>>
     <<dblp fetch one page>>
+    <<dblp check method>>
     <<convert dblp hit>>
 @
 
@@ -2323,6 +2636,17 @@ swallowed error produces---which would freeze a transient outage into a
 permanently empty cache entry.  Here, a transient failure returns an empty list
 \emph{without} writing it to the cache.
 
+Before anything reaches the network the query passes through
+[[_sanitize_query]] (\cref{sec:dblp-sanitize}), and every \emph{genuine}
+result---fresh or cached---passes through [[_warn_if_overconstrained]].  The
+cache is keyed on the \emph{raw} query, not the sanitised one: sanitisation is
+deterministic, so both keyings are equivalent, and the raw key stays aligned
+with what review sessions record as the query provenance.  The cached path
+warns again on purpose: a review pipeline that reruns the same command hits
+the cache and would otherwise never see why a query yields nothing.  The
+transient-failure path does \emph{not} warn---zero results there mean
+\enquote{DBLP was down}, not \enquote{query overconstrained}.
+
 <<dblp search method>>=
 def search(
     self,
@@ -2333,15 +2657,28 @@ def search(
     """
     Search DBLP for papers matching the query.
 
+    Boolean syntax (AND/OR/NOT, parentheses, double quotes) is stripped
+    before the query is sent, since DBLP supports none of it.
+
     Automatically fetches multiple pages if the requested limit exceeds
     the API's per-request maximum (1000 results per page).
     """
+    sanitized = self._sanitize_query(query)
     cache_key = (query, limit, filters.cache_key() if filters else "")
     if cache_key in self._cache:
-        return self._cache[cache_key]
+        papers = self._cache[cache_key]
+        self._warn_if_overconstrained(sanitized, papers)
+        return papers
+
+    if sanitized != query:
+        logger.warning(
+            "dblp: query syntax not supported by DBLP; "
+            "searching for '%s' instead of '%s'",
+            sanitized, query,
+        )
 
     try:
-        papers = self._fetch_pages(query, limit, filters)
+        papers = self._fetch_pages(sanitized, limit, filters)
     except Exception as e:
         # Transient API failure (throttling, malformed body, HTTP error) or
         # an unexpected parsing error: return empty but do NOT cache, so a
@@ -2349,8 +2686,200 @@ def search(
         logger.warning("dblp: %s", e)
         return []
 
+    self._warn_if_overconstrained(sanitized, papers)
     self._cache[cache_key] = papers
     return papers
+@
+
+\subsubsection{Sanitising the query}
+\label{sec:dblp-sanitize}
+
+DBLP has no boolean query syntax at all: a space is an implicit AND, and
+[[OR]]/[[NOT]] are unsupported.  Worse, the API echoes its effective query
+back, and probing it shows that bare uppercase operator tokens become
+\emph{literal search terms}: \enquote{misconceptions AND programming} becomes
+the effective query [[misconceptions* AND* programming*]], and
+\enquote{misconceptions OR programming} matches only 2 papers where
+\enquote{misconceptions programming} matches 60---the stray [[OR]] term
+actively distorts the result set.  Parentheses and double quotes, by contrast,
+are discarded server-side ([[(misconceptions) "programming"]] and
+[[misconceptions programming]] produce identical effective queries), so
+stripping them client-side changes nothing except making the query we log and
+count honest.
+
+A systematic-review query like
+\enquote{misconceptions \enquote{introductory programming} novice students}
+therefore silently degenerates into a five-term conjunction that matches
+nothing, while its three-term core matches ten papers.  This is exactly what
+made DBLP contribute zero papers to a real literature review
+(\url{https://github.com/dbosk/vt-prog-misconceptions/issues/3}).
+
+We fix the operator problem deterministically: drop bare uppercase
+[[AND]]/[[OR]]/[[NOT]] tokens and strip the grouping characters before
+sending.  Lowercase [[and]]/[[or]]/[[not]] survive---they are legitimate
+title words (\enquote{war and peace}), and only the uppercase forms signal
+boolean intent.
+
+We deliberately do \emph{not} auto-relax an overconstrained query (say, by
+retrying with fewer terms until something matches).  In a systematic review
+the retrieved set must be traceable to the exact query the protocol records;
+results from a silently weakened query would corrupt that provenance.
+Instead, [[_warn_if_overconstrained]] tells the user \emph{why} they got
+nothing so they can revise the query themselves.
+
+<<dblp sanitize query>>=
+@staticmethod
+def _sanitize_query(query: str) -> str:
+    """Strip boolean syntax that DBLP does not support.
+
+    Removes parentheses and double quotes, and drops bare uppercase
+    AND/OR/NOT tokens, which DBLP would otherwise match as literal
+    terms. Lowercase forms are kept: they are ordinary words.
+    """
+    tokens = (
+        query.replace("(", " ").replace(")", " ").replace('"', " ").split()
+    )
+    return " ".join(t for t in tokens if t not in DBLP_BOOLEAN_TOKENS)
+@
+
+The zero-hit warning triggers at [[DBLP_MANY_TERMS]] terms.  The threshold
+comes from the motivating failure: the five-term query above matches nothing
+while its three-term core matches ten papers, so four terms catches the
+failure mode without nagging on typical two- or three-term searches that
+genuinely have no match.
+
+<<dblp zero-hit warning>>=
+@staticmethod
+def _warn_if_overconstrained(sanitized: str, papers: list) -> None:
+    """Warn when a many-term query yields nothing.
+
+    DBLP requires every term to match (implicit AND), so long queries
+    that work elsewhere often match nothing here.
+    """
+    terms = sanitized.split()
+    if papers or len(terms) < DBLP_MANY_TERMS:
+        return
+    logger.warning(
+        "dblp: 0 hits for %d-term query '%s'; DBLP requires every term "
+        "to match (implicit AND) -- try fewer, more general terms",
+        len(terms), sanitized,
+    )
+@
+
+Let's verify that boolean syntax is stripped (and that the stripped query is
+what actually goes over the wire), that ordinary queries pass untouched, and
+that the zero-hit warning fires exactly when it should---including from the
+cached path:
+
+<<test functions>>=
+class TestDBLPQuerySanitization:
+    """Tests for DBLP boolean-syntax stripping and zero-hit warnings."""
+
+    @staticmethod
+    def _empty_response():
+        response = Mock()
+        response.json.return_value = {
+            "result": {"hits": {"hit": [], "@total": "0"}}
+        }
+        response.raise_for_status = Mock()
+        return response
+
+    def test_strips_boolean_operators_and_parens(self, caplog):
+        """Uppercase AND/OR/NOT, parens, and quotes are stripped."""
+        provider = DBLPProvider()
+
+        with patch("requests.get") as mock_get:
+            mock_get.return_value = self._empty_response()
+            with caplog.at_level(logging.WARNING, logger="scholar.providers"):
+                provider.search(
+                    'misconceptions AND ("introductory programming" OR novice)'
+                )
+
+            sent = mock_get.call_args[1]["params"]["q"]
+            assert sent == "misconceptions introductory programming novice"
+        assert any("instead of" in r.message for r in caplog.records)
+
+    def test_lowercase_operators_preserved(self, caplog):
+        """Lowercase and/or/not are ordinary words and pass through."""
+        provider = DBLPProvider()
+
+        with patch("requests.get") as mock_get:
+            mock_get.return_value = self._empty_response()
+            with caplog.at_level(logging.WARNING, logger="scholar.providers"):
+                provider.search("war and peace")
+
+            sent = mock_get.call_args[1]["params"]["q"]
+            assert sent == "war and peace"
+        assert not any("instead of" in r.message for r in caplog.records)
+
+    def test_filters_applied_after_sanitization(self):
+        """Field filters (year:) survive sanitization of the base query."""
+        provider = DBLPProvider()
+        filters = SearchFilters(year="2020")
+
+        with patch("requests.get") as mock_get:
+            mock_get.return_value = self._empty_response()
+            provider.search("misconceptions AND novice", filters=filters)
+
+            sent = mock_get.call_args[1]["params"]["q"]
+            assert "year:2020" in sent
+            assert "AND" not in sent
+
+    def test_zero_hits_many_terms_warns(self, caplog):
+        """A 4+-term query with no hits triggers the implicit-AND warning."""
+        provider = DBLPProvider()
+
+        with patch("requests.get") as mock_get:
+            mock_get.return_value = self._empty_response()
+            with caplog.at_level(logging.WARNING, logger="scholar.providers"):
+                provider.search(
+                    "misconceptions introductory programming novice students"
+                )
+
+        assert any("implicit AND" in r.message for r in caplog.records)
+
+    def test_zero_hits_few_terms_no_warning(self, caplog):
+        """A short query with no hits is a normal miss, not a warning."""
+        provider = DBLPProvider()
+
+        with patch("requests.get") as mock_get:
+            mock_get.return_value = self._empty_response()
+            with caplog.at_level(logging.WARNING, logger="scholar.providers"):
+                provider.search("nonexistent gibberish")
+
+        assert not any("implicit AND" in r.message for r in caplog.records)
+
+    def test_zero_hit_warning_repeats_from_cache(self, caplog):
+        """The warning fires again when the empty result comes from cache.
+
+        A review pipeline reruns the same command; the second run hits the
+        cache, and silence there would hide why the query yields nothing.
+        """
+        provider = DBLPProvider()
+        query = "misconceptions introductory programming novice students"
+
+        with patch("requests.get") as mock_get:
+            mock_get.return_value = self._empty_response()
+            with caplog.at_level(logging.WARNING, logger="scholar.providers"):
+                provider.search(query)
+                provider.search(query)
+
+            assert mock_get.call_count == 1
+        warnings = [
+            r for r in caplog.records if "implicit AND" in r.message
+        ]
+        assert len(warnings) == 2
+
+    def test_cache_keyed_on_raw_query(self):
+        """Repeating a boolean-laden query makes only one HTTP request."""
+        provider = DBLPProvider()
+
+        with patch("requests.get") as mock_get:
+            mock_get.return_value = self._empty_response()
+            provider.search("misconceptions AND novice")
+            provider.search("misconceptions AND novice")
+
+            assert mock_get.call_count == 1
 @
 
 \subsubsection{Paging through results}
@@ -2492,6 +3021,25 @@ logger.warning("dblp: rate limited (429), retrying in %.1fs", delay)
 time.sleep(delay)
 @
 
+\subsubsection{Health check}
+
+Unlike [[_fetch_one_page]], the probe makes exactly one request with no 429
+retry loop: for a health check, a 429 \emph{is} the answer we want to report,
+not something to wait out.  We keep the descriptive [[User-Agent]] so the
+probe is throttled the same way real searches are.
+
+<<dblp check method>>=
+def check(self) -> tuple[str, str]:
+    """Probe the publication search endpoint with a one-result query."""
+    response = requests.get(
+        DBLP_API_URL,
+        params={"q": "test", "format": "json", "h": 1},
+        headers={"User-Agent": DBLP_USER_AGENT},
+        timeout=30,
+    )
+    return classify_check_response(response, authenticated=False)
+@
+
 \subsubsection{Applying filters}
 
 DBLP supports limited filtering via query syntax:
@@ -2622,6 +3170,8 @@ DBLP_API_URL = "https://dblp.org/search/publ/api"
 DBLP_USER_AGENT = "scholarcli (https://github.com/dbosk/scholar)"
 DBLP_MAX_RETRIES = 3       # extra attempts on HTTP 429 before giving up
 DBLP_RETRY_BACKOFF = 2.0   # base seconds for the exponential 429 back-off
+DBLP_BOOLEAN_TOKENS = frozenset({"AND", "OR", "NOT"})
+DBLP_MANY_TERMS = 4        # warn on zero hits at or above this many terms
 @
 
 \subsection{Testing DBLP provider}
@@ -3059,6 +3609,7 @@ class WebOfScienceProvider:
 
     <<wos init>>
     <<wos is available>>
+    <<wos check method>>
     <<wos search>>
     <<wos convert starter hit>>
     <<wos convert expanded hit>>
@@ -3153,6 +3704,39 @@ def __init__(
 def is_available(self) -> bool:
     """Web of Science requires an API key to be configured."""
     return bool(self._api_key)
+@
+
+\subsubsection{Health check}
+
+The probe targets whichever API tier initialisation selected, mirroring that
+tier's parameter format (the two APIs share nothing but the [[X-ApiKey]]
+header).  Since both tiers require a key, any 401/403 here means the key is
+the problem; the hint names both environment variables because either could
+be the one that was set.
+
+<<wos check method>>=
+def check(self) -> tuple[str, str]:
+    """Probe the active WoS API tier with a one-result query."""
+    if self._api_tier == "expanded":
+        params = {
+            "databaseId": "WOS",
+            "usrQuery": "TS=(test)",
+            "count": 1,
+            "firstRecord": 1,
+        }
+    else:
+        params = {"q": "TS=(test)", "db": "WOS", "limit": 1, "page": 1}
+    response = requests.get(
+        self._api_url,
+        params=params,
+        headers={"X-ApiKey": self._api_key},
+        timeout=30,
+    )
+    return classify_check_response(
+        response,
+        authenticated=True,
+        key_hint="WOS_EXPANDED_API_KEY or WOS_STARTER_API_KEY",
+    )
 @
 
 \subsubsection{Search dispatch}
@@ -5243,6 +5827,31 @@ in the provider cache.
 
 @
 
+\subsubsection{Health check}
+
+IEEE authenticates via the [[apikey]] request \emph{parameter} rather than a
+header, so the probe mirrors the search request exactly and any 401/403 points
+at [[IEEE_API_KEY]].
+
+<<ieee provider>>=
+
+    def check(self) -> tuple[str, str]:
+        """Probe the search endpoint with a one-result query."""
+        response = requests.get(
+            IEEE_API_URL,
+            params={
+                "querytext": "test",
+                "max_records": 1,
+                "start_record": 1,
+                "apikey": self.api_key,
+            },
+            timeout=30,
+        )
+        return classify_check_response(
+            response, authenticated=True, key_hint="IEEE_API_KEY"
+        )
+@
+
 \subsubsection{Applying filters}
 
 IEEE Xplore supports some filters via API parameters:
@@ -5853,6 +6462,27 @@ class ArxivProvider:
 
     <<convert arxiv result>>
     <<arxiv citation methods>>
+    <<arxiv check method>>
+@
+
+\subsubsection{Health check}
+
+The [[arxiv]] package hides HTTP status codes behind retries and its own
+exception types, so---as with OpenAlex---the probe bypasses the package and
+queries the Atom endpoint directly.  arXiv has no credentials at all, hence
+[[authenticated=False]].
+
+<<arxiv check method>>=
+def check(self) -> tuple[str, str]:
+    """Probe the Atom query endpoint with a one-result query."""
+    response = requests.get(
+        ARXIV_API_URL,
+        params={"search_query": "all:test", "max_results": 1},
+        timeout=30,
+    )
+    return classify_check_response(response, authenticated=False)
+<<arxiv constants>>=
+ARXIV_API_URL = "https://export.arxiv.org/api/query"
 @
 
 \subsubsection{DOI lookup}
@@ -6713,6 +7343,33 @@ def _convert_entry(self, entry: dict) -> Paper:
 
 @
 
+\subsection{Health check}
+
+Scopus authenticates via the [[X-ELS-APIKey]] header (plus the optional
+institutional token, which we forward so the probe sees the same access level
+as real searches).  Any 401/403 points at [[SCOPUS_API_KEY]].
+
+<<scopus provider>>=
+
+    def check(self) -> tuple[str, str]:
+        """Probe the search endpoint with a one-result query."""
+        headers = {
+            "X-ELS-APIKey": self.api_key,
+            "Accept": "application/json",
+        }
+        if self.inst_token:
+            headers["X-ELS-Insttoken"] = self.inst_token
+        response = requests.get(
+            SCOPUS_API_URL,
+            headers=headers,
+            params={"query": "TITLE-ABS-KEY(test)", "count": 1},
+            timeout=30,
+        )
+        return classify_check_response(
+            response, authenticated=True, key_hint="SCOPUS_API_KEY"
+        )
+@
+
 \subsection{Auto-registration}
 
 <<scopus provider>>=
@@ -7024,8 +7681,10 @@ logger = logging.getLogger(__name__)
 <<constants>>=
 # Provider constants
 DEFAULT_LIMIT = 100
+<<openalex constants>>
 <<dblp constants>>
 <<wos constants>>
 <<ieee constants>>
 <<scopus constants>>
+<<arxiv constants>>
 @

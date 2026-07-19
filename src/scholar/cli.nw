@@ -384,12 +384,13 @@ def complete_synthesis_format(incomplete: str) -> list[str]:
 @
 
 \paragraph{Action completion}
-The [[cache]] and [[pdf]] commands take an action argument.
+The [[cache]], [[pdf]], and [[providers]] commands take an action argument.
 We complete from the valid action names:
 
 <<completion functions>>=
 CACHE_ACTIONS = ["clear", "info", "path"]
 PDF_ACTIONS = ["open", "info", "clear", "path", "quote"]
+PROVIDERS_ACTIONS = ["list", "check"]
 
 
 def complete_cache_action(incomplete: str) -> list[str]:
@@ -400,6 +401,11 @@ def complete_cache_action(incomplete: str) -> list[str]:
 def complete_pdf_action(incomplete: str) -> list[str]:
     """Provide shell completion for PDF actions."""
     return [a for a in PDF_ACTIONS if a.startswith(incomplete)]
+
+
+def complete_providers_action(incomplete: str) -> list[str]:
+    """Provide shell completion for providers actions."""
+    return [a for a in PROVIDERS_ACTIONS if a.startswith(incomplete)]
 @
 
 \paragraph{Session name completion}
@@ -1866,22 +1872,129 @@ class TestVerifyCommand:
         assert result.exit_code == 1
 @
 
-\section{Listing Available Providers}
+\section{Listing and Checking Providers}
 
-Users need to know which search providers are available and how to configure
-them.
+Users need to know which search providers are available, how to configure
+them---and whether that configuration actually \emph{works}.
 Rather than requiring users to read the literate documentation, we provide a
 [[providers]] command that displays this information directly.
 
+Following the cache command's action-based design (\cref{ch:cache-cli}), the
+command takes an action argument rather than subcommands.  The action
+defaults to [[list]] so the long-standing bare [[scholar providers]]
+invocation keeps working; [[check]] adds the health probe.
+
 <<providers command>>=
 @app.command()
-def providers() -> None:
+def providers(
+    action: Annotated[
+        str,
+        typer.Argument(
+            help="Action: list or check",
+            autocompletion=complete_providers_action,
+        ),
+    ] = "list",
+    offline: Annotated[
+        bool,
+        typer.Option(
+            "--offline",
+            help="Only check configuration; make no network requests.",
+        ),
+    ] = False,
+) -> None:
     """
     List available search providers and their configuration.
 
-    Shows which providers require API keys and how to obtain them.
+    Actions:
+        list   - Show providers, API key requirements, how to get keys
+        check  - Probe each provider; report key and connectivity problems
     """
-    <<display provider information>>
+    if action == "list":
+        <<display provider information>>
+    elif action == "check":
+        <<check provider health>>
+    else:
+        console = Console()
+        console.print(f"[red]Unknown action: {escape(action)}[/red]")
+        console.print("Valid actions: list, check")
+        raise typer.Exit(1)
+@
+
+\subsection{Checking provider health}
+
+The check action exists because a misconfigured provider fails
+\emph{silently} during searches: every provider degrades to an empty result
+list on error, so an expired API key just makes its provider contribute
+nothing (see the health-check section of the providers module for the
+review that this actually happened to).  Running [[scholar providers check]]
+before a big search surfaces the problem while it is still cheap to fix.
+
+The exit code makes the command usable as a pre-flight gate in scripts.  We
+exit nonzero if and only if a \emph{configured} provider fails---a rejected
+key, an HTTP error, or a network error.  \enquote{Not configured} is a normal
+state (most users have no Scopus key) and exiting nonzero on it would make
+the gate useless on minimal setups.  \enquote{Rate limited} also exits
+zero: the credentials and connectivity are fine, and the search path already
+handles 429s with back-off, so failing on one would make the gate flaky.
+Nonzero thus means exactly \enquote{a provider you believe you have will
+silently contribute nothing}.
+
+<<check provider health>>=
+from scholar.providers import (
+    HEALTH_HTTP_ERROR,
+    HEALTH_KEY_REJECTED,
+    HEALTH_NETWORK_ERROR,
+    HEALTH_OK,
+    HEALTH_RATE_LIMITED,
+    check_provider,
+    get_all_providers,
+)
+
+console = Console()
+
+status_styles = {
+    HEALTH_OK: "green",
+    HEALTH_KEY_REJECTED: "red",
+    HEALTH_HTTP_ERROR: "red",
+    HEALTH_NETWORK_ERROR: "red",
+    HEALTH_RATE_LIMITED: "yellow",
+}
+failure_statuses = (
+    HEALTH_KEY_REJECTED,
+    HEALTH_HTTP_ERROR,
+    HEALTH_NETWORK_ERROR,
+)
+
+table = Table(title="Provider Health", box=box.HORIZONTALS)
+table.add_column("Provider", style="cyan")
+table.add_column("Configured", style="magenta")
+table.add_column("Status")
+table.add_column("Detail", style="dim")
+
+failures = []
+for provider in get_all_providers():
+    health = check_provider(provider, live=not offline)
+    style = status_styles.get(health.status, "dim")
+    configured = (
+        "[green]Yes[/green]" if health.configured else "[dim]No[/dim]"
+    )
+    table.add_row(
+        health.name,
+        configured,
+        f"[{style}]{health.status}[/{style}]",
+        health.message,
+    )
+    if health.configured and health.status in failure_statuses:
+        failures.append(health)
+
+console.print(table)
+if failures:
+    console.print()
+    for health in failures:
+        console.print(
+            f"[red]{health.name}: {health.status}[/red] {health.message}"
+        )
+    raise typer.Exit(1)
 @
 
 We organize provider information in a table showing the provider name,
@@ -1906,6 +2019,7 @@ console.print(table)
 console.print()
 console.print("[dim]Default providers are those currently available (no key required or key configured).[/dim]")
 console.print("[dim]Use -p <name> to select specific providers for a search.[/dim]")
+console.print("[dim]Run 'scholar providers check' to verify keys and connectivity.[/dim]")
 @
 
 We define the configuration details for each provider.
@@ -1994,6 +2108,86 @@ class TestProvidersCommand:
         assert "WOS_EXPANDED_API_KEY" in result.stdout
         assert "IEEE_API_KEY" in result.stdout
         assert "SCOPUS_API_KEY" in result.stdout
+
+    def test_providers_invalid_action(self):
+        """An unknown action exits nonzero and names the valid ones."""
+        result = runner.invoke(app, ["providers", "bogus"])
+        assert result.exit_code == 1
+        assert "list" in result.stdout
+        assert "check" in result.stdout
+@
+
+Let's verify the check action: offline mode never touches the network, an
+all-healthy fleet exits zero, and a rejected key both names the environment
+variable and flips the exit code---that gate behaviour is the point of the
+command:
+
+<<test functions>>=
+class TestProvidersCheckCommand:
+    """Tests for the providers check action."""
+
+    def test_check_offline_makes_no_requests(self):
+        """--offline reports configuration without any HTTP request."""
+        with patch("scholar.providers.requests.get") as mock_get:
+            result = runner.invoke(app, ["providers", "check", "--offline"])
+
+            mock_get.assert_not_called()
+        assert result.exit_code == 0
+        assert "not checked" in result.stdout
+
+    def test_check_all_ok_exits_zero(self):
+        """A healthy fleet exits zero."""
+        from scholar.providers import ProviderHealth
+
+        def fake_check(provider, live=True):
+            return ProviderHealth(provider.name, True, "ok")
+
+        with patch(
+            "scholar.providers.check_provider", side_effect=fake_check
+        ):
+            result = runner.invoke(app, ["providers", "check"])
+
+        assert result.exit_code == 0
+        assert "ok" in result.stdout
+
+    def test_check_key_rejected_exits_one(self):
+        """A rejected key names its env var and makes the gate fail."""
+        from scholar.providers import ProviderHealth
+
+        def fake_check(provider, live=True):
+            if provider.name == "s2":
+                return ProviderHealth(
+                    provider.name, True, "key rejected",
+                    "HTTP 403 -- check or replace S2_API_KEY",
+                )
+            return ProviderHealth(provider.name, True, "ok")
+
+        with patch(
+            "scholar.providers.check_provider", side_effect=fake_check
+        ):
+            result = runner.invoke(app, ["providers", "check"])
+
+        assert result.exit_code == 1
+        assert "key rejected" in result.stdout
+        assert "S2_API_KEY" in result.stdout
+
+    def test_check_not_configured_exits_zero(self):
+        """Missing optional keys are a normal state, not a failure."""
+        from scholar.providers import ProviderHealth
+
+        def fake_check(provider, live=True):
+            return ProviderHealth(
+                provider.name, False, "not configured",
+                "required API key missing",
+            )
+
+        with patch(
+            "scholar.providers.check_provider", side_effect=fake_check
+        ):
+            result = runner.invoke(app, ["providers", "check"])
+
+        assert result.exit_code == 0
+        assert "not configured" in result.stdout
 @
 
 
@@ -2041,7 +2235,7 @@ table.add_row("s2", "[green]✓[/]", "[green]✓[/]", "[green]✓[/]", "[green]�
 table.add_row("openalex", "[green]✓[/]", "[green]✓[/]", "[green]✓[/]", "[green]✓[/]",
               "Must be UPPERCASE")
 table.add_row("dblp", "[dim]implicit[/]", "[red]✗[/]", "[red]✗[/]", "[red]✗[/]",
-              "Space = AND, NOT disabled")
+              "Space = AND; scholar strips AND/OR/NOT and quotes")
 table.add_row("wos", "[green]✓[/]", "[green]✓[/]", "[green]✓[/]", "[green]✓[/]",
               "Must be UPPERCASE, supports NEAR/SAME")
 table.add_row("ieee", "[green]✓[/]", "[green]✓[/]", "[green]✓[/]", "[green]✓[/]",
