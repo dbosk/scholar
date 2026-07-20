@@ -2133,27 +2133,70 @@ if failures:
     raise typer.Exit(1)
 @
 
-We organize provider information in a table showing the provider name,
-whether it is a default, whether an API key is required, and the environment
-variable to set:
+We organize provider information in a table showing the provider name, whether
+it is configured, whether an API key is required, and the environment variable
+to set.
+
+The status column reports [[is_available()]]---true when the provider needs no
+key or already has one in the environment, the very predicate
+[[get_default_providers]] uses to choose what a bare search queries.  We label
+it \enquote{Configured} rather than \enquote{Default} because the two status
+columns were being read together and misread: a red \enquote{Required} in the
+API-key column looked like \emph{this key is missing}, even on rows where
+\enquote{Default: Yes} had already said the key was present.  Naming the
+column after the question it actually answers---is this provider ready to
+use?---removes that ambiguity, and it matches the identically-named column in
+[[providers check]] above, so the same word means the same thing in both
+tables.
+
+For the same reason we no longer paint \enquote{Required} red
+unconditionally.  Red is how this CLI marks something the user must act
+on---[[providers check]] uses it for a rejected key---so spending it on a
+requirement that is already satisfied trains readers to ignore it.  Red now
+appears only when a required key is genuinely absent, which is exactly the row
+that needs attention.
+
+The longer header costs horizontal space, and at the 80-column default that
+pushed [[WOS_EXPANDED_API_KEY]] over its column's width.  Rich's default
+overflow ellipsized it to \enquote{WOS\_EXPANDED\_API\_K\ldots}, which is
+worse than useless in the two columns the reader is meant to \emph{copy}: an
+environment variable or a URL cut mid-token cannot be acted on.  We fold those
+two columns instead, so a value that does not fit wraps rather than
+disappearing.
+
+Folding alone still splits a long variable name across lines, which is no more
+copy-pasteable than an ellipsis.  So we also give the variable column a floor
+width, derived from the longest name we actually document rather than fixed at
+a literal: Rich then takes the space from the prose-like \enquote{How to Get
+Key} column, which wraps harmlessly.  Computing the floor means adding a
+provider with a longer variable name cannot silently reintroduce the
+splitting.  Because that computation reads the reference table, we define it
+before building the table:
 
 <<display provider information>>=
 from scholar.providers import get_all_providers
 
 console = Console()
 
+<<provider configuration reference>>
+
 table = Table(title="Available Search Providers", box=box.HORIZONTALS)
 table.add_column("Provider", style="cyan")
-table.add_column("Default", style="magenta")
+table.add_column("Configured", style="magenta")
 table.add_column("API Key", style="yellow")
-table.add_column("Environment Variable", style="green")
-table.add_column("How to Get Key", style="dim")
+table.add_column(
+    "Environment Variable",
+    style="green",
+    overflow="fold",
+    min_width=widest_env_var,
+)
+table.add_column("How to Get Key", style="dim", overflow="fold")
 
 <<add provider rows to table>>
 
 console.print(table)
 console.print()
-console.print("[dim]Default providers are those currently available (no key required or key configured).[/dim]")
+console.print("[dim]Configured providers (no key needed, or key already set) are searched by default.[/dim]")
 console.print("[dim]Use -p <name> to select specific providers for a search.[/dim]")
 console.print("[dim]Run 'scholar providers check' to verify keys and connectivity.[/dim]")
 @
@@ -2162,7 +2205,7 @@ We define the configuration details for each provider.
 This information is kept here rather than in the provider classes because
 it is user-facing documentation, not implementation details:
 
-<<add provider rows to table>>=
+<<provider configuration reference>>=
 provider_info = {
     "s2": {
         "required": False,
@@ -2175,6 +2218,11 @@ provider_info = {
         "how_to_get": "Any email (optional, faster responses)",
     },
     "dblp": {
+        "required": False,
+        "env_var": "-",
+        "how_to_get": "No key needed",
+    },
+    "arxiv": {
         "required": False,
         "env_var": "-",
         "how_to_get": "No key needed",
@@ -2195,16 +2243,38 @@ provider_info = {
         "how_to_get": "dev.elsevier.com",
     },
 }
+@
 
+A cell may name several alternatives (\enquote{[[WOS_EXPANDED_API_KEY or
+WOS_STARTER_API_KEY]]}), so we measure individual words rather than whole
+cells---the column only has to hold one variable name per line for each to
+stay intact:
+
+<<provider configuration reference>>=
+widest_env_var = max(
+    len(word)
+    for info in provider_info.values()
+    for word in info["env_var"].split()
+)
+@
+
+<<add provider rows to table>>=
 for provider in get_all_providers():
     info = provider_info.get(provider.name, {})
     is_available = provider.is_available()
-    default_status = "[green]Yes[/green]" if is_available else "[dim]No[/dim]"
+    configured_status = (
+        "[green]Yes[/green]" if is_available else "[dim]No[/dim]"
+    )
     required = info.get("required", False)
-    key_status = "[red]Required[/red]" if required else "[green]Optional[/green]"
+    if not required:
+        key_status = "[green]Optional[/green]"
+    elif is_available:
+        key_status = "Required"
+    else:
+        key_status = "[red]Required[/red]"
     table.add_row(
         provider.name,
-        default_status,
+        configured_status,
         key_status,
         info.get("env_var", "-"),
         info.get("how_to_get", ""),
@@ -2244,6 +2314,36 @@ class TestProvidersCommand:
         assert "WOS_EXPANDED_API_KEY" in result.stdout
         assert "IEEE_API_KEY" in result.stdout
         assert "SCOPUS_API_KEY" in result.stdout
+
+    def test_status_column_is_named_configured(self):
+        """The status column answers "is this ready to use?" by name.
+
+        Read as "Default", it was taken together with the red "Required"
+        in the next column to mean the key was missing, even on rows
+        where the key was in fact configured.
+        """
+        result = runner.invoke(app, ["providers"])
+        assert result.exit_code == 0
+        assert "Configured" in result.stdout
+        assert "Default" not in result.stdout
+
+    def test_env_var_names_are_never_truncated(self):
+        """Env vars and URLs must survive intact -- they are meant to be
+        copied, and an ellipsized name cannot be acted on."""
+        result = runner.invoke(app, ["providers"])
+        assert result.exit_code == 0
+        assert "WOS_EXPANDED_API_KEY" in result.stdout
+        assert "…" not in result.stdout
+
+    def test_arxiv_documented_as_keyless(self):
+        """arxiv states it needs no key rather than leaving a blank cell."""
+        result = runner.invoke(app, ["providers"])
+        assert result.exit_code == 0
+        arxiv_row = next(
+            line for line in result.stdout.splitlines()
+            if line.strip().startswith("arxiv")
+        )
+        assert "No key needed" in arxiv_row
 
     def test_providers_invalid_action(self):
         """An unknown action exits nonzero and names the valid ones."""
