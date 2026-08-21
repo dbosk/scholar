@@ -100,6 +100,8 @@ import sys
 import platformdirs
 import requests
 
+from scholar.unpaywall import resolve_pdf_url
+
 logger = logging.getLogger(__name__)
 @
 
@@ -322,65 +324,42 @@ def extract_doi(identifier: str) -> str | None:
 
 \subsection{Unpaywall Resolution}
 
-Unpaywall provides a free API to find open access versions of papers.
-We query their API with the DOI and extract the PDF URL from the response.
+Unpaywall maps a DOI to its open-access locations.  The lookup itself lives in
+the Unpaywall module (\cref{unpaywall-module}), which caches per DOI, encodes
+the DOI, retries transient errors, and sends the contact email Unpaywall
+requires; this function is a thin adapter that keeps the progress-callback
+contract the other resolvers share.  Routing through that module rather than
+calling the API here means a DOI whose session was already enriched opens
+without a second request---and that, absent a configured [[SCHOLAR_EMAIL]],
+resolution quietly falls through to Semantic Scholar instead of sending a
+bogus address.
 
 <<doi resolution functions>>=
-UNPAYWALL_API = "https://api.unpaywall.org/v2/{doi}"
-UNPAYWALL_EMAIL = "scholar-cli@example.com"  # Required by Unpaywall API
-
-
 def resolve_doi_unpaywall(
     doi: str,
     progress_callback: Callable[[str], None] | None = None,
 ) -> str | None:
     """
     Resolve a DOI to a PDF URL using Unpaywall.
-    
+
+    Requires a contact email (SCHOLAR_EMAIL); without one, returns None.
+
     Args:
         doi: The DOI to resolve.
         progress_callback: Optional callback for status messages.
-    
+
     Returns:
         PDF URL if found, None otherwise.
     """
     logger.debug("Resolving DOI via Unpaywall: %s", doi)
     if progress_callback:
         progress_callback(f"Checking Unpaywall for {doi}...")
-    
-    try:
-        url = UNPAYWALL_API.format(doi=doi)
-        response = requests.get(
-            url,
-            params={"email": UNPAYWALL_EMAIL},
-            timeout=10,
-        )
-        
-        if response.status_code != 200:
-            logger.debug("Unpaywall returned status %d for DOI %s", 
-                        response.status_code, doi)
-            return None
-        
-        data = response.json()
-        
-        # Try best_oa_location first
-        best_oa = data.get("best_oa_location")
-        if best_oa and best_oa.get("url_for_pdf"):
-            logger.debug("Found PDF URL via Unpaywall best_oa_location")
-            return best_oa["url_for_pdf"]
-        
-        # Fall back to any OA location with a PDF
-        for location in data.get("oa_locations", []):
-            if location.get("url_for_pdf"):
-                logger.debug("Found PDF URL via Unpaywall oa_locations")
-                return location["url_for_pdf"]
-        
-        logger.debug("No PDF URL found in Unpaywall response for DOI %s", doi)
-        return None
-        
-    except Exception as e:
-        logger.debug("Unpaywall request failed for DOI %s: %s", doi, e)
-        return None
+    url = resolve_pdf_url(doi)
+    if url:
+        logger.debug("Found PDF URL via Unpaywall")
+    else:
+        logger.debug("No Unpaywall PDF URL for DOI %s", doi)
+    return url
 @
 
 \subsection{Semantic Scholar Resolution}
@@ -523,17 +502,15 @@ class TestDOIResolution:
         assert extract_doi("not a doi") is None
         assert extract_doi("https://example.com") is None
 
-    def test_resolve_doi_unpaywall(self, monkeypatch):
-        """Unpaywall resolution finds PDF URL."""
-        mock_response = Mock()
-        mock_response.status_code = 200
-        mock_response.json.return_value = {
-            "best_oa_location": {"url_for_pdf": "https://example.com/paper.pdf"}
-        }
-        
-        with patch("scholar.pdf.requests.get", return_value=mock_response):
+    def test_resolve_doi_unpaywall(self):
+        """Unpaywall resolution delegates to the unpaywall module."""
+        with patch(
+            "scholar.pdf.resolve_pdf_url",
+            return_value="https://example.com/paper.pdf",
+        ) as mock_resolve:
             url = resolve_doi_unpaywall("10.1234/test")
-        
+
+        mock_resolve.assert_called_once_with("10.1234/test")
         assert url == "https://example.com/paper.pdf"
 
     def test_resolve_doi_s2(self, monkeypatch):
@@ -549,34 +526,32 @@ class TestDOIResolution:
         
         assert url == "https://arxiv.org/pdf/2301.00001.pdf"
 
-    def test_resolve_doi_to_pdf_tries_sources(self, monkeypatch):
-        """Combined resolution tries multiple sources."""
-        # First call (Unpaywall) fails, second (S2) succeeds
-        mock_response_fail = Mock()
-        mock_response_fail.status_code = 404
-        
+    def test_resolve_doi_to_pdf_tries_sources(self):
+        """Combined resolution falls through from Unpaywall to S2."""
         mock_response_success = Mock()
         mock_response_success.status_code = 200
         mock_response_success.json.return_value = {
             "openAccessPdf": {"url": "https://example.com/paper.pdf"}
         }
-        
-        with patch("scholar.pdf.requests.get", side_effect=[
-            mock_response_fail, mock_response_success
-        ]):
+
+        with patch("scholar.pdf.resolve_pdf_url", return_value=None), patch(
+            "scholar.pdf.requests.get", return_value=mock_response_success
+        ):
             url = resolve_doi_to_pdf("10.1234/test")
-        
+
         assert url == "https://example.com/paper.pdf"
 
     def test_resolve_doi_to_pdf_no_pdf_raises(self):
         """Raises error when no PDF found."""
         mock_response = Mock()
         mock_response.status_code = 404
-        
-        with patch("scholar.pdf.requests.get", return_value=mock_response):
+
+        with patch("scholar.pdf.resolve_pdf_url", return_value=None), patch(
+            "scholar.pdf.requests.get", return_value=mock_response
+        ):
             with pytest.raises(PDFDownloadError) as exc_info:
                 resolve_doi_to_pdf("10.1234/no-pdf")
-        
+
         assert "Could not find open access PDF" in str(exc_info.value)
 @
 

@@ -1651,9 +1651,12 @@ class TestFormatCurrencyWarning:
 
 \section{Enriching Papers}
 
-The [[enrich]] command fetches missing abstracts/metadata for papers in a review session.
-This is useful when you've already done a search and want to fill in abstracts
-without re-running the search.
+The [[enrich]] command fetches missing abstracts/metadata for papers in a
+review session.  This is useful when you've already done a search and want to
+fill in abstracts without re-running the search.  It is also where a session
+learns which of its papers are open access: the enrichment step consults
+Unpaywall (\cref{unpaywall-module}) for every paper with a DOI, and the
+command reports the tally.
 
 <<enrich command>>=
 @app.command()
@@ -1681,7 +1684,9 @@ def enrich(
 
     Looks up papers by DOI in available providers to fill in missing
     abstracts/metadata. Providers requiring API keys (IEEE, WoS) are used
-    only when configured.
+    only when configured. Also looks up open-access status and PDF links
+    via Unpaywall (requires SCHOLAR_EMAIL) and checks Crossref for
+    retractions.
 
     Example:
         scholar enrich "machine learning"
@@ -1691,11 +1696,18 @@ def enrich(
 
 \subsection{Enriching session papers}
 
-We load the session, enrich the papers, and save the updated session:
+We load the session, enrich the papers, and save the updated session.
+Enrichment runs over \emph{all} the session's papers, not only those missing
+an abstract: a paper can be metadata-complete yet never have had its
+open-access status looked up, and the per-paper cost for a complete paper is
+one cached (or skipped) Unpaywall call.  The \enquote{N papers to enrich}
+message therefore describes the metadata gaps, while the open-access and
+currency passes below always cover the whole session.
 
 <<enrich session papers>>=
 from scholar.review import load_session, save_session
 from scholar.enrich import enrich_papers, needs_enrichment
+from scholar import unpaywall
 from rich.progress import Progress
 
 console = Console()
@@ -1717,13 +1729,12 @@ providers_for_enrich = (
     else None
 )
 
-if not papers_to_enrich:
-    console.print("[yellow]No papers need enrichment (all have abstracts).[/yellow]")
-    return
+if papers_to_enrich:
+    console.print(f"[cyan]Found {len(papers_to_enrich)} papers to enrich (of {len(papers)} total).[/cyan]")
+else:
+    console.print("[yellow]No papers need metadata enrichment (all have abstracts).[/yellow]")
 
-console.print(f"[cyan]Found {len(papers_to_enrich)} papers to enrich (of {len(papers)} total).[/cyan]")
-
-# Enrich with progress bar
+# Enrich with progress bar (all papers, so open-access status is filled too)
 with Progress() as progress:
     task = progress.add_task("[cyan]Enriching...", total=len(papers))
 
@@ -1741,16 +1752,42 @@ with Progress() as progress:
 for decision, enriched in zip(session_data.decisions, enriched_papers):
     decision.paper = enriched
 
+<<report open-access findings during enrich>>
+
 <<warn on currency issues during enrich>>
 
 save_session(session_data)
 
-# Count how many were actually enriched
+# Count how many gained an abstract or a PDF link
 enriched_count = sum(
     1 for orig, new in zip(papers, enriched_papers)
-    if orig.abstract != new.abstract and new.abstract
+    if (new.abstract and orig.abstract != new.abstract)
+    or (new.pdf_url and orig.pdf_url != new.pdf_url)
 )
 console.print(f"[green]Enriched {enriched_count} papers.[/green]")
+@
+
+The open-access tally answers the question a reviewer actually has---how much
+of this session can I read?---so we count open papers and, among them, those
+with a direct PDF link, over the papers Unpaywall managed to check.  When no
+contact email is configured the lookups were silently skipped, and the only
+useful thing to say is which variable enables them; we say it once here rather
+than once per paper.
+
+<<report open-access findings during enrich>>=
+if unpaywall.is_configured():
+    checked = [p for p in enriched_papers if p.oa_status is not None]
+    open_papers = [p for p in checked if p.is_open_access]
+    with_pdf = [p for p in open_papers if p.pdf_url]
+    console.print(
+        f"[cyan]Open access: {len(open_papers)} of {len(checked)} checked "
+        f"papers ({len(with_pdf)} with PDF link).[/cyan]"
+    )
+else:
+    console.print(
+        "[dim]Unpaywall lookup skipped: set SCHOLAR_EMAIL to enable "
+        "open-access checks.[/dim]"
+    )
 @
 
 Enrichment is also the natural moment to check currency: we already hold the
@@ -1932,6 +1969,111 @@ Let's verify the command end to end: the human report, the JSON mode, and the
 missing-session error.  We build a small session on disk and stub the Crossref
 lookup so no network is touched---the stub marks one paper retracted and leaves
 the other clean.
+
+<<test functions>>=
+class TestEnrichCommand:
+    """Tests for the enrich command's open-access and currency passes."""
+
+    def _make_session(self, tmp_path, monkeypatch):
+        """Create a two-paper session (one complete, one bare) on disk."""
+        from scholar import Paper, SearchResult
+        from scholar.review import create_review_session, save_session
+
+        monkeypatch.setenv("SCHOLAR_DATA_DIR", str(tmp_path))
+        papers = [
+            Paper(
+                title="Full", authors=["a"], doi="10.1/full", sources=["m"],
+                abstract="Has one", pdf_url="https://p/full.pdf",
+                keywords=["k"],
+            ),
+            Paper(title="Bare", authors=["b"], doi="10.1/bare", sources=["m"]),
+        ]
+        result = SearchResult(
+            query="q", provider="m", timestamp="t", papers=papers
+        )
+        session = create_review_session([result], "q", session_name="etest")
+        save_session(session)
+        return "etest"
+
+    @staticmethod
+    def _fake_enrich(papers, fields=None, providers=None, progress_callback=None):
+        """Stand in for enrich_papers: mark everything gold OA with a PDF."""
+        from dataclasses import replace
+
+        return [
+            replace(
+                p, oa_status="gold", oa_url=f"https://j/{p.doi}",
+                pdf_url=p.pdf_url or f"https://j/{p.doi}.pdf",
+            )
+            for p in papers
+        ]
+
+    @staticmethod
+    def _identity_annotate(papers, progress_callback=None):
+        return list(papers)
+
+    def test_reports_open_access_and_persists(self, tmp_path, monkeypatch):
+        """The OA tally is printed and the new links are saved."""
+        from scholar import isolated_registry
+        from scholar.review import load_session
+
+        name = self._make_session(tmp_path, monkeypatch)
+        monkeypatch.setenv("SCHOLAR_EMAIL", "tests@example.org")
+        with patch(
+            "scholar.enrich.enrich_papers", side_effect=self._fake_enrich
+        ), patch(
+            "scholar.crossref.annotate_papers",
+            side_effect=self._identity_annotate,
+        ):
+            result = runner.invoke(app, ["enrich", name])
+        assert result.exit_code == 0, result.stdout
+        assert "Open access: 2 of 2 checked papers (2 with PDF link)" in result.stdout
+        assert "Enriched 1 papers" in result.stdout
+        # Reload in a fresh registry: the process-wide one still holds the
+        # Paper objects created above and would hand them back unchanged.
+        with isolated_registry():
+            saved = load_session(name)
+        by_doi = {d.paper.doi: d.paper for d in saved.decisions}
+        assert by_doi["10.1/bare"].pdf_url == "https://j/10.1/bare.pdf"
+        assert by_doi["10.1/bare"].oa_status == "gold"
+        assert by_doi["10.1/full"].pdf_url == "https://p/full.pdf"
+
+    def test_hint_when_no_contact_email(self, tmp_path, monkeypatch):
+        """Without SCHOLAR_EMAIL the command says how to enable lookups."""
+        name = self._make_session(tmp_path, monkeypatch)
+        with patch(
+            "scholar.enrich.enrich_papers", side_effect=lambda ps, **kw: list(ps)
+        ), patch(
+            "scholar.crossref.annotate_papers",
+            side_effect=self._identity_annotate,
+        ):
+            result = runner.invoke(app, ["enrich", name])
+        assert result.exit_code == 0, result.stdout
+        assert "set SCHOLAR_EMAIL" in result.stdout
+
+    def test_complete_session_still_runs_checks(self, tmp_path, monkeypatch):
+        """Even with nothing to fill in, the currency pass runs and saves."""
+        from scholar import Paper, SearchResult
+        from scholar.review import create_review_session, save_session
+
+        monkeypatch.setenv("SCHOLAR_DATA_DIR", str(tmp_path))
+        paper = Paper(
+            title="Full", authors=["a"], doi="10.1/full", sources=["m"],
+            abstract="Has one", pdf_url="https://p/full.pdf", keywords=["k"],
+        )
+        result = SearchResult(query="q", provider="m", timestamp="t", papers=[paper])
+        save_session(create_review_session([result], "q", session_name="ctest"))
+        with patch(
+            "scholar.enrich.enrich_papers", side_effect=lambda ps, **kw: list(ps)
+        ), patch(
+            "scholar.crossref.annotate_papers",
+            side_effect=self._identity_annotate,
+        ) as mock_annotate:
+            result = runner.invoke(app, ["enrich", "ctest"])
+        assert result.exit_code == 0, result.stdout
+        assert "No papers need metadata enrichment" in result.stdout
+        mock_annotate.assert_called_once()
+@
 
 <<test functions>>=
 class TestVerifyCommand:
@@ -6166,7 +6308,9 @@ expected header and metadata comments:
 
 \subsection{JSON formatter}
 
-For scripting, we provide JSON output that includes all paper metadata.
+For scripting, we provide JSON output that includes all paper metadata,
+including the open-access fields ([[pdf_url]], [[oa_status]]) so a script can
+pick out the papers it can fetch.
 We also surface the [[filters]] and [[limit]] that were applied, so a consumer
 reading the JSON has the same provenance the [[bibtex+prov]] export
 reconstructs --- the search is fully described by its query, providers,
@@ -6196,6 +6340,8 @@ class JSONFormatter:
                         "abstract": p.abstract,
                         "venue": p.venue,
                         "url": p.url,
+                        "pdf_url": p.pdf_url,
+                        "oa_status": p.oa_status,
                     }
                     for p in result.papers
                 ],
@@ -6219,6 +6365,8 @@ structure, including the search metadata:
         # Metadata keys are always present (None when unset)
         assert data[0]["filters"] is None
         assert data[0]["limit"] is None
+        assert "pdf_url" in data[0]["papers"][0]
+        assert "oa_status" in data[0]["papers"][0]
 
     def test_json_formatter_exposes_filters_and_limit(self, capsys):
         """Active filters and limit appear in the JSON output."""
