@@ -52,7 +52,7 @@ Providers self-register via `register_provider()` at module load time.
 | Provider | Name | API | Auth |
 |----------|------|-----|------|
 | Semantic Scholar | `semantic_scholar` | `semanticscholar` client | `S2_API_KEY` (optional) |
-| OpenAlex | `openalex` | `pyalex` client | `OPENALEX_EMAIL` (optional) |
+| OpenAlex | `openalex` | `pyalex` client | `SCHOLAR_EMAIL` (optional) |
 | DBLP | `dblp` | REST API | None required |
 | Web of Science | `wos` | REST API | `WOS_API_KEY` (required) |
 | IEEE Xplore | `ieee` | REST API | `IEEE_API_KEY` (required) |
@@ -79,6 +79,14 @@ become literal search terms). `DBLPProvider` strips operators, parentheses,
 and quotes before sending (warning shows the sent query) and warns when a
 query of ≥4 terms yields zero hits. Queries are never auto-relaxed — results
 stay traceable to the recorded query.
+
+### Contact Email
+
+`SCHOLAR_EMAIL` is the one contact address for every service that asks for
+one: OpenAlex and Crossref (polite pools, optional) and Unpaywall
+(mandatory). `scholar.utils.contact_email(*override_vars)` resolves it;
+`OPENALEX_EMAIL` / `CROSSREF_MAILTO` still work as per-service overrides.
+The test `conftest.py` unsets all three so unit tests never make live calls.
 
 ### Currency / Retraction Checks
 

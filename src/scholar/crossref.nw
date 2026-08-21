@@ -126,9 +126,10 @@ on-disk cache machinery.
 
 The polite identity comes from an email address: Crossref offers a faster,
 more reliable \enquote{polite} request pool to clients that identify themselves
-with a [[mailto]].  We reuse [[OPENALEX_EMAIL]] (already configured for the
-OpenAlex provider's identical polite pool) as a fallback so users need not set a
-second variable, while still allowing a dedicated [[CROSSREF_MAILTO]] override.
+with a [[mailto]].  We take it from the shared [[contact_email]] resolver
+(\cref{sec:contact-email}), so the one [[SCHOLAR_EMAIL]] setting serves
+Crossref, OpenAlex, and Unpaywall alike, while a dedicated [[CROSSREF_MAILTO]]
+override is still honoured.
 
 <<the crossref client>>=
 class CrossrefClient:
@@ -141,10 +142,7 @@ class CrossrefClient:
         register_cache(self.name, self._cache)
         self._last_request_time: float = 0.0
         self._session = self._create_session()
-        self._mailto = (
-            os.environ.get("CROSSREF_MAILTO")
-            or os.environ.get("OPENALEX_EMAIL")
-        )
+        self._mailto = contact_email("CROSSREF_MAILTO")
 
     <<crossref client methods>>
 @
@@ -618,11 +616,11 @@ class TestCurrencyStatus:
 \section{Imports}
 
 The module needs the HTTP stack the other providers use, the shared cache
-helpers, [[replace]] for immutable annotation, and [[quote]] for DOI encoding.
+helpers, the contact-email resolver, [[replace]] for immutable annotation, and
+[[quote]] for DOI encoding.
 
 <<imports>>=
 import logging
-import os
 import time
 from dataclasses import replace
 from urllib.parse import quote
@@ -633,6 +631,7 @@ from urllib3.util.retry import Retry
 
 from scholar import Paper
 from scholar.cache import load_cache, register_cache
+from scholar.utils import contact_email
 
 logger = logging.getLogger(__name__)
 @

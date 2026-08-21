@@ -2214,7 +2214,7 @@ provider_info = {
     },
     "openalex": {
         "required": False,
-        "env_var": "OPENALEX_EMAIL",
+        "env_var": "SCHOLAR_EMAIL",
         "how_to_get": "Any email (optional, faster responses)",
     },
     "dblp": {

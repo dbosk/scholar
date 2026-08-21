@@ -164,12 +164,17 @@ uv pip install scholarcli
 
 ## Configuration
 
+Set `SCHOLAR_EMAIL` to a contact address: OpenAlex and Crossref use it for
+their faster "polite pools", and Unpaywall (open-access lookup during
+`scholar enrich` and `scholar pdf open <doi>`) requires it. `OPENALEX_EMAIL`
+and `CROSSREF_MAILTO` are still honoured as per-service overrides.
+
 Some providers require API keys set as environment variables:
 
 | Provider | Environment Variable | Required | How to Get |
 |----------|---------------------|----------|------------|
 | Semantic Scholar | `S2_API_KEY` | No | [api.semanticscholar.org](https://api.semanticscholar.org) |
-| OpenAlex | `OPENALEX_EMAIL` | No | Any email (for polite pool) |
+| OpenAlex | `SCHOLAR_EMAIL` | No | Any email (for polite pool) |
 | DBLP | - | No | No key needed |
 | Web of Science | `WOS_EXPANDED_API_KEY` or `WOS_STARTER_API_KEY` | Yes | [developer.clarivate.com](https://developer.clarivate.com) |
 | IEEE Xplore | `IEEE_API_KEY` | Yes | [developer.ieee.org](https://developer.ieee.org) |
