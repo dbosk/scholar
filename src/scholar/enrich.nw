@@ -129,6 +129,16 @@ requested explicitly by passing them in the [[fields]] parameter.
 Callers can also override which providers to try (and in what order) by passing
 provider names in [[providers]].
 
+After the providers have had their turn, and whenever [[pdf_url]] is among
+the requested fields, we ask Unpaywall (\cref{unpaywall-module}) for the
+paper's open-access status.  Unpaywall is not a provider: it answers a
+different question (\enquote{is there a free copy, and where?}) and answers
+it for DOIs the providers know nothing about, so it runs regardless of whether
+the provider loop found anything.  It fills [[oa_status]] and [[oa_url]], and
+supplies a [[pdf_url]] only where the providers left none.  The call is cheap
+when it cannot help---no DOI, no contact email, or an already-cached DOI---so
+it is safe to make on every enrichment.
+
 Providers are not perfectly consistent in DOI lookups: some omit the DOI field
 in the returned record, and occasionally a lookup yields a non-matching work.
 Because [[Paper]] identity uses the DOI when present, we treat a missing DOI in
@@ -254,6 +264,10 @@ def enrich_paper(
                     continue
     else:
         logger.debug(f"Paper '{paper.title_preview()}' doesn't need metadata enrichment")
+
+    # Open-access status and a fallback PDF link from Unpaywall
+    if "pdf_url" in fields and result.doi:
+        result = unpaywall.annotate_paper(result)
 
     # Fetch references and citations if requested
     if fetch_refs_cites and result.doi:
@@ -758,6 +772,40 @@ class TestEnrichPaper:
         result = enrich_paper(paper)
         assert result is paper
 
+    def test_unpaywall_fills_open_access_after_providers(self):
+        """Unpaywall annotates OA status and a missing PDF link."""
+        from dataclasses import replace
+
+        paper = Paper(
+            title="Test Paper",
+            authors=["Author"],
+            doi="10.1234/test",
+            abstract="Already here",
+        )
+
+        def fake_annotate(p):
+            return replace(
+                p, oa_status="green", pdf_url=p.pdf_url or "https://r/p.pdf"
+            )
+
+        with patch("scholar.enrich.get_provider", return_value=None), patch(
+            "scholar.enrich.unpaywall.annotate_paper", side_effect=fake_annotate
+        ) as mock_annotate:
+            result = enrich_paper(paper, fields=["abstract", "pdf_url"])
+
+        mock_annotate.assert_called_once()
+        assert result.oa_status == "green"
+        assert result.pdf_url == "https://r/p.pdf"
+
+    def test_unpaywall_skipped_when_pdf_url_not_requested(self):
+        """Without pdf_url among the fields, Unpaywall is not consulted."""
+        paper = Paper(title="Test Paper", authors=["Author"], doi="10.1234/t")
+        with patch("scholar.enrich.get_provider", return_value=None), patch(
+            "scholar.enrich.unpaywall.annotate_paper"
+        ) as mock_annotate:
+            enrich_paper(paper, fields=["abstract"])
+        mock_annotate.assert_not_called()
+
     def test_derives_arxiv_doi_from_url(self):
         """enrich_paper derives arXiv DOI from arXiv URLs."""
         paper = Paper(
@@ -1137,7 +1185,7 @@ class TestEnrichPapers:
 import logging
 from typing import Any, Callable, cast
 
-from scholar import Paper
+from scholar import Paper, unpaywall
 from scholar.providers import get_provider
 from scholar.utils import derive_arxiv_doi
 <<enrichment cache imports>>

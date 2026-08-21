@@ -27,6 +27,8 @@ Providers self-register via `register_provider()` at module load time.
 | `src/scholar/scholar.py` | Core data models (Paper, SearchResult) |
 | `src/scholar/crossref.py` | Crossref currency/retraction checks |
 | `src/scholar/crossref.nw` | Literate source for currency checks |
+| `src/scholar/unpaywall.py` | Unpaywall open-access lookup (per DOI) |
+| `src/scholar/unpaywall.nw` | Literate source for open-access lookup |
 | `src/scholar/cli.py` | CLI commands and output formatters |
 | `src/scholar/cli.nw` | Literate programming source for CLI |
 
@@ -52,7 +54,7 @@ Providers self-register via `register_provider()` at module load time.
 | Provider | Name | API | Auth |
 |----------|------|-----|------|
 | Semantic Scholar | `semantic_scholar` | `semanticscholar` client | `S2_API_KEY` (optional) |
-| OpenAlex | `openalex` | `pyalex` client | `OPENALEX_EMAIL` (optional) |
+| OpenAlex | `openalex` | `pyalex` client | `SCHOLAR_EMAIL` (optional) |
 | DBLP | `dblp` | REST API | None required |
 | Web of Science | `wos` | REST API | `WOS_API_KEY` (required) |
 | IEEE Xplore | `ieee` | REST API | `IEEE_API_KEY` (required) |
@@ -79,6 +81,30 @@ become literal search terms). `DBLPProvider` strips operators, parentheses,
 and quotes before sending (warning shows the sent query) and warns when a
 query of ≥4 terms yields zero hits. Queries are never auto-relaxed — results
 stay traceable to the recorded query.
+
+### Contact Email
+
+`SCHOLAR_EMAIL` is the one contact address for every service that asks for
+one: OpenAlex and Crossref (polite pools, optional) and Unpaywall
+(mandatory). `scholar.utils.contact_email(*override_vars)` resolves it;
+`OPENALEX_EMAIL` / `CROSSREF_MAILTO` still work as per-service overrides.
+The test `conftest.py` unsets all three so unit tests never make live calls.
+
+### Open-Access Lookup (Unpaywall)
+
+`unpaywall.py` mirrors `crossref.py`: a cached per-DOI lookup, **not** a
+search provider (Unpaywall's search endpoint is title-only and its OA data is
+what OpenAlex already serves). `fetch_oa(doi)` returns
+`{is_oa, oa_status, oa_url, pdf_url, host_type, version, license}` or
+`None` (undetermined: no DOI, no email, 404, 429, error);
+`annotate_paper(paper)` writes `Paper.oa_status`/`oa_url` and fills a
+missing `pdf_url` (never overwrites one); `resolve_pdf_url(doi)` serves
+`pdf.resolve_doi_unpaywall`. `enrich.enrich_paper` calls `annotate_paper`
+whenever `pdf_url` is among the requested fields, so `scholar enrich`,
+`search --enrich`, and the TUI all get it; `scholar enrich` prints an
+`Open access: N of M checked papers (K with PDF link)` tally (or a
+`set SCHOLAR_EMAIL` hint). `Paper.is_open_access` (checked status, else
+`bool(pdf_url)`) backs the client-side `--open-access` filter.
 
 ### Currency / Retraction Checks
 

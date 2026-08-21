@@ -472,25 +472,35 @@ class Paper:
     citations: list["Paper"] | None = None
     updated_by: list[dict] | None = None
     newer_versions: list[dict] | None = None
+    oa_status: str | None = None
+    oa_url: str | None = None
 
     <<paper methods>>
 @
 
-The last two fields record the result of a \emph{currency check} against
-Crossref (\cref{crossref-module}): [[updated_by]] lists retraction and
-correction notices that point at this paper, and [[newer_versions]] lists
-superseding-version relations (e.g.\ a preprint's published version).
-We keep these out of the equality and hash logic below on purpose---a paper's
-identity is its work, not whether we have checked its currency yet, so a checked
+The last four fields record the results of \emph{checks} made against a paper
+we already hold, as opposed to metadata a search returned.  [[updated_by]] and
+[[newer_versions]] come from the currency check against Crossref
+(\cref{crossref-module}): the former lists retraction and correction notices
+that point at this paper, the latter superseding-version relations (e.g.\ a
+preprint's published version).  [[oa_status]] and [[oa_url]] come from the
+open-access lookup against Unpaywall (\cref{unpaywall-module}):
+[[oa_status]] is Unpaywall's classification (\enquote{gold}, \enquote{hybrid},
+\enquote{bronze}, \enquote{green}, or \enquote{closed}) and [[oa_url]] is
+the landing page of the best open copy, complementing [[pdf_url]], which the
+lookup also fills when a provider left it empty.
+We keep all four out of the equality and hash logic below on purpose---a
+paper's identity is its work, not whether we have checked it yet, so a checked
 and an unchecked copy of the same DOI must still deduplicate to one registry
 entry.
 
 For the same reason we do \emph{not} coerce these fields in [[__post_init__]].
 The other list fields treat [[None]] and [[[]]] as equivalent, but here the
 distinction carries meaning: [[None]] means \enquote{never checked} while an
-empty list means \enquote{checked, no notices found}.  Collapsing them would
-make a clean paper indistinguishable from an unchecked one, which the
-[[verify]] report needs to tell apart.
+empty list (or, for [[oa_status]], the word \enquote{closed}) means
+\enquote{checked, nothing found}.  Collapsing them would make a clean paper
+indistinguishable from an unchecked one, which the [[verify]] report needs to
+tell apart.
 
 \subsubsection{Classifying currency notices}
 
@@ -665,6 +675,44 @@ are not available.
 The [[sources]] field tracks which databases returned this paper, useful for
 provenance in reports when merging results from multiple providers.
 
+\subsubsection{Open-access status}
+
+The [[--open-access]] filter and the TUI both need a yes/no answer to
+\enquote{can this be read for free?}, and neither should have to know
+Unpaywall's vocabulary.  When the paper has been checked, the answer is
+whatever Unpaywall said (anything but \enquote{closed} is open); when it has
+not, we fall back to the presence of a [[pdf_url]], since a provider only
+supplies one when it knows of a freely downloadable copy.  The fallback makes
+the predicate useful on freshly searched papers, before any enrichment, at the
+cost of answering \enquote{no} for an unchecked paper without a link---an
+acceptable bias for a filter whose job is to narrow a list.
+
+<<paper methods>>=
+@property
+def is_open_access(self) -> bool:
+    """Whether a free-to-read copy is known (checked status, else PDF link)."""
+    if self.oa_status is not None:
+        return self.oa_status != "closed"
+    return bool(self.pdf_url)
+@
+
+<<test functions>>=
+class TestPaperIsOpenAccess:
+    """Tests for the is_open_access predicate."""
+
+    def test_checked_status_decides(self):
+        assert Paper(title="T", authors=[], oa_status="green").is_open_access
+        assert not Paper(title="T", authors=[], oa_status="closed").is_open_access
+
+    def test_checked_closed_beats_stale_pdf_link(self):
+        paper = Paper(title="T", authors=[], oa_status="closed", pdf_url="x")
+        assert not paper.is_open_access
+
+    def test_unchecked_falls_back_to_pdf_link(self):
+        assert Paper(title="T", authors=[], pdf_url="https://x/p.pdf").is_open_access
+        assert not Paper(title="T", authors=[]).is_open_access
+@
+
 \subsubsection{Keywords versus tags}
 
 Different providers expose different 
@@ -812,10 +860,11 @@ when papers reference each other.
 When [[include_refs_cites=True]], we serialize them one level deep (the
 referenced papers themselves have their refs/cites excluded).
 
-The currency fields ([[updated_by]], [[newer_versions]]), by contrast, are
-always serialized.  They are small and they must survive a session
-save/reload, so that once [[scholar verify]] has checked a session the result
-is cached on disk rather than re-fetched every time the session is opened.
+The check fields ([[updated_by]], [[newer_versions]], [[oa_status]],
+[[oa_url]]), by contrast, are always serialized.  They are small and they must
+survive a session save/reload, so that once [[scholar verify]] or
+[[scholar enrich]] has checked a session the result is stored with it rather
+than re-fetched every time the session is opened.
 
 <<paper methods>>=
 def to_dict(self, include_refs_cites: bool = False) -> dict:
@@ -844,6 +893,8 @@ def to_dict(self, include_refs_cites: bool = False) -> dict:
         "sources": self.sources,
         "updated_by": self.updated_by,
         "newer_versions": self.newer_versions,
+        "oa_status": self.oa_status,
+        "oa_url": self.oa_url,
     }
 
     if include_refs_cites:
@@ -931,6 +982,8 @@ def _from_dict_without_registry(cls, data: dict) -> "Paper":
         citations=citations,
         updated_by=data.get("updated_by"),
         newer_versions=data.get("newer_versions"),
+        oa_status=data.get("oa_status"),
+        oa_url=data.get("oa_url"),
     )
 @
 
@@ -1003,6 +1056,22 @@ class TestPaperCurrencyRoundTrip:
             )
             assert paper.updated_by is None
             assert paper.newer_versions is None
+            assert paper.oa_status is None
+            assert paper.oa_url is None
+
+    def test_open_access_fields_round_trip(self):
+        """A checked paper reloads with its open-access status preserved."""
+        with isolated_registry():
+            paper = Paper(
+                title="T",
+                authors=["A"],
+                doi="10.1/x",
+                oa_status="gold",
+                oa_url="https://journal.example/a",
+            )
+            restored = Paper.from_dict(paper.to_dict(), use_registry=False)
+            assert restored.oa_status == "gold"
+            assert restored.oa_url == "https://journal.example/a"
 @
 
 When two copies of a paper merge, a checked-clean copy (empty list) must not be
@@ -1029,6 +1098,13 @@ class TestPaperCurrencyMerge:
             updated_by=[{"type": "retraction"}],
         )
         assert unchecked.merge_with(checked).updated_by == [{"type": "retraction"}]
+
+    def test_checked_closed_survives_merge_with_unchecked(self):
+        """A checked 'closed' status wins over None (unchecked)."""
+        checked = Paper(title="T", authors=["A"], doi="10.1/x", oa_status="closed")
+        unchecked = Paper(title="T", authors=["A"], doi="10.1/x")
+        assert checked.merge_with(unchecked).oa_status == "closed"
+        assert unchecked.merge_with(checked).oa_status == "closed"
 @
 
 \subsubsection{Title preview for display}
@@ -1152,6 +1228,8 @@ def merge_with(self, other: "Paper") -> "Paper":
             if self.newer_versions is not None
             else other.newer_versions
         ),
+        oa_status=self.oa_status if self.oa_status is not None else other.oa_status,
+        oa_url=self.oa_url or other.oa_url,
     )
 @
 
@@ -1183,8 +1261,8 @@ def metadata_score(self) -> int:
     score = len(self.authors)
     for value in (
         self.title, self.year, self.doi, self.abstract, self.venue,
-        self.url, self.pdf_url, self.citation_count, self.keywords,
-        self.tags, self.references, self.citations,
+        self.url, self.pdf_url, self.oa_url, self.citation_count,
+        self.keywords, self.tags, self.references, self.citations,
     ):
         if value:
             score += 1
@@ -1770,10 +1848,8 @@ def matches(self, paper: Paper) -> bool:
             return False
     
     # Open access filter
-    if self.open_access:
-        paper_oa = getattr(paper, 'open_access', False)
-        if not paper_oa:
-            return False
+    if self.open_access and not paper.is_open_access:
+        return False
     
     # Publication type filter
     if self.pub_types:
@@ -1947,6 +2023,15 @@ class TestSearchFilters:
             assert f.matches(Paper(title="Test2", authors=[], venue="nature")) is True
             assert f.matches(Paper(title="Test3", authors=[], venue="Science")) is False
             assert f.matches(Paper(title="Test4", authors=[], venue=None)) is False
+
+    def test_matches_open_access(self):
+        """The OA filter keeps checked-open and linked papers only."""
+        with isolated_registry():
+            f = SearchFilters(open_access=True)
+            assert f.matches(Paper(title="T1", authors=[], oa_status="gold")) is True
+            assert f.matches(Paper(title="T2", authors=[], pdf_url="https://x/p.pdf")) is True
+            assert f.matches(Paper(title="T3", authors=[], oa_status="closed")) is False
+            assert f.matches(Paper(title="T4", authors=[])) is False
 
     def test_matches_multiple_filters(self):
         """All active filters must match."""

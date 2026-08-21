@@ -1975,9 +1975,11 @@ dictionaries rather than typed objects, requiring manual field extraction.
 
 \subsection{Authentication}
 
-No API key is required, but providing an email address (via [[OPENALEX_EMAIL]]
-environment variable) gives access to the \enquote{polite pool}---a separate
-pool of API resources with faster response times for identified users.
+No API key is required, but providing an email address gives access to the
+\enquote{polite pool}---a separate pool of API resources with faster response
+times for identified users.  The address comes from the shared
+[[contact_email]] resolver (\cref{sec:contact-email}): the generic
+[[SCHOLAR_EMAIL]], or [[OPENALEX_EMAIL]] as a service-specific override.
 
 This is OpenAlex's approach to encouraging good API citizenship without
 creating barriers to access.
@@ -2014,9 +2016,10 @@ class OpenAlexProvider:
 
         Args:
             email: Optional email for polite pool access (faster responses).
-                   If not provided, uses OPENALEX_EMAIL environment variable.
+                   If not provided, uses the OPENALEX_EMAIL or SCHOLAR_EMAIL
+                   environment variable.
         """
-        configured_email = email or os.environ.get("OPENALEX_EMAIL")
+        configured_email = email or contact_email("OPENALEX_EMAIL")
         if configured_email:
             pyalex.config.email = configured_email
         self._cache: dict = load_cache(self.name)
@@ -2346,7 +2349,7 @@ import time
 
 import pyalex
 
-from scholar.utils import arxiv_doi_from_url
+from scholar.utils import arxiv_doi_from_url, contact_email
 @
 
 \subsection{Testing OpenAlex provider}

@@ -416,21 +416,32 @@ The provider tests use caching, which can cause test pollution---cached results
 from one test may be returned in another test, causing mock assertions to fail.
 We provide a pytest fixture that isolates each test with its own cache directory.
 
+The same fixture also unsets the contact-email variables
+(\cref{sec:contact-email}).  Integrations such as Unpaywall only make
+requests when an email is configured, so a developer who has
+[[SCHOLAR_EMAIL]] set in their shell would otherwise turn offline unit tests
+into live API calls.  Tests that need an email set it explicitly.
+
 <<[[conftest.py]]>>=
 """Pytest configuration and fixtures for Scholar tests."""
 import pytest
 
+CONTACT_EMAIL_VARS = ("SCHOLAR_EMAIL", "OPENALEX_EMAIL", "CROSSREF_MAILTO")
+
 
 @pytest.fixture(autouse=True)
 def isolate_cache(tmp_path, monkeypatch):
-    """Use a temporary cache directory to prevent cache pollution between tests.
+    """Isolate each test from the developer's cache and contact email.
 
-    This fixture is applied automatically to all tests to ensure each test run
-    starts with an empty cache and doesn't interfere with other tests.
+    Applied automatically to all tests: every test starts with an empty
+    cache directory and no contact email configured, so tests neither
+    interfere with each other nor make live API calls by accident.
     """
     cache_dir = tmp_path / "scholar_cache"
     cache_dir.mkdir()
     monkeypatch.setenv("SCHOLAR_CACHE_DIR", str(cache_dir))
+    for var in CONTACT_EMAIL_VARS:
+        monkeypatch.delenv(var, raising=False)
 @
 
 \subsection{Gating live API tests}

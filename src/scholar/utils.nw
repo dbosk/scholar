@@ -473,3 +473,73 @@ class TestPaperIdentifierHelpers:
         )
         assert derive_arxiv_doi(paper2) is None
 @
+
+
+\section{Contact email for polite API pools}
+\label{sec:contact-email}
+
+Several of the services Scholar talks to ask clients to identify themselves
+with an email address.  OpenAlex and Crossref reward it with a faster
+\enquote{polite pool}; Unpaywall (\cref{unpaywall-module}) refuses requests
+without one.  Historically each integration read its own variable
+([[OPENALEX_EMAIL]], [[CROSSREF_MAILTO]]), which meant a user had to discover
+and set a new variable for every service even though the answer---\enquote{how
+can this service reach me?}---is the same each time.
+
+We therefore introduce one generic setting, [[SCHOLAR_EMAIL]], and a single
+resolver that every integration calls.  The service-specific variables are
+kept as \emph{overrides} rather than removed: an override is more specific
+than the generic setting, so it wins when both are set, and existing
+configurations keep working unchanged.  Centralising the precedence rule here
+means no module can drift into its own ordering.
+
+<<utils functions>>=
+import os
+
+SCHOLAR_EMAIL_VAR = "SCHOLAR_EMAIL"
+
+
+def contact_email(*service_vars: str) -> str | None:
+    """Return the contact email to send to an external API, or ``None``.
+
+    A service-specific override named in ``service_vars`` (e.g.
+    ``"OPENALEX_EMAIL"``) takes precedence, in the order given; otherwise
+    the generic ``SCHOLAR_EMAIL`` is used.  Empty values are ignored.
+    """
+    for var in (*service_vars, SCHOLAR_EMAIL_VAR):
+        value = os.environ.get(var, "").strip()
+        if value:
+            return value
+    return None
+@
+
+Let's verify the precedence: the override wins, the generic setting fills in
+when no override is set, and nothing set yields [[None]] rather than an empty
+string (callers test truthiness to decide whether to send the parameter at
+all).
+
+<<test functions>>=
+class TestContactEmail:
+    """Tests for contact_email precedence."""
+
+    def test_override_wins_over_generic(self, monkeypatch):
+        monkeypatch.setenv("SCHOLAR_EMAIL", "generic@example.org")
+        monkeypatch.setenv("OPENALEX_EMAIL", "specific@example.org")
+        assert contact_email("OPENALEX_EMAIL") == "specific@example.org"
+
+    def test_generic_fills_in_without_override(self, monkeypatch):
+        monkeypatch.setenv("SCHOLAR_EMAIL", "generic@example.org")
+        monkeypatch.delenv("OPENALEX_EMAIL", raising=False)
+        assert contact_email("OPENALEX_EMAIL") == "generic@example.org"
+        assert contact_email() == "generic@example.org"
+
+    def test_nothing_set_is_none(self, monkeypatch):
+        monkeypatch.delenv("SCHOLAR_EMAIL", raising=False)
+        monkeypatch.delenv("CROSSREF_MAILTO", raising=False)
+        assert contact_email("CROSSREF_MAILTO") is None
+
+    def test_blank_value_is_ignored(self, monkeypatch):
+        monkeypatch.setenv("SCHOLAR_EMAIL", "generic@example.org")
+        monkeypatch.setenv("OPENALEX_EMAIL", "   ")
+        assert contact_email("OPENALEX_EMAIL") == "generic@example.org"
+@

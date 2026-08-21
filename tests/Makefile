@@ -2,6 +2,7 @@ TESTS+=		test_scholar.py
 TESTS+=		test_providers.py
 TESTS+=		test_cache.py
 TESTS+=		test_crossref.py
+TESTS+=		test_unpaywall.py
 TESTS+=		test_enrich.py
 TESTS+=		test_cli.py
 TESTS+=		test_tui.py
@@ -28,6 +29,9 @@ test_cache.py: ../src/scholar/cache.nw
 
 test_crossref.py: ../src/scholar/crossref.nw
 	notangle -R"test [[crossref.py]]" $< | cpif $@
+
+test_unpaywall.py: ../src/scholar/unpaywall.nw
+	notangle -R"test [[unpaywall.py]]" $< | cpif $@
 
 test_enrich.py: ../src/scholar/enrich.nw
 	notangle -R"test [[enrich.py]]" $< | cpif $@
