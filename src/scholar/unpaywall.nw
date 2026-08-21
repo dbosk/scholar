@@ -1,0 +1,705 @@
+\chapter{Open-access lookup}
+\label{unpaywall-module}
+
+Knowing that a paper exists is not the same as being able to read it.  The
+claim-backing workflow (\cref{pdf-module}) needs the full text, and a
+systematic reviewer wants to know up front which of a session's papers can be
+read without a subscription.  Search providers answer this unevenly: OpenAlex
+and Semantic Scholar return a PDF link when they have one, while DBLP, IEEE,
+Web of Science, and Scopus records carry none---so a paper found through those
+providers looks paywalled even when a legal open-access copy exists.
+
+This chapter asks the question directly of Unpaywall, a database that maps a
+DOI to its open-access (OA) locations: the publisher's own copy when the
+article is gold or bronze OA, and repository copies (arXiv, PubMed~Central,
+institutional archives) when it is green.  One lookup per DOI tells us whether
+the paper is OA at all, \emph{how} it is OA, and where the best copy lives.
+
+\section{Design overview}
+
+The lookup is one HTTP request per paper: [[GET
+https://api.unpaywall.org/v2/{doi}?email=...]].  Unpaywall requires the
+[[email]] parameter---a request without it is rejected with HTTP~422---so,
+unlike the polite pools of OpenAlex and Crossref where an email merely speeds
+things up, here it is a precondition.  We take it from the shared
+[[contact_email]] resolver (\cref{sec:contact-email}) and treat a missing
+address as \enquote{not configured}: lookups become a silent no-op rather than
+a stream of 422 errors, and the CLI tells the user once which variable to set.
+We deliberately do \emph{not} fall back to a placeholder address; Unpaywall's
+terms ask for a real contact, and a fake one would let the tool appear to work
+while violating them.
+
+From the response we keep a small, stable subset:
+\begin{description}
+\item[ [[is_oa]] and [[oa_status]] ] Whether any OA copy exists, and
+  Unpaywall's classification of it: \enquote{gold} (OA journal),
+  \enquote{hybrid} (OA article in a subscription journal), \enquote{bronze}
+  (free on the publisher site but without a licence), \enquote{green}
+  (repository copy only), or \enquote{closed}.
+\item[ [[best_oa_location]] ] Unpaywall's ranking of the best copy: its
+  landing page [[url]], its direct [[url_for_pdf]] when one is known, the
+  [[host_type]] (publisher or repository), the [[version]]
+  (published, accepted, or submitted), and the [[license]].
+\item[ [[oa_locations]] ] Every known copy, which we scan only as a fallback
+  for a PDF link when the best location has none.
+\end{description}
+
+Unpaywall is a per-DOI lookup, not a search engine: its title-search endpoint
+is limited and its data is the same OA data OpenAlex already exposes.  So this
+module is \emph{not} a search provider.  Like the Crossref currency check
+(\cref{crossref-module}), it is an enrichment step that annotates papers we
+already hold, and it is structured the same way so a reader who knows one
+knows the other:
+\begin{description}
+\item[Caching] Results are cached per DOI through the shared cache layer, so
+  enriching a session twice or re-opening a PDF costs nothing.
+\item[Silent failure] Network and parse errors are logged and turned into
+  \enquote{could not determine}, matching the provider contract that callers
+  never wrap lookups in [[try]].
+\end{description}
+
+As with Crossref, \enquote{checked, closed} must not be confused with
+\enquote{could not check}.  Only an HTTP~200 means we saw the record; a 404
+(DOI unknown to Unpaywall), a rate limit, or a transport error says nothing
+about the paper's openness.  We return a result only for the former and
+[[None]] for the latter, so a transient failure never marks a paper closed.
+
+<<[[unpaywall.py]]>>=
+"""
+Open-access lookup against Unpaywall.
+
+Looks up a paper's DOI in the Unpaywall REST API and reports whether an
+open-access copy exists, how it is open (gold/hybrid/bronze/green/closed),
+and where the best copy lives. Used by ``scholar enrich`` (and
+``search --enrich``) to fill in ``pdf_url``/``oa_status``/``oa_url``, and
+by the PDF module to resolve a DOI to a downloadable PDF. Results are cached
+per DOI. Unpaywall requires a contact email: set ``SCHOLAR_EMAIL``.
+"""
+
+<<imports>>
+<<constants>>
+<<the unpaywall client>>
+<<oa normalization helpers>>
+<<module-level oa interface>>
+@
+
+
+\section{Testing}
+\label{sec:unpaywall-testing}
+
+Tests are distributed through this chapter, each following the code it
+verifies.  The client holds a shared cache and a rate-limit clock, so before
+every test we reset both---otherwise a cached DOI from one test would satisfy
+the next test's lookup without hitting our mock.  The shared [[conftest]]
+fixture (\cref{cache-module}) unsets every contact-email variable, so we also
+set [[SCHOLAR_EMAIL]] here: without it the client is unconfigured and makes no
+requests at all, which is exactly what one test checks and what every other
+test must avoid.
+
+<<test [[unpaywall.py]]>>=
+"""Tests for the unpaywall open-access lookup module."""
+from unittest.mock import Mock, patch
+
+import pytest
+
+from scholar.unpaywall import *
+from scholar.unpaywall import _client, _normalize_oa
+from scholar import Paper
+
+
+@pytest.fixture(autouse=True)
+def _configured_client(monkeypatch, isolate_cache):
+    """Reset the shared client per test and configure a contact email."""
+    monkeypatch.setenv("SCHOLAR_EMAIL", "tests@example.org")
+    _client._cache.clear()
+    _client._last_request_time = 0.0
+    _client._warned_unconfigured = False
+    yield
+    _client._cache.clear()
+
+
+def _mock_response(status=200, data=None):
+    """Build a fake requests response wrapping an Unpaywall DOI object."""
+    response = Mock()
+    response.status_code = status
+    response.json.return_value = data or {}
+    response.raise_for_status = Mock()
+    return response
+
+
+<<test functions>>
+@
+
+
+\section{The Unpaywall client}
+
+The client encapsulates the HTTP session, the per-DOI cache, proactive rate
+limiting, and the contact email.  It is modelled on [[CrossrefClient]]; the
+shared [[load_cache]]/[[register_cache]] calls give it its own
+[[unpaywall.pkl]] next to the provider caches, so [[scholar cache info]] and
+[[scholar cache clear]] cover it without further work.
+
+The email is resolved on every request rather than once at construction.
+The difference is invisible in normal use (environment lookups are cheap),
+but it means a process that sets [[SCHOLAR_EMAIL]] after import---a test, or a
+notebook---sees the change, and that [[is_configured]] always reflects the
+current environment rather than the state at import time.
+
+<<the unpaywall client>>=
+class UnpaywallClient:
+    """Looks up open-access locations for DOIs via Unpaywall."""
+
+    name = "unpaywall"
+
+    def __init__(self) -> None:
+        self._cache: dict = load_cache(self.name)
+        register_cache(self.name, self._cache)
+        self._last_request_time: float = 0.0
+        self._session = self._create_session()
+        self._warned_unconfigured = False
+
+    @property
+    def email(self) -> str | None:
+        """The contact email sent with every request, or ``None``."""
+        return contact_email()
+
+    def is_configured(self) -> bool:
+        """Whether a contact email is available (Unpaywall requires one)."""
+        return bool(self.email)
+
+    <<unpaywall client methods>>
+@
+
+The session carries the same exponential back-off as the other providers: an
+OA lookup that trips a transient 429 or 5xx should retry quietly rather than
+report a false \enquote{could not check}.
+
+<<unpaywall client methods>>=
+def _create_session(self) -> requests.Session:
+    """Create a session with exponential back-off retry logic."""
+    session = requests.Session()
+    retry = Retry(
+        total=3,
+        backoff_factor=1,  # 1s, 2s, 4s delays
+        status_forcelist=[429, 500, 502, 503, 504],
+        allowed_methods=["GET"],
+    )
+    session.mount("https://", HTTPAdapter(max_retries=retry))
+    return session
+@
+
+Unpaywall's stated limit is generous (100\,000 calls per day), but enriching a
+large session issues one request per paper in a burst.  A short minimum
+interval keeps us a polite neighbour without making a few dozen lookups feel
+slow.
+
+<<unpaywall client methods>>=
+def _wait_for_rate_limit(self) -> None:
+    """Ensure a minimum interval between Unpaywall requests."""
+    elapsed = time.time() - self._last_request_time
+    if elapsed < UNPAYWALL_MIN_INTERVAL:
+        time.sleep(UNPAYWALL_MIN_INTERVAL - elapsed)
+    self._last_request_time = time.time()
+@
+
+<<constants>>=
+# Unpaywall REST endpoint for single-DOI lookups, and request tuning.
+UNPAYWALL_URL = "https://api.unpaywall.org/v2"
+UNPAYWALL_TIMEOUT = 30
+UNPAYWALL_MIN_INTERVAL = 0.1  # seconds between requests (polite pacing)
+UNPAYWALL_USER_AGENT = "scholarcli (https://github.com/dbosk/scholar)"
+@
+
+\subsection{Fetching a DOI's open-access record}
+
+The lookup is the heart of the module.  The DOI is URL-encoded before it is
+spliced into the path: DOIs routinely contain slashes and occasionally other
+reserved characters, which would otherwise be read as extra path segments and
+produce a spurious 404.
+
+The return contract is the checked/unknown distinction from the overview: a
+normalized dictionary when Unpaywall served the record (HTTP~200) and [[None]]
+when it did not (missing DOI, unconfigured email, 404, 429, or error).  A 404
+is cached as [[None]] so an unregistered DOI is not retried every run; a 429 or
+transport error is left uncached so a later run can try again.  The
+unconfigured case is logged once per process rather than once per paper, since
+a session of fifty papers would otherwise produce fifty identical warnings.
+
+<<unpaywall client methods>>=
+def fetch_oa(self, doi: str | None) -> dict | None:
+    """Return open-access metadata for ``doi``, or ``None`` if undetermined.
+
+    On an HTTP 200 response, returns a dict with ``is_oa``, ``oa_status``,
+    ``oa_url``, ``pdf_url``, ``host_type``, ``version`` and ``license``.
+    Returns ``None`` when the DOI is missing, no contact email is
+    configured, the DOI is not found, the request is rate-limited, or it
+    fails.
+    """
+    if not doi:
+        return None
+    if not self.is_configured():
+        if not self._warned_unconfigured:
+            logger.warning(
+                "unpaywall: no contact email configured; set SCHOLAR_EMAIL "
+                "to enable open-access lookups"
+            )
+            self._warned_unconfigured = True
+        return None
+
+    cache_key = ("oa", doi)
+    if cache_key in self._cache:
+        logger.debug("unpaywall: cache hit for DOI %s", doi)
+        return self._cache[cache_key]
+
+    try:
+        self._wait_for_rate_limit()
+        url = f"{UNPAYWALL_URL}/{quote(doi, safe='')}"
+        response = self._session.get(
+            url,
+            params={"email": self.email},
+            headers={"User-Agent": UNPAYWALL_USER_AGENT},
+            timeout=UNPAYWALL_TIMEOUT,
+        )
+
+        if response.status_code == 404:
+            # DOI unknown to Unpaywall: cache the miss to avoid re-lookups.
+            self._cache[cache_key] = None
+            return None
+        if response.status_code == 429:
+            logger.warning("unpaywall: rate limited for DOI %s", doi)
+            return None
+
+        response.raise_for_status()
+        result = _normalize_oa(response.json())
+        self._cache[cache_key] = result
+        return result
+
+    except requests.exceptions.HTTPError as e:
+        logger.warning("unpaywall: lookup error for %s: %s", doi, e)
+        return None
+    except Exception as e:
+        logger.warning("unpaywall: lookup failed for %s: %s", doi, e)
+        return None
+@
+
+Let's verify the happy path, the email precondition, the encoding
+requirement, and each \enquote{undetermined} branch.  We mock the session's
+[[get]] so no network is touched.
+
+<<test functions>>=
+class TestFetchOA:
+    """Tests for UnpaywallClient.fetch_oa via the shared client."""
+
+    def test_no_doi_makes_no_request(self):
+        """A missing DOI returns None without calling the API."""
+        with patch.object(_client._session, "get") as mock_get:
+            assert fetch_oa(None) is None
+            mock_get.assert_not_called()
+
+    def test_unconfigured_makes_no_request(self, monkeypatch):
+        """Without a contact email the lookup is a silent no-op."""
+        monkeypatch.delenv("SCHOLAR_EMAIL")
+        assert not is_configured()
+        with patch.object(_client._session, "get") as mock_get:
+            assert fetch_oa("10.1/any") is None
+            mock_get.assert_not_called()
+
+    def test_email_is_sent_as_parameter(self):
+        """The configured email travels in the query string."""
+        with patch.object(
+            _client._session, "get", return_value=_mock_response(200, {})
+        ) as mock_get:
+            fetch_oa("10.1/work")
+        assert mock_get.call_args.kwargs["params"] == {
+            "email": "tests@example.org"
+        }
+
+    def test_open_work_returns_best_location(self):
+        """Status and best-location fields are normalized onto the result."""
+        data = {
+            "is_oa": True,
+            "oa_status": "green",
+            "best_oa_location": {
+                "url": "https://arxiv.org/abs/1234",
+                "url_for_pdf": "https://arxiv.org/pdf/1234",
+                "url_for_landing_page": "https://arxiv.org/abs/1234",
+                "host_type": "repository",
+                "version": "submittedVersion",
+                "license": "cc-by",
+            },
+            "oa_locations": [],
+        }
+        with patch.object(
+            _client._session, "get", return_value=_mock_response(200, data)
+        ):
+            result = fetch_oa("10.1/work")
+        assert result == {
+            "is_oa": True,
+            "oa_status": "green",
+            "oa_url": "https://arxiv.org/abs/1234",
+            "pdf_url": "https://arxiv.org/pdf/1234",
+            "host_type": "repository",
+            "version": "submittedVersion",
+            "license": "cc-by",
+        }
+
+    def test_closed_work_is_checked_not_unknown(self):
+        """A closed record yields a result (status 'closed'), not None."""
+        data = {"is_oa": False, "oa_status": "closed",
+                "best_oa_location": None, "oa_locations": []}
+        with patch.object(
+            _client._session, "get", return_value=_mock_response(200, data)
+        ):
+            result = fetch_oa("10.1/closed")
+        assert result["is_oa"] is False
+        assert result["oa_status"] == "closed"
+        assert result["pdf_url"] is None
+        assert result["oa_url"] is None
+
+    def test_doi_is_url_encoded(self):
+        """The DOI's slashes and reserved characters are percent-encoded."""
+        captured = {}
+
+        def fake_get(url, **kwargs):
+            captured["url"] = url
+            return _mock_response(200, {})
+
+        with patch.object(_client._session, "get", side_effect=fake_get):
+            fetch_oa("10.1/a#b")
+        assert captured["url"].endswith("/10.1%2Fa%23b")
+
+    def test_not_found_returns_none_and_is_cached(self):
+        """A 404 yields None and is not retried."""
+        with patch.object(
+            _client._session, "get", return_value=_mock_response(404)
+        ) as mock_get:
+            assert fetch_oa("10.1/missing") is None
+            assert fetch_oa("10.1/missing") is None
+        assert mock_get.call_count == 1
+
+    def test_rate_limit_returns_none_and_is_not_cached(self):
+        """A 429 yields None but leaves the DOI retryable."""
+        with patch.object(
+            _client._session, "get", return_value=_mock_response(429)
+        ) as mock_get:
+            assert fetch_oa("10.1/busy") is None
+            assert fetch_oa("10.1/busy") is None
+        assert mock_get.call_count == 2
+
+    def test_transport_error_returns_none(self):
+        """A raised exception is swallowed into None."""
+        with patch.object(
+            _client._session, "get", side_effect=Exception("boom")
+        ):
+            assert fetch_oa("10.1/broken") is None
+
+    def test_result_is_cached(self):
+        """A second lookup of the same DOI does not hit the network."""
+        with patch.object(
+            _client._session, "get", return_value=_mock_response(200, {})
+        ) as mock_get:
+            fetch_oa("10.1/cached")
+            fetch_oa("10.1/cached")
+        assert mock_get.call_count == 1
+@
+
+
+\section{Normalizing the Unpaywall record}
+
+Unpaywall's DOI object is large (authors, journal identifiers, every
+location) and its shape is theirs to change; we flatten the few fields the rest
+of the system needs into a small, stable dictionary so nothing outside this
+chapter has to know the wire format.
+
+Two choices deserve a word.  First, the PDF link prefers
+[[best_oa_location.url_for_pdf]] but falls back to the first location that
+has one: Unpaywall ranks the \emph{best copy} (publisher version first), and
+that copy sometimes has only a landing page while a repository copy further
+down has a direct PDF---for the reader who wants the file, a second-best
+version with a link beats the best version without one.  Second, [[oa_url]] is
+the best location's [[url]], falling back to its landing page: it is the
+address to send a human to, complementing [[pdf_url]], which is the address
+to send a download to.
+
+The [[oa_status]] vocabulary is Unpaywall's and, as far as their data format
+documents, always present.  We still guard against its absence with a
+fallback derived from [[is_oa]], so a malformed record degrades to a coarse
+open/closed answer rather than to [[None]]---which, on the [[Paper]] model,
+would mean \enquote{never checked}.
+
+<<oa normalization helpers>>=
+def _normalize_oa(data: dict) -> dict:
+    """Flatten an Unpaywall DOI object into the fields Scholar keeps."""
+    is_oa = bool(data.get("is_oa"))
+    best = data.get("best_oa_location") or {}
+    pdf_url = best.get("url_for_pdf")
+    if not pdf_url:
+        for location in data.get("oa_locations") or []:
+            if location.get("url_for_pdf"):
+                pdf_url = location["url_for_pdf"]
+                break
+    return {
+        "is_oa": is_oa,
+        "oa_status": data.get("oa_status")
+        or ("open" if is_oa else "closed"),
+        "oa_url": best.get("url") or best.get("url_for_landing_page"),
+        "pdf_url": pdf_url,
+        "host_type": best.get("host_type"),
+        "version": best.get("version"),
+        "license": best.get("license"),
+    }
+@
+
+<<test functions>>=
+class TestNormalizeOA:
+    """Tests for _normalize_oa fallbacks."""
+
+    def test_pdf_falls_back_to_other_location(self):
+        """When the best copy has no PDF link, another location's is used."""
+        data = {
+            "is_oa": True,
+            "oa_status": "bronze",
+            "best_oa_location": {
+                "url": "https://publisher.example/landing",
+                "url_for_pdf": None,
+            },
+            "oa_locations": [
+                {"url_for_pdf": None},
+                {"url_for_pdf": "https://repo.example/paper.pdf"},
+            ],
+        }
+        result = _normalize_oa(data)
+        assert result["pdf_url"] == "https://repo.example/paper.pdf"
+        assert result["oa_url"] == "https://publisher.example/landing"
+
+    def test_missing_status_degrades_to_open_or_closed(self):
+        assert _normalize_oa({"is_oa": True})["oa_status"] == "open"
+        assert _normalize_oa({})["oa_status"] == "closed"
+
+    def test_empty_record_has_no_links(self):
+        result = _normalize_oa({})
+        assert result["pdf_url"] is None
+        assert result["oa_url"] is None
+        assert result["is_oa"] is False
+@
+
+
+\section{The module-level interface}
+
+Callers want a handful of verbs over a single shared client: ask whether
+lookups are possible at all, look up one DOI, annotate a paper or a batch, and
+resolve a DOI straight to a PDF link.  We instantiate the client once at import
+time so its cache and session are shared across the whole process.
+
+<<module-level oa interface>>=
+_client = UnpaywallClient()
+
+
+def is_configured() -> bool:
+    """Whether a contact email is set, i.e. lookups will be attempted."""
+    return _client.is_configured()
+
+
+def fetch_oa(doi: str | None) -> dict | None:
+    """Look up open-access metadata for a single DOI (see UnpaywallClient)."""
+    return _client.fetch_oa(doi)
+@
+
+\subsection{Annotating a paper}
+
+The single-paper annotator is what enrichment calls (\cref{enrich-module}).
+It writes the lookup onto a copy of the paper via [[replace]] and leaves the
+paper untouched when the lookup is undetermined, so a paper without a DOI stays
+unchecked and a transient failure never erases a status a previous run had
+established.
+
+The one asymmetry is [[pdf_url]]: a link the paper already carries is kept in
+preference to Unpaywall's.  The provider that supplied it (OpenAlex, Semantic
+Scholar, arXiv) is a source the user has seen and chosen; silently swapping it
+for a different host would make the session's record drift from what was
+found.  Unpaywall fills the gap only where there is one.
+
+<<module-level oa interface>>=
+def annotate_paper(paper: Paper) -> Paper:
+    """Return a copy of ``paper`` annotated with Unpaywall open-access data.
+
+    Sets ``oa_status`` and ``oa_url``, and fills ``pdf_url`` if the paper
+    has none. A paper whose DOI cannot be resolved (missing, not found, no
+    contact email, or a failed request) is returned unchanged.
+    """
+    result = _client.fetch_oa(paper.doi)
+    if result is None:
+        return paper
+    return replace(
+        paper,
+        oa_status=result["oa_status"],
+        oa_url=result["oa_url"],
+        pdf_url=paper.pdf_url or result["pdf_url"],
+    )
+@
+
+<<test functions>>=
+class TestAnnotatePaper:
+    """Tests for annotate_paper."""
+
+    OPEN = {
+        "is_oa": True,
+        "oa_status": "gold",
+        "best_oa_location": {
+            "url": "https://journal.example/article",
+            "url_for_pdf": "https://journal.example/article.pdf",
+        },
+    }
+
+    def test_fills_status_and_missing_pdf(self):
+        paper = Paper(title="A", authors=["x"], doi="10.1/a")
+        with patch.object(
+            _client._session, "get", return_value=_mock_response(200, self.OPEN)
+        ):
+            out = annotate_paper(paper)
+        assert out.oa_status == "gold"
+        assert out.oa_url == "https://journal.example/article"
+        assert out.pdf_url == "https://journal.example/article.pdf"
+
+    def test_keeps_existing_pdf_url(self):
+        """A provider-supplied PDF link is not replaced by Unpaywall's."""
+        paper = Paper(
+            title="A", authors=["x"], doi="10.1/a",
+            pdf_url="https://arxiv.org/pdf/1",
+        )
+        with patch.object(
+            _client._session, "get", return_value=_mock_response(200, self.OPEN)
+        ):
+            out = annotate_paper(paper)
+        assert out.pdf_url == "https://arxiv.org/pdf/1"
+        assert out.oa_status == "gold"
+
+    def test_undetermined_leaves_paper_unchanged(self):
+        """A 404 returns the very same paper (still 'never checked')."""
+        paper = Paper(title="A", authors=["x"], doi="10.1/a")
+        with patch.object(
+            _client._session, "get", return_value=_mock_response(404)
+        ):
+            assert annotate_paper(paper) is paper
+
+    def test_no_doi_is_unchanged(self):
+        paper = Paper(title="B", authors=["y"])
+        with patch.object(_client._session, "get") as mock_get:
+            assert annotate_paper(paper) is paper
+            mock_get.assert_not_called()
+@
+
+\subsection{Annotating a batch of papers}
+
+The batch form exists for callers that hold a whole session and want a progress
+bar; it is a loop over [[annotate_paper]] with the same
+[[progress_callback(done, total)]] contract as the Crossref batch annotator,
+so the CLI can drive both from one progress display.
+
+<<module-level oa interface>>=
+def annotate_papers(
+    papers: list[Paper], progress_callback=None
+) -> list[Paper]:
+    """Return copies of ``papers`` annotated with Unpaywall open-access data.
+
+    Papers whose DOI cannot be resolved are returned unchanged.
+    ``progress_callback(done, total)`` is invoked after each paper if given.
+    """
+    annotated = []
+    total = len(papers)
+    for index, paper in enumerate(papers):
+        annotated.append(annotate_paper(paper))
+        if progress_callback:
+            progress_callback(index + 1, total)
+    return annotated
+@
+
+<<test functions>>=
+class TestAnnotatePapers:
+    """Tests for annotate_papers."""
+
+    def test_preserves_order_and_reports_progress(self):
+        with_doi = Paper(title="A", authors=["x"], doi="10.1/a")
+        without_doi = Paper(title="B", authors=["y"])
+        seen = []
+        data = {"is_oa": False, "oa_status": "closed"}
+        with patch.object(
+            _client._session, "get", return_value=_mock_response(200, data)
+        ):
+            out = annotate_papers(
+                [with_doi, without_doi],
+                progress_callback=lambda d, t: seen.append((d, t)),
+            )
+        assert [p.title for p in out] == ["A", "B"]
+        assert out[0].oa_status == "closed"
+        assert out[1].oa_status is None
+        assert seen == [(1, 2), (2, 2)]
+@
+
+\subsection{Resolving a DOI to a PDF link}
+
+The PDF module (\cref{pdf-module}) only wants one thing from Unpaywall: a URL
+it can download.  Exposing that as its own verb keeps the PDF code free of the
+result dictionary's shape, and routes the lookup through the same cache as
+enrichment---so a DOI whose session was enriched opens without a second
+request.
+
+<<module-level oa interface>>=
+def resolve_pdf_url(doi: str | None) -> str | None:
+    """Return the best open-access PDF URL for ``doi``, or ``None``."""
+    result = _client.fetch_oa(doi)
+    if result is None:
+        return None
+    return result["pdf_url"]
+@
+
+<<test functions>>=
+class TestResolvePdfUrl:
+    """Tests for resolve_pdf_url."""
+
+    def test_returns_pdf_link(self):
+        data = {
+            "is_oa": True,
+            "oa_status": "gold",
+            "best_oa_location": {"url_for_pdf": "https://x.example/p.pdf"},
+        }
+        with patch.object(
+            _client._session, "get", return_value=_mock_response(200, data)
+        ):
+            assert resolve_pdf_url("10.1/a") == "https://x.example/p.pdf"
+
+    def test_closed_or_unknown_is_none(self):
+        closed = {"is_oa": False, "oa_status": "closed"}
+        with patch.object(
+            _client._session, "get", return_value=_mock_response(200, closed)
+        ):
+            assert resolve_pdf_url("10.1/closed") is None
+        with patch.object(
+            _client._session, "get", return_value=_mock_response(404)
+        ):
+            assert resolve_pdf_url("10.1/missing") is None
+@
+
+
+\section{Imports}
+
+The module needs the HTTP stack the other providers use, the shared cache
+helpers, the contact-email resolver, [[replace]] for immutable annotation, and
+[[quote]] for DOI encoding.
+
+<<imports>>=
+import logging
+import time
+from dataclasses import replace
+from urllib.parse import quote
+
+import requests
+from requests.adapters import HTTPAdapter
+from urllib3.util.retry import Retry
+
+from scholar import Paper
+from scholar.cache import load_cache, register_cache
+from scholar.utils import contact_email
+
+logger = logging.getLogger(__name__)
+@
