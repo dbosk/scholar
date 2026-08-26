@@ -343,13 +343,14 @@ completions.
 
 \paragraph{Provider completion}
 For the [[-p]]/[[--provider]] option, we complete from the registered
-providers:
+providers and the group aliases, since [[-p]] accepts both:
 
 <<completion functions>>=
 def complete_provider(incomplete: str) -> list[str]:
-    """Provide shell completion for provider names."""
-    from scholar.providers import PROVIDERS
-    return [name for name in PROVIDERS.keys() if name.startswith(incomplete)]
+    """Provide shell completion for provider names and group aliases."""
+    from scholar.providers import PROVIDERS, PROVIDER_GROUPS
+    names = list(PROVIDERS.keys()) + list(PROVIDER_GROUPS.keys())
+    return [name for name in names if name.startswith(incomplete)]
 @
 
 \paragraph{Output format completion}
@@ -500,7 +501,10 @@ provider: Annotated[
     Optional[list[str]],
     typer.Option(
         "--provider", "-p",
-        help="Provider to query. Repeatable. Default: all available providers.",
+        help="Provider or group (e.g. preprints) to query. Repeatable. "
+             "Default: all available providers except the preprint "
+             "servers, whose papers openalex already covers; name them "
+             "(-p ssrn) to scope a search to one server.",
         autocompletion=complete_provider,
     ),
 ] = None,
@@ -668,14 +672,16 @@ provider implementations handle paging and rate limiting automatically:
 
 <<execute search and display results>>=
 from scholar import Search, SearchFilters, SearchResult
-from scholar.providers import get_default_providers
+from scholar.providers import get_default_providers, expand_provider_names
 import sys
 
-# Determine which providers will be used
+# Determine which providers will be used. Group aliases (e.g.
+# "preprints") are expanded here so the log and any session record
+# name the actual per-server providers.
 if provider is None:
     provider_names = [p.name for p in get_default_providers()]
 else:
-    provider_names = provider
+    provider_names = expand_provider_names(provider)
 
 effective_limit = UNLIMITED_PROVIDER_LIMIT if limit == 0 else limit
 limit_label = "unlimited" if limit == 0 else str(limit)
@@ -696,7 +702,11 @@ if any([year, open_access, venue, min_citations is not None, pub_type]):
     )
 
 s = Search(query)
-results = s.execute(providers=provider, limit=effective_limit, filters=filters)
+results = s.execute(
+    providers=None if provider is None else provider_names,
+    limit=effective_limit,
+    filters=filters,
+)
 
 logger.debug(f"Retrieved {len(results)} result sets")
 
@@ -889,6 +899,33 @@ class TestSearchCommand:
 
         result = runner.invoke(app, ["search", "test query"])
         assert result.exit_code == 0
+
+    def test_search_expands_preprints_group(self, monkeypatch):
+        """-p preprints queries every registered group member once."""
+        from scholar import providers
+
+        def make_mock(name):
+            mock_provider = Mock()
+            mock_provider.name = name
+            mock_provider.MAX_LIMIT = None
+            mock_provider.search.return_value = []
+            return mock_provider
+
+        mocks = {
+            name: make_mock(name)
+            for name in providers.PROVIDER_GROUPS["preprints"]
+        }
+        monkeypatch.setattr(providers, "PROVIDERS", mocks)
+
+        result = runner.invoke(app, ["search", "q", "-p", "preprints"])
+        assert result.exit_code == 0
+        for mock_provider in mocks.values():
+            assert mock_provider.search.call_count == 1
+
+    def test_provider_completion_offers_groups(self):
+        """Provider completion offers group aliases alongside names."""
+        assert "preprints" in complete_provider("prep")
+        assert "ssrn" in complete_provider("ss")
 
     def _mock_duplicate_provider(self, monkeypatch):
         """Install a provider that returns the same paper twice."""
@@ -1089,7 +1126,10 @@ def rq(
         typer.Option(
             "--provider",
             "-p",
-            help="Provider to query. Repeatable. Default: all available providers.",
+            help="Provider or group (e.g. preprints) to query. Repeatable. "
+                 "Default: all available providers except the preprint "
+                 "servers, whose papers openalex already covers; name "
+                 "them (-p ssrn) to scope a search to one server.",
             autocompletion=complete_provider,
         ),
     ] = None,
@@ -1186,7 +1226,11 @@ import json
 import re
 
 from scholar import SearchFilters
-from scholar.providers import get_default_providers, get_provider
+from scholar.providers import (
+    get_default_providers,
+    get_provider,
+    expand_provider_names,
+)
 from scholar.scholar import SearchResult
 from scholar.review import create_review_session, save_session
 from scholar.llm_review import (
@@ -1223,7 +1267,7 @@ model_selection = LLMModelSelection(
 if provider is None:
     provider_names = [p.name for p in get_default_providers()]
 else:
-    provider_names = provider
+    provider_names = expand_provider_names(provider)
 
 if not provider_names:
     console.print("[red]No providers available[/red]")
@@ -1396,7 +1440,24 @@ def generate_provider_queries(
             "arXiv: supports boolean operators; avoid adding category filters "
             "(cat:) because --venue handles that separately."
         ),
+        "hal": (
+            "HAL: Solr syntax; UPPERCASE AND/OR/NOT and quoted phrases "
+            "work; avoid field prefixes and stray colons (HAL rejects "
+            "malformed queries)."
+        ),
     }
+
+    # The preprint-server providers all answer through OpenAlex, so they
+    # share its query rule; generating the entries from PREPRINT_SOURCES
+    # keeps this list from going stale when a server is added.
+    from scholar.providers import PREPRINT_SOURCES
+
+    for source_name, _source_id, source_label in PREPRINT_SOURCES:
+        rules[source_name] = (
+            f"{source_label} (via OpenAlex): natural-language keywords "
+            "work well; use UPPERCASE AND/OR/NOT if you include boolean "
+            "operators."
+        )
 
     rule_lines = [
         f"- {p}: {rules[p]}" for p in provider_names if p in rules
@@ -2316,7 +2377,7 @@ splitting.  Because that computation reads the reference table, we define it
 before building the table:
 
 <<display provider information>>=
-from scholar.providers import get_all_providers
+from scholar.providers import get_all_providers, PROVIDER_GROUPS
 
 console = Console()
 
@@ -2339,7 +2400,12 @@ table.add_column("How to Get Key", style="dim", overflow="fold")
 console.print(table)
 console.print()
 console.print("[dim]Configured providers (no key needed, or key already set) are searched by default.[/dim]")
-console.print("[dim]Use -p <name> to select specific providers for a search.[/dim]")
+console.print("[dim]* opt-in: answers through OpenAlex, so a plain search already finds these papers[/dim]")
+console.print("[dim]  via openalex; name the provider (e.g. -p ssrn) to scope a search to that server.[/dim]")
+for group_name, members in PROVIDER_GROUPS.items():
+    console.print(
+        f"[dim]Group: -p {group_name} = {', '.join(members)}[/dim]"
+    )
 console.print("[dim]Run 'scholar providers check' to verify keys and connectivity.[/dim]")
 @
 
@@ -2368,6 +2434,46 @@ provider_info = {
         "required": False,
         "env_var": "-",
         "how_to_get": "No key needed",
+    },
+    "hal": {
+        "required": False,
+        "env_var": "-",
+        "how_to_get": "No key needed",
+    },
+    "ssrn": {
+        "required": False,
+        "env_var": "SCHOLAR_EMAIL",
+        "how_to_get": "Any email (optional, faster responses)",
+    },
+    "biorxiv": {
+        "required": False,
+        "env_var": "SCHOLAR_EMAIL",
+        "how_to_get": "Any email (optional, faster responses)",
+    },
+    "medrxiv": {
+        "required": False,
+        "env_var": "SCHOLAR_EMAIL",
+        "how_to_get": "Any email (optional, faster responses)",
+    },
+    "chemrxiv": {
+        "required": False,
+        "env_var": "SCHOLAR_EMAIL",
+        "how_to_get": "Any email (optional, faster responses)",
+    },
+    "researchsquare": {
+        "required": False,
+        "env_var": "SCHOLAR_EMAIL",
+        "how_to_get": "Any email (optional, faster responses)",
+    },
+    "preprintsorg": {
+        "required": False,
+        "env_var": "SCHOLAR_EMAIL",
+        "how_to_get": "Any email (optional, faster responses)",
+    },
+    "iacr": {
+        "required": False,
+        "env_var": "SCHOLAR_EMAIL",
+        "how_to_get": "Any email (optional, faster responses)",
     },
     "wos": {
         "required": True,
@@ -2400,6 +2506,17 @@ widest_env_var = max(
 )
 @
 
+The \enquote{Configured} cell marks the OpenAlex-backed preprint
+providers with an asterisk ([[Yes*]]): they are configured (green) yet
+deliberately absent from default searches, and without a marker those
+two facts read as a contradiction.
+The marker rides on the status word rather than the provider name
+because every character added to the provider column---whose widest
+entry is already [[researchsquare]]---is taken from the fold-prone
+\enquote{How to Get Key} column at the standard 80-column width, and
+because the name cells are copy-material that must stay pristine.
+The footer explains the marker once instead of per row.
+
 <<add provider rows to table>>=
 for provider in get_all_providers():
     info = provider_info.get(provider.name, {})
@@ -2407,6 +2524,8 @@ for provider in get_all_providers():
     configured_status = (
         "[green]Yes[/green]" if is_available else "[dim]No[/dim]"
     )
+    if not getattr(provider, "default_enabled", True):
+        configured_status += "[dim]*[/dim]"
     required = info.get("required", False)
     if not required:
         key_status = "[green]Optional[/green]"
@@ -2493,6 +2612,40 @@ class TestProvidersCommand:
         assert result.exit_code == 1
         assert "list" in result.stdout
         assert "check" in result.stdout
+
+    def test_providers_lists_preprint_servers(self):
+        """The preprint-server providers and HAL appear as rows."""
+        result = runner.invoke(app, ["providers"])
+        assert result.exit_code == 0
+        for name in ("ssrn", "biorxiv", "iacr", "hal"):
+            assert name in result.stdout
+
+    def test_hal_documented_as_keyless(self):
+        """hal states it needs no key rather than leaving a blank cell."""
+        result = runner.invoke(app, ["providers"])
+        assert result.exit_code == 0
+        hal_row = next(
+            line for line in result.stdout.splitlines()
+            if line.strip().startswith("hal")
+        )
+        assert "No key needed" in hal_row
+
+    def test_opt_in_marker_and_legend(self):
+        """Opt-in rows carry the asterisk and the footer explains it."""
+        result = runner.invoke(app, ["providers"])
+        assert result.exit_code == 0
+        ssrn_row = next(
+            line for line in result.stdout.splitlines()
+            if line.strip().startswith("ssrn")
+        )
+        assert "*" in ssrn_row
+        assert "* opt-in" in result.stdout
+
+    def test_preprints_group_in_footer(self):
+        """The footer documents the preprints group and its members."""
+        result = runner.invoke(app, ["providers"])
+        assert result.exit_code == 0
+        assert "-p preprints" in result.stdout
 @
 
 Let's verify the check action: offline mode never touches the network, an

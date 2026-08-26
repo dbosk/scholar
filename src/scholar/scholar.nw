@@ -2457,6 +2457,14 @@ would encounter an import cycle.
 The lazy import pattern has a small runtime cost (import check on each call)
 but is negligible compared to API call latency.
 
+Explicit provider names pass through [[expand_provider_names]] before
+resolution, so group aliases like [[preprints]] work no matter which code
+path calls [[execute()]]---the CLI expands them too, but expansion is
+idempotent, and doing it here keeps programmatic callers (and the recorded
+per-provider results) consistent with the CLI.
+Names that resolve to no provider are skipped as before; expansion has
+already warned about them.
+
 <<search methods>>=
 def execute(
     self,
@@ -2468,15 +2476,20 @@ def execute(
     Execute the search across specified providers.
 
     Args:
-        providers: List of provider names to search. If None, uses the
-            default providers (openalex, dblp).
+        providers: List of provider names or group aliases (e.g.
+            "preprints") to search. If None, uses the default
+            providers.
         limit: Maximum number of results per provider.
         filters: Optional SearchFilters to apply to the search.
 
     Returns:
         List of SearchResult objects, one per provider.
     """
-    from scholar.providers import get_provider, get_default_providers
+    from scholar.providers import (
+        get_provider,
+        get_default_providers,
+        expand_provider_names,
+    )
 
     timestamp = datetime.now().isoformat()
 
@@ -2485,9 +2498,9 @@ def execute(
         provider_list = get_default_providers()
     else:
         provider_list = [
-            get_provider(name)
-            for name in providers
-            if get_provider(name) is not None
+            provider
+            for name in expand_provider_names(providers)
+            if (provider := get_provider(name)) is not None
         ]
 
     logger.info(f"Executing search for query: '{self.query}'")
@@ -2568,6 +2581,36 @@ value is what later reconstructs the [[--limit]] of the original search:
 
             results = Search("test").execute(providers=["mock"], limit=42)
             assert results[0].limit == 42
+@
+
+A group alias must reach every registered member exactly once, even when
+the caller mixes it with an explicit member name:
+
+<<test functions>>=
+    def test_execute_expands_provider_groups(self, monkeypatch):
+        """Search.execute expands group aliases like "preprints"."""
+        with isolated_registry():
+            from scholar import providers
+
+            mock_arxiv = Mock()
+            mock_arxiv.name = "arxiv"
+            mock_arxiv.search.return_value = []
+            mock_ssrn = Mock()
+            mock_ssrn.name = "ssrn"
+            mock_ssrn.search.return_value = []
+            monkeypatch.setattr(
+                providers,
+                "PROVIDERS",
+                {"arxiv": mock_arxiv, "ssrn": mock_ssrn},
+            )
+
+            results = Search("test").execute(
+                providers=["preprints", "arxiv"]
+            )
+
+            assert {r.provider for r in results} == {"arxiv", "ssrn"}
+            assert mock_arxiv.search.call_count == 1
+            assert mock_ssrn.search.call_count == 1
 @
 
 
