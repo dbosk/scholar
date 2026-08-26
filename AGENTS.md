@@ -2,7 +2,7 @@
 
 ## Project Overview
 
-Scholar is a CLI tool for searching academic papers across multiple providers (Semantic Scholar, OpenAlex, DBLP, Web of Science, IEEE Xplore, Scopus).
+Scholar is a CLI tool for searching academic papers across multiple providers (Semantic Scholar, OpenAlex, DBLP, Web of Science, IEEE Xplore, Scopus, arXiv, HAL, and — via OpenAlex source pinning — the preprint servers SSRN, bioRxiv, medRxiv, ChemRxiv, Research Square, Preprints.org, and IACR Cryptology ePrint).
 
 ## Architecture
 
@@ -53,12 +53,40 @@ Providers self-register via `register_provider()` at module load time.
 
 | Provider | Name | API | Auth |
 |----------|------|-----|------|
-| Semantic Scholar | `semantic_scholar` | `semanticscholar` client | `S2_API_KEY` (optional) |
+| Semantic Scholar | `s2` | `semanticscholar` client | `S2_API_KEY` (optional) |
 | OpenAlex | `openalex` | `pyalex` client | `SCHOLAR_EMAIL` (optional) |
 | DBLP | `dblp` | REST API | None required |
 | Web of Science | `wos` | REST API | `WOS_API_KEY` (required) |
 | IEEE Xplore | `ieee` | REST API | `IEEE_API_KEY` (required) |
 | Scopus | `scopus` | REST API | `SCOPUS_API_KEY` (required) |
+| arXiv | `arxiv` | `arxiv` client | None required |
+| HAL | `hal` | REST API (Solr) | None required |
+| SSRN | `ssrn` | OpenAlex (`pyalex`), source-pinned | `SCHOLAR_EMAIL` (optional) |
+| bioRxiv | `biorxiv` | OpenAlex (`pyalex`), source-pinned | `SCHOLAR_EMAIL` (optional) |
+| medRxiv | `medrxiv` | OpenAlex (`pyalex`), source-pinned | `SCHOLAR_EMAIL` (optional) |
+| ChemRxiv | `chemrxiv` | OpenAlex (`pyalex`), source-pinned | `SCHOLAR_EMAIL` (optional) |
+| Research Square | `researchsquare` | OpenAlex (`pyalex`), source-pinned | `SCHOLAR_EMAIL` (optional) |
+| Preprints.org | `preprintsorg` | OpenAlex (`pyalex`), source-pinned | `SCHOLAR_EMAIL` (optional) |
+| IACR ePrint | `iacr` | OpenAlex (`pyalex`), source-pinned | `SCHOLAR_EMAIL` (optional) |
+
+### Preprint-Server Providers and Groups
+
+The seven source-pinned providers exist because their servers have no
+usable public search API (SSRN/Research Square: none; bioRxiv/medRxiv:
+DOI/date lookup only; ChemRxiv: Cloudflare-blocked; Preprints.org:
+registration-gated; IACR: HTML-only search). Each is an
+`OpenAlexSourceProvider` — a subclass of `OpenAlexProvider` pinned via
+the `locations.source.id` filter (not `primary_location`, which would
+hide preprints later published elsewhere). They set
+`default_enabled = False`, so `get_default_providers()` skips them: an
+unscoped search already gets their papers through `openalex`, and
+running them by default would only duplicate requests. Select them
+explicitly (`-p ssrn`) or through the group alias `-p preprints`, which
+`expand_provider_names()` (in `providers.py`) expands to
+arxiv, hal, ssrn, biorxiv, medrxiv, chemrxiv, researchsquare,
+preprintsorg, iacr. Groups are aliases, not registered providers, so
+they never appear in `providers list/check` and provenance stays
+per-server. TechRxiv is a known gap: no API and not in OpenAlex.
 
 ### Error Handling
 
@@ -157,7 +185,7 @@ reconstructing a `Paper` from the `.bib` fields and reusing `Paper.id`
 ## Testing
 
 ```bash
-poetry run pytest tests/
+uv run pytest tests/
 ```
 
 Key test files:

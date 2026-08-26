@@ -6,18 +6,35 @@ A command-line tool for conducting structured literature searches across multipl
 
 ### Multi-Database Search
 
-Search across six academic databases with a single query:
+Search across fifteen academic databases with a single query:
 
 - **Semantic Scholar** - AI-powered research database with 200M+ papers
 - **OpenAlex** - Open catalog of 250M+ scholarly works
 - **DBLP** - Computer science bibliography
 - **Web of Science** - Comprehensive citation index (requires API key)
 - **IEEE Xplore** - IEEE technical literature (requires API key)
-- **arXiv** - Preprints (no API key)
+- **Scopus** - Elsevier's abstract and citation database (requires API key)
+- **arXiv** - Preprints in physics, math, CS (no API key)
+- **HAL** - The French national open archive (no API key)
+- **Preprint servers** - SSRN, bioRxiv, medRxiv, ChemRxiv, Research
+  Square, Preprints.org, and the IACR Cryptology ePrint Archive, each
+  searched through OpenAlex pinned to that server (none of them offers
+  a usable search API of its own)
+
+The preprint-server providers are opt-in: a default search already finds
+their papers through OpenAlex, so they run only when you name them —
+either individually (`-p ssrn` scopes a search to SSRN) or all at once
+with the `preprints` group.
 
 ```bash
 # Search specific providers
 scholar search "federated learning" -p s2 -p openalex
+
+# Scope a search to one preprint server
+scholar search "corporate governance" -p ssrn
+
+# All preprint servers at once (arXiv, HAL, SSRN, bioRxiv, medRxiv, ...)
+scholar search "diffusion models" -p preprints
 
 # Start from a research question (LLM generates provider-specific queries)
 scholar rq "How can privacy-preserving ML be evaluated?" \
@@ -164,8 +181,9 @@ uv pip install scholarcli
 
 ## Configuration
 
-Set `SCHOLAR_EMAIL` to a contact address: OpenAlex and Crossref use it for
-their faster "polite pools", and Unpaywall (open-access lookup during
+Set `SCHOLAR_EMAIL` to a contact address: OpenAlex (and thus every
+preprint-server provider), Crossref, and the polite pools use it for
+faster responses, and Unpaywall (open-access lookup during
 `scholar enrich` and `scholar pdf open <doi>`) requires it. `OPENALEX_EMAIL`
 and `CROSSREF_MAILTO` are still honoured as per-service overrides.
 
@@ -176,8 +194,12 @@ Some providers require API keys set as environment variables:
 | Semantic Scholar | `S2_API_KEY` | No | [api.semanticscholar.org](https://api.semanticscholar.org) |
 | OpenAlex | `SCHOLAR_EMAIL` | No | Any email (for polite pool) |
 | DBLP | - | No | No key needed |
+| arXiv | - | No | No key needed |
+| HAL | - | No | No key needed |
+| SSRN, bioRxiv, medRxiv, ChemRxiv, Research Square, Preprints.org, IACR | `SCHOLAR_EMAIL` | No | Any email (they search via OpenAlex) |
 | Web of Science | `WOS_EXPANDED_API_KEY` or `WOS_STARTER_API_KEY` | Yes | [developer.clarivate.com](https://developer.clarivate.com) |
 | IEEE Xplore | `IEEE_API_KEY` | Yes | [developer.ieee.org](https://developer.ieee.org) |
+| Scopus | `SCOPUS_API_KEY` | Yes | [dev.elsevier.com](https://dev.elsevier.com) |
 
 View provider status:
 

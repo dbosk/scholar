@@ -343,13 +343,14 @@ completions.
 
 \paragraph{Provider completion}
 For the [[-p]]/[[--provider]] option, we complete from the registered
-providers:
+providers and the group aliases, since [[-p]] accepts both:
 
 <<completion functions>>=
 def complete_provider(incomplete: str) -> list[str]:
-    """Provide shell completion for provider names."""
-    from scholar.providers import PROVIDERS
-    return [name for name in PROVIDERS.keys() if name.startswith(incomplete)]
+    """Provide shell completion for provider names and group aliases."""
+    from scholar.providers import PROVIDERS, PROVIDER_GROUPS
+    names = list(PROVIDERS.keys()) + list(PROVIDER_GROUPS.keys())
+    return [name for name in names if name.startswith(incomplete)]
 @
 
 \paragraph{Output format completion}
@@ -500,7 +501,10 @@ provider: Annotated[
     Optional[list[str]],
     typer.Option(
         "--provider", "-p",
-        help="Provider to query. Repeatable. Default: all available providers.",
+        help="Provider or group (e.g. preprints) to query. Repeatable. "
+             "Default: all available providers except the preprint "
+             "servers, whose papers openalex already covers; name them "
+             "(-p ssrn) to scope a search to one server.",
         autocompletion=complete_provider,
     ),
 ] = None,
@@ -668,14 +672,16 @@ provider implementations handle paging and rate limiting automatically:
 
 <<execute search and display results>>=
 from scholar import Search, SearchFilters, SearchResult
-from scholar.providers import get_default_providers
+from scholar.providers import get_default_providers, expand_provider_names
 import sys
 
-# Determine which providers will be used
+# Determine which providers will be used. Group aliases (e.g.
+# "preprints") are expanded here so the log and any session record
+# name the actual per-server providers.
 if provider is None:
     provider_names = [p.name for p in get_default_providers()]
 else:
-    provider_names = provider
+    provider_names = expand_provider_names(provider)
 
 effective_limit = UNLIMITED_PROVIDER_LIMIT if limit == 0 else limit
 limit_label = "unlimited" if limit == 0 else str(limit)
@@ -696,7 +702,11 @@ if any([year, open_access, venue, min_citations is not None, pub_type]):
     )
 
 s = Search(query)
-results = s.execute(providers=provider, limit=effective_limit, filters=filters)
+results = s.execute(
+    providers=None if provider is None else provider_names,
+    limit=effective_limit,
+    filters=filters,
+)
 
 logger.debug(f"Retrieved {len(results)} result sets")
 
@@ -889,6 +899,33 @@ class TestSearchCommand:
 
         result = runner.invoke(app, ["search", "test query"])
         assert result.exit_code == 0
+
+    def test_search_expands_preprints_group(self, monkeypatch):
+        """-p preprints queries every registered group member once."""
+        from scholar import providers
+
+        def make_mock(name):
+            mock_provider = Mock()
+            mock_provider.name = name
+            mock_provider.MAX_LIMIT = None
+            mock_provider.search.return_value = []
+            return mock_provider
+
+        mocks = {
+            name: make_mock(name)
+            for name in providers.PROVIDER_GROUPS["preprints"]
+        }
+        monkeypatch.setattr(providers, "PROVIDERS", mocks)
+
+        result = runner.invoke(app, ["search", "q", "-p", "preprints"])
+        assert result.exit_code == 0
+        for mock_provider in mocks.values():
+            assert mock_provider.search.call_count == 1
+
+    def test_provider_completion_offers_groups(self):
+        """Provider completion offers group aliases alongside names."""
+        assert "preprints" in complete_provider("prep")
+        assert "ssrn" in complete_provider("ss")
 
     def _mock_duplicate_provider(self, monkeypatch):
         """Install a provider that returns the same paper twice."""
@@ -1089,7 +1126,10 @@ def rq(
         typer.Option(
             "--provider",
             "-p",
-            help="Provider to query. Repeatable. Default: all available providers.",
+            help="Provider or group (e.g. preprints) to query. Repeatable. "
+                 "Default: all available providers except the preprint "
+                 "servers, whose papers openalex already covers; name "
+                 "them (-p ssrn) to scope a search to one server.",
             autocompletion=complete_provider,
         ),
     ] = None,
@@ -1186,7 +1226,11 @@ import json
 import re
 
 from scholar import SearchFilters
-from scholar.providers import get_default_providers, get_provider
+from scholar.providers import (
+    get_default_providers,
+    get_provider,
+    expand_provider_names,
+)
 from scholar.scholar import SearchResult
 from scholar.review import create_review_session, save_session
 from scholar.llm_review import (
@@ -1223,7 +1267,7 @@ model_selection = LLMModelSelection(
 if provider is None:
     provider_names = [p.name for p in get_default_providers()]
 else:
-    provider_names = provider
+    provider_names = expand_provider_names(provider)
 
 if not provider_names:
     console.print("[red]No providers available[/red]")
@@ -1396,7 +1440,24 @@ def generate_provider_queries(
             "arXiv: supports boolean operators; avoid adding category filters "
             "(cat:) because --venue handles that separately."
         ),
+        "hal": (
+            "HAL: Solr syntax; UPPERCASE AND/OR/NOT and quoted phrases "
+            "work; avoid field prefixes and stray colons (HAL rejects "
+            "malformed queries)."
+        ),
     }
+
+    # The preprint-server providers all answer through OpenAlex, so they
+    # share its query rule; generating the entries from PREPRINT_SOURCES
+    # keeps this list from going stale when a server is added.
+    from scholar.providers import PREPRINT_SOURCES
+
+    for source_name, _source_id, source_label in PREPRINT_SOURCES:
+        rules[source_name] = (
+            f"{source_label} (via OpenAlex): natural-language keywords "
+            "work well; use UPPERCASE AND/OR/NOT if you include boolean "
+            "operators."
+        )
 
     rule_lines = [
         f"- {p}: {rules[p]}" for p in provider_names if p in rules
@@ -2302,36 +2363,49 @@ The longer header costs horizontal space, and at the 80-column default that
 pushed [[WOS_EXPANDED_API_KEY]] over its column's width.  Rich's default
 overflow ellipsized it to \enquote{WOS\_EXPANDED\_API\_K\ldots}, which is
 worse than useless in the two columns the reader is meant to \emph{copy}: an
-environment variable or a URL cut mid-token cannot be acted on.  We fold those
-two columns instead, so a value that does not fit wraps rather than
-disappearing.
+environment variable or a URL cut mid-token cannot be acted on.  The
+prose-like \enquote{How to Get Key} column folds, so a value that does not
+fit wraps rather than disappearing.
 
-Folding alone still splits a long variable name across lines, which is no more
-copy-pasteable than an ellipsis.  So we also give the variable column a floor
-width, derived from the longest name we actually document rather than fixed at
-a literal: Rich then takes the space from the prose-like \enquote{How to Get
-Key} column, which wraps harmlessly.  Computing the floor means adding a
-provider with a longer variable name cannot silently reintroduce the
-splitting.  Because that computation reads the reference table, we define it
-before building the table:
+The variable column cannot rely on folding plus a [[min_width]] floor,
+though that was the first design.  Rich (15.0.0) resolves contention by
+shrinking foldable columns and then \emph{re-measuring} each column, and
+the re-measure clamps back to [[min_width]]---after the shrinking is
+already done.  With enough contention (our fifteen rows provide it) the
+clamped total exceeds the console width, and Rich then crops every
+rendered line to fit, silently dropping the trailing characters of the
+last column: exactly the mid-token loss the floor was meant to prevent,
+minus even the ellipsis that would reveal it
+(\url{https://github.com/dbosk/scholar/issues/74}).
+
+So the copy-material columns negotiate nothing: the provider-name and
+variable columns are [[no_wrap]], and the one cell listing alternative
+variables carries explicit line breaks
+(\cref{sec:provider-config-reference}).  A [[no_wrap]] column self-sizes
+to its longest line and is exempt from shrinking, so those names always
+arrive intact---all contention lands on the foldable prose column, which
+wraps harmlessly---and adding a provider with a longer name or variable
+widens its column instead of splitting or ellipsizing the name.
+The table also drops its edge padding ([[pad_edge=False]]): with four
+columns now rigid, those two blank columns of margin are what let
+\enquote{No key needed} render on one line at 80 columns.
 
 <<display provider information>>=
-from scholar.providers import get_all_providers
+from scholar.providers import get_all_providers, PROVIDER_GROUPS
 
 console = Console()
 
 <<provider configuration reference>>
 
-table = Table(title="Available Search Providers", box=box.HORIZONTALS)
-table.add_column("Provider", style="cyan")
+table = Table(
+    title="Available Search Providers",
+    box=box.HORIZONTALS,
+    pad_edge=False,
+)
+table.add_column("Provider", style="cyan", no_wrap=True)
 table.add_column("Configured", style="magenta")
 table.add_column("API Key", style="yellow")
-table.add_column(
-    "Environment Variable",
-    style="green",
-    overflow="fold",
-    min_width=widest_env_var,
-)
+table.add_column("Environment Variable", style="green", no_wrap=True)
 table.add_column("How to Get Key", style="dim", overflow="fold")
 
 <<add provider rows to table>>
@@ -2339,13 +2413,24 @@ table.add_column("How to Get Key", style="dim", overflow="fold")
 console.print(table)
 console.print()
 console.print("[dim]Configured providers (no key needed, or key already set) are searched by default.[/dim]")
-console.print("[dim]Use -p <name> to select specific providers for a search.[/dim]")
+console.print("[dim]* opt-in: answers through OpenAlex, so a plain search already finds these papers[/dim]")
+console.print("[dim]  via openalex; name the provider (e.g. -p ssrn) to scope a search to that server.[/dim]")
+for group_name, members in PROVIDER_GROUPS.items():
+    console.print(
+        f"[dim]Group: -p {group_name} = {', '.join(members)}[/dim]"
+    )
 console.print("[dim]Run 'scholar providers check' to verify keys and connectivity.[/dim]")
 @
 
 We define the configuration details for each provider.
+\label{sec:provider-config-reference}
 This information is kept here rather than in the provider classes because
-it is user-facing documentation, not implementation details:
+it is user-facing documentation, not implementation details.
+The Web of Science entry lists its two alternative variables on separate
+lines with a lone \enquote{or} between them: its column is [[no_wrap]],
+so line breaks are the cell's own responsibility, one name per line is
+what keeps each name copyable, and the widest \emph{line} (not the whole
+cell) is what sizes the column.
 
 <<provider configuration reference>>=
 provider_info = {
@@ -2369,9 +2454,49 @@ provider_info = {
         "env_var": "-",
         "how_to_get": "No key needed",
     },
+    "hal": {
+        "required": False,
+        "env_var": "-",
+        "how_to_get": "No key needed",
+    },
+    "ssrn": {
+        "required": False,
+        "env_var": "SCHOLAR_EMAIL",
+        "how_to_get": "Any email (optional, faster responses)",
+    },
+    "biorxiv": {
+        "required": False,
+        "env_var": "SCHOLAR_EMAIL",
+        "how_to_get": "Any email (optional, faster responses)",
+    },
+    "medrxiv": {
+        "required": False,
+        "env_var": "SCHOLAR_EMAIL",
+        "how_to_get": "Any email (optional, faster responses)",
+    },
+    "chemrxiv": {
+        "required": False,
+        "env_var": "SCHOLAR_EMAIL",
+        "how_to_get": "Any email (optional, faster responses)",
+    },
+    "researchsquare": {
+        "required": False,
+        "env_var": "SCHOLAR_EMAIL",
+        "how_to_get": "Any email (optional, faster responses)",
+    },
+    "preprintsorg": {
+        "required": False,
+        "env_var": "SCHOLAR_EMAIL",
+        "how_to_get": "Any email (optional, faster responses)",
+    },
+    "iacr": {
+        "required": False,
+        "env_var": "SCHOLAR_EMAIL",
+        "how_to_get": "Any email (optional, faster responses)",
+    },
     "wos": {
         "required": True,
-        "env_var": "WOS_EXPANDED_API_KEY or WOS_STARTER_API_KEY",
+        "env_var": "WOS_EXPANDED_API_KEY\nor\nWOS_STARTER_API_KEY",
         "how_to_get": "developer.clarivate.com (Expanded API preferred)",
     },
     "ieee": {
@@ -2387,18 +2512,16 @@ provider_info = {
 }
 @
 
-A cell may name several alternatives (\enquote{[[WOS_EXPANDED_API_KEY or
-WOS_STARTER_API_KEY]]}), so we measure individual words rather than whole
-cells---the column only has to hold one variable name per line for each to
-stay intact:
-
-<<provider configuration reference>>=
-widest_env_var = max(
-    len(word)
-    for info in provider_info.values()
-    for word in info["env_var"].split()
-)
-@
+The \enquote{Configured} cell marks the OpenAlex-backed preprint
+providers with an asterisk ([[Yes*]]): they are configured (green) yet
+deliberately absent from default searches, and without a marker those
+two facts read as a contradiction.
+The marker rides on the status word rather than the provider name
+because every character added to the provider column---whose widest
+entry is already [[researchsquare]]---is taken from the fold-prone
+\enquote{How to Get Key} column at the standard 80-column width, and
+because the name cells are copy-material that must stay pristine.
+The footer explains the marker once instead of per row.
 
 <<add provider rows to table>>=
 for provider in get_all_providers():
@@ -2407,6 +2530,8 @@ for provider in get_all_providers():
     configured_status = (
         "[green]Yes[/green]" if is_available else "[dim]No[/dim]"
     )
+    if not getattr(provider, "default_enabled", True):
+        configured_status += "[dim]*[/dim]"
     required = info.get("required", False)
     if not required:
         key_status = "[green]Optional[/green]"
@@ -2477,6 +2602,30 @@ class TestProvidersCommand:
         assert "WOS_EXPANDED_API_KEY" in result.stdout
         assert "…" not in result.stdout
 
+    def test_urls_survive_folding(self):
+        """Folded URLs keep every character.
+
+        Regression test for issue #74: a min_width floor made Rich size
+        the table one column-cell wider than the console, and the crop
+        to console width silently dropped trailing characters of the
+        last column. We reconstruct that column from its x-offset and
+        require each documented URL to appear contiguously.
+        """
+        result = runner.invoke(app, ["providers"])
+        assert result.exit_code == 0
+        lines = result.stdout.splitlines()
+        # The header cell may itself wrap, so anchor on its first word.
+        header = next(l for l in lines if "How to Get" in l)
+        offset = header.index("How to Get")
+        column = "".join(l[offset:].strip() for l in lines)
+        for url in (
+            "api.semanticscholar.org",
+            "developer.clarivate.com",
+            "developer.ieee.org",
+            "dev.elsevier.com",
+        ):
+            assert url in column, f"{url} lost characters in rendering"
+
     def test_arxiv_documented_as_keyless(self):
         """arxiv states it needs no key rather than leaving a blank cell."""
         result = runner.invoke(app, ["providers"])
@@ -2493,6 +2642,40 @@ class TestProvidersCommand:
         assert result.exit_code == 1
         assert "list" in result.stdout
         assert "check" in result.stdout
+
+    def test_providers_lists_preprint_servers(self):
+        """The preprint-server providers and HAL appear as rows."""
+        result = runner.invoke(app, ["providers"])
+        assert result.exit_code == 0
+        for name in ("ssrn", "biorxiv", "iacr", "hal"):
+            assert name in result.stdout
+
+    def test_hal_documented_as_keyless(self):
+        """hal states it needs no key rather than leaving a blank cell."""
+        result = runner.invoke(app, ["providers"])
+        assert result.exit_code == 0
+        hal_row = next(
+            line for line in result.stdout.splitlines()
+            if line.strip().startswith("hal")
+        )
+        assert "No key needed" in hal_row
+
+    def test_opt_in_marker_and_legend(self):
+        """Opt-in rows carry the asterisk and the footer explains it."""
+        result = runner.invoke(app, ["providers"])
+        assert result.exit_code == 0
+        ssrn_row = next(
+            line for line in result.stdout.splitlines()
+            if line.strip().startswith("ssrn")
+        )
+        assert "*" in ssrn_row
+        assert "* opt-in" in result.stdout
+
+    def test_preprints_group_in_footer(self):
+        """The footer documents the preprints group and its members."""
+        result = runner.invoke(app, ["providers"])
+        assert result.exit_code == 0
+        assert "-p preprints" in result.stdout
 @
 
 Let's verify the check action: offline mode never touches the network, an
