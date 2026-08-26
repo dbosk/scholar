@@ -7264,6 +7264,23 @@ class TestArxivProvider:
 
         assert "arXiv does not provide reference data" in str(exc_info.value)
 
+    def test_check_classifies_statuses(self):
+        """check() maps probe responses to health statuses."""
+        provider = ArxivProvider()
+
+        def response(status_code):
+            mock = Mock()
+            mock.status_code = status_code
+            mock.ok = 200 <= status_code < 300
+            return mock
+
+        with patch("requests.get", return_value=response(200)):
+            assert provider.check()[0] == HEALTH_OK
+        with patch("requests.get", return_value=response(429)):
+            assert provider.check()[0] == HEALTH_RATE_LIMITED
+        with patch("requests.get", return_value=response(500)):
+            assert provider.check()[0] == HEALTH_HTTP_ERROR
+
 
 class TestArxivIntegration:
     """Integration test for the arXiv provider."""
