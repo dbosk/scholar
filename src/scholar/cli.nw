@@ -2363,18 +2363,32 @@ The longer header costs horizontal space, and at the 80-column default that
 pushed [[WOS_EXPANDED_API_KEY]] over its column's width.  Rich's default
 overflow ellipsized it to \enquote{WOS\_EXPANDED\_API\_K\ldots}, which is
 worse than useless in the two columns the reader is meant to \emph{copy}: an
-environment variable or a URL cut mid-token cannot be acted on.  We fold those
-two columns instead, so a value that does not fit wraps rather than
-disappearing.
+environment variable or a URL cut mid-token cannot be acted on.  The
+prose-like \enquote{How to Get Key} column folds, so a value that does not
+fit wraps rather than disappearing.
 
-Folding alone still splits a long variable name across lines, which is no more
-copy-pasteable than an ellipsis.  So we also give the variable column a floor
-width, derived from the longest name we actually document rather than fixed at
-a literal: Rich then takes the space from the prose-like \enquote{How to Get
-Key} column, which wraps harmlessly.  Computing the floor means adding a
-provider with a longer variable name cannot silently reintroduce the
-splitting.  Because that computation reads the reference table, we define it
-before building the table:
+The variable column cannot rely on folding plus a [[min_width]] floor,
+though that was the first design.  Rich (15.0.0) resolves contention by
+shrinking foldable columns and then \emph{re-measuring} each column, and
+the re-measure clamps back to [[min_width]]---after the shrinking is
+already done.  With enough contention (our fifteen rows provide it) the
+clamped total exceeds the console width, and Rich then crops every
+rendered line to fit, silently dropping the trailing characters of the
+last column: exactly the mid-token loss the floor was meant to prevent,
+minus even the ellipsis that would reveal it
+(\url{https://github.com/dbosk/scholar/issues/74}).
+
+So the copy-material columns negotiate nothing: the provider-name and
+variable columns are [[no_wrap]], and the one cell listing alternative
+variables carries explicit line breaks
+(\cref{sec:provider-config-reference}).  A [[no_wrap]] column self-sizes
+to its longest line and is exempt from shrinking, so those names always
+arrive intact---all contention lands on the foldable prose column, which
+wraps harmlessly---and adding a provider with a longer name or variable
+widens its column instead of splitting or ellipsizing the name.
+The table also drops its edge padding ([[pad_edge=False]]): with four
+columns now rigid, those two blank columns of margin are what let
+\enquote{No key needed} render on one line at 80 columns.
 
 <<display provider information>>=
 from scholar.providers import get_all_providers, PROVIDER_GROUPS
@@ -2383,16 +2397,15 @@ console = Console()
 
 <<provider configuration reference>>
 
-table = Table(title="Available Search Providers", box=box.HORIZONTALS)
-table.add_column("Provider", style="cyan")
+table = Table(
+    title="Available Search Providers",
+    box=box.HORIZONTALS,
+    pad_edge=False,
+)
+table.add_column("Provider", style="cyan", no_wrap=True)
 table.add_column("Configured", style="magenta")
 table.add_column("API Key", style="yellow")
-table.add_column(
-    "Environment Variable",
-    style="green",
-    overflow="fold",
-    min_width=widest_env_var,
-)
+table.add_column("Environment Variable", style="green", no_wrap=True)
 table.add_column("How to Get Key", style="dim", overflow="fold")
 
 <<add provider rows to table>>
@@ -2410,8 +2423,14 @@ console.print("[dim]Run 'scholar providers check' to verify keys and connectivit
 @
 
 We define the configuration details for each provider.
+\label{sec:provider-config-reference}
 This information is kept here rather than in the provider classes because
-it is user-facing documentation, not implementation details:
+it is user-facing documentation, not implementation details.
+The Web of Science entry lists its two alternative variables on separate
+lines with a lone \enquote{or} between them: its column is [[no_wrap]],
+so line breaks are the cell's own responsibility, one name per line is
+what keeps each name copyable, and the widest \emph{line} (not the whole
+cell) is what sizes the column.
 
 <<provider configuration reference>>=
 provider_info = {
@@ -2477,7 +2496,7 @@ provider_info = {
     },
     "wos": {
         "required": True,
-        "env_var": "WOS_EXPANDED_API_KEY or WOS_STARTER_API_KEY",
+        "env_var": "WOS_EXPANDED_API_KEY\nor\nWOS_STARTER_API_KEY",
         "how_to_get": "developer.clarivate.com (Expanded API preferred)",
     },
     "ieee": {
@@ -2491,19 +2510,6 @@ provider_info = {
         "how_to_get": "dev.elsevier.com",
     },
 }
-@
-
-A cell may name several alternatives (\enquote{[[WOS_EXPANDED_API_KEY or
-WOS_STARTER_API_KEY]]}), so we measure individual words rather than whole
-cells---the column only has to hold one variable name per line for each to
-stay intact:
-
-<<provider configuration reference>>=
-widest_env_var = max(
-    len(word)
-    for info in provider_info.values()
-    for word in info["env_var"].split()
-)
 @
 
 The \enquote{Configured} cell marks the OpenAlex-backed preprint
@@ -2595,6 +2601,30 @@ class TestProvidersCommand:
         assert result.exit_code == 0
         assert "WOS_EXPANDED_API_KEY" in result.stdout
         assert "…" not in result.stdout
+
+    def test_urls_survive_folding(self):
+        """Folded URLs keep every character.
+
+        Regression test for issue #74: a min_width floor made Rich size
+        the table one column-cell wider than the console, and the crop
+        to console width silently dropped trailing characters of the
+        last column. We reconstruct that column from its x-offset and
+        require each documented URL to appear contiguously.
+        """
+        result = runner.invoke(app, ["providers"])
+        assert result.exit_code == 0
+        lines = result.stdout.splitlines()
+        # The header cell may itself wrap, so anchor on its first word.
+        header = next(l for l in lines if "How to Get" in l)
+        offset = header.index("How to Get")
+        column = "".join(l[offset:].strip() for l in lines)
+        for url in (
+            "api.semanticscholar.org",
+            "developer.clarivate.com",
+            "developer.ieee.org",
+            "dev.elsevier.com",
+        ):
+            assert url in column, f"{url} lost characters in rendering"
 
     def test_arxiv_documented_as_keyless(self):
         """arxiv states it needs no key rather than leaving a blank cell."""
