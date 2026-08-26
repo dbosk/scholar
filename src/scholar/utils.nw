@@ -474,6 +474,110 @@ class TestPaperIdentifierHelpers:
         assert derive_arxiv_doi(paper2) is None
 @
 
+\section{Classifying preprint versions}
+\label{sec:preprint-classification}
+
+A published paper and its preprint are distinct records with distinct
+DOIs, so when both appear in a result set (or when a lookup returns a
+candidate preprint), Scholar must decide which record is the preprint.
+We cannot ask the records themselves --- most APIs do not label
+versions --- but two signals are reliable in practice:
+
+\begin{description}
+\item[DOI prefix] The large preprint servers each mint DOIs under their
+  own registrant prefix, so the prefix alone identifies the server:
+  arXiv uses [[10.48550/]], bioRxiv and medRxiv share [[10.1101/]],
+  SSRN uses [[10.2139/]], Research Square [[10.21203/]],
+  Preprints.org [[10.20944/]], and ChemRxiv [[10.26434/]].
+\item[Venue name] Records without a DOI (or with a DOI from an
+  institutional archive like HAL) still carry the server's display name
+  as their venue, matching the provider labels in
+  [[PREPRINT_SOURCES]] in [[providers.py]].
+\end{description}
+
+We keep these primitives here, rather than in [[providers.py]] or the
+new [[preprint.py]], because both the dedup pass in [[scholar.py]] and
+the fallback lookup in [[preprint.py]] need them, and [[utils.py]] is
+the only module both may import without creating a cycle.
+
+<<utils functions>>=
+PREPRINT_DOI_PREFIXES = (
+    "10.48550/",  # arXiv
+    "10.1101/",  # bioRxiv and medRxiv (Cold Spring Harbor)
+    "10.2139/",  # SSRN
+    "10.21203/",  # Research Square
+    "10.20944/",  # Preprints.org
+    "10.26434/",  # ChemRxiv
+)
+
+PREPRINT_VENUE_NAMES = (
+    "arxiv",
+    "hal",
+    "ssrn",
+    "biorxiv",
+    "medrxiv",
+    "chemrxiv",
+    "research square",
+    "preprints.org",
+    "iacr cryptology eprint archive",
+)
+<<utils functions>>=
+def is_preprint_paper(doi: str | None, venue: str | None) -> bool:
+    """Return whether a paper record looks like a preprint.
+
+    Classifies by DOI registrant prefix (each preprint server mints
+    DOIs under its own prefix) or, failing that, by the venue's
+    display name matching a known preprint server.
+    """
+    if doi:
+        normalized = doi.strip().lower()
+        for prefix in ("https://doi.org/", "http://doi.org/", "doi:"):
+            if normalized.startswith(prefix):
+                normalized = normalized[len(prefix) :]
+        if normalized.startswith(PREPRINT_DOI_PREFIXES):
+            return True
+
+    if venue:
+        venue_normalized = venue.strip().lower()
+        for name in PREPRINT_VENUE_NAMES:
+            if name in venue_normalized:
+                return True
+
+    return False
+@
+
+The venue check is a substring match because providers decorate the
+display names ([[arXiv (Cornell University)]] in OpenAlex, for
+instance); an exact comparison would silently misclassify those.
+The DOI check strips resolver prefixes the same way
+[[Paper._normalize_doi]] does, so both spellings of the same DOI
+classify identically.
+
+Let's verify both signals and the negative case:
+
+<<test functions>>=
+class TestIsPreprintPaper:
+    """Tests for preprint classification."""
+
+    def test_arxiv_doi_prefix_is_preprint(self):
+        assert is_preprint_paper("10.48550/arXiv.2401.12345", None)
+
+    def test_doi_resolver_prefix_is_stripped(self):
+        assert is_preprint_paper(
+            "https://doi.org/10.2139/ssrn.1234567", None
+        )
+
+    def test_decorated_venue_name_is_preprint(self):
+        assert is_preprint_paper(None, "arXiv (Cornell University)")
+
+    def test_journal_paper_is_not_preprint(self):
+        assert not is_preprint_paper(
+            "10.1145/3025453", "ACM Transactions on Something"
+        )
+
+    def test_no_doi_no_venue_is_not_preprint(self):
+        assert not is_preprint_paper(None, None)
+@
 
 \section{Contact email for polite API pools}
 \label{sec:contact-email}

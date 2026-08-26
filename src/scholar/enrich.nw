@@ -51,7 +51,14 @@ with better coverage like Semantic Scholar and OpenAlex.
 \label{sec:enrich-testing}
 
 Tests are distributed throughout this document after each function.
-The test file collects all test chunks:
+The test file collects all test chunks.
+
+The autouse fixture disables the preprint fallback's real lookup: the
+fallback lives in its own module ([[scholar.preprint]]) with its own
+clients, so the [[scholar.enrich.get_provider]] patches these tests
+use would not reach it, and a test paper without a PDF would trigger
+live OpenAlex and Crossref requests.  Tests of the fallback wiring
+patch [[find_preprint]] again themselves, overriding the fixture.
 
 <<test [[enrich.py]]>>=
 """Tests for the enrich module."""
@@ -67,6 +74,15 @@ from scholar.enrich import (
     _get_enrichment_cache_dir,
     _safe_cache_filename,
 )
+
+
+@pytest.fixture(autouse=True)
+def _offline_preprint_fallback(monkeypatch):
+    """Keep the preprint fallback offline unless a test patches it."""
+    monkeypatch.setattr(
+        "scholar.preprint.find_preprint",
+        lambda paper, search=False: None,
+    )
 
 
 <<test functions>>
@@ -139,6 +155,16 @@ supplies a [[pdf_url]] only where the providers left none.  The call is cheap
 when it cannot help---no DOI, no contact email, or an already-cached DOI---so
 it is safe to make on every enrichment.
 
+When even Unpaywall leaves [[pdf_url]] empty, the paper has exhausted
+every lookup keyed on its own identity, and the preprint fallback
+(\cref{preprint-module}) takes over: it may \emph{replace} the entry
+with a preprint version of the work so the citation points at the
+version the user can actually read.  This is the one enrichment step
+that can change a paper's identity, which is why it runs last and only
+when the PDF is still missing---an entry whose publisher PDF was found
+must never be swapped.  The [[preprint_search]] flag is passed through
+to [[find_preprint]]; the authoritative link tiers always run.
+
 Providers are not perfectly consistent in DOI lookups: some omit the DOI field
 in the returned record, and occasionally a lookup yields a non-matching work.
 Because [[Paper]] identity uses the DOI when present, we treat a missing DOI in
@@ -154,6 +180,7 @@ def enrich_paper(
     fields: list[str] | None = None,
     providers: list[str] | None = None,
     fetch_refs_cites: bool = False,
+    preprint_search: bool = False,
 ) -> Paper:
     """
     Enrich a paper by fetching missing fields from other providers.
@@ -175,10 +202,15 @@ def enrich_paper(
         providers: Provider names to try, in priority order. If None, uses
             [[ENRICHMENT_PROVIDERS]].
         fetch_refs_cites: If True, also fetch references and citations.
+        preprint_search: If True, the preprint fallback may also search
+            preprint servers by title and authors; authoritative
+            DOI-based preprint links are followed regardless.
 
     Returns:
         A new Paper with enriched fields, or the original if enrichment
-        fails or isn't needed.
+        fails or isn't needed. When only a preprint of the paper has a
+        readable PDF, the returned entry is that preprint (a different
+        DOI), with the published DOI in `published_versions`.
     """
     if fields is None:
         fields = ENRICHABLE_FIELDS
@@ -268,6 +300,14 @@ def enrich_paper(
     # Open-access status and a fallback PDF link from Unpaywall
     if "pdf_url" in fields and result.doi:
         result = unpaywall.annotate_paper(result)
+
+    # Still no PDF: try to adopt a preprint version instead.
+    if "pdf_url" in fields and not result.pdf_url:
+        replacement = preprint.find_preprint(
+            result, search=preprint_search
+        )
+        if replacement is not None:
+            result = replacement
 
     # Fetch references and citations if requested
     if fetch_refs_cites and result.doi:
@@ -806,6 +846,53 @@ class TestEnrichPaper:
             enrich_paper(paper, fields=["abstract"])
         mock_annotate.assert_not_called()
 
+    def test_preprint_fallback_replaces_paper_without_pdf(self):
+        """When no PDF is found, the preprint replacement is adopted."""
+        paper = Paper(
+            title="Test Paper", authors=["Author"], doi="10.1234/test"
+        )
+        preprint_version = Paper(
+            title="Test Paper",
+            authors=["Author"],
+            doi="10.48550/arXiv.2401.1",
+            pdf_url="https://arxiv.org/pdf/2401.1",
+            published_versions=[
+                {"doi": "10.1234/test", "relation": "preprint-of"}
+            ],
+        )
+        with patch("scholar.enrich.get_provider", return_value=None), patch(
+            "scholar.enrich.preprint.find_preprint",
+            return_value=preprint_version,
+        ) as mock_find:
+            result = enrich_paper(
+                paper, fields=["pdf_url"], preprint_search=True
+            )
+        mock_find.assert_called_once()
+        assert mock_find.call_args.kwargs["search"] is True
+        assert result.doi == "10.48550/arXiv.2401.1"
+        assert result.is_preprint_substitute
+
+    def test_preprint_fallback_skipped_when_pdf_found(self):
+        """A paper whose PDF was found is never swapped for a preprint."""
+        from dataclasses import replace as dc_replace
+
+        paper = Paper(
+            title="Test Paper", authors=["Author"], doi="10.1234/test"
+        )
+
+        def fake_annotate(p):
+            return dc_replace(p, pdf_url="https://publisher/p.pdf")
+
+        with patch("scholar.enrich.get_provider", return_value=None), patch(
+            "scholar.enrich.unpaywall.annotate_paper",
+            side_effect=fake_annotate,
+        ), patch(
+            "scholar.enrich.preprint.find_preprint"
+        ) as mock_find:
+            result = enrich_paper(paper, fields=["pdf_url"])
+        mock_find.assert_not_called()
+        assert result.pdf_url == "https://publisher/p.pdf"
+
     def test_derives_arxiv_doi_from_url(self):
         """enrich_paper derives arXiv DOI from arXiv URLs."""
         paper = Paper(
@@ -1082,6 +1169,7 @@ def enrich_papers(
     fields: list[str] | None = None,
     providers: list[str] | None = None,
     progress_callback: Callable[[int, int], None] | None = None,
+    preprint_search: bool = False,
 ) -> list[Paper]:
     """
     Enrich multiple papers.
@@ -1092,6 +1180,8 @@ def enrich_papers(
         providers: Provider names to try, in priority order. If None, uses
             [[ENRICHMENT_PROVIDERS]].
         progress_callback: Called with (current, total) after each paper.
+        preprint_search: Passed through to `enrich_paper`: allow the
+            preprint fallback to search preprint servers by title.
 
     Returns:
         List of enriched papers in the same order.
@@ -1100,13 +1190,18 @@ def enrich_papers(
         fields = ["abstract", "pdf_url"]
 
     logger.info(f"Starting batch enrichment of {len(papers)} papers")
-    
+
     enriched = []
     total = len(papers)
     enriched_count = 0
 
     for i, paper in enumerate(papers):
-        result = enrich_paper(paper, fields, providers=providers)
+        result = enrich_paper(
+            paper,
+            fields,
+            providers=providers,
+            preprint_search=preprint_search,
+        )
         if result != paper:  # Paper was enriched
             enriched_count += 1
         enriched.append(result)
@@ -1185,7 +1280,7 @@ class TestEnrichPapers:
 import logging
 from typing import Any, Callable, cast
 
-from scholar import Paper, unpaywall
+from scholar import Paper, preprint, unpaywall
 from scholar.providers import get_provider
 from scholar.utils import derive_arxiv_doi
 <<enrichment cache imports>>

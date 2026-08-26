@@ -7,6 +7,7 @@ SRC_TEX+=	../src/scholar/providers.tex
 SRC_TEX+=	../src/scholar/enrich.tex
 SRC_TEX+=	../src/scholar/crossref.tex
 SRC_TEX+=	../src/scholar/unpaywall.tex
+SRC_TEX+=	../src/scholar/preprint.tex
 SRC_TEX+=	../src/scholar/pdf.tex
 SRC_TEX+=	../src/scholar/notes.tex
 SRC_TEX+=	../src/scholar/review.tex

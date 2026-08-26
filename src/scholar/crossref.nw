@@ -89,6 +89,7 @@ from scholar.crossref import (
     _client,
     _format_notice_date,
     _normalize_newer_versions,
+    _normalize_preprints,
     _normalize_updated_by,
 )
 from scholar import Paper
@@ -194,23 +195,37 @@ or other reserved characters), which would otherwise be read as extra path
 segments and produce a spurious 404.
 
 The return contract is the checked/unknown distinction from the overview: a
-dictionary with [[updated_by]] and [[newer_versions]] lists when Crossref served
-the record (HTTP~200), and [[None]] when it did not (missing DOI, 404, 429, or
-error).  A 404 is cached as [[None]] so an unregistered DOI is not retried every
-run; a 429 or transport error is left uncached so a later run can try again.
+dictionary with [[updated_by]], [[newer_versions]], and [[preprints]] lists
+when Crossref served the record (HTTP~200), and [[None]] when it did not
+(missing DOI, 404, 429, or error).  A 404 is cached as [[None]] so an
+unregistered DOI is not retried every run; a 429 or transport error is left
+uncached so a later run can try again.
 
+The cache key carries an explicit schema version.  When the [[preprints]]
+key was added to the result dictionary, entries cached under the old
+key shape lacked it, and a reader could not tell \enquote{no preprint
+relation} from \enquote{cached before the key existed}.  Bumping
+[[CURRENCY_CACHE_VERSION]] orphans the old entries instead---they
+simply miss and are refetched, which is cheap---so every served result
+is guaranteed to have the full schema.
+
+<<constants>>=
+# Bump when the fetch_currency result schema changes, so stale cache
+# entries miss instead of being served with keys absent.
+CURRENCY_CACHE_VERSION = 2
 <<crossref client methods>>=
 def fetch_currency(self, doi: str | None) -> dict | None:
     """Return currency metadata for ``doi``, or ``None`` if undetermined.
 
-    On an HTTP 200 response, returns a dict with ``updated_by`` and
-    ``newer_versions`` lists (each possibly empty). Returns ``None`` when the
-    DOI is missing, not found, rate-limited, or the request fails.
+    On an HTTP 200 response, returns a dict with ``updated_by``,
+    ``newer_versions``, and ``preprints`` lists (each possibly empty).
+    Returns ``None`` when the DOI is missing, not found, rate-limited,
+    or the request fails.
     """
     if not doi:
         return None
 
-    cache_key = ("currency", doi)
+    cache_key = ("currency", CURRENCY_CACHE_VERSION, doi)
     if cache_key in self._cache:
         logger.debug("crossref: cache hit for DOI %s", doi)
         return self._cache[cache_key]
@@ -239,6 +254,7 @@ def fetch_currency(self, doi: str | None) -> dict | None:
         result = {
             "updated_by": _normalize_updated_by(message),
             "newer_versions": _normalize_newer_versions(message),
+            "preprints": _normalize_preprints(message),
         }
         self._cache[cache_key] = result
         return result
@@ -299,7 +315,11 @@ class TestFetchCurrency:
             _client._session, "get", return_value=_mock_response(200, {})
         ):
             result = fetch_currency("10.1/clean")
-        assert result == {"updated_by": [], "newer_versions": []}
+        assert result == {
+            "updated_by": [],
+            "newer_versions": [],
+            "preprints": [],
+        }
 
     def test_doi_is_url_encoded(self):
         """The DOI's slashes/spaces are percent-encoded in the path."""
@@ -483,13 +503,75 @@ class TestNormalizeNewerVersions:
         assert _normalize_newer_versions({}) == []
 @
 
+\subsection{Normalizing preprint relations}
+
+[[is-preprint-of]] has an inverse: [[has-preprint]] appears on the
+\emph{published} work's record and points back at its preprint's DOI.
+Where the superseding relations answer \enquote{should I cite something
+newer?}, this one answers \enquote{is there a free earlier version of
+this work?}---which is exactly what the preprint fallback during
+enrichment needs (\cref{preprint-module}).  Publishers populate it
+sparsely, but when present it is an authoritative, DOI-to-DOI link that
+requires no title matching.  Since [[fetch_currency]] already retrieves
+the full relation map for every checked paper, extracting it costs no
+additional request.
+
+<<constants>>=
+# Inverse of is-preprint-of: on a published work, points at its preprint.
+PREPRINT_RELATION = "has-preprint"
+<<currency normalization helpers>>=
+def _normalize_preprints(message: dict) -> list[dict]:
+    """Extract preprint DOIs from the relation map."""
+    relation = message.get("relation") or {}
+    preprints = []
+    for entry in relation.get(PREPRINT_RELATION) or []:
+        if entry.get("id-type") == "doi" and entry.get("id"):
+            preprints.append(
+                {"doi": entry["id"], "relation": PREPRINT_RELATION}
+            )
+    return preprints
+@
+
+The same DOI-only rule applies as for the superseding relations: a
+preprint we cannot address by DOI cannot be looked up or adopted, so
+non-DOI identifiers are dropped.
+
+<<test functions>>=
+class TestNormalizePreprints:
+    """Tests for _normalize_preprints."""
+
+    def test_has_preprint_relation_is_extracted(self):
+        message = {
+            "relation": {
+                "has-preprint": [
+                    {"id-type": "doi", "id": "10.48550/arXiv.2401.1"}
+                ]
+            }
+        }
+        assert _normalize_preprints(message) == [
+            {"doi": "10.48550/arXiv.2401.1", "relation": "has-preprint"}
+        ]
+
+    def test_non_doi_relation_is_ignored(self):
+        message = {
+            "relation": {
+                "has-preprint": [{"id-type": "url", "id": "http://x"}]
+            }
+        }
+        assert _normalize_preprints(message) == []
+
+    def test_no_relation_is_empty(self):
+        assert _normalize_preprints({}) == []
+@
+
 
 \section{The module-level interface}
 
-Callers want three convenient verbs over a single shared client: look up one
-DOI, annotate a batch of papers, and reduce a paper to a one-word status.  We
-instantiate the client once at import time so its cache and session are shared
-across the whole process.
+Callers want four convenient verbs over a single shared client: look up
+one DOI, list a published work's preprint DOIs, annotate a batch of
+papers, and reduce a paper to a one-word status.  We instantiate the
+client once at import time so its cache and session are shared across
+the whole process.
 
 <<module-level currency interface>>=
 _client = CrossrefClient()
@@ -498,6 +580,66 @@ _client = CrossrefClient()
 def fetch_currency(doi: str | None) -> dict | None:
     """Look up currency metadata for a single DOI (see CrossrefClient)."""
     return _client.fetch_currency(doi)
+@
+
+\subsection{Listing a work's preprint DOIs}
+
+The preprint fallback (\cref{preprint-module}) needs only the DOIs from
+the [[has-preprint]] relation, not the full currency dictionary, so we
+give it a wrapper that flattens the result.  An undetermined lookup and
+a work without the relation both yield an empty list here: for the
+caller the distinction does not matter---either way there is no
+preprint DOI to follow---and collapsing them keeps the fallback's tier
+logic a simple iteration.
+
+<<module-level currency interface>>=
+def fetch_preprint_dois(doi: str | None) -> list[str]:
+    """Return DOIs of known preprints of the published work ``doi``.
+
+    Reads Crossref's `has-preprint` relation. Returns an empty list
+    when the lookup is undetermined or no preprint is on record.
+    """
+    result = _client.fetch_currency(doi)
+    if not result:
+        return []
+    dois = [
+        entry["doi"]
+        for entry in result.get("preprints", [])
+        if entry.get("doi")
+    ]
+    # Crossref records occasionally repeat a relation entry verbatim.
+    return list(dict.fromkeys(dois))
+@
+
+<<test functions>>=
+class TestFetchPreprintDois:
+    """Tests for fetch_preprint_dois."""
+
+    def test_returns_preprint_dois(self):
+        message = {
+            "relation": {
+                "has-preprint": [
+                    {"id-type": "doi", "id": "10.48550/arXiv.2401.1"}
+                ]
+            }
+        }
+        with patch.object(
+            _client._session, "get",
+            return_value=_mock_response(message=message),
+        ):
+            assert fetch_preprint_dois("10.1/work") == [
+                "10.48550/arXiv.2401.1"
+            ]
+
+    def test_undetermined_lookup_yields_empty_list(self):
+        with patch.object(
+            _client._session, "get",
+            return_value=_mock_response(status=404),
+        ):
+            assert fetch_preprint_dois("10.1/missing") == []
+
+    def test_no_doi_yields_empty_list(self):
+        assert fetch_preprint_dois(None) == []
 @
 
 \subsection{Annotating a batch of papers}
@@ -564,22 +706,55 @@ distinguish a checked-clean paper (\enquote{ok}) from one we never managed to
 check (\enquote{unknown}), using the [[None]]-versus-empty distinction the
 [[Paper]] model preserves for exactly this purpose.
 
+Supersession needs one refinement.  An entry that \emph{is} an adopted
+preprint (\cref{preprint-module}) will be reported by Crossref as
+[[is-preprint-of]] its published version---which is precisely the
+substitution the user chose, recorded in [[published_versions]].
+Flagging it \enquote{superseded} would make every deliberate adoption
+look like a stale citation.  When the newer versions Crossref reports
+are exactly the recorded published versions (compared as normalized
+DOIs), we report the distinct status \enquote{preprint} instead;
+a newer version \emph{beyond} those still warns as superseded.
+Retractions and corrections are never softened this way: a retracted
+work is retracted no matter which version we cite.
+
 <<module-level currency interface>>=
 def currency_status(paper: Paper) -> str:
-    """Summarize a paper's currency as one of five status words.
+    """Summarize a paper's currency as one of six status words.
 
-    Returns ``"retracted"``, ``"corrected"``, ``"superseded"``, ``"ok"``
-    (checked, no issues), or ``"unknown"`` (never successfully checked).
+    Returns ``"retracted"``, ``"corrected"``, ``"superseded"``,
+    ``"preprint"`` (a deliberately adopted preprint of a published
+    version), ``"ok"`` (checked, no issues), or ``"unknown"`` (never
+    successfully checked).
     """
     if paper.is_retracted:
         return "retracted"
     if paper.is_corrected:
         return "corrected"
     if paper.is_superseded:
+        if _is_adopted_substitution(paper):
+            return "preprint"
         return "superseded"
     if paper.updated_by is None and paper.newer_versions is None:
         return "unknown"
     return "ok"
+
+
+def _is_adopted_substitution(paper: Paper) -> bool:
+    """Whether all reported newer versions are recorded adoptions."""
+    recorded = {
+        Paper._normalize_doi(entry["doi"])
+        for entry in paper.published_versions or []
+        if entry.get("doi")
+    }
+    if not recorded:
+        return False
+    reported = {
+        Paper._normalize_doi(version["doi"])
+        for version in paper.newer_versions or []
+        if version.get("doi")
+    }
+    return bool(reported) and reported <= recorded
 @
 
 <<test functions>>=
@@ -608,6 +783,35 @@ class TestCurrencyStatus:
             authors=["a"],
             updated_by=[],
             newer_versions=[{"doi": "10.1/v2", "relation": "is-preprint-of"}],
+        )
+        assert currency_status(paper) == "superseded"
+
+    def test_adopted_preprint_is_not_superseded(self):
+        paper = Paper(
+            title="T",
+            authors=["a"],
+            updated_by=[],
+            newer_versions=[
+                {"doi": "10.1/Published", "relation": "is-preprint-of"}
+            ],
+            published_versions=[
+                {"doi": "10.1/published", "relation": "preprint-of"}
+            ],
+        )
+        assert currency_status(paper) == "preprint"
+
+    def test_newer_version_beyond_adoption_still_warns(self):
+        paper = Paper(
+            title="T",
+            authors=["a"],
+            updated_by=[],
+            newer_versions=[
+                {"doi": "10.1/published", "relation": "is-preprint-of"},
+                {"doi": "10.1/other", "relation": "is-version-of"},
+            ],
+            published_versions=[
+                {"doi": "10.1/published", "relation": "preprint-of"}
+            ],
         )
         assert currency_status(paper) == "superseded"
 @

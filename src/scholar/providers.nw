@@ -2279,6 +2279,7 @@ class OpenAlexProvider:
     <<openalex extension hooks>>
     <<openalex check method>>
     <<openalex get paper by doi>>
+    <<openalex preprint lookups>>
     <<convert openalex work>>
 @
 
@@ -2558,6 +2559,194 @@ def get_paper_by_doi(self, doi: str | None) -> Paper | None:
     except Exception as e:
         logger.warning("openalex: DOI lookup failed: %s", e)
         return None
+@
+
+\subsubsection{Preprint locations of a work}
+
+An OpenAlex work carries a [[locations]] array listing \emph{every}
+host of the work---publisher, aggregators, and repository deposits.
+[[_convert_work]] deliberately reads only [[primary_location]] and
+[[open_access]], but for the preprint fallback
+(\cref{preprint-module}) the rest of the array is the payload: when a
+preprint deposit was merged into the same OpenAlex work, it appears
+here as a location whose source is a known preprint server, complete
+with its own PDF link.  Reading the array costs nothing extra---it is
+in the same response the DOI lookup already fetches.
+
+A location counts as a preprint host in either of two ways: its
+source ID matches a server in [[PREPRINT_SOURCES]], or its URLs point
+into arXiv.  The second test is needed because arXiv is not in
+[[PREPRINT_SOURCES]] (it has a native provider), yet it is by far the
+most common repository location.  Source IDs in location objects are
+full URLs ([[https://openalex.org/S4210172589]]) while
+[[PREPRINT_SOURCES]] stores bare IDs, so we compare the URL's tail.
+
+The result contract mirrors [[fetch_preprint_dois]] in the Crossref
+module: an empty list for both \enquote{no preprint host} and
+\enquote{lookup failed}, cached only in the former case so transient
+failures retry.
+
+<<openalex preprint lookups>>=
+def get_preprint_locations(self, doi: str | None) -> list[dict]:
+    """Return preprint-server locations hosting the work `doi`.
+
+    Each location dict has `source_id`, `source_name`, `pdf_url`,
+    `landing_page_url`, and `is_oa`. Returns an empty list when the
+    work has no preprint-server location or the lookup fails.
+    """
+    if not doi:
+        return []
+
+    cache_key = ("preprint_locations", self.CACHE_VERSION, doi)
+    if cache_key in self._cache:
+        return self._cache[cache_key]
+
+    try:
+        self._wait_for_rate_limit()
+        doi_url = f"https://doi.org/{doi}"
+        work = pyalex.Works()[doi_url]
+    except Exception as e:
+        logger.warning(
+            "openalex: preprint-location lookup failed for %s: %s",
+            doi, e,
+        )
+        return []
+
+    locations = self._preprint_locations_from_work(work or {})
+    self._cache[cache_key] = locations
+    return locations
+
+def _preprint_locations_from_work(self, work: dict) -> list[dict]:
+    """Filter a work's locations down to preprint-server hosts."""
+    known_ids = {source_id for _name, source_id, _label in PREPRINT_SOURCES}
+    found = []
+    for location in work.get("locations") or []:
+        source = location.get("source") or {}
+        source_id = (source.get("id") or "").rsplit("/", 1)[-1]
+        pdf_url = location.get("pdf_url")
+        landing_page_url = location.get("landing_page_url")
+        hosted_on_server = source_id in known_ids
+        hosted_on_arxiv = bool(
+            arxiv_doi_from_url(pdf_url)
+            or arxiv_doi_from_url(landing_page_url)
+        )
+        if not (hosted_on_server or hosted_on_arxiv):
+            continue
+        found.append(
+            {
+                "source_id": source_id or None,
+                "source_name": source.get("display_name"),
+                "pdf_url": pdf_url,
+                "landing_page_url": landing_page_url,
+                "is_oa": location.get("is_oa"),
+            }
+        )
+    return found
+@
+
+\subsubsection{Title search over preprint works}
+
+The search tier of the preprint fallback needs \enquote{preprints with
+this title} across all servers.  Fanning out to the nine providers of
+the [[preprints]] group would cost nine requests per paper; but the
+seven [[PREPRINT_SOURCES]] servers are OpenAlex sources anyway, and
+OpenAlex classifies works with [[type="preprint"]], so \emph{one}
+type-filtered title search spans them all (plus arXiv and HAL, which
+OpenAlex also indexes).  Conversion reuses [[_convert_work]], which
+already derives canonical arXiv DOIs from arXiv URLs---exactly what
+the caller needs to adopt a hit as a citable entry.
+
+We search [[title.search]] rather than the general [[search]] field:
+the caller matches candidates on exact normalized title, so hits whose
+title merely \emph{mentions} the query words are useless and abstracts
+would only add noise.
+
+<<openalex preprint lookups>>=
+def search_preprints_by_title(
+    self, title: str, limit: int = 5
+) -> list[Paper]:
+    """Search OpenAlex for preprint works matching `title`.
+
+    Filters on OpenAlex's work type `preprint`, which covers the
+    dedicated preprint servers as well as arXiv and HAL deposits.
+    Returns an empty list on failure.
+    """
+    if not title or not title.strip():
+        return []
+
+    normalized = title.strip()
+    cache_key = (
+        "preprint_search", self.CACHE_VERSION, normalized.lower(),
+    )
+    if cache_key in self._cache:
+        return self._cache[cache_key]
+
+    try:
+        self._wait_for_rate_limit()
+        works = (
+            pyalex.Works()
+            .filter(title={"search": normalized}, type="preprint")
+            .get(per_page=limit)
+        )
+    except Exception as e:
+        logger.warning(
+            "openalex: preprint title search failed: %s", e
+        )
+        return []
+
+    papers = [self._convert_work(work) for work in works or []]
+    self._cache[cache_key] = papers
+    return papers
+@
+
+Let's verify the location filtering logic, which is pure and needs no
+network: a publisher location must be ignored, a pinned-source and an
+arXiv location must both be found.
+
+<<test functions>>=
+class TestOpenAlexPreprintLocations:
+    """Tests for OpenAlexProvider._preprint_locations_from_work."""
+
+    def test_filters_to_preprint_hosts(self):
+        provider = OpenAlexProvider()
+        work = {
+            "locations": [
+                {
+                    "source": {
+                        "id": "https://openalex.org/S123",
+                        "display_name": "A Journal",
+                    },
+                    "pdf_url": None,
+                    "landing_page_url": "https://doi.org/10.1/x",
+                    "is_oa": False,
+                },
+                {
+                    "source": {
+                        "id": "https://openalex.org/S4210172589",
+                        "display_name": "SSRN",
+                    },
+                    "pdf_url": "https://papers.ssrn.com/x.pdf",
+                    "landing_page_url": "https://papers.ssrn.com/x",
+                    "is_oa": True,
+                },
+                {
+                    "source": None,
+                    "pdf_url": "https://arxiv.org/pdf/2401.12345v1",
+                    "landing_page_url": None,
+                    "is_oa": True,
+                },
+            ]
+        }
+        locations = provider._preprint_locations_from_work(work)
+        assert len(locations) == 2
+        assert locations[0]["source_name"] == "SSRN"
+        assert locations[1]["pdf_url"] == (
+            "https://arxiv.org/pdf/2401.12345v1"
+        )
+
+    def test_empty_work_yields_no_locations(self):
+        provider = OpenAlexProvider()
+        assert provider._preprint_locations_from_work({}) == []
 @
 
 \subsection{Auto-registration}
