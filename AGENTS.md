@@ -31,6 +31,8 @@ Providers self-register via `register_provider()` at module load time.
 | `src/scholar/unpaywall.nw` | Literate source for open-access lookup |
 | `src/scholar/preprint.py` | Preprint fallback (adopt a preprint when no PDF found) |
 | `src/scholar/preprint.nw` | Literate source for the preprint fallback |
+| `src/scholar/ratelimit.py` | Persistent cross-session rate-limit/quota tracking |
+| `src/scholar/ratelimit.nw` | Literate source for rate-limit tracking |
 | `src/scholar/cli.py` | CLI commands and output formatters |
 | `src/scholar/cli.nw` | Literate programming source for CLI |
 
@@ -272,6 +274,48 @@ scholar cache path   # Print cache directory
 ```
 
 Environment variable: `SCHOLAR_CACHE_DIR` to override cache location.
+
+The keyed REST providers cache manually (search wrapper +
+`_search_uncached` returning `(papers, cacheable)`) instead of via
+`@cachedmethod`, so a rate-limited or errored empty result is never
+frozen into the persistent cache.
+
+## Rate Limits and Quotas
+
+`ratelimit.py` tracks provider rate limits and quotas **persistently
+across CLI invocations** — necessary because e.g. IEEE allows only 200
+requests/day and each `scholar` run is a fresh process.
+
+- Providers declare limits as class attributes read via `getattr`:
+  `LIMITS = Limits(per_second=10.0, daily=200)` (IEEE), plus optional
+  `QUOTA_GROUP` for providers sharing one API budget (the eight
+  OpenAlex-backed providers share group `"openalex"`).
+- Providers bracket each HTTP request with `limiter.acquire()`
+  (paces, counts, raises `RateLimited` when the budget is spent) and
+  `limiter.record_response(response)` (429 → cooldown honoring
+  `Retry-After`; syncs `X-RateLimit-*` headers, which is how Scopus's
+  weekly quota is tracked). IEEE additionally decodes Mashery
+  `X-Mashery-Error-Code` 403s: `ERR_403_DEVELOPER_OVER_RATE` = daily
+  quota spent (marks the day exhausted), `OVER_QPS` = transient.
+- State: one JSON file per quota group in
+  `$SCHOLAR_DATA_DIR/rate_limits/` (data dir, NOT the cache dir —
+  `scholar cache clear` must not erase quota memory). Written
+  atomically on every change; fail-open on corruption. Daily quotas
+  bucket on the UTC calendar day and self-correct via the provider's
+  own rejection if the guess is wrong.
+- `Search.execute` pre-checks `check_available()` and **skips** a
+  blocked provider with one `logger.warning` (no `SearchResult` is
+  recorded for it). `providers check` reports `quota exhausted`
+  (yellow, exit 0) from persisted state without burning a probe.
+- CLI: `scholar providers limits` shows usage/remaining/reset per
+  quota group; `--reset <name|all>` clears state (use after a key
+  rotation or when the real quota is known to have rolled over).
+- Tests: `tests/conftest.py` isolates `SCHOLAR_DATA_DIR` per test and
+  no-ops the pacing sleep; `test_ratelimit.py` controls time via the
+  module's `_now`/`_sleep` seams.
+- Phase 2 (not done): migrate S2/OpenAlex/DBLP/arXiv in-process pacing
+  (and crossref/unpaywall) into the limiter; wire WoS/Scopus extended
+  methods (citations/references) through `acquire()`.
 
 ## Dependencies
 

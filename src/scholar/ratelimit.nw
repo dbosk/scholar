@@ -1,0 +1,1345 @@
+\chapter{Rate limits and quotas}
+\label{ch:ratelimit}
+
+Every provider API enforces rate limits, and some enforce hard quotas:
+IEEE Xplore, for instance, allows at most 10 requests per second and 200
+requests per day.
+The providers already pace and back off \emph{within} a process
+(\cref{providers-module}), but every [[scholar]] invocation is a fresh
+process---so a daily quota spent by this morning's search is invisible to
+this afternoon's, which then fires 200 doomed requests, gets blocked, and
+(until \cref{sec:cache-successful-only}) even freezes the empty responses
+into the cache.
+This chapter adds the missing memory: a small, persistent, cross-session
+record of how much of each provider's budget is spent and when it comes
+back.
+
+The division of labour follows from what can be reconstructed where:
+\begin{description}
+\item[Per-second pacing] needs no persistence.
+  Two CLI invocations are always more than a fraction of a second apart,
+  so an in-process timestamp suffices---though we do persist the last
+  request time and consult it opportunistically, since the state file is
+  loaded anyway.
+\item[Daily quotas and cooldowns] cannot be reconstructed in-process.
+  These are exactly what we persist: how many requests today's budget has
+  absorbed, and until when a provider told us to go away.
+\end{description}
+
+
+\section{Design overview}
+
+The module has four moving parts:
+\begin{description}
+\item[Declarations] A provider declares its limits as a class attribute,
+  [[LIMITS = Limits(per_second=10.0, daily=200)]], read via [[getattr]]
+  like the existing [[MAX_LIMIT]] and [[default_enabled]] attributes.
+  Providers that share one API budget (the OpenAlex source-pinned
+  providers all hit the OpenAlex API) declare a common [[QUOTA_GROUP]].
+\item[Persistent state] One small JSON file per quota group under the
+  \emph{data} directory ([[rate_limits/<name>.json]]), written atomically
+  and immediately on every change.
+\item[The [[RateLimiter]] ] One object per quota group.
+  Providers call [[acquire()]] before each HTTP request (it paces, counts,
+  and raises [[RateLimited]] when the budget is spent) and
+  [[record_response()]] after (it turns 429s and rate-limit headers into
+  persistent cooldowns).
+\item[The registry] Module-level accessors---[[limiter_for(provider)]],
+  [[check_available(name)]], [[all_status()]], [[reset_state()]]---used by
+  the providers, by [[Search.execute]] to skip a spent provider with one
+  clear warning, and by the [[scholar providers limits]] command.
+\end{description}
+
+Instrumentation is per HTTP request, inside the providers, rather than a
+wrapper around [[Search.execute]].
+The coarse alternative would miss the real quota burners: one IEEE search
+pages through results at 200 records per request, and [[scholar enrich]]
+calls [[get_paper_by_doi]] once per paper---a 300-paper session is 300
+requests, none of them a search.
+
+<<[[ratelimit.py]]>>=
+"""
+Persistent, cross-session rate-limit and quota tracking.
+
+Providers declare their limits (`Limits`) and call `acquire()` before and
+`record_response()` after each HTTP request.  Spent daily quotas and
+server-imposed cooldowns are remembered across CLI invocations in small
+JSON files under the data directory.
+"""
+
+<<imports>>
+<<constants>>
+<<data classes>>
+<<time helpers>>
+<<state functions>>
+<<rate limiter class>>
+<<registry functions>>
+@
+
+\section{Testing}
+
+Tests are distributed throughout this chapter, appearing after the
+implementation they verify.
+All of them control time through the module's [[_now]] and [[_sleep]]
+seams (\cref{sec:ratelimit-time}), so no test ever sleeps for real or
+depends on the wall clock.
+The [[clean_registry]] fixture complements the global [[isolate_cache]]
+fixture (\cref{sec:cache-testing}): the latter gives every test a private
+[[SCHOLAR_DATA_DIR]], but the limiter registry and its per-process
+warning flags live in module memory and must be cleared separately.
+
+<<test [[ratelimit.py]]>>=
+"""Tests for the rate-limit module."""
+import email.utils
+import json
+import pytest
+
+import scholar.ratelimit as rl
+from scholar.ratelimit import *
+from scholar.ratelimit import _fresh_state, _state_file, _today
+
+
+@pytest.fixture(autouse=True)
+def clean_registry():
+    """Clear the module-level limiter registry around each test."""
+    rl._LIMITERS.clear()
+    yield
+    rl._LIMITERS.clear()
+
+
+@pytest.fixture
+def clock(monkeypatch):
+    """Freeze module time; tests advance `clock["now"]` explicitly.
+
+    Sleeps are recorded in `clock["sleeps"]` instead of sleeping.
+    """
+    state = {"now": 1_700_000_000.0, "sleeps": []}
+    monkeypatch.setattr(rl, "_now", lambda: state["now"])
+    monkeypatch.setattr(rl, "_sleep", lambda s: state["sleeps"].append(s))
+    return state
+
+
+class FakeResponse:
+    """Minimal stand-in for `requests.Response` in tests."""
+
+    def __init__(self, status_code=200, headers=None):
+        self.status_code = status_code
+        self.headers = headers or {}
+
+
+<<test functions>>
+@
+
+
+\section{Declaring limits}
+
+A provider's limits are data, not behaviour, so they live in a small
+frozen dataclass the provider exposes as a class attribute.
+We deliberately support only two kinds of limit: a request rate
+([[per_second]]) and a daily budget ([[daily]]).
+A generic \enquote{$n$ requests per arbitrary window} bucket was
+considered and rejected: the two long-window quotas it would serve are
+Semantic Scholar's shared anonymous pool (shared with all other anonymous
+users, so our local count says nothing about it) and Scopus's weekly
+quota (which the API reports authoritatively in its
+[[X-RateLimit-Remaining]] header, \cref{sec:ratelimit-record-response}).
+Neither can be tracked accurately with a local window, so the extra state
+machinery would buy only false confidence.
+
+Note the units: [[per_second]] is a \emph{rate} (requests per second),
+not the seconds-between-requests convention of the older per-provider
+[[RATE_LIMIT]] attributes in \cref{providers-module}.
+
+<<data classes>>=
+@dataclass(frozen=True)
+class Limits:
+    """Declared rate limits for a provider.
+
+    `per_second` is a request rate (requests per second); `daily` is the
+    maximum number of requests per UTC calendar day.  `None` means
+    unlimited (or unknown).
+    """
+
+    per_second: float | None = None
+    daily: int | None = None
+@
+
+The answer to \enquote{may I make a request?} needs more than a boolean:
+callers want to tell the user \emph{why} a provider is unavailable and
+\emph{when} to come back.
+The [[quota]] flag separates the two families of unavailability, because
+users act on them differently: a spent \emph{quota} means the day's
+budget is gone and the provider is off the table until the reset (the
+health check reports this as its own status), while a plain cooldown is a
+transient \enquote{slow down} that resolves itself in seconds or
+minutes.
+
+<<data classes>>=
+@dataclass(frozen=True)
+class Availability:
+    """Whether a provider may be queried now, and if not, why and until when.
+
+    `retry_at` is an epoch timestamp, or `None` if unknown.  `quota` is
+    true when the block is a spent (daily or provider-reported) quota
+    rather than a transient cooldown.
+    """
+
+    ok: bool
+    reason: str = ""
+    retry_at: float | None = None
+    quota: bool = False
+@
+
+When [[acquire()]] finds the budget spent it raises rather than returns:
+the provider code sits deep inside paging loops, and an exception is the
+only way to unwind them without threading a status flag through every
+level.
+Providers catch [[RateLimited]] and return the papers they have, matching
+the project-wide contract that provider errors never propagate to the
+CLI.
+
+<<data classes>>=
+class RateLimited(Exception):
+    """Raised by `acquire()` when a request must not be made now."""
+
+    def __init__(self, provider: str, reason: str,
+                 retry_at: float | None = None):
+        super().__init__(f"{provider}: {reason}")
+        self.provider = provider
+        self.reason = reason
+        self.retry_at = retry_at
+@
+
+<<imports>>=
+from dataclasses import dataclass
+import logging
+
+logger = logging.getLogger(__name__)
+@
+
+
+\section{Time}
+\label{sec:ratelimit-time}
+
+All time flows through three module-level seams.
+This is what makes the module testable: a test monkeypatches [[_now]] and
+[[_sleep]] and can then simulate midnight rollovers, expired cooldowns,
+and pacing waits without ever touching the wall clock or actually
+sleeping.
+The derived helpers ([[_today]], [[next_daily_reset]]) are defined in
+terms of [[_now]] so that patching the one seam moves everything
+consistently.
+
+<<time helpers>>=
+def _now() -> float:
+    """Return the current time as an epoch timestamp."""
+    return time.time()
+
+
+def _sleep(seconds: float) -> None:
+    """Sleep for `seconds` seconds."""
+    time.sleep(seconds)
+
+
+def _today() -> str:
+    """Return the current UTC calendar day as `YYYY-MM-DD`."""
+    now = datetime.fromtimestamp(_now(), tz=timezone.utc)
+    return now.strftime("%Y-%m-%d")
+@
+
+Daily quotas are bucketed on the UTC calendar day.
+This is a guess: IEEE does not document when its counter resets (its
+Mashery gateway defaults to midnight UTC, but midnight US~Eastern is
+plausible).
+We guess UTC midnight rather than a conservative later time because the
+design is self-correcting: if the first request after our reset still
+hits the quota, the provider's rejection (the [[OVER_RATE]] gateway code,
+\cref{sec:ieee-error-handling}) immediately re-marks the day as spent.
+A wrong guess therefore costs exactly one request per stale window,
+whereas a conservative guess would idle the provider for hours every day.
+
+<<time helpers>>=
+def next_daily_reset() -> float:
+    """Return the epoch timestamp of the next UTC midnight."""
+    now = datetime.fromtimestamp(_now(), tz=timezone.utc)
+    tomorrow = now + timedelta(days=1)
+    midnight = tomorrow.replace(
+        hour=0, minute=0, second=0, microsecond=0
+    )
+    return midnight.timestamp()
+@
+
+<<imports>>=
+from datetime import datetime, timedelta, timezone
+import time
+@
+
+Let's verify the reset lands on the next midnight, in particular when we
+are already just before midnight:
+
+<<test functions>>=
+class TestTimeHelpers:
+    """Tests for the time helper functions."""
+
+    def test_next_daily_reset_is_next_utc_midnight(self, clock):
+        reset = next_daily_reset()
+        assert reset > clock["now"]
+        assert reset - clock["now"] <= 24 * 3600
+        from datetime import datetime, timezone
+        dt = datetime.fromtimestamp(reset, tz=timezone.utc)
+        assert (dt.hour, dt.minute, dt.second) == (0, 0, 0)
+
+    def test_today_follows_clock(self, clock):
+        day_before = _today()
+        clock["now"] += 24 * 3600
+        assert _today() != day_before
+@
+
+\subsection{Parsing [[Retry-After]] }
+
+A 429 response may carry a [[Retry-After]] header in either of two
+formats: a delay in seconds, or an HTTP date.
+Both appear in the wild, and so do malformed values, so the parser
+returns [[None]] rather than raising on garbage---the caller then falls
+back to a default cooldown instead of crashing mid-search.
+
+<<time helpers>>=
+def parse_retry_after(value: str | None) -> float | None:
+    """Parse a `Retry-After` header value into a delay in seconds.
+
+    Accepts both the delay-seconds and the HTTP-date form.  Returns
+    `None` if the value is missing or unparseable.
+    """
+    if not value:
+        return None
+    value = value.strip()
+    try:
+        return max(0.0, float(value))
+    except ValueError:
+        pass
+    try:
+        dt = email.utils.parsedate_to_datetime(value)
+    except (TypeError, ValueError):
+        return None
+    if dt is None:
+        return None
+    return max(0.0, dt.timestamp() - _now())
+@
+
+<<imports>>=
+import email.utils
+@
+
+<<test functions>>=
+class TestParseRetryAfter:
+    """Tests for `parse_retry_after`."""
+
+    def test_delay_seconds(self, clock):
+        assert parse_retry_after("60") == 60.0
+
+    def test_http_date(self, clock):
+        date = email.utils.formatdate(clock["now"] + 120, usegmt=True)
+        delay = parse_retry_after(date)
+        assert delay == pytest.approx(120, abs=1)
+
+    def test_garbage_returns_none(self, clock):
+        assert parse_retry_after("soon") is None
+        assert parse_retry_after("") is None
+        assert parse_retry_after(None) is None
+
+    def test_past_date_clamps_to_zero(self, clock):
+        date = email.utils.formatdate(clock["now"] - 120, usegmt=True)
+        assert parse_retry_after(date) == 0.0
+@
+
+\subsection{Formatting reset times for users}
+
+The skip warning must be actionable: \enquote{resets 02:00 (in 14h37m)}
+tells the user both when to retry and how long that is from now.
+The absolute time is shown in the user's local timezone---that is the
+clock they will look at---while all internal bookkeeping stays in epoch
+seconds.
+
+<<time helpers>>=
+def format_retry(retry_at: float | None) -> str:
+    """Format an epoch timestamp as `HH:MM (in XhYYm)` local time.
+
+    Returns `"later"` if the timestamp is unknown.
+    """
+    if retry_at is None:
+        return "later"
+    delta = max(0, int(retry_at - _now()))
+    when = datetime.fromtimestamp(retry_at).strftime("%H:%M")
+    hours, remainder = divmod(delta, 3600)
+    minutes = remainder // 60
+    if hours:
+        relative = f"{hours}h{minutes:02d}m"
+    elif minutes:
+        relative = f"{minutes}m"
+    else:
+        relative = f"{delta}s"
+    return f"{when} (in {relative})"
+@
+
+<<test functions>>=
+class TestFormatRetry:
+    """Tests for `format_retry`."""
+
+    def test_unknown_is_later(self, clock):
+        assert format_retry(None) == "later"
+
+    def test_relative_part(self, clock):
+        text = format_retry(clock["now"] + 2 * 3600 + 5 * 60)
+        assert "(in 2h05m)" in text
+        text = format_retry(clock["now"] + 5 * 60)
+        assert "(in 5m)" in text
+        text = format_retry(clock["now"] + 30)
+        assert "(in 30s)" in text
+@
+
+
+\section{Where the state lives}
+
+Quota state goes in the \emph{data} directory
+(\cref{sec:enrichment-cache} established the [[SCHOLAR_DATA_DIR]]
+convention), not the cache directory---and the distinction is
+load-bearing.
+[[scholar cache clear]] is the documented remedy for stale search
+results, and a user whose IEEE searches return nothing will reach for it.
+If clearing the cache also erased the memory that today's 200 requests
+are spent, the remedy would un-block the provider locally while it is
+still blocked remotely, and the next search would burn requests just to
+rediscover the block.
+We reuse [[notes.get_data_dir]] rather than re-deriving the path so all
+data-directory consumers stay in agreement.
+
+One file per quota group (rather than one file for all providers) keeps
+two concurrent [[scholar]] processes that hit \emph{different} providers
+off each other's files entirely; the concurrency story for the same
+provider is discussed with [[save_state]] below.
+
+<<state functions>>=
+def get_state_dir() -> Path:
+    """Return the directory holding rate-limit state files.
+
+    The directory is created if it does not exist.  It lives under the
+    data directory (`SCHOLAR_DATA_DIR`), not the cache directory, so
+    `scholar cache clear` does not erase quota bookkeeping.
+    """
+    path = get_data_dir() / STATE_DIR_NAME
+    path.mkdir(parents=True, exist_ok=True)
+    return path
+
+
+def _state_file(name: str) -> Path:
+    return get_state_dir() / f"{name}.json"
+<<constants>>=
+STATE_DIR_NAME = "rate_limits"
+@
+
+<<imports>>=
+from pathlib import Path
+
+from scholar.notes import get_data_dir
+@
+
+
+\section{Loading and saving state}
+\label{sec:ratelimit-state}
+
+The state record is deliberately small and self-describing:
+
+\begin{description}
+\item[ [[day]] / [[day_count]] ] which UTC day the count belongs to, and
+  how many requests that day has absorbed.
+\item[ [[daily_limit]] ] the declared daily quota, copied from the
+  provider's [[Limits]] on every save.  Storing it makes the file
+  self-contained: [[check_available]] and the status table can judge
+  exhaustion from the file alone, without access to the provider class.
+\item[ [[cooldown_until]] / [[cooldown_reason]] ] a server-imposed
+  block (429, or a gateway quota rejection) and its human-readable cause.
+\item[ [[remaining]] / [[reset_at]] ] the provider's \emph{own} report of
+  its budget, synced from [[X-RateLimit-*]] headers when present.  When
+  set, these override our local tally---the server's count is
+  authoritative, ours is a reconstruction.
+\item[ [[last_request]] ] when we last talked to this provider, giving
+  free cross-process request spacing.
+\end{description}
+
+<<state functions>>=
+def _fresh_state(name: str) -> dict:
+    return {
+        "version": STATE_VERSION,
+        "provider": name,
+        "day": _today(),
+        "day_count": 0,
+        "daily_limit": None,
+        "cooldown_until": None,
+        "cooldown_reason": "",
+        "cooldown_quota": False,
+        "remaining": None,
+        "reset_at": None,
+        "last_request": None,
+        "last_updated": None,
+    }
+<<constants>>=
+STATE_VERSION = 1
+@
+
+Loading fails \emph{open}: a missing, truncated, or
+incomprehensible-version file yields a fresh zeroed state, never an
+error.
+A broken bookkeeping file must not stop Scholar from searching---the
+worst outcome of forgotten state is one round of doomed requests, after
+which the provider's own rejection rebuilds the record
+(\cref{sec:ratelimit-record-limit-hit}).
+Loading also normalises expired facts so no caller ever has to reason
+about stale state: a passed cooldown is dropped, a passed header-reported
+reset clears the reported budget, and a new UTC day zeroes the day count.
+Note what the day roll does \emph{not} clear: a cooldown outlives
+midnight, because a server that said \enquote{go away until 01:30} did
+not change its mind at 00:00.
+
+<<state functions>>=
+def load_state(name: str) -> dict:
+    """Load the rate-limit state for a quota group.
+
+    Returns a fresh zeroed state if no file exists or it cannot be read
+    (fail-open).  Expired cooldowns and stale day counts are normalised
+    away before returning.
+    """
+    state_file = _state_file(name)
+    try:
+        with open(state_file) as f:
+            state = json.load(f)
+        if state.get("version") != STATE_VERSION:
+            raise ValueError(f"unknown version {state.get('version')}")
+    except FileNotFoundError:
+        return _fresh_state(name)
+    except (OSError, ValueError) as e:
+        logger.debug(f"Discarding rate-limit state for {name}: {e}")
+        return _fresh_state(name)
+    <<normalise expired state>>
+    return state
+@
+
+<<normalise expired state>>=
+now = _now()
+if state.get("day") != _today():
+    state["day"] = _today()
+    state["day_count"] = 0
+if state.get("cooldown_until") and state["cooldown_until"] <= now:
+    state["cooldown_until"] = None
+    state["cooldown_reason"] = ""
+    state["cooldown_quota"] = False
+if state.get("reset_at") and state["reset_at"] <= now:
+    state["reset_at"] = None
+    state["remaining"] = None
+@
+
+Saving is atomic (write a temporary file, then [[os.replace]]) and
+happens immediately on every change---both deliberate departures from
+the cache layer's simpler choices (\cref{sec:cache-load-save} writes
+directly and only flushes at exit).
+The asymmetry in failure cost justifies the asymmetry in care: a corrupt
+or lost \emph{cache} file costs a cache miss, but a corrupt or lost
+\emph{quota} file makes Scholar forget a spent daily budget and hammer an
+API that already told it to stop.
+A crash mid-run is also precisely when rate-limit events are most likely
+to have just happened, so waiting for [[atexit]] would lose exactly the
+records that matter most.
+
+We accept one known race: two concurrent [[scholar]] processes doing
+read-modify-write on the same file can lose an increment (last writer
+wins).
+File locking would close it, but [[fcntl]] is POSIX-only and Scholar
+ships to Windows via [[platformdirs]].
+The undercount is bounded by the number of concurrent processes, and two
+authoritative backstops correct it: the provider's own quota rejection
+(\cref{sec:ratelimit-record-limit-hit}) and header sync
+(\cref{sec:ratelimit-record-response}).
+
+<<state functions>>=
+def save_state(name: str, state: dict) -> None:
+    """Atomically persist the rate-limit state for a quota group.
+
+    Failures are logged but never raised: bookkeeping must not break a
+    running search.
+    """
+    state["last_updated"] = datetime.fromtimestamp(
+        _now(), tz=timezone.utc
+    ).isoformat()
+    state_file = _state_file(name)
+    try:
+        fd, temp_path = tempfile.mkstemp(
+            dir=state_file.parent, suffix=".tmp"
+        )
+        with os.fdopen(fd, "w") as f:
+            json.dump(state, f, indent=2)
+        os.replace(temp_path, state_file)
+    except OSError as e:
+        logger.warning(f"Failed to save rate-limit state for {name}: {e}")
+@
+
+<<imports>>=
+import json
+import os
+import tempfile
+@
+
+Let's verify the fail-open and normalisation behaviour:
+
+<<test functions>>=
+class TestStateStore:
+    """Tests for loading and saving rate-limit state."""
+
+    def test_fresh_state_when_no_file(self, clock):
+        state = load_state("nobody")
+        assert state["day_count"] == 0
+        assert state["cooldown_until"] is None
+
+    def test_fail_open_on_garbage(self, clock):
+        _state_file("broken").write_text("not json {")
+        state = load_state("broken")
+        assert state["day_count"] == 0
+
+    def test_fail_open_on_unknown_version(self, clock):
+        state = _fresh_state("future")
+        state["version"] = 999
+        state["day_count"] = 150
+        save_state("future", state)
+        assert load_state("future")["day_count"] == 0
+
+    def test_day_roll_resets_count_not_cooldown(self, clock):
+        state = _fresh_state("ieee")
+        state["day_count"] = 200
+        state["cooldown_until"] = clock["now"] + 25 * 3600
+        state["cooldown_reason"] = "rate limited"
+        save_state("ieee", state)
+        clock["now"] += 24 * 3600
+        rolled = load_state("ieee")
+        assert rolled["day_count"] == 0
+        assert rolled["cooldown_until"] == state["cooldown_until"]
+
+    def test_expired_cooldown_dropped(self, clock):
+        state = _fresh_state("ieee")
+        state["cooldown_until"] = clock["now"] + 10
+        save_state("ieee", state)
+        clock["now"] += 11
+        assert load_state("ieee")["cooldown_until"] is None
+
+    def test_atomic_save_leaves_no_temp_files(self, clock):
+        save_state("ieee", _fresh_state("ieee"))
+        files = sorted(p.name for p in get_state_dir().iterdir())
+        assert files == ["ieee.json"]
+
+    def test_last_writer_wins(self, clock):
+        """Concurrent read-modify-write loses increments; last save wins.
+
+        This pins the documented trade-off: no file locking, bounded
+        undercount, corrected by the provider's own rejections.
+        """
+        first = load_state("ieee")
+        second = load_state("ieee")
+        first["day_count"] = 1
+        save_state("ieee", first)
+        second["day_count"] = 5
+        save_state("ieee", second)
+        assert load_state("ieee")["day_count"] == 5
+@
+
+
+\section{Judging availability}
+
+Availability is judged from the state record in a fixed order of
+authority.
+A server-imposed cooldown comes first: it is an explicit instruction from
+the provider and overrides everything.
+The provider's own header-reported budget comes second, for the same
+reason---when the server says zero remaining, our local count is
+irrelevant.
+Our reconstructed daily tally comes last, as the fallback for providers
+that report nothing.
+The declared limit is taken from the caller's [[Limits]] when available
+and from the [[daily_limit]] stored in the file otherwise, which is what
+lets [[check_available]] work from a bare name.
+
+<<state functions>>=
+def _availability(state: dict, limits: Limits) -> Availability:
+    now = _now()
+    cooldown = state.get("cooldown_until")
+    if cooldown and cooldown > now:
+        reason = state.get("cooldown_reason") or "in cooldown"
+        return Availability(
+            False, reason, cooldown,
+            quota=state.get("cooldown_quota", False),
+        )
+    remaining = state.get("remaining")
+    if remaining is not None and remaining <= 0:
+        retry_at = state.get("reset_at") or next_daily_reset()
+        reason = "no requests remaining (provider-reported)"
+        return Availability(False, reason, retry_at, quota=True)
+    daily = limits.daily or state.get("daily_limit")
+    if daily and state["day_count"] >= daily:
+        reason = (
+            f"daily quota spent"
+            f" ({state['day_count']}/{daily} requests)"
+        )
+        return Availability(
+            False, reason, next_daily_reset(), quota=True
+        )
+    return Availability(True)
+@
+
+
+\section{The rate limiter}
+
+One [[RateLimiter]] per quota group.
+The object itself is almost stateless: all quota facts live in the state
+file and are re-read on every operation, so concurrent processes see each
+other's updates as promptly as the file system allows.
+What does live in memory is [[_last_request]] (sub-second pacing needs
+better resolution than a file round-trip guarantees) and [[_warned]], a
+per-process flag that keeps a blocked 300-paper enrichment run from
+printing 300 identical warnings.
+
+<<rate limiter class>>=
+class RateLimiter:
+    """Rate-limit and quota gate for one provider (or quota group).
+
+    Providers call `acquire()` before and `record_response()` after each
+    HTTP request.  Obtain instances via `get_limiter()`/`limiter_for()`
+    so providers sharing a quota group share one limiter.
+    """
+
+    def __init__(self, name: str, limits: Limits | None = None):
+        self.name = name
+        self.limits = limits or Limits()
+        self._last_request: float | None = None
+        self._warned = False
+
+    <<rate limiter methods>>
+@
+
+\subsection{Checking availability}
+
+[[check_available]] is a pure query: it reads the file, judges it, and
+changes nothing.
+[[Search.execute]] uses it to decide whether to enter a provider at all,
+and [[check_provider]] uses it to answer health checks without burning a
+probe request against a spent quota.
+
+<<rate limiter methods>>=
+def check_available(self) -> Availability:
+    """Return whether a request may be made now, without side effects."""
+    return _availability(load_state(self.name), self.limits)
+@
+
+<<test functions>>=
+class TestCheckAvailable:
+    """Tests for `RateLimiter.check_available`."""
+
+    def test_available_by_default(self, clock):
+        limiter = RateLimiter("ieee", Limits(daily=200))
+        assert limiter.check_available().ok
+
+    def test_no_side_effects(self, clock):
+        limiter = RateLimiter("ieee", Limits(daily=200))
+        limiter.check_available()
+        limiter.check_available()
+        assert load_state("ieee")["day_count"] == 0
+        assert not _state_file("ieee").exists()
+
+    def test_blocked_when_daily_spent(self, clock):
+        state = _fresh_state("ieee")
+        state["day_count"] = 200
+        save_state("ieee", state)
+        limiter = RateLimiter("ieee", Limits(daily=200))
+        avail = limiter.check_available()
+        assert not avail.ok
+        assert "daily quota spent" in avail.reason
+        assert avail.retry_at == next_daily_reset()
+
+    def test_stored_limit_used_when_undeclared(self, clock):
+        """The file's `daily_limit` makes it self-describing."""
+        state = _fresh_state("ieee")
+        state["day_count"] = 200
+        state["daily_limit"] = 200
+        save_state("ieee", state)
+        limiter = RateLimiter("ieee")
+        assert not limiter.check_available().ok
+@
+
+\subsection{Acquiring permission to make a request}
+
+[[acquire]] does three things, in order: refuse, pace, count.
+Refusal raises [[RateLimited]] (after logging one warning per process,
+see above) so paging loops unwind without status plumbing.
+Pacing sleeps away the remainder of the per-second interval, spacing
+against the later of the in-process and the persisted last-request time,
+so even two back-to-back CLI invocations respect the rate.
+Counting increments the day tally and persists immediately---not at
+exit---so a crash or Ctrl-C cannot lose requests that were actually
+made.
+
+<<rate limiter methods>>=
+def acquire(self, cost: int = 1) -> None:
+    """Gate one imminent HTTP request.
+
+    Sleeps as needed to respect the declared request rate; raises
+    `RateLimited` if the request must not be made at all.  Counts the
+    request against the daily budget and persists the count
+    immediately.
+    """
+    state = load_state(self.name)
+    availability = _availability(state, self.limits)
+    if not availability.ok:
+        if not self._warned:
+            logger.warning(
+                f"{self.name}: {availability.reason};"
+                f" retry {format_retry(availability.retry_at)}."
+            )
+            self._warned = True
+        raise RateLimited(
+            self.name, availability.reason, availability.retry_at
+        )
+    <<pace the request rate>>
+    now = _now()
+    state["day_count"] += cost
+    state["daily_limit"] = self.limits.daily
+    state["last_request"] = now
+    self._last_request = now
+    save_state(self.name, state)
+@
+
+<<pace the request rate>>=
+if self.limits.per_second:
+    interval = 1.0 / self.limits.per_second
+    last = max(
+        self._last_request or 0.0,
+        state.get("last_request") or 0.0,
+    )
+    wait = last + interval - _now()
+    if wait > 0:
+        _sleep(wait)
+@
+
+<<test functions>>=
+class TestAcquire:
+    """Tests for `RateLimiter.acquire`."""
+
+    def test_counts_and_persists_immediately(self, clock):
+        limiter = RateLimiter("ieee", Limits(daily=200))
+        limiter.acquire()
+        on_disk = json.loads(_state_file("ieee").read_text())
+        assert on_disk["day_count"] == 1
+        assert on_disk["daily_limit"] == 200
+        limiter.acquire()
+        on_disk = json.loads(_state_file("ieee").read_text())
+        assert on_disk["day_count"] == 2
+
+    def test_paces_within_interval(self, clock):
+        limiter = RateLimiter("ieee", Limits(per_second=10.0))
+        limiter.acquire()
+        limiter.acquire()
+        assert clock["sleeps"] == [pytest.approx(0.1)]
+
+    def test_paces_across_processes(self, clock):
+        """A fresh limiter spaces against the persisted timestamp."""
+        RateLimiter("ieee", Limits(per_second=10.0)).acquire()
+        RateLimiter("ieee", Limits(per_second=10.0)).acquire()
+        assert clock["sleeps"] == [pytest.approx(0.1)]
+
+    def test_no_pacing_without_rate(self, clock):
+        limiter = RateLimiter("dblp")
+        limiter.acquire()
+        limiter.acquire()
+        assert clock["sleeps"] == []
+
+    def test_raises_when_daily_spent(self, clock):
+        limiter = RateLimiter("ieee", Limits(daily=2))
+        limiter.acquire()
+        limiter.acquire()
+        with pytest.raises(RateLimited) as excinfo:
+            limiter.acquire()
+        assert "daily quota spent" in str(excinfo.value)
+        assert load_state("ieee")["day_count"] == 2
+
+    def test_warns_once_per_process(self, clock, caplog):
+        limiter = RateLimiter("ieee", Limits(daily=1))
+        limiter.acquire()
+        with caplog.at_level("WARNING"):
+            for _ in range(3):
+                with pytest.raises(RateLimited):
+                    limiter.acquire()
+        warnings = [
+            r for r in caplog.records if r.levelname == "WARNING"
+        ]
+        assert len(warnings) == 1
+
+    def test_budget_recovers_next_day(self, clock):
+        limiter = RateLimiter("ieee", Limits(daily=1))
+        limiter.acquire()
+        with pytest.raises(RateLimited):
+            limiter.acquire()
+        clock["now"] += 24 * 3600
+        limiter.acquire()
+        assert load_state("ieee")["day_count"] == 1
+@
+
+\subsection{Recording responses}
+\label{sec:ratelimit-record-response}
+
+After each request the provider hands the response back so limit signals
+become persistent state.
+Two independent signals are handled:
+
+\begin{description}
+\item[Status 429] becomes a cooldown, honouring [[Retry-After]] when the
+  server sends a usable one and falling back to a default otherwise.
+\item[ [[X-RateLimit-*]] headers] (Scopus and other Elsevier APIs send
+  [[X-RateLimit-Remaining]] and [[X-RateLimit-Reset]]) are synced into
+  the state, where they override the local tally
+  (\cref{sec:ratelimit-state}).  This is how Scopus's \emph{weekly} quota
+  is tracked without any weekly bucket of our own: the server does the
+  counting, we just remember its last answer.  The reset header may be an
+  epoch timestamp or a delay in seconds depending on the API; values too
+  small to be a timestamp are treated as delays.
+\end{description}
+
+A 403 is deliberately \emph{not} handled here: bare 403s are
+authentication failures, and the gateway-specific quota rejections that
+hide behind 403 (IEEE's Mashery codes, \cref{sec:ieee-error-handling}) need
+provider knowledge to decode, so the provider calls
+[[record_limit_hit]] itself for those.
+
+<<rate limiter methods>>=
+def record_response(self, response) -> None:
+    """Update persistent state from an HTTP response.
+
+    Handles 429 (cooldown, honouring `Retry-After`) and syncs
+    `X-RateLimit-Remaining`/`X-RateLimit-Reset` headers when present.
+    """
+    headers = getattr(response, "headers", None) or {}
+    <<sync rate-limit headers>>
+    if getattr(response, "status_code", None) == 429:
+        self.record_limit_hit(
+            retry_after=parse_retry_after(_get_header(
+                headers, "Retry-After"
+            )),
+            reason="rate limited (HTTP 429)",
+        )
+@
+
+<<sync rate-limit headers>>=
+remaining = _get_header(headers, "X-RateLimit-Remaining")
+reset = _get_header(headers, "X-RateLimit-Reset")
+if remaining is not None or reset is not None:
+    state = load_state(self.name)
+    try:
+        state["remaining"] = int(remaining)
+    except (TypeError, ValueError):
+        pass
+    try:
+        value = float(reset)
+        if value < EPOCH_THRESHOLD:
+            value = _now() + value
+        state["reset_at"] = value
+    except (TypeError, ValueError):
+        pass
+    save_state(self.name, state)
+@
+
+Real [[requests.Response]] headers are case-insensitive dictionaries, but
+tests (and any non-[[requests]] caller) may pass plain dictionaries, so
+the lookup tolerates both spellings.
+
+<<state functions>>=
+def _get_header(headers, name: str):
+    value = headers.get(name)
+    if value is None:
+        value = headers.get(name.lower())
+    return value
+<<constants>>=
+# Header reset values >= this are epoch timestamps, smaller are delays.
+EPOCH_THRESHOLD = 10**8
+@
+
+<<test functions>>=
+class TestRecordResponse:
+    """Tests for `RateLimiter.record_response`."""
+
+    def test_429_with_numeric_retry_after(self, clock):
+        limiter = RateLimiter("s2")
+        limiter.record_response(
+            FakeResponse(429, {"Retry-After": "60"})
+        )
+        avail = limiter.check_available()
+        assert not avail.ok
+        assert avail.retry_at == clock["now"] + 60
+        assert not avail.quota
+
+    def test_429_with_http_date(self, clock):
+        date = email.utils.formatdate(clock["now"] + 300, usegmt=True)
+        limiter = RateLimiter("s2")
+        limiter.record_response(FakeResponse(429, {"Retry-After": date}))
+        avail = limiter.check_available()
+        assert not avail.ok
+        assert avail.retry_at == pytest.approx(clock["now"] + 300, abs=1)
+
+    def test_429_with_garbage_uses_default(self, clock):
+        limiter = RateLimiter("s2")
+        limiter.record_response(
+            FakeResponse(429, {"Retry-After": "soon"})
+        )
+        avail = limiter.check_available()
+        assert not avail.ok
+        assert avail.retry_at == clock["now"] + DEFAULT_COOLDOWN
+
+    def test_success_records_nothing(self, clock):
+        limiter = RateLimiter("s2")
+        limiter.record_response(FakeResponse(200))
+        assert not _state_file("s2").exists()
+
+    def test_remaining_zero_blocks(self, clock):
+        """The server's own budget report overrides the local tally."""
+        limiter = RateLimiter("scopus", Limits(daily=None))
+        limiter.record_response(FakeResponse(200, {
+            "X-RateLimit-Remaining": "0",
+            "X-RateLimit-Reset": str(clock["now"] + 3600),
+        }))
+        avail = limiter.check_available()
+        assert not avail.ok
+        assert "provider-reported" in avail.reason
+        assert avail.retry_at == clock["now"] + 3600
+
+    def test_reset_as_delay_seconds(self, clock):
+        limiter = RateLimiter("scopus")
+        limiter.record_response(FakeResponse(200, {
+            "X-RateLimit-Remaining": "5",
+            "X-RateLimit-Reset": "3600",
+        }))
+        state = load_state("scopus")
+        assert state["reset_at"] == clock["now"] + 3600
+        assert state["remaining"] == 5
+@
+
+\subsection{Recording limit hits}
+\label{sec:ratelimit-record-limit-hit}
+
+Some limit signals never pass through [[record_response]]---client
+libraries like [[pyalex]] raise instead of returning responses, and
+IEEE's quota rejection is a 403 whose meaning only the IEEE provider can
+decode.
+[[record_limit_hit]] is the direct entry point for those cases.
+
+The [[exhausted_daily]] flag is the self-correction half of the daily
+reset guess (\cref{sec:ratelimit-time}): when the provider explicitly
+says the daily quota is spent, we force the day count to the declared
+limit \emph{and} set a cooldown to the next reset.
+This is what makes an undercounted tally (the accepted concurrency race)
+or a wrongly guessed reset time cost at most one request: the first
+rejection re-establishes the truth.
+
+<<rate limiter methods>>=
+def record_limit_hit(self, *, retry_after: float | None = None,
+                     until: float | None = None, reason: str = "",
+                     exhausted_daily: bool = False) -> None:
+    """Persist a rate-limit or quota rejection.
+
+    `retry_after` is a delay in seconds, `until` an absolute epoch
+    timestamp; with neither, a default cooldown applies.  Set
+    `exhausted_daily` when the provider signalled that the daily quota
+    is spent: the day count is forced to the declared limit and the
+    cooldown extends to the next daily reset.
+    """
+    state = load_state(self.name)
+    if exhausted_daily:
+        if self.limits.daily:
+            state["day_count"] = max(
+                state["day_count"], self.limits.daily
+            )
+            state["daily_limit"] = self.limits.daily
+        if until is None and retry_after is None:
+            until = next_daily_reset()
+    if until is None:
+        delay = (
+            retry_after if retry_after is not None else DEFAULT_COOLDOWN
+        )
+        until = _now() + delay
+    state["cooldown_until"] = until
+    state["cooldown_reason"] = reason or "rate limited"
+    state["cooldown_quota"] = exhausted_daily
+    save_state(self.name, state)
+<<constants>>=
+# Cooldown applied on a 429 without a usable Retry-After, in seconds.
+DEFAULT_COOLDOWN = 60.0
+@
+
+<<test functions>>=
+class TestRecordLimitHit:
+    """Tests for `RateLimiter.record_limit_hit`."""
+
+    def test_exhausted_daily_forces_count_and_midnight(self, clock):
+        limiter = RateLimiter("ieee", Limits(daily=200))
+        limiter.record_limit_hit(
+            reason="daily quota exhausted", exhausted_daily=True
+        )
+        state = load_state("ieee")
+        assert state["day_count"] == 200
+        assert state["cooldown_until"] == next_daily_reset()
+        avail = limiter.check_available()
+        assert not avail.ok
+        assert avail.reason == "daily quota exhausted"
+        assert avail.quota
+
+    def test_default_cooldown(self, clock):
+        limiter = RateLimiter("wos")
+        limiter.record_limit_hit()
+        state = load_state("wos")
+        assert state["cooldown_until"] == clock["now"] + DEFAULT_COOLDOWN
+@
+
+\subsection{Reporting status}
+
+The status report backs the [[scholar providers limits]] table.
+It is a snapshot of the state file plus the declared limits, with the
+availability judgement already applied so the CLI does not re-implement
+the order of authority.
+
+<<data classes>>=
+@dataclass(frozen=True)
+class QuotaStatus:
+    """Snapshot of one quota group's limits and usage for display."""
+
+    name: str
+    limits: Limits
+    day_count: int
+    remaining: int | None
+    reset_at: float | None
+    availability: Availability
+@
+
+<<rate limiter methods>>=
+def status(self) -> QuotaStatus:
+    """Return a display snapshot of limits, usage, and availability."""
+    state = load_state(self.name)
+    reset_at = state.get("reset_at")
+    if reset_at is None and self.limits.daily:
+        reset_at = next_daily_reset()
+    return QuotaStatus(
+        name=self.name,
+        limits=self.limits,
+        day_count=state["day_count"],
+        remaining=state.get("remaining"),
+        reset_at=reset_at,
+        availability=_availability(state, self.limits),
+    )
+@
+
+<<test functions>>=
+class TestStatus:
+    """Tests for `RateLimiter.status`."""
+
+    def test_status_snapshot(self, clock):
+        limiter = RateLimiter("ieee", Limits(per_second=10.0, daily=200))
+        limiter.acquire()
+        status = limiter.status()
+        assert status.day_count == 1
+        assert status.limits.daily == 200
+        assert status.availability.ok
+        assert status.reset_at == next_daily_reset()
+@
+
+
+\section{The limiter registry}
+
+Limiters must be shared: the seven OpenAlex source-pinned providers and
+the OpenAlex provider proper all draw on one API budget, so they must
+meet in one [[RateLimiter]] (this mirrors the module-level pacing
+timestamp they already share in \cref{providers-module}).
+The registry keys limiters by quota group and hands the same instance to
+every member.
+Because the provider protocol is structural, [[limiter_for]] validates
+what it reads: any provider-shaped object---a third-party provider, or a
+test double whose attribute accesses auto-generate values---may carry a
+[[LIMITS]] or [[QUOTA_GROUP]] of the wrong type, and treating those as
+absent keeps a malformed declaration from crashing a search.
+
+<<registry functions>>=
+_LIMITERS: dict[str, RateLimiter] = {}
+
+
+def get_limiter(name: str, limits: Limits | None = None) -> RateLimiter:
+    """Return the shared limiter for a quota group, creating it if new.
+
+    `limits` only takes effect when the limiter is first created.
+    """
+    limiter = _LIMITERS.get(name)
+    if limiter is None:
+        limiter = RateLimiter(name, limits)
+        _LIMITERS[name] = limiter
+    return limiter
+
+
+def limiter_for(provider) -> RateLimiter:
+    """Return the limiter for a provider object.
+
+    Reads the provider's optional `LIMITS` and `QUOTA_GROUP` class
+    attributes; the quota group defaults to the provider's name.
+    Attributes of the wrong type are treated as absent.
+    """
+    group = getattr(provider, "QUOTA_GROUP", None)
+    if not isinstance(group, str) or not group:
+        group = provider.name
+    limits = getattr(provider, "LIMITS", None)
+    if not isinstance(limits, Limits):
+        limits = None
+    return get_limiter(group, limits)
+@
+
+[[check_available]] by bare name serves callers that have no provider
+object at hand.
+It prefers the registered limiter (which knows the declared limits) and
+falls back to judging the state file alone---which works because the
+file stores [[daily_limit]] (\cref{sec:ratelimit-state}).
+
+<<registry functions>>=
+def check_available(name: str) -> Availability:
+    """Return availability for a quota group by name, without side
+    effects."""
+    limiter = _LIMITERS.get(name)
+    if limiter is not None:
+        return limiter.check_available()
+    return _availability(load_state(name), Limits())
+@
+
+[[all_status]] drives the status table.
+It walks the provider registry (imported lazily---[[providers]] imports
+this module at load time, so a top-level import back would be a cycle)
+and deduplicates by quota group, then picks up any orphaned state files
+so usage recorded under a since-renamed provider still shows up.
+
+<<registry functions>>=
+def all_status() -> list[QuotaStatus]:
+    """Return a status snapshot per quota group, sorted by name."""
+    from scholar.providers import PROVIDERS
+
+    statuses: dict[str, QuotaStatus] = {}
+    for provider in PROVIDERS.values():
+        limiter = limiter_for(provider)
+        if limiter.name not in statuses:
+            statuses[limiter.name] = limiter.status()
+    for state_file in get_state_dir().glob("*.json"):
+        name = state_file.stem
+        if name not in statuses:
+            statuses[name] = get_limiter(name).status()
+    return [statuses[name] for name in sorted(statuses)]
+@
+
+Finally, users need an escape hatch: the reset-time guess can be wrong in
+the too-conservative direction too (the real quota rolled over but our
+file still says spent), and a replaced API key starts a fresh budget.
+[[scholar providers limits --reset]] deletes the persistent record; the
+per-process flags are cleared too so a long-lived process (the TUI)
+starts warning afresh.
+
+<<registry functions>>=
+def reset_state(name: str | None = None) -> int:
+    """Delete persisted rate-limit state.
+
+    Resets one quota group, or all of them when `name` is `None`.
+    Returns the number of state files deleted.
+    """
+    if name is not None:
+        files = [_state_file(name)]
+    else:
+        files = list(get_state_dir().glob("*.json"))
+    count = 0
+    for state_file in files:
+        try:
+            state_file.unlink()
+            count += 1
+        except FileNotFoundError:
+            pass
+        except OSError as e:
+            logger.warning(f"Failed to delete {state_file.name}: {e}")
+    for limiter in _LIMITERS.values():
+        if name is None or limiter.name == name:
+            limiter._warned = False
+            limiter._last_request = None
+    return count
+@
+
+<<test functions>>=
+class TestRegistry:
+    """Tests for the module-level limiter registry."""
+
+    def test_quota_group_shares_one_limiter(self, clock):
+        class Base:
+            name = "openalex"
+            QUOTA_GROUP = "openalex"
+            LIMITS = Limits(daily=100_000)
+
+        class Pinned:
+            name = "ssrn"
+            QUOTA_GROUP = "openalex"
+            LIMITS = Limits(daily=100_000)
+
+        assert limiter_for(Base()) is limiter_for(Pinned())
+        limiter_for(Base()).acquire()
+        limiter_for(Pinned()).acquire()
+        assert load_state("openalex")["day_count"] == 2
+        assert not _state_file("ssrn").exists()
+
+    def test_group_defaults_to_name(self, clock):
+        class Plain:
+            name = "dblp"
+
+        assert limiter_for(Plain()).name == "dblp"
+
+    def test_bogus_declarations_treated_as_absent(self, clock):
+        class Odd:
+            name = "odd"
+            QUOTA_GROUP = 42
+            LIMITS = "fast"
+
+        limiter = limiter_for(Odd())
+        assert limiter.name == "odd"
+        assert limiter.limits == Limits()
+
+    def test_check_available_by_name_unregistered(self, clock):
+        state = _fresh_state("ieee")
+        state["day_count"] = 200
+        state["daily_limit"] = 200
+        save_state("ieee", state)
+        assert not check_available("ieee").ok
+
+    def test_reset_state_single(self, clock):
+        RateLimiter("ieee", Limits(daily=200)).acquire()
+        RateLimiter("wos").acquire()
+        assert reset_state("ieee") == 1
+        assert not _state_file("ieee").exists()
+        assert _state_file("wos").exists()
+
+    def test_reset_state_all(self, clock):
+        RateLimiter("ieee", Limits(daily=200)).acquire()
+        RateLimiter("wos").acquire()
+        assert reset_state() == 2
+        assert list(get_state_dir().glob("*.json")) == []
+
+    def test_reset_clears_warned_flag(self, clock, caplog):
+        limiter = get_limiter("ieee", Limits(daily=1))
+        limiter.acquire()
+        with caplog.at_level("WARNING"):
+            with pytest.raises(RateLimited):
+                limiter.acquire()
+            reset_state("ieee")
+            limiter.acquire()
+            with pytest.raises(RateLimited):
+                limiter.acquire()
+        warnings = [
+            r for r in caplog.records if r.levelname == "WARNING"
+        ]
+        assert len(warnings) == 2
+@

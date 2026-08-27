@@ -422,6 +422,14 @@ requests when an email is configured, so a developer who has
 [[SCHOLAR_EMAIL]] set in their shell would otherwise turn offline unit tests
 into live API calls.  Tests that need an email set it explicitly.
 
+The fixture isolates the data directory ([[SCHOLAR_DATA_DIR]]) as well.
+The data directory holds state that must survive [[scholar cache clear]],
+such as the rate-limit bookkeeping of \cref{ch:ratelimit}---and that
+persistence is exactly why isolation matters more here than for the cache:
+a test that simulates an exhausted IEEE quota would otherwise record
+\enquote{quota spent} in the developer's real data directory, making their
+own [[scholar]] runs skip that provider for the rest of the day.
+
 <<[[conftest.py]]>>=
 """Pytest configuration and fixtures for Scholar tests."""
 import pytest
@@ -431,17 +439,42 @@ CONTACT_EMAIL_VARS = ("SCHOLAR_EMAIL", "OPENALEX_EMAIL", "CROSSREF_MAILTO")
 
 @pytest.fixture(autouse=True)
 def isolate_cache(tmp_path, monkeypatch):
-    """Isolate each test from the developer's cache and contact email.
+    """Isolate each test from the developer's cache, data directory,
+    and contact email.
 
     Applied automatically to all tests: every test starts with an empty
-    cache directory and no contact email configured, so tests neither
-    interfere with each other nor make live API calls by accident.
+    cache directory, an empty data directory, and no contact email
+    configured, so tests neither interfere with each other nor make live
+    API calls by accident---nor leak persistent state (rate-limit
+    bookkeeping, enrichment data) into the developer's real directories.
     """
     cache_dir = tmp_path / "scholar_cache"
     cache_dir.mkdir()
     monkeypatch.setenv("SCHOLAR_CACHE_DIR", str(cache_dir))
+    data_dir = tmp_path / "scholar_data"
+    data_dir.mkdir()
+    monkeypatch.setenv("SCHOLAR_DATA_DIR", str(data_dir))
     for var in CONTACT_EMAIL_VARS:
         monkeypatch.delenv(var, raising=False)
+@
+
+Rate-limit pacing must not slow the test suite down: once providers
+declare request rates (\cref{ch:ratelimit}), every mocked multi-page
+search would otherwise spend real wall-clock time sleeping between
+requests.
+We therefore disable the limiter's sleep seam globally.
+The pacing \emph{behaviour} is still verified---the rate-limit module's
+own tests replace the same seam with a recorder and assert on the
+requested sleep durations.
+
+<<[[conftest.py]]>>=
+
+@pytest.fixture(autouse=True)
+def no_rate_limit_sleep(monkeypatch):
+    """Disable real rate-limit pacing sleeps during tests."""
+    monkeypatch.setattr(
+        "scholar.ratelimit._sleep", lambda seconds: None
+    )
 @
 
 \subsection{Gating live API tests}

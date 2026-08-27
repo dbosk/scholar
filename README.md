@@ -116,6 +116,18 @@ scholar cache path    # Print cache directory
 
 PDF downloads are also cached for offline viewing.
 
+### Rate-Limit and Quota Tracking
+
+Provider rate limits and daily quotas (e.g. IEEE's 200 requests/day) are
+tracked persistently across invocations: a provider whose budget is spent
+is skipped with a warning naming the reset time instead of firing doomed
+requests.
+
+```bash
+scholar providers limits              # Show usage, remaining budget, reset times
+scholar providers limits --reset ieee # Clear tracked state for one provider
+```
+
 ## Quickstart
 
 ### Install

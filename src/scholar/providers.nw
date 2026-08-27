@@ -133,6 +133,7 @@ import requests
 from unittest.mock import Mock, patch
 
 from scholar import *
+from scholar import ratelimit
 from scholar.providers import *
 
 
@@ -815,11 +816,18 @@ and its retrying session turns a 429 into a [[RetryError]] after
 condition the health check
 exists to report.  Each [[check]] method therefore issues one raw request with
 the provider's real credentials and classifies the raw status code.
+One exception: when the persistent rate-limit state (\cref{ch:ratelimit})
+already knows the provider is blocked, [[check_provider]] answers from
+that state and skips the probe entirely---probing a spent daily quota
+would spend yet another request just to learn what we already know.
 
 The classification distinguishes the cases a user acts on differently:
 \begin{description}
 \item[key rejected] 401/403 while sending a credential.  The credential is
   the problem; rotate or remove it.  This is the expired-key case.
+\item[quota exhausted] The provider's request budget is spent (IEEE's
+  daily 200, for instance).  The credential is fine; come back after the
+  reset.
 \item[rate limited] 429.  Transient; the search path already handles this
   with back-off, so nothing is misconfigured.
 \item[http error / network error] The service is unreachable or unhappy for
@@ -828,6 +836,16 @@ The classification distinguishes the cases a user acts on differently:
 \end{description}
 A 401/403 \emph{without} a credential cannot be a key problem, so it
 classifies as an HTTP error (an IP block or outage).
+
+Distinguishing \enquote{quota exhausted} from \enquote{key rejected}
+matters because IEEE's Mashery gateway delivers its quota rejections as
+HTTP 403 (\cref{sec:ieee-error-handling})---the same status as a bad
+key.
+Before this classification existed, a spent daily quota was reported as
+\enquote{check or replace [[IEEE_API_KEY]]}, sending the user off to
+rotate a perfectly good credential.
+The classifier therefore decodes [[X-Mashery-Error-Code]] \emph{before}
+the credential branch.
 
 <<imports>>=
 import dataclasses
@@ -838,6 +856,7 @@ HEALTH_OK = "ok"
 HEALTH_NOT_CONFIGURED = "not configured"
 HEALTH_NOT_CHECKED = "not checked"
 HEALTH_KEY_REJECTED = "key rejected"
+HEALTH_QUOTA_EXHAUSTED = "quota exhausted"
 HEALTH_RATE_LIMITED = "rate limited"
 HEALTH_HTTP_ERROR = "http error"
 HEALTH_NETWORK_ERROR = "network error"
@@ -863,8 +882,22 @@ def classify_check_response(
 
     A 401/403 counts as a rejected key only when a credential was actually
     sent (`authenticated`); `key_hint` names the environment variable to
-    check in that case.
+    check in that case.  Gateway quota rejections (Mashery's
+    `X-Mashery-Error-Code`) are decoded first, since they also arrive
+    as 403.
     """
+    headers = getattr(response, "headers", None) or {}
+    mashery_code = headers.get("X-Mashery-Error-Code", "")
+    if not isinstance(mashery_code, str):
+        mashery_code = ""
+    if IEEE_OVER_RATE_CODE in mashery_code:
+        return HEALTH_QUOTA_EXHAUSTED, (
+            "daily quota exhausted -- resets with the provider's day"
+        )
+    if IEEE_OVER_QPS_CODE in mashery_code:
+        return HEALTH_RATE_LIMITED, (
+            "per-second rate exceeded (transient; try again)"
+        )
     if response.status_code in (401, 403) and authenticated:
         return HEALTH_KEY_REJECTED, (
             f"HTTP {response.status_code} -- check or replace {key_hint}"
@@ -883,7 +916,10 @@ def check_provider(
     """Check one provider's configuration and, if `live`, its connectivity.
 
     An unconfigured provider is never probed. A provider without a `check`
-    method (or with `live=False`) reports "not checked".
+    method (or with `live=False`) reports "not checked".  A provider whose
+    persisted rate-limit state says its quota is spent (or a cooldown is
+    active) is reported from that state without a probe, since the probe
+    itself would count against the budget.
     """
     if not provider.is_available():
         return ProviderHealth(
@@ -892,6 +928,17 @@ def check_provider(
         )
     if not live or not hasattr(provider, "check"):
         return ProviderHealth(provider.name, True, HEALTH_NOT_CHECKED)
+    availability = limiter_for(provider).check_available()
+    if not availability.ok:
+        status = (
+            HEALTH_QUOTA_EXHAUSTED if availability.quota
+            else HEALTH_RATE_LIMITED
+        )
+        message = (
+            f"{availability.reason};"
+            f" retry {format_retry(availability.retry_at)}"
+        )
+        return ProviderHealth(provider.name, True, status, message)
     try:
         status, message = provider.check()
     except requests.RequestException as e:
@@ -1010,6 +1057,46 @@ class TestProviderHealth:
 
         assert health.status == HEALTH_NETWORK_ERROR
 
+    def test_quota_rejection_is_not_a_key_problem(self):
+        """A Mashery OVER_RATE 403 reports quota exhausted, not key
+        rejected.
+
+        Before this classification, a spent IEEE daily quota told the
+        user to replace a perfectly good IEEE_API_KEY.
+        """
+        response = self._response(403)
+        response.headers = {
+            "X-Mashery-Error-Code": "ERR_403_DEVELOPER_OVER_RATE",
+        }
+        status, message = classify_check_response(
+            response, authenticated=True, key_hint="IEEE_API_KEY"
+        )
+        assert status == HEALTH_QUOTA_EXHAUSTED
+        assert "IEEE_API_KEY" not in message
+
+    def test_qps_rejection_is_rate_limited(self):
+        """A Mashery OVER_QPS 403 is transient rate limiting."""
+        response = self._response(403)
+        response.headers = {
+            "X-Mashery-Error-Code": "ERR_403_DEVELOPER_OVER_QPS",
+        }
+        status, _ = classify_check_response(response, authenticated=True)
+        assert status == HEALTH_RATE_LIMITED
+
+    def test_spent_quota_skips_probe(self):
+        """A known-spent quota is reported without burning a probe."""
+        ratelimit._LIMITERS.pop("ieee", None)
+        provider = IEEEXploreProvider(api_key="test_key")
+        provider._limiter.record_limit_hit(
+            reason="daily quota exhausted (IEEE)", exhausted_daily=True
+        )
+        with patch("requests.get") as mock_get:
+            health = check_provider(provider)
+            mock_get.assert_not_called()
+        assert health.status == HEALTH_QUOTA_EXHAUSTED
+        assert "daily quota exhausted" in health.message
+        ratelimit._LIMITERS.pop("ieee", None)
+
 
 class TestProviderHealthIntegration:
     """Live health checks against the keyless providers."""
@@ -1100,6 +1187,7 @@ class SemanticScholarProvider:
         self._last_request_time: float = 0.0
         self._key_rejected: bool = False
         self._session = self._create_session()
+        self._limiter = limiter_for(self)
 
     def is_available(self) -> bool:
         """Semantic Scholar is always available (API key is optional)."""
@@ -1184,6 +1272,16 @@ If the anonymous retry \emph{also} returns 403 something more unusual is wrong
 search either, so we log at [[error]] level and hand the 403 response back to
 the caller, which treats it as an empty result.
 
+Being the single chokepoint also makes [[_request]] the natural place to
+feed the persistent rate limiter (\cref{ch:ratelimit}): [[acquire()]]
+counts each request (no rate is declared here, so the in-process pacing
+above stays authoritative) and refuses while a persistent cooldown is
+active, and [[record_response()]] turns a 429 that survived the
+session's own retries into such a cooldown---so the \emph{next}
+[[scholar]] invocation waits it out instead of rediscovering it.
+The [[RateLimited]] this can raise is contained by the same broad
+exception handling every caller already has for network failures.
+
 <<semantic scholar request helper>>=
 def _build_headers(self) -> dict:
     """Return request headers, omitting the API key once it was rejected."""
@@ -1199,7 +1297,9 @@ def _request(self, url: str, params: dict) -> requests.Response:
     rest of the session, and retry the same request anonymously. A 403 that
     persists without a key is logged at error level; the response is returned
     so the caller degrades to an empty result rather than raising.
+    Raises `RateLimited` while a persistent cooldown is active.
     """
+    self._limiter.acquire()
     self._wait_for_rate_limit()
     headers = self._build_headers()
     response = self._session.get(url, params=params, headers=headers, timeout=30)
@@ -1221,6 +1321,7 @@ def _request(self, url: str, params: dict) -> requests.Response:
             "returning no results for this request"
         )
 
+    self._limiter.record_response(response)
     return response
 @
 
@@ -1374,6 +1475,11 @@ def _search_uncached(
             "https://www.semanticscholar.org/product/api#api-key-form "
             "and set S2_API_KEY environment variable.",
             self.MAX_RETRIES,
+        )
+        # The session's own retries are exhausted, so this is genuine
+        # saturation: remember it across invocations (cf. DBLP).
+        self._limiter.record_limit_hit(
+            reason="rate limited (HTTP 429) after retries"
         )
         return all_papers, False
     except requests.exceptions.HTTPError as e:
@@ -2167,6 +2273,7 @@ the requested limit.
 This makes large result sets transparent to the caller.
 
 \subsection{Caching only successful searches}
+\label{sec:cache-successful-only}
 
 Search results are cached manually rather than with [[@cachedmethod]].
 The decorator caches whatever the method returns, including the empty list
@@ -2182,6 +2289,17 @@ zero-hit answer is still cached (it is a real answer), a failure never is.
 
 \subsection{Provider implementation}
 
+The provider declares its limits for the persistent tracker of
+\cref{ch:ratelimit}: the [[QUOTA_GROUP]] makes the seven source-pinned
+subclasses (\cref{sec:preprint-sources}) and this base class
+meet in \emph{one} shared budget---the same rationale as the
+module-level pacing timestamp above, since they all hit the same API
+with the same credentials.
+Only the daily quota (100\,000 requests, far beyond normal use) is
+declared; per-second pacing stays with [[_wait_for_rate_limit]] for
+now, so [[acquire()]] merely counts requests and would refuse only if
+the daily budget were ever spent.
+
 <<openalex provider>>=
 class OpenAlexProvider:
     """Search provider for OpenAlex."""
@@ -2190,6 +2308,8 @@ class OpenAlexProvider:
     MAX_LIMIT: int | None = None   # No documented maximum
     RATE_LIMIT = 0.1               # 10 requests/second = 0.1 seconds between requests
     CACHE_VERSION = 2              # Invalidate persisted caches when changing parsing
+    QUOTA_GROUP = "openalex"       # All source-pinned subclasses share this budget
+    LIMITS = Limits(daily=100_000)
 
     def __init__(self, email: str | None = None):
         """
@@ -2205,6 +2325,7 @@ class OpenAlexProvider:
             pyalex.config.email = configured_email
         self._cache: dict = load_cache(self.name)
         register_cache(self.name, self._cache)
+        self._limiter = limiter_for(self)
 
     def is_available(self) -> bool:
         """OpenAlex is always available (email is optional)."""
@@ -2267,6 +2388,7 @@ class OpenAlexProvider:
         # Use pagination to fetch all results up to the limit
         for page in works.paginate(per_page=page_size):
             self._wait_for_rate_limit()
+            self._limiter.acquire()
             for work in page:
                 all_papers.append(self._convert_work(work))
                 if len(all_papers) >= limit:
@@ -3202,6 +3324,7 @@ class DBLPProvider:
         """Initialize the DBLP provider."""
         self._cache: dict = load_cache(self.name)
         register_cache(self.name, self._cache)
+        self._limiter = limiter_for(self)
 
     def is_available(self) -> bool:
         """DBLP is always available (no API key needed)."""
@@ -3268,6 +3391,9 @@ def search(
 
     try:
         papers = self._fetch_pages(sanitized, limit, filters)
+    except RateLimited:
+        # A persistent cooldown is active; the limiter already logged it.
+        return []
     except Exception as e:
         # Transient API failure (throttling, malformed body, HTTP error) or
         # an unexpected parsing error: return empty but do NOT cache, so a
@@ -3545,9 +3671,11 @@ def _fetch_one_page(
 
     ``hits`` is always a list, even when DBLP collapses a single result into a
     bare object. Raises ``_DBLPUnavailable`` on a non-JSON body or after
-    exhausting HTTP 429 retries.
+    exhausting HTTP 429 retries; raises `RateLimited` while a persistent
+    cooldown is active.
     """
     for attempt in range(DBLP_MAX_RETRIES + 1):
+        self._limiter.acquire()
         response = requests.get(
             DBLP_API_URL,
             params={
@@ -3579,6 +3707,9 @@ def _fetch_one_page(
         total = self._parse_total(data)
         return hits, total
 
+    self._limiter.record_limit_hit(
+        reason="rate limited (HTTP 429) after retries"
+    )
     raise _DBLPUnavailable("rate limited (HTTP 429) after retries")
 
 def _parse_total(self, data: dict) -> int:
@@ -3595,6 +3726,15 @@ def _parse_total(self, data: dict) -> int:
 On the final attempt we stop retrying and fall through to the
 [[_DBLPUnavailable]] raise below the loop; otherwise we wait---preferring
 DBLP's own [[Retry-After]] hint over our exponential default---and try again.
+Only that final give-up is recorded in the persistent limiter
+(\cref{ch:ratelimit}): a mid-loop 429 is DBLP's normal throttling, which
+the loop itself absorbs, and persisting a cooldown for it would abort
+the very retries that usually succeed.
+Exhausted retries, by contrast, mean DBLP is saturated---remembering
+that across invocations spares the next run the same futile minute.
+[[acquire()]] at the top of each attempt enforces such a remembered
+cooldown (and counts the request); no request rate is declared, so the
+loop's own pacing stays as it is.
 
 <<dblp wait out throttling or give up>>=
 if attempt >= DBLP_MAX_RETRIES:
@@ -4195,6 +4335,7 @@ class WebOfScienceProvider:
     """
 
     name = "wos"
+    LIMITS = Limits(per_second=2.0)
 
     <<wos init>>
     <<wos is available>>
@@ -4285,6 +4426,7 @@ def __init__(
 
     self._cache: dict = load_cache(self.name)
     register_cache(self.name, self._cache)
+    self._limiter = limiter_for(self)
 @
 
 \subsubsection{Availability check}
@@ -4332,9 +4474,20 @@ def check(self) -> tuple[str, str]:
 
 The [[search]] method dispatches to the appropriate API-specific implementation
 based on the detected tier.
+As for Semantic Scholar, OpenAlex, DBLP, and IEEE
+(\cref{sec:cache-successful-only}), only trustworthy results are cached:
+the former [[@cachedmethod]] decorator froze rate-limited and errored
+empty results into the persistent cache, so the tier implementations now
+report a [[cacheable]] flag alongside their papers and the wrapper
+stores only flagged answers.
+The tier implementations also bracket each request with the persistent
+rate limiter (\cref{ch:ratelimit}); WoS publishes no daily quota, so
+only the request rate is declared and enforced.
+(The extended methods for citations and references still make unpaced
+requests; migrating them onto the limiter is left with the other
+per-provider pacing consolidation.)
 
 <<wos search>>=
-@cachedmethod(lambda self: self._cache, key=lambda self, query, limit=100, filters=None: (query, limit, filters.cache_key() if filters else ""))
 def search(
     self,
     query: str,
@@ -4342,8 +4495,28 @@ def search(
     filters: SearchFilters | None = None,
 ) -> list[Paper]:
     """Search Web of Science for papers matching the query."""
+    cache_key = (query, limit, filters.cache_key() if filters else "")
+    if cache_key in self._cache:
+        return self._cache[cache_key]
+    papers, cacheable = self._search_uncached(query, limit, filters)
+    if cacheable:
+        self._cache[cache_key] = papers
+    return papers
+
+def _search_uncached(
+    self,
+    query: str,
+    limit: int,
+    filters: SearchFilters | None,
+) -> tuple[list[Paper], bool]:
+    """Run the tier-appropriate search, returning ``(papers, cacheable)``.
+
+    ``cacheable`` is False when a rate limit or an HTTP/parse error cut
+    the search short, so the caller can avoid freezing a partial or
+    empty result into the cache.
+    """
     if not self._api_key:
-        return []
+        return [], False
 
     logger.debug(f"wos: Searching for '{query}' with limit={limit}")
 
@@ -4393,12 +4566,13 @@ def _search_starter(
     query: str,
     limit: int,
     filters: SearchFilters | None,
-) -> list[Paper]:
+) -> tuple[list[Paper], bool]:
     """
     Search using the WoS Starter API.
 
     Automatically fetches multiple pages if the requested limit exceeds
-    the API's per-request maximum (50 results per page).
+    the API's per-request maximum (50 results per page).  Returns
+    ``(papers, cacheable)``.
     """
     all_papers: list[Paper] = []
     page = 1
@@ -4413,6 +4587,7 @@ def _search_starter(
             remaining = limit - len(all_papers)
             current_page_size = min(page_size, remaining)
 
+            self._limiter.acquire()
             response = requests.get(
                 WOS_STARTER_API_URL,
                 params={
@@ -4424,6 +4599,7 @@ def _search_starter(
                 headers={"X-ApiKey": self._api_key},
                 timeout=30,
             )
+            self._limiter.record_response(response)
             response.raise_for_status()
             data = response.json()
 
@@ -4441,10 +4617,13 @@ def _search_starter(
             if len(all_papers) >= total:
                 break
 
-        return all_papers
+        return all_papers, True
+    except RateLimited:
+        # The limiter already logged the reason once
+        return all_papers, False
     except Exception as e:
         logger.warning("wos (starter): %s", e)
-        return all_papers
+        return all_papers, False
 @
 
 \subsubsection{Expanded API search}
@@ -4461,12 +4640,13 @@ def _search_expanded(
     query: str,
     limit: int,
     filters: SearchFilters | None,
-) -> list[Paper]:
+) -> tuple[list[Paper], bool]:
     """
     Search using the WoS Expanded API.
 
     Automatically fetches multiple pages if the requested limit exceeds
-    the API's per-request maximum (100 results per page).
+    the API's per-request maximum (100 results per page).  Returns
+    ``(papers, cacheable)``.
     """
     all_papers: list[Paper] = []
     first_record = 1  # 1-indexed
@@ -4481,6 +4661,7 @@ def _search_expanded(
             remaining = limit - len(all_papers)
             current_page_size = min(page_size, remaining)
 
+            self._limiter.acquire()
             response = requests.get(
                 WOS_EXPANDED_API_URL,
                 params={
@@ -4492,6 +4673,7 @@ def _search_expanded(
                 headers={"X-ApiKey": self._api_key},
                 timeout=30,
             )
+            self._limiter.record_response(response)
             response.raise_for_status()
             data = response.json()
 
@@ -4519,7 +4701,10 @@ def _search_expanded(
             if first_record > total:
                 break
 
-        return all_papers
+        return all_papers, True
+    except RateLimited:
+        # The limiter already logged the reason once
+        return all_papers, False
     except Exception as e:
         logger.warning("wos (expanded): %s", e)
         # Try falling back to Starter API if we have a starter key
@@ -4530,7 +4715,7 @@ def _search_expanded(
             self._api_url = WOS_STARTER_API_URL
             self.MAX_LIMIT = 50
             return self._search_starter(query, limit, filters)
-        return all_papers
+        return all_papers, False
 @
 
 \subsubsection{Applying filters}
@@ -5070,9 +5255,9 @@ def get_paper_by_doi(self, doi: str | None) -> Paper | None:
 
     try:
         if self._api_tier == "expanded":
-            papers = self._search_expanded(query, limit=1, filters=None)
+            papers, _ = self._search_expanded(query, limit=1, filters=None)
         else:
-            papers = self._search_starter(query, limit=1, filters=None)
+            papers, _ = self._search_starter(query, limit=1, filters=None)
 
         if papers:
             return papers[0]
@@ -6214,6 +6399,21 @@ We extract these details to provide actionable guidance rather than a generic
 Users encountering this error should visit the IEEE Developer Portal to
 reactivate their account.
 
+The same gateway hides IEEE's rate limits behind 403 as well: exceeding
+the daily quota yields [[ERR_403_DEVELOPER_OVER_RATE]], exceeding the
+per-second rate yields [[ERR_403_DEVELOPER_OVER_QPS]].
+Without decoding these, a spent daily quota is indistinguishable from a
+bad API key---which is precisely the wrong diagnosis to hand a user whose
+key is fine.
+The two codes also demand different reactions, which
+[[_record_mashery_rejection]] (below) persists via the rate-limit module
+(\cref{ch:ratelimit}): [[OVER_RATE]] means today's budget is gone, so we
+mark the day exhausted; [[OVER_QPS]] means only \enquote{slow down}, so a
+short cooldown suffices and the day count is untouched.
+
+<<ieee constants>>=
+IEEE_OVER_RATE_CODE = "ERR_403_DEVELOPER_OVER_RATE"
+IEEE_OVER_QPS_CODE = "ERR_403_DEVELOPER_OVER_QPS"
 <<ieee handle response errors>>=
 if response.status_code != 200:
     error_detail = response.headers.get("X-Error-Detail-Header", "Unknown error")
@@ -6224,6 +6424,17 @@ if response.status_code != 200:
             "ieee: Account inactive. "
             "Visit https://developer.ieee.org/ to reactivate your API key. "
             "Error: %s",
+            error_detail,
+        )
+    elif IEEE_OVER_RATE_CODE in error_code:
+        logger.warning(
+            "ieee: Daily quota exhausted. "
+            "No more requests today. Error: %s",
+            error_detail,
+        )
+    elif IEEE_OVER_QPS_CODE in error_code:
+        logger.warning(
+            "ieee: Per-second rate limit exceeded. Error: %s",
             error_detail,
         )
     elif response.status_code == 403:
@@ -6247,6 +6458,10 @@ if response.status_code != 200:
     response.raise_for_status()
 @
 
+The recording half lives in the [[_record_mashery_rejection]] helper
+(defined with the provider implementation below) so the search and
+DOI-lookup paths share it.
+
 \subsection{Pagination}
 
 The IEEE Xplore API supports pagination through the [[max_records]] and
@@ -6256,7 +6471,22 @@ The [[max_records]] parameter specifies the maximum number of results per reques
 When the user requests more than 200 results, we automatically fetch multiple
 pages.
 
-\subsection{Provider implementation}
+\subsection{Rate limits and quotas}
+\label{sec:ieee-rate-limits}
+
+IEEE enforces the strictest limits of all our providers: at most 10
+requests per second and only 200 requests per day.
+The daily quota is the dangerous one---a single [[scholar search -l 0]]
+against a broad query pages through results 200 records at a time and
+can burn the whole day's budget in one command, and [[scholar enrich]]
+performs one DOI lookup per paper on top of that.
+The provider therefore declares its limits for the persistent tracker of
+\cref{ch:ratelimit} and brackets \emph{every} HTTP request with
+[[acquire()]] (which paces the request rate, counts against the daily
+budget, and refuses when the budget is spent---also when it was spent by
+an \emph{earlier} [[scholar]] invocation) and [[record_response()]] plus
+[[_record_mashery_rejection()]] (which turn the server's rejections into
+persistent state).
 
 <<ieee provider>>=
 class IEEEXploreProvider:
@@ -6264,6 +6494,7 @@ class IEEEXploreProvider:
 
     name = "ieee"
     MAX_LIMIT = 200  # IEEE API returns max 200 results per request
+    LIMITS = Limits(per_second=10.0, daily=200)
 
     def __init__(self, api_key: str | None = None):
         """
@@ -6276,78 +6507,142 @@ class IEEEXploreProvider:
         self.api_key = api_key or os.environ.get("IEEE_API_KEY")
         self._cache: dict = load_cache(self.name)
         register_cache(self.name, self._cache)
+        self._limiter = limiter_for(self)
 
     def is_available(self) -> bool:
         """IEEE Xplore requires an API key to be configured."""
         return bool(self.api_key)
 
-    @cachedmethod(lambda self: self._cache, key=lambda self, query, limit=100, filters=None: (query, limit, filters.cache_key() if filters else ""))
-    def search(
-        self,
-        query: str,
-        limit: int = 100,
-        filters: SearchFilters | None = None,
-    ) -> list[Paper]:
-        """
-        Search IEEE Xplore for papers matching the query.
+    <<ieee search methods>>
+@
 
-        Automatically fetches multiple pages if the requested limit exceeds
-        the API's per-request maximum (200 results per page).
-        """
-        if not self.api_key:
-            return []  # No API key configured
+\subsection{Provider implementation}
 
-        logger.debug(f"ieee: Searching for '{query}' with limit={limit}")
+Like Semantic Scholar, OpenAlex, and DBLP before it
+(\cref{sec:cache-successful-only}), IEEE caches only trustworthy
+results: the former [[@cachedmethod]] decorator froze whatever the
+error handling returned---including the empty list produced by a
+rate-limit rejection---into the persistent pickle cache, where it
+masqueraded as a genuine zero-hit answer until [[scholar cache clear]].
+For IEEE this interacts disastrously with the daily quota: one exhausted
+afternoon would poison every query attempted during it.
+The uncached worker reports whether its answer is trustworthy, and only
+those answers are stored; a search cut short by [[RateLimited]] or any
+error returns its partial papers uncached.
 
-        all_papers: list[Paper] = []
-        start_record = 1  # 1-indexed
-        page_size = 200  # IEEE API max per request
+<<ieee search methods>>=
+def search(
+    self,
+    query: str,
+    limit: int = 100,
+    filters: SearchFilters | None = None,
+) -> list[Paper]:
+    """
+    Search IEEE Xplore for papers matching the query.
 
-        try:
-            while len(all_papers) < limit:
-                # Calculate how many results we still need
-                remaining = limit - len(all_papers)
-                current_page_size = min(page_size, remaining)
+    Automatically fetches multiple pages if the requested limit exceeds
+    the API's per-request maximum (200 results per page).
+    """
+    cache_key = (query, limit, filters.cache_key() if filters else "")
+    if cache_key in self._cache:
+        return self._cache[cache_key]
+    papers, cacheable = self._search_uncached(query, limit, filters)
+    if cacheable:
+        self._cache[cache_key] = papers
+    return papers
 
-                params = {
-                    "querytext": query,
-                    "max_records": current_page_size,
-                    "start_record": start_record,
-                    "apikey": self.api_key,
-                }
+def _search_uncached(
+    self,
+    query: str,
+    limit: int,
+    filters: SearchFilters | None,
+) -> tuple[list[Paper], bool]:
+    """Run the paged search, returning ``(papers, cacheable)``.
 
-                # Apply filters (IEEE supports some filters natively)
-                <<ieee apply filters>>
+    ``cacheable`` is False when the search was cut short by a rate
+    limit, a spent quota, or an HTTP/parse error, so the caller can
+    avoid freezing a partial or empty result into the cache.
+    """
+    if not self.api_key:
+        return [], False  # No API key configured
 
-                response = requests.get(
-                    IEEE_API_URL,
-                    params=params,
-                    timeout=30,
-                )
-                <<ieee handle response errors>>
-                data = response.json()
+    logger.debug(f"ieee: Searching for '{query}' with limit={limit}")
 
-                articles = data.get("articles", [])
-                if not articles:
-                    # No more results available
-                    break
+    all_papers: list[Paper] = []
+    start_record = 1  # 1-indexed
+    page_size = 200  # IEEE API max per request
 
-                all_papers.extend(self._convert_article(article) for article in articles)
-                start_record += len(articles)
+    try:
+        while len(all_papers) < limit:
+            # Calculate how many results we still need
+            remaining = limit - len(all_papers)
+            current_page_size = min(page_size, remaining)
 
-                # Check if we've fetched all available results
-                total = data.get("total_records", 0)
-                if start_record > total:
-                    break
+            params = {
+                "querytext": query,
+                "max_records": current_page_size,
+                "start_record": start_record,
+                "apikey": self.api_key,
+            }
 
-            logger.debug(f"ieee: Retrieved {len(all_papers)} papers")
-            return all_papers
-        except requests.exceptions.HTTPError:
-            # Already logged with details in handle response errors
-            return all_papers
-        except Exception as e:
-            logger.warning("ieee: %s", e)
-            return all_papers
+            # Apply filters (IEEE supports some filters natively)
+            <<ieee apply filters>>
+
+            self._limiter.acquire()
+            response = requests.get(
+                IEEE_API_URL,
+                params=params,
+                timeout=30,
+            )
+            self._limiter.record_response(response)
+            self._record_mashery_rejection(response)
+            <<ieee handle response errors>>
+            data = response.json()
+
+            articles = data.get("articles", [])
+            if not articles:
+                # No more results available
+                break
+
+            all_papers.extend(self._convert_article(article) for article in articles)
+            start_record += len(articles)
+
+            # Check if we've fetched all available results
+            total = data.get("total_records", 0)
+            if start_record > total:
+                break
+
+        logger.debug(f"ieee: Retrieved {len(all_papers)} papers")
+        return all_papers, True
+    except RateLimited:
+        # The limiter already logged the reason once
+        return all_papers, False
+    except requests.exceptions.HTTPError:
+        # Already logged with details in handle response errors
+        return all_papers, False
+    except Exception as e:
+        logger.warning("ieee: %s", e)
+        return all_papers, False
+
+def _record_mashery_rejection(self, response) -> None:
+    """Persist IEEE gateway rate-limit rejections.
+
+    Decodes the `X-Mashery-Error-Code` header: `OVER_RATE` marks the
+    daily quota as spent, `OVER_QPS` records a short cooldown.
+    """
+    error_code = response.headers.get("X-Mashery-Error-Code", "")
+    if not isinstance(error_code, str):
+        return
+    if IEEE_OVER_RATE_CODE in error_code:
+        self._limiter.record_limit_hit(
+            reason="daily quota exhausted (IEEE)",
+            exhausted_daily=True,
+        )
+    elif IEEE_OVER_QPS_CODE in error_code:
+        self._limiter.record_limit_hit(
+            retry_after=1.0,
+            reason="per-second rate exceeded (IEEE)",
+        )
 @
 
 \subsubsection{DOI lookup (for enrichment)}
@@ -6359,6 +6654,16 @@ single record.
 
 To keep enrichment fast, we cache DOI lookups (including negative results)
 in the provider cache.
+Note the asymmetry with negative caching: a genuine
+\enquote{no such DOI} answer \emph{is} cached (it is a real answer), but
+the early returns on 403/429---and the [[RateLimited]] raised by
+[[acquire()]] before the request is even made---never reach the caching
+lines, so a blocked lookup is retried once the provider is available
+again.
+Each lookup passes through the same [[acquire()]]/record bracket as the
+search path: enrichment performs one lookup per paper, which makes this
+method, not [[search]], the biggest consumer of IEEE's 200-request daily
+budget.
 
 <<ieee provider>>=
 
@@ -6375,6 +6680,7 @@ in the provider cache.
         logger.info(f"ieee: Cache miss for DOI {doi}, fetching from API")
 
         try:
+            self._limiter.acquire()
             response = requests.get(
                 IEEE_API_URL,
                 params={
@@ -6385,6 +6691,8 @@ in the provider cache.
                 },
                 timeout=30,
             )
+            self._limiter.record_response(response)
+            self._record_mashery_rejection(response)
 
             if response.status_code == 429:
                 logger.warning("ieee: Rate limited during DOI lookup")
@@ -6405,6 +6713,9 @@ in the provider cache.
             paper = self._convert_article(article)
             self._cache[cache_key] = paper
             return paper
+        except RateLimited:
+            # The limiter already logged the reason once
+            return None
         except requests.exceptions.HTTPError as e:
             logger.warning("ieee: DOI lookup error: %s", e)
             return None
@@ -6918,6 +7229,149 @@ class TestIEEEXploreProvider:
             calls = mock_get.call_args_list
             assert calls[0][1]["params"]["start_record"] == 1
             assert calls[1][1]["params"]["start_record"] == 201
+@
+
+Let's verify the quota wiring end to end
+(\cref{sec:ieee-rate-limits}): a spent persisted quota blocks the search
+before any HTTP request, every request made counts against the budget,
+the two Mashery rejection codes update the persistent state differently,
+and---the cache-poisoning regression---a blocked or rate-limited search
+is never frozen into the cache.
+Each test evicts the shared [[ieee]] limiter so no warning-flag or
+pacing state leaks between tests (the state \emph{files} are already
+isolated by [[isolate_cache]], \cref{sec:cache-testing}).
+
+<<test functions>>=
+class TestIEEERateLimits:
+    """Tests for IEEE quota tracking and blocked-search caching."""
+
+    @pytest.fixture(autouse=True)
+    def fresh_limiter(self):
+        """Evict the shared ieee limiter around each test."""
+        ratelimit._LIMITERS.pop("ieee", None)
+        yield
+        ratelimit._LIMITERS.pop("ieee", None)
+
+    @staticmethod
+    def _page():
+        """A successful one-article response."""
+        response = Mock()
+        response.status_code = 200
+        response.headers = {}
+        response.json.return_value = {
+            "total_records": 1,
+            "articles": [{"title": "Paper", "authors": {"authors": []}}],
+        }
+        response.raise_for_status = Mock()
+        return response
+
+    @staticmethod
+    def _rejection(code):
+        """A 403 gateway rejection carrying a Mashery error code."""
+        response = Mock()
+        response.status_code = 403
+        response.headers = {
+            "X-Error-Detail-Header": "Rejected",
+            "X-Mashery-Error-Code": code,
+        }
+        response.raise_for_status.side_effect = (
+            requests.exceptions.HTTPError("403 Client Error")
+        )
+        return response
+
+    def test_skips_when_quota_exhausted(self):
+        """No HTTP request is made when the persisted quota is spent."""
+        provider = IEEEXploreProvider(api_key="test_key")
+        provider._limiter.record_limit_hit(
+            reason="daily quota exhausted (IEEE)", exhausted_daily=True
+        )
+        with patch("requests.get") as mock_get:
+            results = provider.search("test")
+        mock_get.assert_not_called()
+        assert results == []
+
+    def test_counts_requests_against_the_quota(self):
+        """Each HTTP request increments the persisted day count."""
+        provider = IEEEXploreProvider(api_key="test_key")
+        with patch("requests.get", return_value=self._page()):
+            provider.search("one", limit=1)
+            provider.search("two", limit=1)
+        assert ratelimit.load_state("ieee")["day_count"] == 2
+
+    def test_over_rate_marks_daily_quota_spent(self):
+        """The OVER_RATE gateway code exhausts the persisted day."""
+        provider = IEEEXploreProvider(api_key="test_key")
+        with patch(
+            "requests.get", return_value=self._rejection(IEEE_OVER_RATE_CODE)
+        ):
+            results = provider.search("test", limit=1)
+        assert results == []
+        assert ratelimit.load_state("ieee")["day_count"] >= 200
+        avail = provider._limiter.check_available()
+        assert not avail.ok
+        assert avail.quota
+
+    def test_over_qps_sets_short_cooldown_only(self):
+        """The OVER_QPS code cools down without touching the day count."""
+        provider = IEEEXploreProvider(api_key="test_key")
+        with patch(
+            "requests.get", return_value=self._rejection(IEEE_OVER_QPS_CODE)
+        ):
+            results = provider.search("test", limit=1)
+        assert results == []
+        state = ratelimit.load_state("ieee")
+        assert state["day_count"] == 1  # only the request actually made
+        avail = provider._limiter.check_available()
+        assert not avail.ok
+        assert not avail.quota
+
+    def test_blocked_search_is_not_cached(self):
+        """A quota-blocked search must not freeze [] into the cache."""
+        provider = IEEEXploreProvider(api_key="test_key")
+        provider._limiter.record_limit_hit(
+            reason="daily quota exhausted (IEEE)", exhausted_daily=True
+        )
+        assert provider.search("test", limit=1) == []
+        ratelimit.reset_state("ieee")
+        with patch("requests.get", return_value=self._page()):
+            results = provider.search("test", limit=1)
+        assert len(results) == 1
+
+    def test_rate_limited_search_is_not_cached(self):
+        """A 429-truncated search is retried later, not frozen."""
+        provider = IEEEXploreProvider(api_key="test_key")
+        rate_limited = Mock()
+        rate_limited.status_code = 429
+        rate_limited.headers = {}
+        rate_limited.raise_for_status.side_effect = (
+            requests.exceptions.HTTPError("429 Too Many Requests")
+        )
+        with patch("requests.get", return_value=rate_limited):
+            assert provider.search("q", limit=1) == []
+        ratelimit.reset_state("ieee")
+        with patch("requests.get", return_value=self._page()):
+            assert len(provider.search("q", limit=1)) == 1
+
+    def test_blocked_doi_lookup_is_not_cached(self):
+        """A blocked DOI lookup is retried once the quota is back."""
+        provider = IEEEXploreProvider(api_key="test_key")
+        provider._limiter.record_limit_hit(
+            reason="daily quota exhausted (IEEE)", exhausted_daily=True
+        )
+        with patch("requests.get") as mock_get:
+            assert provider.get_paper_by_doi("10.1109/X.2024.1") is None
+            mock_get.assert_not_called()
+        ratelimit.reset_state("ieee")
+        doi_response = Mock()
+        doi_response.status_code = 200
+        doi_response.headers = {}
+        doi_response.json.return_value = {
+            "articles": [{"title": "Paper", "doi": "10.1109/X.2024.1"}]
+        }
+        doi_response.raise_for_status = Mock()
+        with patch("requests.get", return_value=doi_response):
+            paper = provider.get_paper_by_doi("10.1109/X.2024.1")
+        assert paper is not None
 
 
 class TestIEEEXploreIntegration:
@@ -7999,6 +8453,9 @@ loop over a single-page fetcher, and an internal exception separating
 transient or rejected requests from genuine zero-hit answers.
 [[requests]] is already imported for the other REST providers, so no new
 dependencies are needed.
+HAL publishes no hard limits, but as a courtesy to a free archive we
+declare one request per second for the persistent limiter
+(\cref{ch:ratelimit})---the provider previously had no pacing at all.
 
 <<hal provider>>=
 class _HALUnavailable(Exception):
@@ -8015,11 +8472,13 @@ class HALProvider:
 
     name = "hal"
     MAX_LIMIT: int | None = None   # Deep paging verified past start=30000
+    LIMITS = Limits(per_second=1.0)
 
     def __init__(self):
         """Initialize the HAL provider."""
         self._cache: dict = load_cache(self.name)
         register_cache(self.name, self._cache)
+        self._limiter = limiter_for(self)
 
     def is_available(self) -> bool:
         """HAL is always available (no API key needed)."""
@@ -8070,6 +8529,9 @@ def search(
 
     try:
         papers = self._fetch_pages(query, limit, filters)
+    except RateLimited:
+        # The limiter already logged the reason once; do not cache.
+        return []
     except Exception as e:
         # Rejected query or transient failure: return empty but do NOT
         # cache, so a later (possibly corrected) call gets a fresh answer.
@@ -8159,12 +8621,14 @@ def _fetch_one_page(
     if filter_queries:
         params["fq"] = filter_queries  # repeated fq params, ANDed by Solr
 
+    self._limiter.acquire()
     response = requests.get(
         HAL_API_URL,
         params=params,
         headers={"User-Agent": HAL_USER_AGENT},
         timeout=30,
     )
+    self._limiter.record_response(response)
     response.raise_for_status()
 
     try:
@@ -8743,12 +9207,26 @@ Scopus signals empty results by returning an entry with
 [[@_fa]] set to [["false"]] rather than an empty array, so we check
 for this sentinel.
 
+Scopus enforces a request rate (9 per second for the Search API) and
+\emph{weekly} quotas per API key.
+The rate is declared for the persistent limiter (\cref{ch:ratelimit});
+the weekly quota needs no local bucket at all, because Elsevier reports
+it authoritatively in [[X-RateLimit-Remaining]]/[[X-RateLimit-Reset]]
+headers on every response---[[record_response()]] syncs those into the
+persistent state, and the limiter refuses further requests once the
+server says the budget is gone.
+Like the other keyed providers (\cref{sec:cache-successful-only}), only
+trustworthy results are cached: the former [[@cachedmethod]] decorator
+froze rate-limited empty results into the persistent cache until it was
+cleared manually.
+
 <<scopus provider>>=
 class ScopusProvider:
     """Search provider for Elsevier Scopus."""
 
     name = "scopus"
     MAX_LIMIT = 25  # Scopus returns max 25 per page
+    LIMITS = Limits(per_second=9.0)
 
     def __init__(
         self,
@@ -8772,19 +9250,12 @@ class ScopusProvider:
         )
         self._cache: dict = load_cache(self.name)
         register_cache(self.name, self._cache)
+        self._limiter = limiter_for(self)
 
     def is_available(self) -> bool:
         """Scopus requires an API key."""
         return bool(self.api_key)
 
-    @cachedmethod(
-        lambda self: self._cache,
-        key=lambda self, query, limit=100, filters=None: (
-            query,
-            limit,
-            filters.cache_key() if filters else "",
-        ),
-    )
     def search(
         self,
         query: str,
@@ -8796,8 +9267,34 @@ class ScopusProvider:
         Fetches multiple pages when the requested limit
         exceeds the per-request maximum of 25 results.
         """
+        cache_key = (
+            query,
+            limit,
+            filters.cache_key() if filters else "",
+        )
+        if cache_key in self._cache:
+            return self._cache[cache_key]
+        papers, cacheable = self._search_uncached(
+            query, limit, filters
+        )
+        if cacheable:
+            self._cache[cache_key] = papers
+        return papers
+
+    def _search_uncached(
+        self,
+        query: str,
+        limit: int,
+        filters: SearchFilters | None,
+    ) -> tuple[list[Paper], bool]:
+        """Run the paged search, returning ``(papers, cacheable)``.
+
+        ``cacheable`` is False when a rate limit or an HTTP/parse
+        error cut the search short, so the caller can avoid freezing
+        a partial or empty result into the cache.
+        """
         if not self.api_key:
-            return []
+            return [], False
 
         logger.debug(
             "scopus: Searching for '%s' with limit=%d",
@@ -8831,12 +9328,14 @@ class ScopusProvider:
                     "count": current_count,
                 }
 
+                self._limiter.acquire()
                 response = requests.get(
                     SCOPUS_API_URL,
                     headers=headers,
                     params=params,
                     timeout=30,
                 )
+                self._limiter.record_response(response)
                 <<scopus handle response errors>>
                 data = response.json()
 
@@ -8868,12 +9367,15 @@ class ScopusProvider:
                 "scopus: Retrieved %d papers",
                 len(all_papers),
             )
-            return all_papers
+            return all_papers, True
+        except RateLimited:
+            # The limiter already logged the reason once
+            return all_papers, False
         except requests.exceptions.HTTPError:
-            return all_papers
+            return all_papers, False
         except Exception as e:
             logger.warning("scopus: %s", e)
-            return all_papers
+            return all_papers, False
 @
 
 \subsection{Applying filters}
@@ -9357,6 +9859,12 @@ from cachetools import cachedmethod
 
 from scholar import Paper, SearchFilters
 from scholar.cache import load_cache, register_cache
+from scholar.ratelimit import (
+    Limits,
+    RateLimited,
+    format_retry,
+    limiter_for,
+)
 <<semantic scholar imports>>
 <<openalex imports>>
 <<dblp imports>>
