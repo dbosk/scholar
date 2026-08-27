@@ -391,7 +391,7 @@ We complete from the valid action names:
 <<completion functions>>=
 CACHE_ACTIONS = ["clear", "info", "path"]
 PDF_ACTIONS = ["open", "info", "clear", "path", "quote"]
-PROVIDERS_ACTIONS = ["list", "check"]
+PROVIDERS_ACTIONS = ["list", "check", "limits"]
 
 
 def complete_cache_action(incomplete: str) -> list[str]:
@@ -2431,7 +2431,8 @@ Rather than requiring users to read the literate documentation, we provide a
 Following the cache command's action-based design (\cref{ch:cache-cli}), the
 command takes an action argument rather than subcommands.  The action
 defaults to [[list]] so the long-standing bare [[scholar providers]]
-invocation keeps working; [[check]] adds the health probe.
+invocation keeps working; [[check]] adds the health probe, and [[limits]]
+shows the persistent rate-limit bookkeeping (\cref{ch:ratelimit}).
 
 <<providers command>>=
 @app.command()
@@ -2439,7 +2440,7 @@ def providers(
     action: Annotated[
         str,
         typer.Argument(
-            help="Action: list or check",
+            help="Action: list, check, or limits",
             autocompletion=complete_providers_action,
         ),
     ] = "list",
@@ -2450,6 +2451,14 @@ def providers(
             help="Only check configuration; make no network requests.",
         ),
     ] = False,
+    reset: Annotated[
+        Optional[str],
+        typer.Option(
+            "--reset",
+            help="With limits: clear persisted rate-limit state for the"
+            " named provider, or for every provider with 'all'.",
+        ),
+    ] = None,
 ) -> None:
     """
     List available search providers and their configuration.
@@ -2457,15 +2466,18 @@ def providers(
     Actions:
         list   - Show providers, API key requirements, how to get keys
         check  - Probe each provider; report key and connectivity problems
+        limits - Show rate limits, quota usage, and reset times
     """
     if action == "list":
         <<display provider information>>
     elif action == "check":
         <<check provider health>>
+    elif action == "limits":
+        <<display provider limits>>
     else:
         console = Console()
         console.print(f"[red]Unknown action: {escape(action)}[/red]")
-        console.print("Valid actions: list, check")
+        console.print("Valid actions: list, check, limits")
         raise typer.Exit(1)
 @
 
@@ -2485,6 +2497,11 @@ state (most users have no Scopus key) and exiting nonzero on it would make
 the gate useless on minimal setups.  \enquote{Rate limited} also exits
 zero: the credentials and connectivity are fine, and the search path already
 handles 429s with back-off, so failing on one would make the gate flaky.
+The same reasoning covers \enquote{quota exhausted}: the configuration is
+fine, the budget is simply spent, and the search path now skips such a
+provider with a warning (\cref{ch:ratelimit})---which also means the
+check reports it from the persisted state \emph{without} burning a probe
+request against the spent budget.
 Nonzero thus means exactly \enquote{a provider you believe you have will
 silently contribute nothing}.
 
@@ -2494,6 +2511,7 @@ from scholar.providers import (
     HEALTH_KEY_REJECTED,
     HEALTH_NETWORK_ERROR,
     HEALTH_OK,
+    HEALTH_QUOTA_EXHAUSTED,
     HEALTH_RATE_LIMITED,
     check_provider,
     get_all_providers,
@@ -2507,6 +2525,7 @@ status_styles = {
     HEALTH_HTTP_ERROR: "red",
     HEALTH_NETWORK_ERROR: "red",
     HEALTH_RATE_LIMITED: "yellow",
+    HEALTH_QUOTA_EXHAUSTED: "yellow",
 }
 failure_statuses = (
     HEALTH_KEY_REJECTED,
@@ -2544,6 +2563,83 @@ if failures:
             f"[red]{health.name}: {health.status}[/red] {health.message}"
         )
     raise typer.Exit(1)
+@
+
+\subsection{Showing rate limits and quota usage}
+
+The limits action surfaces the persistent rate-limit bookkeeping of
+\cref{ch:ratelimit}: declared limits, how much of today's budget each
+provider has absorbed, and when a spent budget comes back.
+One row per \emph{quota group}, not per provider---the eight
+OpenAlex-backed providers share one budget and appear as one
+[[openalex]] row, which is the truthful unit of accounting.
+
+The [[--reset]] escape hatch deletes the persisted state.
+It exists because the bookkeeping is deliberately conservative: the
+daily reset time is a guess (\cref{ch:ratelimit}), and a replaced API
+key starts a fresh budget the file knows nothing about.
+When the user \emph{knows} the quota is back, resetting beats waiting.
+
+<<display provider limits>>=
+from scholar import ratelimit
+
+console = Console()
+
+if reset is not None:
+    count = ratelimit.reset_state(None if reset == "all" else reset)
+    console.print(f"Cleared {count} rate-limit state file(s).")
+    raise typer.Exit(0)
+
+table = Table(title="Provider Rate Limits", box=box.HORIZONTALS)
+table.add_column("Provider", style="cyan", no_wrap=True)
+table.add_column("Limits")
+table.add_column("Used today", justify="right")
+table.add_column("Remaining", justify="right")
+table.add_column("Resets")
+table.add_column("Status")
+
+for status in ratelimit.all_status():
+    <<format one limits row>>
+
+console.print(table)
+@
+
+Each row folds the availability judgement into a colour-coded status:
+green for available, red for a spent quota (act tomorrow, or
+[[--reset]]), yellow for a transient cooldown (just wait).
+The \enquote{Remaining} column prefers the provider's own report
+(synced from [[X-RateLimit-*]] headers) over our local subtraction,
+matching the limiter's own order of authority.
+
+<<format one limits row>>=
+limits_parts = []
+if status.limits.per_second:
+    limits_parts.append(f"{status.limits.per_second:g}/s")
+if status.limits.daily:
+    limits_parts.append(f"{status.limits.daily}/day")
+if status.remaining is not None:
+    remaining_text = str(status.remaining)
+elif status.limits.daily:
+    remaining_text = str(max(0, status.limits.daily - status.day_count))
+else:
+    remaining_text = "--"
+availability = status.availability
+if availability.ok:
+    status_text = "[green]ok[/green]"
+elif availability.quota:
+    status_text = "[red]quota exhausted[/red]"
+else:
+    status_text = "[yellow]cooling down[/yellow]"
+table.add_row(
+    status.name,
+    ", ".join(limits_parts) or "--",
+    str(status.day_count),
+    remaining_text,
+    ratelimit.format_retry(status.reset_at)
+    if status.reset_at
+    else "--",
+    status_text,
+)
 @
 
 We organize provider information in a table showing the provider name, whether
@@ -2959,6 +3055,74 @@ class TestProvidersCheckCommand:
 
         assert result.exit_code == 0
         assert "not configured" in result.stdout
+
+    def test_check_quota_exhausted_exits_zero(self):
+        """A spent quota is informational, not a gate failure."""
+        from scholar.providers import ProviderHealth
+
+        def fake_check(provider, live=True):
+            if provider.name == "ieee":
+                return ProviderHealth(
+                    provider.name, True, "quota exhausted",
+                    "daily quota spent (200/200 requests)",
+                )
+            return ProviderHealth(provider.name, True, "ok")
+
+        with patch(
+            "scholar.providers.check_provider", side_effect=fake_check
+        ):
+            result = runner.invoke(app, ["providers", "check"])
+
+        assert result.exit_code == 0
+        assert "exhausted" in result.stdout
+@
+
+Let's verify the limits action: the declared limits render, persisted
+exhaustion shows as such, and [[--reset]] actually clears the state:
+
+<<test functions>>=
+class TestProvidersLimitsCommand:
+    """Tests for the providers limits action."""
+
+    def test_limits_shows_declared_limits(self):
+        """The ieee row shows its declared 10/s and 200/day limits."""
+        result = runner.invoke(app, ["providers", "limits"])
+        assert result.exit_code == 0
+        assert "ieee" in result.stdout
+        assert "10/s" in result.stdout
+        assert "200/day" in result.stdout
+
+    def test_limits_shows_persisted_exhaustion(self):
+        """A spent quota recorded in the state file shows as exhausted."""
+        from scholar import ratelimit
+        from scholar.ratelimit import Limits
+
+        ratelimit._LIMITERS.pop("ieee", None)
+        limiter = ratelimit.get_limiter(
+            "ieee", Limits(per_second=10.0, daily=200)
+        )
+        limiter.record_limit_hit(
+            reason="daily quota exhausted (IEEE)", exhausted_daily=True
+        )
+        result = runner.invoke(app, ["providers", "limits"])
+        assert result.exit_code == 0
+        assert "exhausted" in result.stdout
+        ratelimit._LIMITERS.pop("ieee", None)
+
+    def test_limits_reset_clears_state(self):
+        """--reset deletes the persisted state for the named provider."""
+        from scholar import ratelimit
+        from scholar.ratelimit import Limits
+
+        ratelimit._LIMITERS.pop("ieee", None)
+        ratelimit.get_limiter("ieee", Limits(daily=200)).acquire()
+        assert ratelimit.load_state("ieee")["day_count"] == 1
+        result = runner.invoke(
+            app, ["providers", "limits", "--reset", "ieee"]
+        )
+        assert result.exit_code == 0
+        assert ratelimit.load_state("ieee")["day_count"] == 0
+        ratelimit._LIMITERS.pop("ieee", None)
 @
 
 

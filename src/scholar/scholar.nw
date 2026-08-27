@@ -2766,6 +2766,26 @@ per-provider results) consistent with the CLI.
 Names that resolve to no provider are skipped as before; expansion has
 already warned about them.
 
+\subsubsection{Skipping unavailable providers}
+
+Before entering a provider, [[execute()]] consults the persistent
+rate-limit state (\cref{ch:ratelimit}): a provider whose daily quota is
+already spent---possibly by an \emph{earlier} [[scholar]]
+invocation---is skipped with a single warning naming the reason and the
+reset time.
+The providers guard each request themselves as well, but that
+fine-grained refusal surfaces as a quiet empty result deep inside a
+multi-provider run; the pre-check here is what makes the skip
+\emph{visible}.
+The warning goes through [[logger.warning]] (visible at default
+verbosity) rather than a console print, because [[execute()]] is
+library code shared by the CLI, the TUI, and [[rq]], and stdout must
+stay pure for [[-f json]]/[[-f bibtex]].
+A skipped provider produces \emph{no} [[SearchResult]] at all: a
+zero-paper result would read as \enquote{the provider found nothing} in
+a review session's audit trail, which is precisely the wrong record for
+a provider that was never asked.
+
 <<search methods>>=
 def execute(
     self,
@@ -2776,6 +2796,10 @@ def execute(
     """
     Execute the search across specified providers.
 
+    Providers whose persisted rate-limit state says they cannot be
+    queried right now (spent daily quota, active cooldown) are
+    skipped with a warning and produce no `SearchResult`.
+
     Args:
         providers: List of provider names or group aliases (e.g.
             "preprints") to search. If None, uses the default
@@ -2784,13 +2808,14 @@ def execute(
         filters: Optional SearchFilters to apply to the search.
 
     Returns:
-        List of SearchResult objects, one per provider.
+        List of SearchResult objects, one per queried provider.
     """
     from scholar.providers import (
         get_provider,
         get_default_providers,
         expand_provider_names,
     )
+    from scholar.ratelimit import format_retry, limiter_for
 
     timestamp = datetime.now().isoformat()
 
@@ -2809,6 +2834,14 @@ def execute(
 
     # Query each provider
     for provider in provider_list:
+        availability = limiter_for(provider).check_available()
+        if not availability.ok:
+            logger.warning(
+                f"{provider.name}: {availability.reason};"
+                f" resets {format_retry(availability.retry_at)}."
+                f" Skipping."
+            )
+            continue
         logger.debug(f"Querying {provider.name} with limit={limit}")
         papers = provider.search(self.query, limit=limit, filters=filters)
         logger.info(f"{provider.name}: Retrieved {len(papers)} papers")
@@ -2882,6 +2915,52 @@ value is what later reconstructs the [[--limit]] of the original search:
 
             results = Search("test").execute(providers=["mock"], limit=42)
             assert results[0].limit == 42
+@
+
+A provider whose persisted quota is spent must be skipped visibly but
+harmlessly: one warning, no request, no [[SearchResult]]---and the other
+providers must be entirely unaffected:
+
+<<test functions>>=
+    def test_execute_skips_quota_blocked_provider(
+        self, monkeypatch, caplog
+    ):
+        """A quota-blocked provider is skipped with one warning."""
+        from scholar import ratelimit
+
+        with isolated_registry():
+            from scholar import providers
+
+            blocked = Mock()
+            blocked.name = "blocked"
+            healthy = Mock()
+            healthy.name = "healthy"
+            healthy.search.return_value = [
+                Paper(title="Test", authors=["Author"])
+            ]
+            monkeypatch.setattr(
+                providers,
+                "PROVIDERS",
+                {"blocked": blocked, "healthy": healthy},
+            )
+            ratelimit.get_limiter("blocked").record_limit_hit(
+                reason="daily quota spent", exhausted_daily=True
+            )
+
+            with caplog.at_level("WARNING"):
+                results = Search("test").execute(
+                    providers=["blocked", "healthy"]
+                )
+
+        blocked.search.assert_not_called()
+        assert [r.provider for r in results] == ["healthy"]
+        warnings = [
+            r for r in caplog.records
+            if r.levelname == "WARNING" and "blocked" in r.getMessage()
+        ]
+        assert len(warnings) == 1
+        assert "daily quota spent" in warnings[0].getMessage()
+        ratelimit._LIMITERS.pop("blocked", None)
 @
 
 A group alias must reach every registered member exactly once, even when

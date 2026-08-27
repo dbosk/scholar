@@ -319,6 +319,7 @@ def enrich_paper(
 @
 
 \subsection{Global enrichment cache}
+\label{sec:enrichment-cache}
 
 Fetching references and citations is expensive---it requires API calls that count
 against rate limits. When the same paper appears in different searches or sessions,

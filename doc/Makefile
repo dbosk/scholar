@@ -3,6 +3,7 @@ DOC+=		scholar.pdf
 SRC_TEX+=	../src/scholar/scholar.tex
 SRC_TEX+=	../src/scholar/utils.tex
 SRC_TEX+=	../src/scholar/cache.tex
+SRC_TEX+=	../src/scholar/ratelimit.tex
 SRC_TEX+=	../src/scholar/providers.tex
 SRC_TEX+=	../src/scholar/enrich.tex
 SRC_TEX+=	../src/scholar/crossref.tex
