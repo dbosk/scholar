@@ -2519,6 +2519,17 @@ As with the Semantic Scholar implementation, we accept [[str | None]] to
 simplify calling code that passes [[paper.doi]] without checking for [[None]]
 first.
 
+A 404 is an \emph{answer}, not an error: OpenAlex simply has no work
+under that DOI.  This is routine rather than exceptional---arXiv DOIs
+in particular are often absent even when the work itself is indexed
+(under a merged record without the arXiv DOI)---and the preprint
+fallback (\cref{preprint-module}) probes candidate DOIs exactly like
+that on every enrichment.  So we cache the miss like a successful
+lookup and log at debug level; treating it as a warning turned every
+enrich run into a wall of noise, and leaving it uncached re-asked the
+same dead DOI on every run.  Other HTTP errors and transport failures
+stay uncached warnings, so transient trouble is retried later.
+
 <<openalex get paper by doi>>=
 def get_paper_by_doi(self, doi: str | None) -> Paper | None:
     """
@@ -2538,7 +2549,7 @@ def get_paper_by_doi(self, doi: str | None) -> Paper | None:
     if cache_key in self._cache:
         logger.info(f"openalex: Cache hit for DOI {doi}")
         return self._cache[cache_key]
-    
+
     logger.info(f"openalex: Cache miss for DOI {doi}, fetching from API")
 
     try:
@@ -2556,6 +2567,14 @@ def get_paper_by_doi(self, doi: str | None) -> Paper | None:
         self._cache[cache_key] = paper
         return paper
 
+    except requests.exceptions.HTTPError as e:
+        if getattr(e.response, "status_code", None) == 404:
+            # DOI unknown to OpenAlex: cache the definite miss.
+            logger.debug("openalex: no work for DOI %s", doi)
+            self._cache[cache_key] = None
+            return None
+        logger.warning("openalex: DOI lookup failed: %s", e)
+        return None
     except Exception as e:
         logger.warning("openalex: DOI lookup failed: %s", e)
         return None
@@ -2605,6 +2624,17 @@ def get_preprint_locations(self, doi: str | None) -> list[dict]:
         self._wait_for_rate_limit()
         doi_url = f"https://doi.org/{doi}"
         work = pyalex.Works()[doi_url]
+    except requests.exceptions.HTTPError as e:
+        if getattr(e.response, "status_code", None) == 404:
+            # DOI unknown to OpenAlex: cache the definite miss.
+            logger.debug("openalex: no work for DOI %s", doi)
+            self._cache[cache_key] = []
+            return []
+        logger.warning(
+            "openalex: preprint-location lookup failed for %s: %s",
+            doi, e,
+        )
+        return []
     except Exception as e:
         logger.warning(
             "openalex: preprint-location lookup failed for %s: %s",
@@ -2661,7 +2691,25 @@ the caller matches candidates on exact normalized title, so hits whose
 title merely \emph{mentions} the query words are useless and abstracts
 would only add noise.
 
+Real titles routinely contain characters that are syntax in an
+OpenAlex filter expression, so the query is sanitized first.  A [[?]]
+or [[*]] makes OpenAlex treat the query as a wildcard search, which
+the stemmed [[title.search]] field rejects outright (any title ending
+in a question mark failed).  A comma separates filter clauses and a
+pipe separates OR alternatives, so either inside a title truncates or
+corrupts the filter (a 400 for titles like \enquote{RepairAgent: An
+Autonomous, LLM-Based Agent \dots}).  Replacing all four with spaces
+is lossless for our purpose: the search is stemmed, so punctuation
+carries no signal, and the caller re-checks candidates against the
+\emph{original} title anyway.
+
 <<openalex preprint lookups>>=
+@staticmethod
+def _sanitize_title_query(title: str) -> str:
+    """Strip characters that are OpenAlex filter/wildcard syntax."""
+    cleaned = re.sub(r"[*?,|]", " ", title)
+    return re.sub(r"\s+", " ", cleaned).strip()
+
 def search_preprints_by_title(
     self, title: str, limit: int = 5
 ) -> list[Paper]:
@@ -2674,7 +2722,9 @@ def search_preprints_by_title(
     if not title or not title.strip():
         return []
 
-    normalized = title.strip()
+    normalized = self._sanitize_title_query(title)
+    if not normalized:
+        return []
     cache_key = (
         "preprint_search", self.CACHE_VERSION, normalized.lower(),
     )
@@ -2747,6 +2797,44 @@ class TestOpenAlexPreprintLocations:
     def test_empty_work_yields_no_locations(self):
         provider = OpenAlexProvider()
         assert provider._preprint_locations_from_work({}) == []
+
+    def test_404_is_cached_as_definite_miss(self):
+        provider = OpenAlexProvider()
+        response = Mock(status_code=404)
+        error = requests.exceptions.HTTPError(response=response)
+        with patch("pyalex.Works") as mock_works:
+            mock_works.return_value.__getitem__.side_effect = error
+            assert provider.get_preprint_locations("10.1/gone") == []
+            assert provider.get_preprint_locations("10.1/gone") == []
+            assert mock_works.call_count == 1
+
+    def test_other_errors_are_not_cached(self):
+        provider = OpenAlexProvider()
+        response = Mock(status_code=500)
+        error = requests.exceptions.HTTPError(response=response)
+        with patch("pyalex.Works") as mock_works:
+            mock_works.return_value.__getitem__.side_effect = error
+            assert provider.get_preprint_locations("10.1/flaky") == []
+            assert provider.get_preprint_locations("10.1/flaky") == []
+            assert mock_works.call_count == 2
+@
+
+The sanitizer must remove exactly the four syntax characters and
+nothing else:
+
+<<test functions>>=
+class TestSanitizeTitleQuery:
+    """Tests for OpenAlexProvider._sanitize_title_query."""
+
+    def test_strips_wildcards_and_filter_syntax(self):
+        assert OpenAlexProvider._sanitize_title_query(
+            "Is AI the better partner? Human, Machine | Both*"
+        ) == "Is AI the better partner Human Machine Both"
+
+    def test_plain_title_is_unchanged(self):
+        assert OpenAlexProvider._sanitize_title_query(
+            "A Plain Title: With Subtitle"
+        ) == "A Plain Title: With Subtitle"
 @
 
 \subsection{Auto-registration}
@@ -2982,6 +3070,18 @@ class TestOpenAlexGetPaperByDoi:
 
             paper = provider.get_paper_by_doi("10.1234/test")
             assert paper is None
+
+    def test_get_paper_by_doi_caches_404_as_miss(self):
+        """A 404 is a definite miss: cached, not retried."""
+        provider = OpenAlexProvider()
+        response = Mock(status_code=404)
+        error = requests.exceptions.HTTPError(response=response)
+
+        with patch("pyalex.Works") as mock_works:
+            mock_works.return_value.__getitem__.side_effect = error
+            assert provider.get_paper_by_doi("10.1/gone") is None
+            assert provider.get_paper_by_doi("10.1/gone") is None
+            assert mock_works.call_count == 1
 
     def test_get_paper_by_doi_caches_results(self):
         """get_paper_by_doi() caches successful lookups."""
