@@ -29,6 +29,8 @@ Providers self-register via `register_provider()` at module load time.
 | `src/scholar/crossref.nw` | Literate source for currency checks |
 | `src/scholar/unpaywall.py` | Unpaywall open-access lookup (per DOI) |
 | `src/scholar/unpaywall.nw` | Literate source for open-access lookup |
+| `src/scholar/preprint.py` | Preprint fallback (adopt a preprint when no PDF found) |
+| `src/scholar/preprint.nw` | Literate source for the preprint fallback |
 | `src/scholar/cli.py` | CLI commands and output formatters |
 | `src/scholar/cli.nw` | Literate programming source for CLI |
 
@@ -144,10 +146,52 @@ superseded, using Crossref's `updated-by` (Retraction-Watch-backed) and
   `None` means "never checked", `[]` means "checked, clean".
 - `Paper.is_retracted` / `is_corrected` / `is_superseded` are convenience
   predicates; `crossref.currency_status(paper)` reduces these to one word
-  (`retracted`/`corrected`/`superseded`/`ok`/`unknown`).
+  (`retracted`/`corrected`/`superseded`/`preprint`/`ok`/`unknown`).
+  `preprint` means a deliberately adopted preprint (see below) whose only
+  "newer version" is the recorded published DOI — info, not a warning.
 - `scholar verify "<session>"` reports per-paper status (with `--json`);
   `scholar enrich "<session>"` warns on issues as a side effect. Both
   persist the findings back to the session.
+
+### Preprint Fallback (adopt a preprint when no PDF is found)
+
+When enrichment ends with no `pdf_url` (providers + Unpaywall found
+nothing), `preprint.find_preprint(paper, search=False)` tries to locate a
+preprint version and **replace the entry with it** (preprint DOI, venue,
+pdf_url) so citations point at the version actually read. The published
+DOI is kept in `Paper.published_versions`
+(`{"doi": ..., "relation": "preprint-of"}`, drives
+`is_preprint_substitute`). Tiers, first adoptable (= yields a PDF) wins:
+
+0. `Paper.preprint_versions` links recorded by dedup (see below).
+1. OpenAlex `locations` of the published DOI
+   (`OpenAlexProvider.get_preprint_locations`); arXiv locations become a
+   full replacement via the derived arXiv DOI, other hosts only fill
+   `pdf_url` (no DOI to swap to).
+2. Crossref `has-preprint` relation (`crossref.fetch_preprint_dois`,
+   parsed from the same cached `fetch_currency` response; cache key is
+   versioned via `CURRENCY_CACHE_VERSION`).
+3. Only with `--preprint-search` (on `scholar enrich` and
+   `search --enrich`): one OpenAlex `type:preprint` title search
+   (`search_preprints_by_title`) + one arXiv search; candidates accepted
+   only on exact `legacy_hash_paper_id(title, authors)` match — title and
+   authors are the only data shared between versions, and fuzzy matching
+   is deliberately avoided.
+
+Identity change on adoption is handled by `notes.migrate_paper_id`
+(notes + decision stores), announced by `scholar enrich`
+("Adopted preprint <doi> ..."), and reconciled at session append in
+`review.py` (both directions: returning published version folds into the
+adopted entry; a later-arriving adoption upgrades an existing published
+entry, keeping its decision).
+
+**Version-aware dedup**: `deduplicate_papers` runs a second pass
+(`deduplicate_versions`) grouping by `legacy_hash_paper_id`; a group of
+exactly one published paper (`utils.is_preprint_paper` classifies by DOI
+prefix/venue) plus preprints collapses onto the published entry, filling
+content gaps via `merge_version_of` (never version-specific fields like
+`pdf_url`) and recording `Paper.preprint_versions`
+(`{"doi", "pdf_url"}`) for tier 0. Ambiguous groups are left untouched.
 
 ### Headless Review Sessions
 

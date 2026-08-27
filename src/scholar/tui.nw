@@ -609,6 +609,18 @@ class AbstractScreen(Screen[None]):
                 enriched_fields.append(f"{len(enriched.references)} refs")
             if enriched.citations is not None and paper.citations is None:
                 enriched_fields.append(f"{len(enriched.citations)} cites")
+
+            # The preprint fallback may have replaced the entry with a
+            # preprint version (a new identity): migrate the persisted
+            # notes/decisions to the new id and tell the user.
+            if enriched.id != paper.id:
+                from scholar.notes import get_paper_id, migrate_paper_id
+                migrate_paper_id(
+                    get_paper_id(paper), get_paper_id(enriched)
+                )
+                enriched_fields.append(
+                    f"adopted preprint {enriched.doi}"
+                )
             
             # Update decision and notify from main thread
             def finish():

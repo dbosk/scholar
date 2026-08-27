@@ -1,0 +1,757 @@
+\chapter{Preprint fallback}
+\label{preprint-module}
+
+Enrichment (\cref{enrich-module}) fills a paper's [[pdf_url]] from the
+search providers and Unpaywall (\cref{unpaywall-module}), but for a
+paywalled paper without any registered open-access copy both come up
+empty.  Very often, though, the work \emph{is} readable---as a preprint
+on arXiv, HAL, SSRN, bioRxiv, or another server.  The preprint is a
+different record with a different DOI, so no per-DOI lookup on the
+published paper will ever surface it by itself.
+
+This chapter closes that gap: given a paper whose PDF could not be
+found, locate a preprint version of the same work and \emph{adopt} it.
+Adoption replaces the entry wholesale---DOI, venue, URL, and PDF---
+rather than just borrowing the preprint's PDF link.  This is a
+citation-integrity decision: whoever reads the preprint should cite the
+preprint, not the published version they never saw.  The published
+DOI is preserved in the [[published_versions]] field
+(\cref{sec:version-merge}) so the substitution stays auditable and the
+published version is recognized as already-present when a search is
+re-run.
+
+\section{Design overview}
+
+The central difficulty is linking two records that share almost no
+metadata: a preprint and its published version differ in DOI, venue,
+URL, and often year.  The only data that reliably maps between them is
+the title and the authors.  We therefore use two kinds of links, in
+order of trustworthiness:
+
+\begin{description}
+\item[Authoritative DOI links] Some links are asserted by the
+  publishers and indexes themselves: OpenAlex merges a preprint deposit
+  into the published work's [[locations]] array, and Crossref's
+  [[has-preprint]] relation points from the published DOI to the
+  preprint DOI (\cref{crossref-module}).  These need no matching at
+  all and run on every enrichment---each is a single, cached lookup.
+\item[Title+author search] When no authoritative link exists, we can
+  search the preprint servers for the title and match candidates on
+  the strict identity rule [[legacy_hash_paper_id]]
+  (\cref{utils-module}): exact normalized title plus first author's
+  surname.  A looser, fuzzy match would find more preprints but could
+  silently adopt the \emph{wrong} paper---fatal in a systematic
+  review---so we reuse the exact rule the codebase already trusts for
+  DOI-less identity.  Because even an exact match carries residual
+  risk (and costs extra requests per paper), this tier only runs when
+  the caller opts in ([[--preprint-search]] on the CLI).
+\end{description}
+
+Whatever the tier, a candidate is only adopted if it actually yields a
+PDF link: swapping the entry's identity without gaining a readable
+copy would be pure churn.  For the same reason [[find_preprint]]
+returns [[None]] when the paper already has a PDF.
+
+The module is pure orchestration.  All network access and caching
+lives in the clients it composes---the OpenAlex provider
+(\cref{sec:openalex}), the Crossref client, and
+Unpaywall---so results here are cheap to recompute from their caches
+and this module needs no cache of its own.  It follows the same
+silent-failure contract as the providers: any failing tier logs and
+falls through to the next, and [[find_preprint]] never raises.
+
+<<[[preprint.py]]>>=
+"""
+Preprint fallback for papers without a findable PDF.
+
+Locates a preprint version of a published paper---via OpenAlex
+locations, Crossref's `has-preprint` relation, or an opt-in
+title+author search over preprint servers---and builds a replacement
+entry so the citation points at the version actually read. Used by
+`scholar enrich` and `search --enrich` when Unpaywall finds no PDF.
+"""
+
+<<imports>>
+<<preprint lookup functions>>
+@
+
+\section{Testing}
+\label{sec:preprint-testing}
+
+Tests are distributed through this chapter, each following the code it
+verifies.  The module only orchestrates other clients, so the tests
+patch those clients ([[get_provider]], [[crossref]], [[unpaywall]]) at
+this module's import sites and never touch the network.
+
+<<test [[preprint.py]]>>=
+"""Tests for the preprint fallback module."""
+from unittest.mock import Mock, patch
+
+import pytest
+
+from scholar import Paper
+from scholar.preprint import *
+from scholar.preprint import (
+    _adopt,
+    _from_crossref_relation,
+    _from_openalex_locations,
+    _from_recorded_versions,
+    _from_title_search,
+)
+
+
+def _published(**kwargs):
+    """A published paper without a PDF, the fallback's typical input."""
+    defaults = dict(
+        title="A Work",
+        authors=["Ada Lovelace"],
+        year=2024,
+        doi="10.1145/1",
+        venue="TOPLAS",
+        sources=["s2"],
+    )
+    defaults.update(kwargs)
+    return Paper(**defaults)
+
+
+def _preprint(**kwargs):
+    """An arXiv preprint of the same work."""
+    defaults = dict(
+        title="A Work",
+        authors=["Ada Lovelace"],
+        year=2023,
+        doi="10.48550/arXiv.2401.1",
+        venue="arXiv",
+        pdf_url="https://arxiv.org/pdf/2401.1",
+        sources=["openalex"],
+    )
+    defaults.update(kwargs)
+    return Paper(**defaults)
+
+
+<<test functions>>
+@
+
+\section{The tiered lookup}
+
+[[find_preprint]] tries the link sources from most to least
+trustworthy and returns the first adoptable result.  The recorded-link
+tier comes first because version-aware deduplication
+(\cref{sec:version-dedup}) may already have seen the preprint in the
+same result set and stored it in [[preprint_versions]]---discarding
+that in-hand link only to rediscover it over the network (or worse,
+fail to) would be absurd.  The two authoritative tiers need the
+published DOI, so they are skipped for DOI-less papers; the search
+tier works from title and authors alone.
+
+Each tier is wrapped in a broad exception guard rather than trusting
+the clients' own silent-failure contracts: a bug in one tier must
+degrade to \enquote{no preprint found}, never break enrichment---the
+same reasoning the providers apply to their own network errors.
+
+<<preprint lookup functions>>=
+def find_preprint(paper: Paper, search: bool = False) -> Paper | None:
+    """Find an adoptable preprint version of `paper`.
+
+    Tries, in order: preprint links recorded on the paper, OpenAlex's
+    alternate locations of the published DOI, Crossref's
+    `has-preprint` relation, and---only when `search` is true---a
+    title+author search over preprint servers.
+
+    Returns a replacement entry (the preprint, with the published DOI
+    recorded in `published_versions`), the same entry with just the
+    PDF filled in when the preprint copy has no DOI of its own, or
+    None when no preprint with a PDF is found. Returns None when the
+    paper already has a PDF.
+    """
+    if paper.pdf_url:
+        return None
+
+    finders = [_from_recorded_versions]
+    if paper.doi:
+        finders.append(_from_openalex_locations)
+        finders.append(_from_crossref_relation)
+    if search:
+        finders.append(_from_title_search)
+
+    for finder in finders:
+        try:
+            replacement = finder(paper)
+        except Exception as e:
+            logger.debug("preprint: tier %r failed: %s", finder, e)
+            continue
+        if replacement is not None:
+            return replacement
+    return None
+@
+
+Let's verify the gating: a paper with a PDF is left alone, the search
+tier only runs on request, and a failing tier falls through to the
+next.
+
+<<test functions>>=
+class TestFindPreprint:
+    """Tests for find_preprint's tier gating."""
+
+    def test_paper_with_pdf_is_left_alone(self):
+        paper = _published(pdf_url="https://publisher.example/x.pdf")
+        assert find_preprint(paper) is None
+
+    def test_search_tier_only_runs_when_requested(self):
+        paper = _published(doi=None)
+        with patch(
+            "scholar.preprint._from_title_search",
+            return_value=_preprint(),
+        ) as mock_search:
+            assert find_preprint(paper, search=False) is None
+            mock_search.assert_not_called()
+
+            assert find_preprint(paper, search=True) is not None
+            mock_search.assert_called_once()
+
+    def test_doi_tiers_skipped_without_doi(self):
+        paper = _published(doi=None)
+        with patch(
+            "scholar.preprint._from_openalex_locations"
+        ) as mock_locations, patch(
+            "scholar.preprint._from_crossref_relation"
+        ) as mock_crossref:
+            find_preprint(paper)
+            mock_locations.assert_not_called()
+            mock_crossref.assert_not_called()
+
+    def test_failing_tier_falls_through(self):
+        paper = _published()
+        with patch(
+            "scholar.preprint._from_recorded_versions",
+            side_effect=RuntimeError("boom"),
+        ), patch(
+            "scholar.preprint._from_openalex_locations",
+            return_value=None,
+        ), patch(
+            "scholar.preprint._from_crossref_relation",
+            return_value=_preprint(),
+        ):
+            result = find_preprint(paper)
+        assert result is not None
+        assert result.doi == "10.48550/arXiv.2401.1"
+@
+
+\section{Adopting a candidate}
+
+All tiers funnel through one decision: is this candidate an adoptable
+preprint, and what does the replacement entry look like?  Centralizing
+it keeps the adoption rules identical across tiers.
+
+The rules, and why each exists:
+\begin{description}
+\item[Reject the published work itself] A lookup can echo the very
+  DOI we started from (OpenAlex serves merged works under either
+  DOI).  Comparing normalized DOIs catches that; adopting it would
+  discard the entry's identity for nothing.
+\item[Adopt only with a PDF] The candidate's own record may lack a
+  PDF link, so we give Unpaywall a chance to fill it from the
+  \emph{preprint's} DOI before giving up.  If there is still no PDF,
+  there is nothing to gain from the swap.
+\item[Carry over content the preprint lacks] Preprint-server records
+  are often sparser than publisher records.  The work's content
+  metadata---authors, year, abstract, keywords, tags---transfers
+  between versions just as in [[merge_version_of]]
+  (\cref{sec:version-merge}), filling only gaps, and provenance
+  sources are unioned.
+\item[Record the provenance link] The published DOI lands in
+  [[published_versions]], which marks the entry as a deliberate
+  substitution ([[is_preprint_substitute]]): the verify report shows
+  it as \enquote{preprint of \dots} rather than a stale entry, and
+  session merges recognize the published version as already present.
+  Any [[preprint_versions]] link is cleared---the entry now \emph{is}
+  the preprint.
+\end{description}
+
+<<preprint lookup functions>>=
+def _adopt(published: Paper, candidate: Paper | None) -> Paper | None:
+    """Build the replacement entry for an adoptable candidate."""
+    if candidate is None:
+        return None
+    if (
+        candidate.doi
+        and published.doi
+        and Paper._normalize_doi(candidate.doi)
+        == Paper._normalize_doi(published.doi)
+    ):
+        return None
+
+    if not candidate.pdf_url:
+        candidate = unpaywall.annotate_paper(candidate)
+    if not candidate.pdf_url:
+        return None
+
+    combined_sources = list(candidate.sources)
+    for src in published.sources:
+        if src not in combined_sources:
+            combined_sources.append(src)
+
+    published_versions = list(candidate.published_versions or [])
+    if published.doi and not any(
+        entry.get("doi") == published.doi
+        for entry in published_versions
+    ):
+        published_versions.append(
+            {"doi": published.doi, "relation": "preprint-of"}
+        )
+
+    return replace(
+        candidate,
+        authors=(
+            candidate.authors
+            if candidate.authors
+            else list(published.authors)
+        ),
+        year=(
+            candidate.year
+            if candidate.year is not None
+            else published.year
+        ),
+        abstract=candidate.abstract or published.abstract,
+        keywords=Paper._merge_term_lists(
+            candidate.keywords, published.keywords
+        ),
+        tags=Paper._merge_term_lists(candidate.tags, published.tags),
+        sources=combined_sources,
+        preprint_versions=None,
+        published_versions=published_versions or None,
+    )
+@
+
+Let's verify each rule:
+
+<<test functions>>=
+class TestAdopt:
+    """Tests for the adoption rules."""
+
+    def test_adopts_preprint_and_records_provenance(self):
+        result = _adopt(_published(), _preprint())
+        assert result.doi == "10.48550/arXiv.2401.1"
+        assert result.published_versions == [
+            {"doi": "10.1145/1", "relation": "preprint-of"}
+        ]
+        assert result.is_preprint_substitute
+        assert result.sources == ["openalex", "s2"]
+
+    def test_rejects_the_published_work_itself(self):
+        candidate = _preprint(doi="10.1145/1")
+        assert _adopt(_published(), candidate) is None
+
+    def test_rejects_candidate_without_pdf(self):
+        candidate = _preprint(pdf_url=None)
+        with patch(
+            "scholar.preprint.unpaywall.annotate_paper",
+            side_effect=lambda p: p,
+        ):
+            assert _adopt(_published(), candidate) is None
+
+    def test_unpaywall_can_supply_the_pdf(self):
+        candidate = _preprint(pdf_url=None)
+        filled = _preprint(pdf_url="https://oa.example/x.pdf")
+        with patch(
+            "scholar.preprint.unpaywall.annotate_paper",
+            return_value=filled,
+        ) as mock_annotate:
+            result = _adopt(_published(), candidate)
+        mock_annotate.assert_called_once_with(candidate)
+        assert result.pdf_url == "https://oa.example/x.pdf"
+
+    def test_carries_over_missing_content_fields(self):
+        published = _published(abstract="An abstract.")
+        candidate = _preprint(abstract=None, authors=[])
+        result = _adopt(published, candidate)
+        assert result.abstract == "An abstract."
+        assert result.authors == ["Ada Lovelace"]
+@
+
+\section{Tier 0: links recorded by deduplication}
+
+When a search returned both versions of a work, the version-aware
+dedup pass (\cref{sec:version-dedup}) collapsed them onto the
+published entry and left the preprint's DOI and PDF URL in
+[[preprint_versions]].  This tier redeems those links.  When the link
+has a DOI we resolve it through the OpenAlex DOI lookup to recover the
+full preprint record (venue, URL, abstract); if that fails---or the
+link never had a DOI---we fall back to a minimal candidate built from
+the published entry's own content plus the link's data, which is
+enough for [[_adopt]] to work with.
+
+<<preprint lookup functions>>=
+def _from_recorded_versions(paper: Paper) -> Paper | None:
+    """Adopt a preprint link recorded in `paper.preprint_versions`."""
+    for link in paper.preprint_versions or []:
+        doi = link.get("doi")
+        pdf_url = link.get("pdf_url")
+        if not doi and not pdf_url:
+            continue
+
+        candidate = None
+        if doi:
+            provider = get_provider("openalex")
+            if provider is not None:
+                candidate = provider.get_paper_by_doi(doi)
+        if candidate is None:
+            candidate = Paper(
+                title=paper.title,
+                authors=list(paper.authors),
+                year=paper.year,
+                doi=doi,
+                abstract=paper.abstract,
+                pdf_url=pdf_url,
+                sources=list(paper.sources),
+            )
+        elif not candidate.pdf_url and pdf_url:
+            candidate = replace(candidate, pdf_url=pdf_url)
+
+        adopted = _adopt(paper, candidate)
+        if adopted is not None:
+            return adopted
+    return None
+@
+
+<<test functions>>=
+class TestFromRecordedVersions:
+    """Tests for the recorded-links tier."""
+
+    def test_resolves_recorded_doi_via_openalex(self):
+        paper = _published(
+            preprint_versions=[
+                {"doi": "10.48550/arXiv.2401.1", "pdf_url": None}
+            ]
+        )
+        provider = Mock()
+        provider.get_paper_by_doi.return_value = _preprint()
+        with patch(
+            "scholar.preprint.get_provider", return_value=provider
+        ):
+            result = _from_recorded_versions(paper)
+        assert result is not None
+        assert result.doi == "10.48550/arXiv.2401.1"
+        provider.get_paper_by_doi.assert_called_once_with(
+            "10.48550/arXiv.2401.1"
+        )
+
+    def test_falls_back_to_minimal_candidate(self):
+        paper = _published(
+            preprint_versions=[
+                {
+                    "doi": "10.48550/arXiv.2401.1",
+                    "pdf_url": "https://arxiv.org/pdf/2401.1",
+                }
+            ]
+        )
+        provider = Mock()
+        provider.get_paper_by_doi.return_value = None
+        with patch(
+            "scholar.preprint.get_provider", return_value=provider
+        ):
+            result = _from_recorded_versions(paper)
+        assert result is not None
+        assert result.doi == "10.48550/arXiv.2401.1"
+        assert result.pdf_url == "https://arxiv.org/pdf/2401.1"
+
+    def test_no_recorded_links_yields_none(self):
+        assert _from_recorded_versions(_published()) is None
+@
+
+\section{Tier 1: OpenAlex locations}
+
+OpenAlex often merges a preprint deposit into the same work as the
+published version, so the published DOI's own record already lists the
+preprint host in its [[locations]] array
+(\cref{sec:openalex}).  The subtlety is identity: a location
+is a \emph{copy}, not a record, and carries no DOI of its own.  For
+arXiv locations we can derive the canonical arXiv DOI from the URL
+([[arxiv_doi_from_url]], \cref{utils-module}) and adopt a full
+replacement.  For other hosts there is nothing citable to swap to, so
+we keep the entry's identity and only fill in the PDF---the reader
+gets the preprint's file, and the citation stays with the published
+version, which in this case is the only version we can address.
+
+<<preprint lookup functions>>=
+def _from_openalex_locations(paper: Paper) -> Paper | None:
+    """Adopt a preprint location of the published DOI's own work."""
+    provider = get_provider("openalex")
+    if provider is None:
+        return None
+
+    for location in provider.get_preprint_locations(paper.doi):
+        pdf_url = location.get("pdf_url")
+        if not pdf_url:
+            continue
+
+        candidate_doi = arxiv_doi_from_url(pdf_url) or arxiv_doi_from_url(
+            location.get("landing_page_url")
+        )
+        if candidate_doi:
+            candidate = provider.get_paper_by_doi(candidate_doi)
+            if candidate is None:
+                candidate = Paper(
+                    title=paper.title,
+                    authors=list(paper.authors),
+                    year=paper.year,
+                    doi=candidate_doi,
+                    venue=location.get("source_name"),
+                    pdf_url=pdf_url,
+                    sources=list(paper.sources),
+                )
+            elif not candidate.pdf_url:
+                candidate = replace(candidate, pdf_url=pdf_url)
+            adopted = _adopt(paper, candidate)
+            if adopted is not None:
+                return adopted
+        else:
+            return replace(paper, pdf_url=pdf_url)
+    return None
+@
+
+<<test functions>>=
+class TestFromOpenAlexLocations:
+    """Tests for the OpenAlex-locations tier."""
+
+    def test_arxiv_location_becomes_full_replacement(self):
+        provider = Mock()
+        provider.get_preprint_locations.return_value = [
+            {
+                "source_id": None,
+                "source_name": None,
+                "pdf_url": "https://arxiv.org/pdf/2401.12345v1",
+                "landing_page_url": None,
+                "is_oa": True,
+            }
+        ]
+        provider.get_paper_by_doi.return_value = None
+        with patch(
+            "scholar.preprint.get_provider", return_value=provider
+        ):
+            result = _from_openalex_locations(_published())
+        assert result is not None
+        assert result.doi == "10.48550/arXiv.2401.12345"
+        assert result.published_versions == [
+            {"doi": "10.1145/1", "relation": "preprint-of"}
+        ]
+
+    def test_non_arxiv_location_only_fills_pdf(self):
+        provider = Mock()
+        provider.get_preprint_locations.return_value = [
+            {
+                "source_id": "S4210172589",
+                "source_name": "SSRN",
+                "pdf_url": "https://papers.ssrn.com/x.pdf",
+                "landing_page_url": "https://papers.ssrn.com/x",
+                "is_oa": True,
+            }
+        ]
+        with patch(
+            "scholar.preprint.get_provider", return_value=provider
+        ):
+            result = _from_openalex_locations(_published())
+        assert result is not None
+        assert result.doi == "10.1145/1"
+        assert result.pdf_url == "https://papers.ssrn.com/x.pdf"
+        assert result.published_versions is None
+
+    def test_location_without_pdf_is_skipped(self):
+        provider = Mock()
+        provider.get_preprint_locations.return_value = [
+            {
+                "source_id": "S4210172589",
+                "source_name": "SSRN",
+                "pdf_url": None,
+                "landing_page_url": "https://papers.ssrn.com/x",
+                "is_oa": False,
+            }
+        ]
+        with patch(
+            "scholar.preprint.get_provider", return_value=provider
+        ):
+            assert _from_openalex_locations(_published()) is None
+@
+
+\section{Tier 2: Crossref's has-preprint relation}
+
+Crossref's [[has-preprint]] relation is the publisher's own assertion
+that a preprint exists, DOI to DOI (\cref{crossref-module}).  Coverage
+is sparse---many publishers never deposit it---but when present it is
+the strongest possible link and costs nothing beyond the currency
+lookup enrichment already makes.  We resolve the preprint DOI to a
+full record through OpenAlex where possible; failing that, a minimal
+candidate with the preprint DOI still lets [[_adopt]] try Unpaywall
+for the PDF.
+
+<<preprint lookup functions>>=
+def _from_crossref_relation(paper: Paper) -> Paper | None:
+    """Adopt a preprint named by Crossref's `has-preprint` relation."""
+    provider = get_provider("openalex")
+    for doi in crossref.fetch_preprint_dois(paper.doi):
+        candidate = None
+        if provider is not None:
+            candidate = provider.get_paper_by_doi(doi)
+        if candidate is None:
+            candidate = Paper(
+                title=paper.title,
+                authors=list(paper.authors),
+                year=paper.year,
+                doi=doi,
+                abstract=paper.abstract,
+                sources=list(paper.sources),
+            )
+        adopted = _adopt(paper, candidate)
+        if adopted is not None:
+            return adopted
+    return None
+@
+
+<<test functions>>=
+class TestFromCrossrefRelation:
+    """Tests for the Crossref-relation tier."""
+
+    def test_adopts_related_preprint(self):
+        provider = Mock()
+        provider.get_paper_by_doi.return_value = _preprint()
+        with patch(
+            "scholar.preprint.get_provider", return_value=provider
+        ), patch(
+            "scholar.preprint.crossref.fetch_preprint_dois",
+            return_value=["10.48550/arXiv.2401.1"],
+        ):
+            result = _from_crossref_relation(_published())
+        assert result is not None
+        assert result.doi == "10.48550/arXiv.2401.1"
+
+    def test_no_relation_yields_none(self):
+        with patch(
+            "scholar.preprint.crossref.fetch_preprint_dois",
+            return_value=[],
+        ):
+            assert _from_crossref_relation(_published()) is None
+@
+
+\section{Tier 3: title+author search}
+
+The last resort searches for the work by title and accepts only
+candidates whose [[legacy_hash_paper_id]] equals the paper's own---the
+strict rule from the design overview.  Two queries cover all servers:
+one type-filtered OpenAlex search spans the seven OpenAlex-hosted
+servers plus OpenAlex's arXiv and HAL indexing
+(\cref{sec:openalex}), and one native arXiv search covers the
+most common case with fresher data than OpenAlex's index.  We
+deliberately do not fan out to all nine providers of the
+[[preprints]] group; that would multiply request cost for no extra
+coverage.
+
+The identity check compares hashes of \emph{candidate} title and
+authors against the published entry's, so a candidate with no authors
+(some OpenAlex preprint records are sparse) hashes differently and is
+rejected---conservative, as a match on title alone is exactly the
+false-positive risk this tier must avoid.  [[_adopt]] then rejects
+candidates that turn out to be the published record itself.
+
+The arXiv query is scoped to the title field ([[ti:"..."]]) rather
+than sent as a general relevance query.  arXiv's relevance ranking is
+weak for titles made of common words---a general query for
+\enquote{Attention Is All You Need} does not return that paper in its
+top hits---while the title-field search puts the exact-title match
+first, which is the only kind of hit our matcher can accept anyway.
+Embedded quotes are stripped so the title cannot break out of the
+quoted field expression.
+
+<<preprint lookup functions>>=
+def _from_title_search(paper: Paper) -> Paper | None:
+    """Adopt a preprint found by strict title+author search."""
+    if not paper.title or not paper.title.strip():
+        return None
+
+    target = legacy_hash_paper_id(paper.title, paper.authors)
+
+    candidates: list[Paper] = []
+    openalex = get_provider("openalex")
+    if openalex is not None:
+        candidates.extend(
+            openalex.search_preprints_by_title(paper.title)
+        )
+    arxiv = get_provider("arxiv")
+    if arxiv is not None and arxiv.is_available():
+        quoted = paper.title.strip().replace('"', " ")
+        candidates.extend(arxiv.search(f'ti:"{quoted}"', limit=5))
+
+    for candidate in candidates:
+        if (
+            legacy_hash_paper_id(candidate.title, candidate.authors)
+            != target
+        ):
+            continue
+        adopted = _adopt(paper, candidate)
+        if adopted is not None:
+            return adopted
+    return None
+@
+
+<<test functions>>=
+class TestFromTitleSearch:
+    """Tests for the title+author search tier."""
+
+    def _providers(self, openalex_hits, arxiv_hits):
+        openalex = Mock()
+        openalex.search_preprints_by_title.return_value = openalex_hits
+        arxiv = Mock()
+        arxiv.is_available.return_value = True
+        arxiv.search.return_value = arxiv_hits
+        return {"openalex": openalex, "arxiv": arxiv}
+
+    def test_exact_title_author_match_is_adopted(self):
+        providers = self._providers([_preprint()], [])
+        with patch(
+            "scholar.preprint.get_provider",
+            side_effect=providers.get,
+        ):
+            result = _from_title_search(_published())
+        assert result is not None
+        assert result.doi == "10.48550/arXiv.2401.1"
+
+    def test_different_first_author_is_rejected(self):
+        wrong = _preprint(authors=["Charles Babbage"])
+        providers = self._providers([wrong], [])
+        with patch(
+            "scholar.preprint.get_provider",
+            side_effect=providers.get,
+        ):
+            assert _from_title_search(_published()) is None
+
+    def test_different_title_is_rejected(self):
+        wrong = _preprint(title="A Work: Extended Version")
+        providers = self._providers([wrong], [])
+        with patch(
+            "scholar.preprint.get_provider",
+            side_effect=providers.get,
+        ):
+            assert _from_title_search(_published()) is None
+
+    def test_arxiv_results_are_also_considered(self):
+        providers = self._providers([], [_preprint()])
+        with patch(
+            "scholar.preprint.get_provider",
+            side_effect=providers.get,
+        ):
+            result = _from_title_search(_published())
+        assert result is not None
+@
+
+\section{Dependencies}
+
+<<imports>>=
+import logging
+from dataclasses import replace
+
+from scholar import Paper
+from scholar import crossref, unpaywall
+from scholar.providers import get_provider
+from scholar.utils import arxiv_doi_from_url, legacy_hash_paper_id
+
+logger = logging.getLogger(__name__)
+@

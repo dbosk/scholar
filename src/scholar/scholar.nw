@@ -75,6 +75,7 @@ Scholar package for structured literature searches.
 
 from .scholar import Search, SearchResult, Paper, SearchFilters
 from .scholar import search, filter_papers, deduplicate_papers
+from .scholar import deduplicate_versions, merge_version_of
 from .scholar import get_registry, isolated_registry
 from .utils import safe_get_nested, ensure_list
 
@@ -86,6 +87,8 @@ __all__ = [
     "search",
     "filter_papers",
     "deduplicate_papers",
+    "deduplicate_versions",
+    "merge_version_of",
     "get_registry",
     "isolated_registry",
     "safe_get_nested",
@@ -472,13 +475,15 @@ class Paper:
     citations: list["Paper"] | None = None
     updated_by: list[dict] | None = None
     newer_versions: list[dict] | None = None
+    preprint_versions: list[dict] | None = None
+    published_versions: list[dict] | None = None
     oa_status: str | None = None
     oa_url: str | None = None
 
     <<paper methods>>
 @
 
-The last four fields record the results of \emph{checks} made against a paper
+The last six fields record the results of \emph{checks} made against a paper
 we already hold, as opposed to metadata a search returned.  [[updated_by]] and
 [[newer_versions]] come from the currency check against Crossref
 (\cref{crossref-module}): the former lists retraction and correction notices
@@ -489,10 +494,27 @@ open-access lookup against Unpaywall (\cref{unpaywall-module}):
 \enquote{bronze}, \enquote{green}, or \enquote{closed}) and [[oa_url]] is
 the landing page of the best open copy, complementing [[pdf_url]], which the
 lookup also fills when a provider left it empty.
-We keep all four out of the equality and hash logic below on purpose---a
+We keep all six out of the equality and hash logic below on purpose---a
 paper's identity is its work, not whether we have checked it yet, so a checked
 and an unchecked copy of the same DOI must still deduplicate to one registry
 entry.
+
+[[preprint_versions]] and [[published_versions]] are the two directions
+of the same version link between a published paper and its preprint.
+[[preprint_versions]] sits on a \emph{published} entry and lists known
+preprint copies as [[{"doi": ..., "pdf_url": ...}]]; it is recorded by
+the version-aware dedup pass below and consumed by the preprint
+fallback during enrichment (\cref{preprint-module}).
+[[published_versions]] sits on an entry that \emph{is} an adopted
+preprint and records the published version's DOI as
+[[{"doi": ..., "relation": "preprint-of"}]] --- provenance for the
+deliberate decision to cite the version actually read.  We keep both
+directions because they answer different questions: the former
+\enquote{where can I read this?}, the latter \enquote{what did this
+entry replace?}.  Reusing [[newer_versions]] for either would be
+wrong: that field means \enquote{do not cite this, cite that} (it
+drives [[is_superseded]]), while an adopted preprint is a version the
+user chose to cite.
 
 For the same reason we do \emph{not} coerce these fields in [[__post_init__]].
 The other list fields treat [[None]] and [[[]]] as equivalent, but here the
@@ -558,6 +580,12 @@ def is_corrected(self) -> bool:
 def is_superseded(self) -> bool:
     """Whether a newer/canonical version of this work exists."""
     return bool(self.newer_versions)
+
+@property
+def is_preprint_substitute(self) -> bool:
+    """Whether this entry is a preprint adopted in place of a
+    published version (recorded in `published_versions`)."""
+    return bool(self.published_versions)
 @
 
 Let's verify the predicates classify each kind of notice and ignore the
@@ -860,7 +888,8 @@ when papers reference each other.
 When [[include_refs_cites=True]], we serialize them one level deep (the
 referenced papers themselves have their refs/cites excluded).
 
-The check fields ([[updated_by]], [[newer_versions]], [[oa_status]],
+The check fields ([[updated_by]], [[newer_versions]],
+[[preprint_versions]], [[published_versions]], [[oa_status]],
 [[oa_url]]), by contrast, are always serialized.  They are small and they must
 survive a session save/reload, so that once [[scholar verify]] or
 [[scholar enrich]] has checked a session the result is stored with it rather
@@ -893,6 +922,8 @@ def to_dict(self, include_refs_cites: bool = False) -> dict:
         "sources": self.sources,
         "updated_by": self.updated_by,
         "newer_versions": self.newer_versions,
+        "preprint_versions": self.preprint_versions,
+        "published_versions": self.published_versions,
         "oa_status": self.oa_status,
         "oa_url": self.oa_url,
     }
@@ -982,6 +1013,8 @@ def _from_dict_without_registry(cls, data: dict) -> "Paper":
         citations=citations,
         updated_by=data.get("updated_by"),
         newer_versions=data.get("newer_versions"),
+        preprint_versions=data.get("preprint_versions"),
+        published_versions=data.get("published_versions"),
         oa_status=data.get("oa_status"),
         oa_url=data.get("oa_url"),
     )
@@ -1227,6 +1260,16 @@ def merge_with(self, other: "Paper") -> "Paper":
             self.newer_versions
             if self.newer_versions is not None
             else other.newer_versions
+        ),
+        preprint_versions=(
+            self.preprint_versions
+            if self.preprint_versions is not None
+            else other.preprint_versions
+        ),
+        published_versions=(
+            self.published_versions
+            if self.published_versions is not None
+            else other.published_versions
         ),
         oa_status=self.oa_status if self.oa_status is not None else other.oa_status,
         oa_url=self.oa_url or other.oa_url,
@@ -2121,6 +2164,9 @@ wholesale-preferred author list survives while the per-field union still fills
 any gaps from the other copy.
 This is what makes deduplication keep \enquote{the one with the most
 metadata} regardless of the order papers arrive in.
+A second pass, [[deduplicate_versions]] (\cref{sec:version-dedup}),
+then collapses published/preprint pairs of the same work, which share
+a title and authors but never an identity.
 
 <<functions>>=
 def deduplicate_papers(papers: list[Paper]) -> list[Paper]:
@@ -2131,8 +2177,9 @@ def deduplicate_papers(papers: list[Paper]) -> list[Paper]:
     wholesale-preferred fields (authors, references, citations) survive,
     while other fields are unioned. Among copies with equal scores, the
     first-seen value of any conflicting field is kept, mirroring
-    ``Paper.merge_with``. The returned list preserves first-seen order of
-    unique papers.
+    ``Paper.merge_with``. A second pass collapses published/preprint
+    version pairs (see `deduplicate_versions`). The returned list
+    preserves first-seen order of unique papers.
     """
     paper_map: dict[Paper, Paper] = {}
     for paper in papers:
@@ -2143,7 +2190,261 @@ def deduplicate_papers(papers: list[Paper]) -> list[Paper]:
             paper_map[paper] = paper.merge_with(existing)
         else:
             paper_map[paper] = existing.merge_with(paper)
-    return list(paper_map.values())
+    return deduplicate_versions(list(paper_map.values()))
+@
+
+\subsubsection{Merging alternate versions of a work}
+\label{sec:version-merge}
+
+Identity-based deduplication cannot collapse a published paper and its
+preprint: they are the same work under two DOIs, so their [[Paper.id]]s
+differ and [[merge_with]] rightly refuses them.
+Yet a broad search often returns both, and keeping both as separate
+entries means reviewing the same work twice and citing it ambiguously.
+
+[[merge_version_of]] merges \emph{across} that identity boundary, and
+is therefore deliberately more conservative than [[merge_with]]: it
+only ever \emph{fills gaps} in the base entry, never overwrites, and it
+never copies version-specific fields.  The DOI, venue, URL, PDF link,
+and open-access status of a preprint describe the \emph{preprint}, not
+the published version; copying a preprint's [[pdf_url]] onto the
+published entry would claim we have the publisher's PDF when we have
+the preprint's.  The preprint's PDF instead travels in the
+[[preprint_versions]] link recorded by the dedup pass below, where the
+enrichment fallback (\cref{preprint-module}) can adopt it---swapping
+the whole entry so the citation matches the file.  What \emph{is}
+shared between versions is the work's content metadata: abstract,
+keywords, and tags, plus the source provenance union.
+
+<<functions>>=
+def merge_version_of(base: Paper, other: Paper) -> Paper:
+    """Fill `base`'s missing content fields from an alternate version.
+
+    Unlike `Paper.merge_with`, the two papers are different versions
+    of the same work (different identity): nothing in `base` is
+    overwritten, and version-specific fields (`doi`, `venue`, `url`,
+    `pdf_url`, open-access status) are never copied. Sources are
+    unioned for provenance.
+    """
+    combined_sources = list(base.sources)
+    for src in other.sources:
+        if src not in combined_sources:
+            combined_sources.append(src)
+
+    return replace(
+        base,
+        abstract=base.abstract or other.abstract,
+        keywords=Paper._merge_term_lists(base.keywords, other.keywords),
+        tags=Paper._merge_term_lists(base.tags, other.tags),
+        sources=combined_sources,
+    )
+@
+
+Let's verify the fill-only-gaps rule and that version-specific fields
+stay put:
+
+<<test functions>>=
+class TestMergeVersionOf:
+    """Tests for cross-version merging."""
+
+    def test_fills_missing_abstract_and_unions_sources(self):
+        published = Paper(
+            title="A Work", authors=["Ada Lovelace"],
+            doi="10.1145/1", venue="TOPLAS", sources=["s2"],
+        )
+        preprint = Paper(
+            title="A Work", authors=["Ada Lovelace"],
+            doi="10.48550/arXiv.2401.1", venue="arXiv",
+            abstract="An abstract.", pdf_url="https://arxiv.org/pdf/x",
+            sources=["arxiv"],
+        )
+        merged = merge_version_of(published, preprint)
+        assert merged.abstract == "An abstract."
+        assert merged.sources == ["s2", "arxiv"]
+
+    def test_never_copies_version_specific_fields(self):
+        published = Paper(
+            title="A Work", authors=["Ada Lovelace"], doi="10.1145/1",
+        )
+        preprint = Paper(
+            title="A Work", authors=["Ada Lovelace"],
+            doi="10.48550/arXiv.2401.1", venue="arXiv",
+            pdf_url="https://arxiv.org/pdf/x", oa_status="green",
+        )
+        merged = merge_version_of(published, preprint)
+        assert merged.doi == "10.1145/1"
+        assert merged.venue is None
+        assert merged.pdf_url is None
+        assert merged.oa_status is None
+
+    def test_never_overwrites_existing_values(self):
+        published = Paper(
+            title="A Work", authors=["Ada Lovelace"],
+            doi="10.1145/1", abstract="Publisher abstract.",
+        )
+        preprint = Paper(
+            title="A Work", authors=["Ada Lovelace"],
+            doi="10.48550/arXiv.2401.1", abstract="Preprint abstract.",
+        )
+        merged = merge_version_of(published, preprint)
+        assert merged.abstract == "Publisher abstract."
+@
+
+\subsubsection{Version-aware deduplication}
+\label{sec:version-dedup}
+
+The only data a published paper and its preprint reliably share is the
+title and the authors, so that is what the version pass groups by:
+[[legacy_hash_paper_id]] (\cref{utils-module}), the
+same normalized title + first-author-surname rule that already defines
+identity for DOI-less papers.
+We deliberately reuse that strict, exact rule rather than introduce
+fuzzy matching: the false-match risk is one the codebase already
+accepts, and an exact rule keeps results traceable to the recorded
+query.
+The cost is that a preprint whose title drifted (\enquote{\dots:
+extended version}) is not grouped---the enrichment-time fallback can
+still find it through authoritative DOI links.
+
+Within a group, [[is_preprint_paper]] tells versions apart.  We only
+act on the unambiguous shape---exactly one published version plus one
+or more preprints.  The published entry stays the citable base (its
+metadata is canonical); each preprint contributes its content fields
+via [[merge_version_of]] and is recorded as a
+[[preprint_versions]] link carrying its DOI and PDF URL, so the
+enrichment fallback can later swap the entry to the preprint if the
+published PDF never materializes.  Any other shape (all preprints, or
+two published entries whose titles collide) is left untouched:
+guessing wrong there would silently drop a distinct work, which is far
+worse than an occasional duplicate.
+
+<<functions>>=
+def deduplicate_versions(papers: list[Paper]) -> list[Paper]:
+    """Collapse published/preprint version pairs into one entry.
+
+    Papers are grouped by normalized title + first author (the only
+    data the versions share). A group of exactly one published paper
+    plus preprints collapses onto the published entry, which gains
+    the preprints' content fields and a `preprint_versions` link per
+    preprint. Ambiguous groups are returned unchanged. First-seen
+    order is preserved.
+    """
+    groups: dict[str, list[Paper]] = {}
+    order: list[str] = []
+    for paper in papers:
+        key = legacy_hash_paper_id(paper.title, paper.authors)
+        if key not in groups:
+            order.append(key)
+        groups.setdefault(key, []).append(paper)
+
+    result: list[Paper] = []
+    for key in order:
+        group = groups[key]
+        if len(group) == 1:
+            result.append(group[0])
+            continue
+        <<collapse one version group or keep it unchanged>>
+    return result
+@
+
+A preprint link is only worth recording when it identifies or locates
+the copy---an entry with neither DOI nor PDF URL could never be
+adopted, so we skip it.  Links are deduplicated by DOI against any
+already recorded on the base, which makes the pass idempotent when
+[[SearchResult.merge]] runs it repeatedly over accumulating results.
+
+<<collapse one version group or keep it unchanged>>=
+published = [
+    p for p in group if not is_preprint_paper(p.doi, p.venue)
+]
+preprints = [p for p in group if is_preprint_paper(p.doi, p.venue)]
+
+if len(published) != 1 or not preprints:
+    result.extend(group)
+    continue
+
+base = published[0]
+links = list(base.preprint_versions or [])
+known_dois = {
+    link.get("doi") for link in links if link.get("doi")
+}
+for pre in preprints:
+    base = merge_version_of(base, pre)
+    if not pre.doi and not pre.pdf_url:
+        continue
+    if pre.doi and pre.doi in known_dois:
+        continue
+    links.append({"doi": pre.doi, "pdf_url": pre.pdf_url})
+    if pre.doi:
+        known_dois.add(pre.doi)
+base = replace(base, preprint_versions=links or None)
+result.append(base)
+@
+
+Let's verify the collapse, the recorded link, and that ambiguous
+groups survive intact:
+
+<<test functions>>=
+class TestDeduplicateVersions:
+    """Tests for version-aware deduplication."""
+
+    def _pair(self):
+        published = Paper(
+            title="A Work", authors=["Ada Lovelace"],
+            doi="10.1145/1", venue="TOPLAS", sources=["s2"],
+        )
+        preprint = Paper(
+            title="A Work", authors=["Ada Lovelace"],
+            doi="10.48550/arXiv.2401.1", venue="arXiv",
+            pdf_url="https://arxiv.org/pdf/x", sources=["arxiv"],
+        )
+        return published, preprint
+
+    def test_collapses_published_and_preprint(self):
+        published, preprint = self._pair()
+        result = deduplicate_versions([published, preprint])
+        assert len(result) == 1
+        assert result[0].doi == "10.1145/1"
+        assert result[0].preprint_versions == [
+            {
+                "doi": "10.48550/arXiv.2401.1",
+                "pdf_url": "https://arxiv.org/pdf/x",
+            }
+        ]
+
+    def test_is_idempotent_over_repeated_merges(self):
+        published, preprint = self._pair()
+        once = deduplicate_versions([published, preprint])
+        twice = deduplicate_versions(once + [preprint])
+        assert len(twice) == 1
+        assert len(twice[0].preprint_versions) == 1
+
+    def test_all_preprints_group_is_untouched(self):
+        a = Paper(
+            title="A Work", authors=["Ada Lovelace"],
+            doi="10.48550/arXiv.2401.1", venue="arXiv",
+        )
+        b = Paper(
+            title="A Work", authors=["Ada Lovelace"],
+            doi="10.2139/ssrn.1", venue="SSRN",
+        )
+        assert len(deduplicate_versions([a, b])) == 2
+
+    def test_different_first_author_is_not_grouped(self):
+        a = Paper(
+            title="A Work", authors=["Ada Lovelace"], doi="10.1145/1",
+        )
+        b = Paper(
+            title="A Work", authors=["Charles Babbage"],
+            doi="10.48550/arXiv.2401.1", venue="arXiv",
+        )
+        assert len(deduplicate_versions([a, b])) == 2
+
+    def test_deduplicate_papers_applies_version_pass(self):
+        published, preprint = self._pair()
+        result = deduplicate_papers([published, preprint])
+        assert len(result) == 1
+        assert result[0].preprint_versions is not None
 @
 
 \subsubsection{Combining results}
@@ -2620,11 +2921,13 @@ We collect the imports used throughout the module:
 
 <<imports>>=
 from contextlib import contextmanager
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from datetime import datetime
 from functools import cached_property
 import hashlib
 import logging
+
+from scholar.utils import is_preprint_paper, legacy_hash_paper_id
 
 logger = logging.getLogger(__name__)
 @

@@ -1288,6 +1288,126 @@ def clear_all_decisions() -> int:
     return count
 @
 
+\subsection{Migrating a paper's identity}
+
+The legacy-hash migrations above handle one identity change---a paper
+gaining a DOI---lazily, at lookup time, because the old id is always
+derivable from the paper itself.  The preprint fallback
+(\cref{preprint-module}) introduces a second kind of change: adopting
+a preprint swaps one DOI for another, and the old id is \emph{not}
+derivable from the new entry, so lazy migration is impossible.
+Instead the caller, which holds both entries at the moment of
+adoption, migrates eagerly with [[migrate_paper_id]].
+
+Notes are keyed globally, so the note store is a single re-key.
+Decisions are keyed per query file, and the adopting caller does not
+know which past queries produced this paper, so we scan all decision
+files.  The scan is bounded by the number of distinct recorded
+searches, and adoption is rare enough (once per paper, at most) that
+simplicity wins over indexing.  In both stores an existing record
+under the new id is left alone---the new identity's own data is
+fresher than what we would migrate onto it.
+
+<<search decisions functions>>=
+def migrate_paper_id(old_id: str, new_id: str) -> None:
+    """Move any note and search decisions from `old_id` to `new_id`.
+
+    Used when an entry's identity changes, e.g. when enrichment
+    replaces a published paper with its preprint version. Records
+    already present under `new_id` are kept and the old ones dropped.
+    """
+    if old_id == new_id:
+        return
+
+    notes = _load_all_notes()
+    if old_id in notes:
+        note = notes.pop(old_id)
+        if new_id not in notes:
+            notes[new_id] = replace(note, paper_id=new_id)
+        _save_all_notes(notes)
+
+    for decision_file in get_decisions_dir().glob("*.json"):
+        try:
+            with open(decision_file, "r", encoding="utf-8") as f:
+                data = json.load(f)
+            search_decisions = SearchDecisions.from_dict(data)
+        except (json.JSONDecodeError, OSError, KeyError):
+            continue
+        if old_id not in search_decisions.decisions:
+            continue
+        record = search_decisions.decisions.pop(old_id)
+        if new_id not in search_decisions.decisions:
+            search_decisions.decisions[new_id] = record
+        save_search_decisions(
+            search_decisions.query, search_decisions.decisions
+        )
+@
+
+Let's verify both stores migrate and that existing records under the
+new id win:
+
+<<test functions>>=
+class TestMigratePaperId:
+    """Tests for migrate_paper_id."""
+
+    def test_migrates_note_and_decision(self, tmp_path, monkeypatch):
+        monkeypatch.setenv("SCHOLAR_DATA_DIR", str(tmp_path))
+        invalidate_notes_cache()
+
+        published = Paper(
+            title="A Work", authors=["Ada Lovelace"], doi="10.1145/1"
+        )
+        save_note(published, "Read this carefully.")
+        save_search_decisions(
+            "some query",
+            {
+                get_paper_id(published): ReviewDecisionRecord(
+                    status="kept",
+                    doi=published.doi,
+                    title=published.title,
+                    authors=published.authors,
+                )
+            },
+        )
+
+        preprint_version = Paper(
+            title="A Work",
+            authors=["Ada Lovelace"],
+            doi="10.48550/arXiv.2401.1",
+        )
+        migrate_paper_id(
+            get_paper_id(published), get_paper_id(preprint_version)
+        )
+        invalidate_notes_cache()
+
+        assert get_note(preprint_version) is not None
+        assert get_note(published) is None
+        migrated = get_previous_decision("some query", preprint_version)
+        assert migrated is not None
+        assert migrated.status == "kept"
+
+    def test_existing_record_under_new_id_wins(
+        self, tmp_path, monkeypatch
+    ):
+        monkeypatch.setenv("SCHOLAR_DATA_DIR", str(tmp_path))
+        invalidate_notes_cache()
+
+        old = Paper(title="A", authors=["X Y"], doi="10.1/old")
+        new = Paper(title="A", authors=["X Y"], doi="10.1/new")
+        save_note(old, "Old note.")
+        save_note(new, "New note.")
+
+        migrate_paper_id(get_paper_id(old), get_paper_id(new))
+        invalidate_notes_cache()
+
+        assert get_note(new).note == "New note."
+        assert get_note(old) is None
+
+    def test_same_id_is_a_no_op(self, tmp_path, monkeypatch):
+        monkeypatch.setenv("SCHOLAR_DATA_DIR", str(tmp_path))
+        migrate_paper_id("doi:10.1/x", "doi:10.1/x")
+@
+
 \subsection{Testing search decisions}
 
 <<test functions>>=

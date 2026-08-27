@@ -564,6 +564,18 @@ enrich_providers: Annotated[
         ),
     ),
 ] = None,
+preprint_search: Annotated[
+    bool,
+    typer.Option(
+        "--preprint-search",
+        help=(
+            "With --enrich: when no PDF is found, also search preprint "
+            "servers by title and authors for a preprint version to "
+            "adopt. Authoritative preprint links (OpenAlex, Crossref) "
+            "are followed even without this flag."
+        ),
+    ),
+] = False,
 <<deduplication option>>
 <<report option>>
 <<search filter options>>
@@ -1049,7 +1061,17 @@ which order.
 For example, to restrict enrichment to Semantic Scholar and OpenAlex:
 [[scholar search "..." --enrich --enrich-providers s2,openalex]].
 
+The [[--preprint-search]] flag unlocks the search tier of the preprint
+fallback (\cref{preprint-module}); the fallback itself runs as part of
+enrichment, so the flag is meaningless without [[--enrich]] and we
+reject that combination rather than silently ignoring it.
+
 <<enrich papers if requested>>=
+if preprint_search and not enrich:
+    raise typer.BadParameter(
+        "--preprint-search requires --enrich"
+    )
+
 if enrich and merged_results:
     from scholar.enrich import enrich_papers, needs_enrichment
     from rich.progress import Progress
@@ -1082,6 +1104,7 @@ if enrich and merged_results:
                 fields=enrich_fields,
                 providers=providers_for_enrich,
                 progress_callback=update_progress,
+                preprint_search=preprint_search,
             )
             merged_results[i] = SearchResult(
                 query=result.query,
@@ -1739,6 +1762,18 @@ def enrich(
             ),
         ),
     ] = None,
+    preprint_search: Annotated[
+        bool,
+        typer.Option(
+            "--preprint-search",
+            help=(
+                "When no PDF is found, also search preprint servers by "
+                "title and authors for a preprint version to adopt. "
+                "Authoritative preprint links (OpenAlex, Crossref) are "
+                "followed even without this flag."
+            ),
+        ),
+    ] = False,
 ) -> None:
     """
     Fetch missing abstracts/metadata for papers in a review session.
@@ -1747,7 +1782,8 @@ def enrich(
     abstracts/metadata. Providers requiring API keys (IEEE, WoS) are used
     only when configured. Also looks up open-access status and PDF links
     via Unpaywall (requires SCHOLAR_EMAIL) and checks Crossref for
-    retractions.
+    retractions. When no PDF can be found, a preprint version may be
+    adopted in place of the published entry (see --preprint-search).
 
     Example:
         scholar enrich "machine learning"
@@ -1807,11 +1843,14 @@ with Progress() as progress:
         fields=enrich_fields,
         providers=providers_for_enrich,
         progress_callback=update_progress,
+        preprint_search=preprint_search,
     )
 
 # Update decisions with enriched papers (preserve order)
 for decision, enriched in zip(session_data.decisions, enriched_papers):
     decision.paper = enriched
+
+<<record preprint adoptions during enrich>>
 
 <<report open-access findings during enrich>>
 
@@ -1826,6 +1865,31 @@ enriched_count = sum(
     or (new.pdf_url and orig.pdf_url != new.pdf_url)
 )
 console.print(f"[green]Enriched {enriched_count} papers.[/green]")
+@
+
+When the preprint fallback (\cref{preprint-module}) adopted a preprint,
+the paper's identity changed---and the notes and decision stores are
+keyed by that identity, so records saved under the published DOI would
+be orphaned.  Adoption is detectable by comparing ids across the
+enrichment: [[enrich_paper]] is the only enrichment step that can
+change [[Paper.id]].  For each adoption we migrate the persistent
+stores ([[migrate_paper_id]], \cref{notes-module}) and tell the user
+what was swapped, naming both DOIs so the substitution is transparent
+in the terminal transcript, not only in the session file.
+
+<<record preprint adoptions during enrich>>=
+from scholar.notes import get_paper_id, migrate_paper_id
+
+for orig, new in zip(papers, enriched_papers):
+    if get_paper_id(orig) == get_paper_id(new):
+        continue
+    migrate_paper_id(get_paper_id(orig), get_paper_id(new))
+    console.print(
+        f"[cyan]Adopted preprint {new.doi} for "
+        f"\N{LEFT DOUBLE QUOTATION MARK}{escape(new.title_preview())}"
+        f"\N{RIGHT DOUBLE QUOTATION MARK} "
+        f"(published DOI {orig.doi} kept for provenance).[/cyan]"
+    )
 @
 
 The open-access tally answers the question a reviewer actually has---how much
@@ -1975,7 +2039,10 @@ with Progress(console=err_console) as progress:
 The JSON shape mirrors what a verification checklist needs: the DOI and title to
 identify the paper, the one-word [[status]], and the raw notice and
 newer-version lists so a caller can show the linking DOIs without a second
-lookup.  An empty session is a valid empty array, not a message.
+lookup.  [[published_versions]] is included so an adopted preprint's
+provenance (which published DOI it replaced) travels with its
+\enquote{preprint} status.  An empty session is a valid empty array,
+not a message.
 
 <<output the currency report>>=
 if json_output:
@@ -1986,6 +2053,7 @@ if json_output:
             "status": currency_status(paper),
             "updated_by": paper.updated_by,
             "newer_versions": paper.newer_versions,
+            "published_versions": paper.published_versions,
         }
         for paper in checked
     ]
@@ -1998,6 +2066,10 @@ if json_output:
 In human mode we lead with the problems---each rendered by the shared
 [[format_currency_warning]] helper---and close with a one-line tally of every
 status so the reader can see the clean and unchecked counts too.
+Between the two sit the adopted preprints: they are deliberate
+substitutions, not problems, so they render as dim informational lines
+(\enquote{preprint of \dots}, naming the published DOI) rather than
+warnings, and get their own slot in the tally.
 
 <<print the human currency report>>=
 from collections import Counter
@@ -2015,12 +2087,26 @@ else:
         "[green]No retractions, corrections, or newer versions found.[/green]"
     )
 
+for paper in checked:
+    if currency_status(paper) != "preprint":
+        continue
+    published_dois = ", ".join(
+        entry["doi"]
+        for entry in paper.published_versions or []
+        if entry.get("doi")
+    )
+    console.print(
+        f"[dim]\\[PREPRINT] {escape(paper.title_preview())} "
+        f"-> preprint of {published_dois}[/dim]"
+    )
+
 counts = Counter(currency_status(paper) for paper in checked)
 console.print(
     f"[bold]{len(checked)} papers[/bold]: "
     f"{counts.get('retracted', 0)} retracted, "
     f"{counts.get('corrected', 0)} corrected, "
     f"{counts.get('superseded', 0)} superseded, "
+    f"{counts.get('preprint', 0)} preprint, "
     f"{counts.get('ok', 0)} ok, "
     f"{counts.get('unknown', 0)} unknown"
 )
@@ -2057,7 +2143,10 @@ class TestEnrichCommand:
         return "etest"
 
     @staticmethod
-    def _fake_enrich(papers, fields=None, providers=None, progress_callback=None):
+    def _fake_enrich(
+        papers, fields=None, providers=None, progress_callback=None,
+        preprint_search=False,
+    ):
         """Stand in for enrich_papers: mark everything gold OA with a PDF."""
         from dataclasses import replace
 
@@ -2134,6 +2223,49 @@ class TestEnrichCommand:
         assert result.exit_code == 0, result.stdout
         assert "No papers need metadata enrichment" in result.stdout
         mock_annotate.assert_called_once()
+
+    def test_adoption_reports_and_migrates(self, tmp_path, monkeypatch):
+        """An adopted preprint is announced and its records migrated."""
+        from dataclasses import replace
+
+        name = self._make_session(tmp_path, monkeypatch)
+
+        def adopt_bare(papers, **kwargs):
+            out = []
+            for p in papers:
+                if p.doi == "10.1/bare":
+                    out.append(
+                        replace(
+                            p,
+                            doi="10.48550/arXiv.2401.1",
+                            pdf_url="https://arxiv.org/pdf/2401.1",
+                            published_versions=[
+                                {
+                                    "doi": "10.1/bare",
+                                    "relation": "preprint-of",
+                                }
+                            ],
+                        )
+                    )
+                else:
+                    out.append(p)
+            return out
+
+        with patch(
+            "scholar.enrich.enrich_papers", side_effect=adopt_bare
+        ), patch(
+            "scholar.crossref.annotate_papers",
+            side_effect=self._identity_annotate,
+        ), patch(
+            "scholar.notes.migrate_paper_id"
+        ) as mock_migrate:
+            result = runner.invoke(app, ["enrich", name])
+        assert result.exit_code == 0, result.stdout
+        assert "Adopted preprint 10.48550/arXiv.2401.1" in result.stdout
+        assert "10.1/bare" in result.stdout
+        mock_migrate.assert_called_once_with(
+            "doi:10.1/bare", "doi:10.48550/arxiv.2401.1"
+        )
 @
 
 <<test functions>>=
@@ -2209,6 +2341,84 @@ class TestVerifyCommand:
         monkeypatch.setenv("SCHOLAR_DATA_DIR", str(tmp_path))
         result = runner.invoke(app, ["verify", "no-such-session"])
         assert result.exit_code == 1
+
+    def test_adopted_preprint_shows_as_preprint_not_superseded(
+        self, tmp_path, monkeypatch
+    ):
+        """A deliberate preprint substitution is info, not a warning."""
+        from dataclasses import replace
+
+        from scholar import Paper, SearchResult
+        from scholar.review import create_review_session, save_session
+
+        monkeypatch.setenv("SCHOLAR_DATA_DIR", str(tmp_path))
+        adopted = Paper(
+            title="Adopted",
+            authors=["a"],
+            doi="10.48550/arXiv.2401.1",
+            sources=["m"],
+            published_versions=[
+                {"doi": "10.1/published", "relation": "preprint-of"}
+            ],
+        )
+        result = SearchResult(
+            query="q", provider="m", timestamp="t", papers=[adopted]
+        )
+        save_session(
+            create_review_session([result], "q", session_name="ptest")
+        )
+
+        def annotate(papers, progress_callback=None):
+            return [
+                replace(
+                    p,
+                    updated_by=[],
+                    newer_versions=[
+                        {
+                            "doi": "10.1/published",
+                            "relation": "is-preprint-of",
+                        }
+                    ],
+                )
+                for p in papers
+            ]
+
+        with patch(
+            "scholar.crossref.annotate_papers", side_effect=annotate
+        ):
+            result = runner.invoke(app, ["verify", "ptest"])
+        assert result.exit_code == 0
+        assert "SUPERSEDED" not in result.stdout
+        assert "preprint of 10.1/published" in result.stdout
+        assert "1 preprint" in result.stdout
+@
+
+The [[--preprint-search]] flag is only meaningful together with
+[[--enrich]]; let's verify the guard rejects the lone flag:
+
+<<test functions>>=
+class TestPreprintSearchFlag:
+    """Tests for --preprint-search validation on the search command."""
+
+    def test_requires_enrich(self, monkeypatch):
+        import scholar.scholar as scholar_mod
+
+        monkeypatch.setattr(
+            scholar_mod.Search,
+            "execute",
+            lambda self, **kwargs: [],
+        )
+        result = runner.invoke(
+            app, ["search", "q", "--preprint-search"]
+        )
+        assert result.exit_code != 0
+        try:
+            stderr = result.stderr
+        except ValueError:
+            stderr = ""
+        assert "--preprint-search requires --enrich" in (
+            result.stdout + stderr
+        )
 @
 
 \section{Listing and Checking Providers}

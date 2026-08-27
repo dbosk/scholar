@@ -250,6 +250,22 @@ scholar search "query" --enrich
 scholar enrich "session-name"
 ```
 
+When no PDF can be found for a paper, enrichment falls back to preprint
+versions: authoritative links (OpenAlex's alternate locations and
+Crossref's `has-preprint` relation) are always followed, and with
+`--preprint-search` the preprint servers are additionally searched by
+title and authors (exact match only). An adopted preprint *replaces*
+the entry — its DOI, venue, and PDF — so exported citations point at
+the version you actually read; the published DOI is kept on the entry
+for provenance, and `scholar verify` reports such entries as
+`preprint of <doi>` rather than superseded.
+
+```bash
+# Also search preprint servers for papers without a PDF
+scholar enrich "session-name" --preprint-search
+scholar search "query" --enrich --preprint-search
+```
+
 ### PDF Management
 
 ```bash

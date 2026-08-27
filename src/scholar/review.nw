@@ -102,10 +102,11 @@ import logging
 
 from cachetools import cachedmethod
 
-from scholar.scholar import Paper, SearchFilters
+from scholar.scholar import Paper, SearchFilters, merge_version_of
 from scholar.notes import (
     get_paper_id, get_query_hash, get_data_dir,
     load_search_decisions, save_search_decisions as notes_save_decisions,
+    migrate_paper_id,
     ReviewDecisionRecord,
 )
 
@@ -1298,10 +1299,41 @@ When we encounter a duplicate paper ID, we keep a single [[ReviewDecision]] and
 merge the underlying [[Paper]] objects to consolidate metadata (e.g., a missing
 abstract in one provider and a present abstract in another).
 
+A session entry may also be an \emph{adopted preprint}
+(\cref{preprint-module}): enrichment replaced the published paper with
+its preprint, keeping the published DOI in [[published_versions]].
+Adoption breaks the id-based matching in both directions, and each
+direction needs its own guard:
+\begin{description}
+\item[Published returns after adoption] The session holds the adopted
+  preprint; a re-run returns the published version under its old id,
+  which matches no decision.  The provenance lookup below maps each
+  recorded published DOI back to its adopted entry, so the returning
+  published paper is folded into that entry (content gaps filled via
+  [[merge_version_of]], which never disturbs the preprint's identity)
+  instead of re-entering as a fresh pending paper.
+\item[Adoption arrives after the published entry] The session holds
+  the published entry from an earlier run; a re-run with enrichment
+  now delivers the adopted preprint under a \emph{new} id.  Here the
+  incoming paper itself carries the link: its [[published_versions]]
+  DOI matches the existing decision, whose entry we upgrade to the
+  preprint identity---preserving the decision status and tags, since
+  the work under review is unchanged---and re-key.  The persistent
+  note and decision stores are migrated the same way
+  ([[migrate_paper_id]], \cref{notes-module}).
+\end{description}
+
 <<convert search results to decisions>>=
 decision_lookup: dict[str, ReviewDecision] = {
     get_paper_id(d.paper): d for d in session.decisions
 }
+provenance_lookup: dict[str, ReviewDecision] = {}
+for d in session.decisions:
+    for entry in d.paper.published_versions or []:
+        published_doi = entry.get("doi")
+        if published_doi:
+            key = f"doi:{Paper._normalize_doi(published_doi)}"
+            provenance_lookup[key] = d
 
 for result in results:
     for paper in result.papers:
@@ -1314,6 +1346,27 @@ for result in results:
                 existing.paper = existing.paper.merge_with(paper)
             except ValueError:
                 pass
+            continue
+
+        adopted = provenance_lookup.get(paper_id)
+        if adopted is not None:
+            adopted.paper = merge_version_of(adopted.paper, paper)
+            continue
+
+        replaced = None
+        for entry in paper.published_versions or []:
+            published_doi = entry.get("doi")
+            if not published_doi:
+                continue
+            old_id = f"doi:{Paper._normalize_doi(published_doi)}"
+            replaced = decision_lookup.get(old_id)
+            if replaced is not None:
+                break
+        if replaced is not None:
+            migrate_paper_id(get_paper_id(replaced.paper), paper_id)
+            replaced.paper = merge_version_of(paper, replaced.paper)
+            decision_lookup[paper_id] = replaced
+            provenance_lookup[old_id] = replaced
             continue
 
         # Check for previous decision (prefer session data over notes)
@@ -2061,6 +2114,115 @@ class TestSessionFunctions:
         assert set(session.decisions[0].paper.sources) == {"dblp", "s2"}
         assert ("q1", "dblp") in session.query_provider_pairs
         assert ("q2", "s2") in session.query_provider_pairs
+
+    def test_published_version_of_adopted_preprint_not_readded(
+        self, tmp_path, monkeypatch
+    ):
+        """Re-running a search must not re-add the published version
+        next to the preprint entry that replaced it."""
+        from scholar import isolated_registry
+
+        monkeypatch.setenv("SCHOLAR_DATA_DIR", str(tmp_path))
+
+        with isolated_registry():
+            adopted = Paper(
+                title="A Work",
+                authors=["Ada Lovelace"],
+                doi="10.48550/arXiv.2401.1",
+                pdf_url="https://arxiv.org/pdf/2401.1",
+                published_versions=[
+                    {"doi": "10.1145/1", "relation": "preprint-of"}
+                ],
+            )
+            session = ReviewSession(
+                query="test query",
+                providers=["s2"],
+                timestamp=datetime.now(),
+                name="test query",
+            )
+            session.decisions.append(
+                ReviewDecision(
+                    paper=adopted,
+                    provider="s2",
+                    status=DecisionStatus.KEPT,
+                )
+            )
+            save_session(session)
+
+            result = Mock()
+            result.provider = "s2"
+            result.query = "test query"
+            result.papers = [
+                Paper(
+                    title="A Work",
+                    authors=["Ada Lovelace"],
+                    doi="10.1145/1",
+                    abstract="Publisher abstract.",
+                    sources=["s2"],
+                )
+            ]
+
+            merged = create_review_session([result], "test query")
+
+            assert len(merged.decisions) == 1
+            entry = merged.decisions[0].paper
+            assert entry.doi == "10.48550/arXiv.2401.1"
+            assert entry.abstract == "Publisher abstract."
+
+    def test_incoming_adoption_upgrades_published_entry(
+        self, tmp_path, monkeypatch
+    ):
+        """An adopted preprint arriving later replaces the session's
+        published entry, keeping the decision."""
+        from scholar import isolated_registry
+
+        monkeypatch.setenv("SCHOLAR_DATA_DIR", str(tmp_path))
+
+        with isolated_registry():
+            published = Paper(
+                title="A Work",
+                authors=["Ada Lovelace"],
+                doi="10.1145/1",
+                abstract="Publisher abstract.",
+            )
+            session = ReviewSession(
+                query="test query",
+                providers=["s2"],
+                timestamp=datetime.now(),
+                name="test query",
+            )
+            session.decisions.append(
+                ReviewDecision(
+                    paper=published,
+                    provider="s2",
+                    status=DecisionStatus.KEPT,
+                    tags=["relevant"],
+                )
+            )
+            save_session(session)
+
+            result = Mock()
+            result.provider = "s2"
+            result.query = "test query"
+            result.papers = [
+                Paper(
+                    title="A Work",
+                    authors=["Ada Lovelace"],
+                    doi="10.48550/arXiv.2401.1",
+                    pdf_url="https://arxiv.org/pdf/2401.1",
+                    published_versions=[
+                        {"doi": "10.1145/1", "relation": "preprint-of"}
+                    ],
+                )
+            ]
+
+            merged = create_review_session([result], "test query")
+
+            assert len(merged.decisions) == 1
+            decision = merged.decisions[0]
+            assert decision.paper.doi == "10.48550/arXiv.2401.1"
+            assert decision.status == DecisionStatus.KEPT
+            assert decision.paper.abstract == "Publisher abstract."
 
     def test_save_and_load_session(self, tmp_path, monkeypatch):
         """Can save and load a session."""
