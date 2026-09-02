@@ -456,6 +456,7 @@ def isolate_cache(tmp_path, monkeypatch):
     monkeypatch.setenv("SCHOLAR_DATA_DIR", str(data_dir))
     for var in CONTACT_EMAIL_VARS:
         monkeypatch.delenv(var, raising=False)
+    monkeypatch.delenv("OPENALEX_API_KEY", raising=False)
 @
 
 Rate-limit pacing must not slow the test suite down: once providers
