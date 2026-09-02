@@ -360,7 +360,9 @@ We define completers for each set of valid formats:
 <<completion functions>>=
 SEARCH_FORMATS = ["auto", "table", "csv", "json", "bibtex", "bibtex+prov"]
 DISPLAY_FORMATS = ["table", "json"]
-EXPORT_FORMATS = ["csv", "latex", "all"]
+EXPORT_FORMATS = ["csv", "latex", "table", "all"]
+TABLE_LANGUAGES = ["en", "sv"]
+DECISION_SOURCES = ["human", "llm"]
 SYNTHESIS_FORMATS = ["markdown", "latex"]
 
 
@@ -377,6 +379,16 @@ def complete_display_format(incomplete: str) -> list[str]:
 def complete_export_format(incomplete: str) -> list[str]:
     """Provide shell completion for export formats."""
     return [f for f in EXPORT_FORMATS if f.startswith(incomplete)]
+
+
+def complete_table_language(incomplete: str) -> list[str]:
+    """Complete the audit table language."""
+    return [l for l in TABLE_LANGUAGES if l.startswith(incomplete)]
+
+
+def complete_decision_source(incomplete: str) -> list[str]:
+    """Complete the --source of a headless decision."""
+    return [s for s in DECISION_SOURCES if s.startswith(incomplete)]
 
 
 def complete_synthesis_format(incomplete: str) -> list[str]:
@@ -4697,24 +4709,98 @@ def sessions_export(
         str,
         typer.Option(
             "--format", "-f",
-            help="Export format: csv, latex, or all.",
+            help="Export format: csv, latex, table, or all (csv + latex).",
             autocompletion=complete_export_format,
         ),
     ] = "all",
+    standalone: Annotated[
+        bool,
+        typer.Option(
+            "--standalone/--no-standalone",
+            help="LaTeX report: compilable document (default) or an "
+                 "\\input-able fragment.",
+        ),
+    ] = True,
+    lang: Annotated[
+        str,
+        typer.Option(
+            "--lang",
+            help="Audit table language: en or sv.",
+            autocompletion=complete_table_language,
+        ),
+    ] = "en",
+    label: Annotated[
+        Optional[str],
+        typer.Option(
+            "--label",
+            help="Audit table: \\label{tab:LABEL} (default: session name).",
+        ),
+    ] = None,
+    track: Annotated[
+        Optional[str],
+        typer.Option(
+            "--track",
+            help="Audit table: free text added to the caption.",
+        ),
+    ] = None,
+    theme: Annotated[
+        Optional[list[str]],
+        typer.Option(
+            "--theme",
+            help="Audit table: TAG=NAME, readable name for a theme tag "
+                 "(repeatable).",
+        ),
+    ] = None,
 ) -> None:
     """
     Export a saved session to file(s).
 
     Generates CSV and/or LaTeX reports from a saved review session.
-    Use --format to select specific formats.
+    Use --format to select specific formats. The LaTeX report is a
+    compilable document by default; with --no-standalone it becomes a
+    fragment for \\input, with the bibliography in a sibling .bib.
+    The table format writes an audit table (one row per paper with the
+    reason it was kept or excluded) meant for a backing appendix; it is
+    always a fragment and takes --lang, --label, --track and --theme.
+
+    Examples:
+        scholar sessions export "my review" -f all
+        scholar sessions export "my review" -f latex --no-standalone -o review
+        scholar sessions export "my review" -f table --lang sv --label sok-A \\
+            --track "sökspår 1" --theme ml=maskininlärning -o review-full
     """
     from scholar.review import (
         load_session,
         generate_latex_report,
         generate_csv_report,
+        generate_audit_table,
         ReviewSource,
         DecisionStatus,
     )
+
+    if format_type not in EXPORT_FORMATS:
+        console = Console()
+        console.print(
+            f"[red]Invalid format: {escape(format_type)}. "
+            f"Use one of {', '.join(EXPORT_FORMATS)}.[/red]"
+        )
+        raise typer.Exit(1)
+    if lang not in TABLE_LANGUAGES:
+        console = Console()
+        console.print(
+            f"[red]Invalid --lang: {escape(lang)}. "
+            f"Use one of {', '.join(TABLE_LANGUAGES)}.[/red]"
+        )
+        raise typer.Exit(1)
+    theme_names: dict[str, str] = {}
+    for item in theme or []:
+        tag, sep, readable = item.partition("=")
+        if not sep or not tag:
+            Console().print(
+                f"[red]Invalid --theme {escape(item)}: expected TAG=NAME[/red]"
+            )
+            raise typer.Exit(1)
+        theme_names[tag] = readable
 
     console = Console()
     session = load_session(name)
@@ -4741,13 +4827,32 @@ def sessions_export(
 
     if format_type in ("latex", "all"):
         tex_path = Path(f"{output}.tex")
-        generate_latex_report(session, tex_path)
+        generate_latex_report(session, tex_path, standalone=standalone)
         files_created.append(tex_path)
         files_created.append(tex_path.with_suffix(".bib"))
+
+    if format_type == "table":
+        table_path = Path(f"{output}.tex")
+        default_label = "".join(
+            c if c.isalnum() or c in "-_" else "_"
+            for c in (session.name or session.query)[:30]
+        )
+        generate_audit_table(
+            session,
+            table_path,
+            label=label or default_label,
+            lang=lang,
+            track=track,
+            theme_names=theme_names,
+        )
+        files_created.append(table_path)
 
     console.print("[green]Exported:[/green]")
     for f in files_created:
         console.print(f"  - {escape(str(f))}")
+
+    if format_type in ("latex", "all") and not standalone:
+        _print_fragment_hint(console, tex_path.with_suffix(".bib").name)
 
     # If the session includes any LLM decisions, report agreement/change counts.
     has_llm_decisions = any(
@@ -4793,8 +4898,119 @@ def sessions_export(
             "LLM changed (discarded->kept)", str(llm_changed_discarded_to_kept)
         )
         console.print(table)
+@
 
+A fragment cannot set up its own bibliography, so both commands that
+write one end with the same reminder of what the including document
+must do; the fragment's header repeats it for whoever opens the file
+later.
 
+<<sessions command>>=
+def _print_fragment_hint(console: Console, bib_name: str) -> None:
+    """Tell the user how to include a LaTeX fragment."""
+    console.print(
+        "[dim]Fragment: \\input it from your document body, add "
+        f"\\addbibresource{{{escape(bib_name)}}} and the packages listed "
+        "in its header to the preamble, and compile with biber.[/dim]"
+    )
+@
+
+The export command is exercised end to end through the CLI runner with a
+session saved under an isolated data directory:
+
+<<test functions>>=
+class TestSessionsExport:
+    """Tests for sessions export."""
+
+    def _save(self, monkeypatch, tmp_path):
+        from datetime import datetime
+        from scholar import review
+        from scholar.scholar import Paper
+
+        monkeypatch.setenv("SCHOLAR_DATA_DIR", str(tmp_path))
+        session = review.ReviewSession(
+            query="q", providers=["openalex", "dblp"],
+            timestamp=datetime(2026, 1, 1), name="exp",
+        )
+        llm = review.ReviewSource.LLM_UNREVIEWED
+        session.decisions = [
+            review.ReviewDecision(
+                paper=Paper(title="Kept", authors=["A"], year=2024,
+                            doi="10/a"),
+                provider="openalex", status=review.DecisionStatus.KEPT,
+                tags=["ml"],
+            ),
+            review.ReviewDecision(
+                paper=Paper(title="Supports", authors=["B"], year=2023,
+                            doi="10/b"),
+                provider="dblp", status=review.DecisionStatus.DISCARDED,
+                tags=["supports-claim"], source=llm, llm_confidence=0.93,
+            ),
+            review.ReviewDecision(
+                paper=Paper(title="Later", authors=["C"], year=2022,
+                            doi="10/c"),
+                provider="dblp", status=review.DecisionStatus.PENDING,
+            ),
+        ]
+        review.save_session(session)
+
+    def test_latex_default_is_standalone(self, monkeypatch, tmp_path):
+        self._save(monkeypatch, tmp_path)
+        out = tmp_path / "rep"
+        result = runner.invoke(
+            app, ["sessions", "export", "exp", "-f", "latex", "-o", str(out)]
+        )
+        assert result.exit_code == 0, result.stdout
+        assert r"\documentclass" in out.with_suffix(".tex").read_text()
+
+    def test_latex_fragment(self, monkeypatch, tmp_path):
+        self._save(monkeypatch, tmp_path)
+        out = tmp_path / "rep"
+        result = runner.invoke(
+            app, ["sessions", "export", "exp", "-f", "latex",
+                  "--no-standalone", "-o", str(out)],
+        )
+        assert result.exit_code == 0, result.stdout
+        content = out.with_suffix(".tex").read_text()
+        assert r"\documentclass" not in content
+        assert r"\section{Kept Papers}" in content
+        assert out.with_suffix(".bib").exists()
+        assert "rep.bib" in result.stdout
+        assert "Fragment" in result.stdout
+
+    def test_table(self, monkeypatch, tmp_path):
+        self._save(monkeypatch, tmp_path)
+        out = tmp_path / "tab"
+        result = runner.invoke(
+            app, ["sessions", "export", "exp", "-f", "table", "--lang",
+                  "sv", "--label", "sok-A", "--theme", "ml=maskin",
+                  "-o", str(out)],
+        )
+        assert result.exit_code == 0, result.stdout
+        content = out.with_suffix(".tex").read_text()
+        assert r"\documentclass" not in content
+        assert r"\begin{longtable}" in content
+        assert r"\label{tab:sok-A}" in content
+        assert r"\emph{citerad}: maskin" in content
+        assert "stöder påståendet (0.93)" in content
+        assert "ej klassad" in content
+
+    def test_table_rejects_bad_theme_and_lang(self, monkeypatch, tmp_path):
+        self._save(monkeypatch, tmp_path)
+        result = runner.invoke(
+            app, ["sessions", "export", "exp", "-f", "table",
+                  "--theme", "nokey"],
+        )
+        assert result.exit_code == 1
+        assert "TAG=NAME" in result.stdout
+        result = runner.invoke(
+            app, ["sessions", "export", "exp", "-f", "table", "--lang", "de"],
+        )
+        assert result.exit_code == 1
+        assert "--lang" in result.stdout
+@
+
+<<sessions command>>=
 @sessions_app.command("resume")
 def sessions_resume(
     name: Annotated[
@@ -4865,6 +5081,16 @@ Tags accumulate via [[add_tag]] (idempotent), so redeciding a paper refines
 rather than clobbers its tags; the status change itself is an overwrite,
 which is what redeciding means.
 
+Decisions carry their provenance. An agent that screens papers on an
+LLM's behalf must not record its verdicts as human decisions, because
+the TUI queues unreviewed LLM decisions for confirmation and the export
+counts how many of them the reviewer confirmed or changed. [[--source
+llm]] therefore stores the decision as [[LLM_UNREVIEWED]]. Conversely, a
+human decision on such a row \emph{is} the review: it goes through
+[[mark_as_reviewed]], which mirrors the TUI (confirmed when the status
+stands, changed and flagged as a training example when it does not),
+instead of overwriting the provenance with [[HUMAN]] as it used to.
+
 <<sessions command>>=
 @sessions_app.command("decide")
 def sessions_decide(
@@ -4909,6 +5135,15 @@ def sessions_decide(
                  "Repeatable.",
         ),
     ] = None,
+    source: Annotated[
+        str,
+        typer.Option(
+            "--source", "-s",
+            help="Who decided: human (default) or llm. LLM decisions stay "
+                 "unreviewed so the TUI still asks for confirmation.",
+            autocompletion=complete_decision_source,
+        ),
+    ] = "human",
 ) -> None:
     """
     Record keep/discard decisions in a saved session, without the TUI.
@@ -4917,13 +5152,20 @@ def sessions_decide(
     requires at least one --tag as motivation. If any selector matches
     nothing, no changes are saved and the exit code is nonzero.
 
-    Example:
+    --source llm records an unreviewed LLM decision (an agent deciding on
+    the LLM's behalf). A human decision on such a paper marks it
+    reviewed, and changed if the status differs.
+
+    Examples:
         scholar sessions decide my-review --keep --doi 10.1145/3568813 \\
             --tag misconceptions
+        scholar sessions decide my-review --source llm --discard \\
+            --doi 10.1145/3568813 --tag off-topic-false-hit
     """
     from scholar.review import (
         DecisionStatus, ReviewSource, load_session, save_session,
     )
+    from scholar.llm_review import mark_as_reviewed
 
     console = Console()
     <<validate decide options>>
@@ -4937,10 +5179,7 @@ def sessions_decide(
 
     status = DecisionStatus.KEPT if keep else DecisionStatus.DISCARDED
     for decision in selected.values():
-        decision.status = status
-        decision.source = ReviewSource.HUMAN
-        for t in tag or []:
-            decision.add_tag(t)
+        <<record one decision with its source>>
 
     save_session(session)
     word = "kept" if keep else "discarded"
@@ -4962,11 +5201,41 @@ if not doi and not paper_id:
         "[red]Select at least one paper with --doi or --paper-id.[/red]"
     )
     raise typer.Exit(1)
+if source not in DECISION_SOURCES:
+    console.print(
+        f"[red]Invalid --source: {escape(source)}. Use human or llm.[/red]"
+    )
+    raise typer.Exit(1)
 if discard and not tag:
     console.print(
         "[red]--discard requires at least one --tag (motivation).[/red]"
     )
     raise typer.Exit(1)
+@
+
+Recording one decision has three cases. An LLM decision is stored as
+unreviewed, with [[is_example]] cleared since nobody has corrected it
+yet. A human decision on an unreviewed LLM decision is a review and is
+delegated to [[mark_as_reviewed]]; agreement means the status stands.
+Any other human decision simply overwrites status and source. Tags are
+added afterwards in all three cases.
+
+<<record one decision with its source>>=
+if source == "llm":
+    decision.status = status
+    decision.source = ReviewSource.LLM_UNREVIEWED
+    decision.is_example = False
+elif decision.source == ReviewSource.LLM_UNREVIEWED:
+    mark_as_reviewed(
+        decision,
+        user_agrees=decision.status == status,
+        new_status=status,
+    )
+else:
+    decision.status = status
+    decision.source = ReviewSource.HUMAN
+for t in tag or []:
+    decision.add_tag(t)
 @
 
 Selection collects matches into a dict keyed by paper id, which both
@@ -5041,7 +5310,7 @@ class TestSessionsDecideCommand:
 
     def test_keep_by_doi(self, tmp_path, monkeypatch):
         """--keep --doi records the decision (case-insensitively)."""
-        from scholar.review import load_session
+        from scholar.review import ReviewSource, load_session
 
         self._make_session(tmp_path, monkeypatch)
         result = runner.invoke(app, [
@@ -5055,6 +5324,67 @@ class TestSessionsDecideCommand:
         assert len(kept) == 1
         assert kept[0].paper.doi == "10.1/WithDoi"
         assert kept[0].tags == ["core"]
+        assert kept[0].source == ReviewSource.HUMAN
+
+    def test_source_llm_stays_unreviewed(self, tmp_path, monkeypatch):
+        """--source llm records an LLM decision the TUI can still review."""
+        from scholar.review import ReviewSource, load_session
+
+        self._make_session(tmp_path, monkeypatch)
+        result = runner.invoke(app, [
+            "sessions", "decide", "headless", "--source", "llm",
+            "--discard", "--doi", "10.1/withdoi", "--tag", "supports-claim",
+        ])
+        assert result.exit_code == 0
+        decision = load_session("headless").discarded_papers()[0]
+        assert decision.source == ReviewSource.LLM_UNREVIEWED
+        assert decision.is_example is False
+
+    def test_human_decision_reviews_llm_decision(self, tmp_path, monkeypatch):
+        """A human decision on an LLM row marks it reviewed and changed."""
+        from scholar.review import ReviewSource, load_session
+
+        self._make_session(tmp_path, monkeypatch)
+        runner.invoke(app, [
+            "sessions", "decide", "headless", "--source", "llm",
+            "--discard", "--doi", "10.1/withdoi", "--tag", "supports-claim",
+        ])
+        result = runner.invoke(app, [
+            "sessions", "decide", "headless",
+            "--keep", "--doi", "10.1/withdoi", "--tag", "ml",
+        ])
+        assert result.exit_code == 0
+        decision = load_session("headless").kept_papers()[0]
+        assert decision.source == ReviewSource.LLM_REVIEWED
+        assert decision.is_example is True
+        assert decision.tags == ["supports-claim", "ml"]
+
+    def test_human_agreement_is_not_an_example(self, tmp_path, monkeypatch):
+        """Confirming an LLM decision reviews it without making an example."""
+        from scholar.review import ReviewSource, load_session
+
+        self._make_session(tmp_path, monkeypatch)
+        runner.invoke(app, [
+            "sessions", "decide", "headless", "--source", "llm",
+            "--keep", "--doi", "10.1/withdoi",
+        ])
+        runner.invoke(app, [
+            "sessions", "decide", "headless",
+            "--keep", "--doi", "10.1/withdoi",
+        ])
+        decision = load_session("headless").kept_papers()[0]
+        assert decision.source == ReviewSource.LLM_REVIEWED
+        assert decision.is_example is False
+
+    def test_unknown_source_refused(self, tmp_path, monkeypatch):
+        """An unknown --source is rejected before loading the session."""
+        self._make_session(tmp_path, monkeypatch)
+        result = runner.invoke(app, [
+            "sessions", "decide", "headless", "--source", "robot",
+            "--keep", "--doi", "10.1/withdoi",
+        ])
+        assert result.exit_code == 1
+        assert "--source" in result.output
 
     def test_discard_by_paper_id(self, tmp_path, monkeypatch):
         """--discard --paper-id works for papers without a DOI."""
@@ -6136,9 +6466,17 @@ Instead, we generate the synthesis in multiple rounds:
 The [[--dry-run]] option prints all prompts so the user can inspect what is
 sent to the model.
 
-For LaTeX output, the synthesis is a complete compilable document.
-The output embeds a BibTeX file and uses [[biblatex]]; compilation therefore
-requires running [[biber]].
+For \LaTeX{} output the document ends with the review's decision record
+(the summary tables and the kept and discarded papers, as in
+[[sessions export]]) as an appendix in its own [[refsection]], so the
+reference list holds exactly what the prose cites. By default the output
+is a complete compilable document that embeds its BibTeX file and uses
+[[biblatex]], so compilation requires [[biber]]. With
+[[--no-standalone]] the output is a fragment for [[\input]] into another
+document; the bibliography then has to be a sibling [[.bib]] file, which
+is why that mode requires [[--output]]. The fragment's header says what
+the including document must load. Markdown has no fragment notion, so
+[[--no-standalone]] is rejected there rather than silently ignored.
 
 \paragraph{Theme selection.}
 By default, all themes are included in the synthesis.
@@ -6474,6 +6812,14 @@ def llm_synthesize(
             help="Use LLM to suggest similar themes for grouping.",
         ),
     ] = False,
+    standalone: Annotated[
+        bool,
+        typer.Option(
+            "--standalone/--no-standalone",
+            help="LaTeX: compilable document (default) or an "
+                 "\\input-able fragment (requires --output).",
+        ),
+    ] = True,
 ) -> None:
     """
     Generate a prose literature synthesis from kept papers.
@@ -6487,9 +6833,12 @@ def llm_synthesize(
     when paper tags are present), a "Conclusion", and a deterministic
     reference list.
 
-    For LaTeX output, a full compilable document is produced, including an
-    embedded BibTeX file and a biblatex reference section (run biber when
-    compiling).
+    For LaTeX output, the document ends with the review's decision
+    record (summary tables, kept and discarded papers) as an appendix.
+    By default it is a full compilable document with an embedded BibTeX
+    file and a biblatex reference section (run biber when compiling);
+    with --no-standalone it is a fragment for \\input, with the
+    bibliography written next to the --output file.
 
     Requires:
     - At least one kept paper in the session
@@ -6499,6 +6848,7 @@ def llm_synthesize(
         scholar llm synthesize "my review"
         scholar llm synthesize "my review" -o synthesis.md
         scholar llm synthesize "my review" --format latex -o synthesis.tex
+        scholar llm synthesize "my review" -f latex --no-standalone -o part.tex
         scholar llm synthesize "my review" -t security -t privacy
         scholar llm synthesize "my review" --interactive
         scholar llm synthesize "my review" -i --suggest-groups
@@ -6524,6 +6874,21 @@ def llm_synthesize(
             "Use 'markdown' or 'latex'.[/red]"
         )
         raise typer.Exit(1)
+
+    if not standalone:
+        if output_format != "latex":
+            console.print(
+                "[red]--no-standalone applies to --format latex only.[/red]"
+            )
+            raise typer.Exit(1)
+        if output is None:
+            console.print(
+                "[red]--no-standalone writes the bibliography next to the "
+                ".tex file; pass --output.[/red]"
+            )
+            raise typer.Exit(1)
+
+    bib_name = output.with_suffix(".bib").name if output else "synthesis.bib"
 
     model_selection = LLMModelSelection(
         base=model,
@@ -6551,6 +6916,8 @@ def llm_synthesize(
             dry_run=dry_run,
             selected_themes=selected_themes,
             theme_groupings=theme_groupings,
+            standalone=standalone,
+            bib_name=bib_name,
         )
 
         if dry_run:
@@ -6570,14 +6937,22 @@ def llm_synthesize(
             console.print(
                 f"[green]Synthesis written to {escape(str(output))}[/green]"
             )
+            if output_format == "latex" and not standalone:
+                bib_path = output.with_suffix(".bib")
+                bib_path.write_text(result.bibtex + "\n")
+                console.print(
+                    f"[green]Bibliography written to {escape(str(bib_path))}"
+                    "[/green]"
+                )
+                _print_fragment_hint(console, bib_path.name)
             console.print(f"  Papers: {result.paper_count}")
             console.print(
                 f"  Themes: {', '.join(escape(t) for t in result.themes)}"
             )
             console.print(f"  Model: {result.model_id}")
         else:
-            # Print to stdout
-            console.print(synthesis_text, markup=False)
+            # Plain write: Rich would wrap long LaTeX lines when piped.
+            sys.stdout.write(synthesis_text)
 
     except ValueError as e:
         console.print(f"[red]Error: {escape(str(e))}[/red]")
@@ -6638,6 +7013,42 @@ class TestLLMCommands:
         )
         assert result.exit_code == 1
         assert "invalid format" in result.stdout.lower()
+
+    def test_llm_synthesize_no_standalone_requires_output(self, monkeypatch):
+        """--no-standalone without --output fails before any LLM work."""
+        from scholar import review
+        from datetime import datetime
+
+        session = review.ReviewSession(
+            query="test", providers=["test"], timestamp=datetime.now(),
+            research_context="Test question", name="test-session",
+        )
+        monkeypatch.setattr(review, "load_session", lambda x: session)
+
+        result = runner.invoke(
+            app, ["llm", "synthesize", "test-session", "-f", "latex",
+                  "--no-standalone"],
+        )
+        assert result.exit_code == 1
+        assert "--output" in result.stdout
+
+    def test_llm_synthesize_no_standalone_needs_latex(self, monkeypatch):
+        """--no-standalone is rejected for markdown output."""
+        from scholar import review
+        from datetime import datetime
+
+        session = review.ReviewSession(
+            query="test", providers=["test"], timestamp=datetime.now(),
+            research_context="Test question", name="test-session",
+        )
+        monkeypatch.setattr(review, "load_session", lambda x: session)
+
+        result = runner.invoke(
+            app, ["llm", "synthesize", "test-session", "--no-standalone",
+                  "-o", "x.md"],
+        )
+        assert result.exit_code == 1
+        assert "--format latex" in result.stdout
 @
 
 
