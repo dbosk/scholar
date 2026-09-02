@@ -272,17 +272,22 @@ report body builders (`build_review_provenance_latex`,
   unchanged.
 - `scholar sessions export -f table --lang en|sv --label L --track T
   --theme TAG=NAME -o base` writes `base.tex`, always a fragment: one
-  row per unique title+year (providers merged, a kept duplicate wins).
-  Reason: *cited* = kept by a human decision (source `human` or
-  `llm_reviewed`) with a non-category tag or no tags, theme = first
-  non-category tag (`sessions decide -t` appends, so category and theme
-  tags coexist); otherwise the first category tag, with the confidence
-  for unreviewed LLM rows; an LLM keep is a candidate, not a citation.
-  Order: cited (0), `supports-claim` (1), `qualifies-claim` (2),
-  `adjacent-subtopic` (3), `off-topic-false-hit` (4), pending/unknown
-  (5). `--bearing-only` lists only orders 0-2 and states the adjacent,
-  off-topic and unclassified counts in the caption. `all` stays csv +
-  latex.
+  row per unique title+year (providers merged, the best-placed decision
+  wins). Tags split three ways: category tags (`supports-claim` …),
+  note tags (`AUDIT_STRINGS[lang]["notes"]`: `recorded-not-cited`,
+  `duplicate-record-of-cited-source`, `extended-tech-report`, …) and
+  theme tags (the rest; with `--theme` given, only the listed tags).
+  *Cited* = kept by a human decision (source `human` or `llm_reviewed`)
+  with a theme tag or no tags; otherwise the first category tag, with
+  the confidence for unreviewed LLM rows; notes are appended in
+  parentheses, note-only rows are "other". An LLM keep is a candidate,
+  not a citation. Order: cited (0), `supports-claim` (1),
+  `qualifies-claim` (2), `adjacent-subtopic` (3),
+  `off-topic-false-hit` (4), pending (5), other (6). The caption never
+  names the session (it is a `%` comment in the fragment) and ends with
+  a full-name-first "Databases:" sentence built from the providers
+  present. `--bearing-only` lists only orders 0-2 and states the other
+  counts in the caption. `all` stays csv + latex.
 - The TUI's `prompt_for_report` keeps the standalone default.
 
 ## Testing
