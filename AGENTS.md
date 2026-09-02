@@ -205,6 +205,10 @@ confirmation goes to stderr so `-f json`/`-f bibtex` stdout stays pure.
 `scholar sessions decide <name> --keep|--discard --doi ...|--paper-id ...
 --tag ...` records decisions non-interactively; discarding requires a tag
 (motivation), and if any selector matches nothing the batch aborts unsaved.
+`--source llm` stores the decision as an unreviewed LLM decision
+(agent-driven screening that the TUI still queues for confirmation); a
+human `decide` on such a row marks it `llm_reviewed`, with `is_example`
+set when the status changed, mirroring the TUI.
 Together these let scripted/agent-driven systematic reviews produce the same
 session record and `sessions export` audit trail as TUI reviews.
 
@@ -227,6 +231,57 @@ A note is parsed into ordered segments — `personal` (verbatim) or `prov`
 reconstructing a `Paper` from the `.bib` fields and reusing `Paper.id`
 (DOI, else title+author hash). All round-trip code lives in `cli.nw`'s
 `<<formatter classes>>` and `<<prov command>>` chunks.
+
+### LaTeX Output: Standalone, Fragment, Audit Table
+
+`review.py` owns the shared LaTeX pieces: the escapers (`escape_latex`,
+`escape_bibtex`: one pass, Unicode punctuation mapped to TeX, symbols
+above U+2100 dropped so pdflatex never sees `☆`), `LATEX_PACKAGES`,
+`latex_document` (compilable skeleton, escaped title), `latex_fragment`
+(body plus a `%` header telling the includer which packages,
+`\addbibresource` line and biber run it needs; `\addbibresource` is
+preamble-only, so a fragment can only instruct), `refsection`, the two
+report body builders (`build_review_provenance_latex`,
+`build_review_decisions_latex`) and the audit table
+(`build_audit_table_latex` / `generate_audit_table`).
+
+- `scholar sessions export -f latex [--standalone|--no-standalone]` →
+  `generate_latex_report(session, path, standalone=True)`. Always writes
+  the sibling `.bib`. Standalone output is byte-identical to before; the
+  fragment wraps its body in a `refsection` so the host's
+  `\printbibliography` is not polluted by the report's `\fullcite`s.
+- `scholar llm synthesize -f latex [--standalone|--no-standalone]`: the
+  document ends with the decision record (`build_review_decisions_latex`)
+  as `\appendix` inside a `refsection`, after `\printbibliography`, so the
+  References list exactly what the prose cites (discarded and uncited
+  kept papers stay out). Standalone embeds the bib via
+  `\begin{filecontents*}[overwrite]{<stem>.bib}` (`overwrite`: LaTeX
+  otherwise keeps a stale file of that name); `--no-standalone` requires
+  `--output`, writes `<stem>.bib` next to the `.tex` from
+  `SynthesisResult.bibtex`, and is rejected for markdown.
+- **Key-stability rule.** The theme cache stores LLM prose containing
+  literal `\textcite{key}`s, so `_synthesis_key_space` orders the key
+  space as included kept papers (original order), then remaining kept,
+  then discarded, deduplicated by paper id; suffixes are assigned in
+  iteration order, so kept keys never change. The report keeps its own
+  `surname{year}_{index}` scheme keyed by `id(decision)` (a loaded
+  session can hold one paper twice); builders take a `cite_key`
+  resolver so the two schemes never have to agree. Synthesis keys strip
+  only the characters biber rejects (apostrophes, quotes, braces,
+  delimiters), so `O'Brien` yields `obrien2024` while all other keys are
+  unchanged.
+- `scholar sessions export -f table --lang en|sv --label L --track T
+  --theme TAG=NAME -o base` writes `base.tex`, always a fragment: one
+  row per unique title+year (providers merged, a kept duplicate wins).
+  Reason: *cited* = kept by a human decision (source `human` or
+  `llm_reviewed`) with a non-category tag or no tags, theme = first
+  non-category tag (`sessions decide -t` appends, so category and theme
+  tags coexist); otherwise the first category tag, with the confidence
+  for unreviewed LLM rows; an LLM keep is a candidate, not a citation.
+  Order: cited (0), `supports-claim` (1), `qualifies-claim` (2),
+  `adjacent-subtopic` (3), `off-topic-false-hit` (4), pending/unknown
+  (5). `all` stays csv + latex.
+- The TUI's `prompt_for_report` keeps the standalone default.
 
 ## Testing
 

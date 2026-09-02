@@ -86,6 +86,14 @@ scholar sessions resume "machine learning"
 
 # Export session to reports
 scholar sessions export "machine learning" -f all
+
+# LaTeX report as an \input-able fragment (writes review.tex + review.bib)
+scholar sessions export "machine learning" -f latex --no-standalone -o review
+
+# Audit table for a backing appendix (one row per paper with the reason;
+# always a fragment; --lang en|sv, --theme TAG=NAME gives themes readable names)
+scholar sessions export "machine learning" -f table --lang sv --label sok-A \
+    --track "sökspår 1" --theme ml=maskininlärning -o review-full
 ```
 
 ### Paper Notes
@@ -248,6 +256,15 @@ scholar sessions resume "privacy-ml-review"
 
 # 4. Generate reports
 scholar sessions export "privacy-ml-review" -f all
+
+# 5. Synthesise the kept papers (needs a research context); the LaTeX
+#    document ends with the decision record as an appendix
+scholar llm context "privacy-ml-review" "How is privacy preserved in ML?"
+scholar llm synthesize "privacy-ml-review" -f latex -o synthesis.tex
+
+# ... or as a fragment to \input into a thesis chapter (also writes
+#     synthesis.bib; add \addbibresource{synthesis.bib} to the preamble)
+scholar llm synthesize "privacy-ml-review" -f latex --no-standalone -o synthesis.tex
 ```
 
 ### Enriching Results
