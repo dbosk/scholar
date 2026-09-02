@@ -209,12 +209,21 @@ faster responses, and Unpaywall (open-access lookup during
 `scholar enrich` and `scholar pdf open <doi>`) requires it. `OPENALEX_EMAIL`
 and `CROSSREF_MAILTO` are still honoured as per-service overrides.
 
+OpenAlex meters requests against a daily budget (a search costs $0.001,
+reset at midnight UTC). A free API key from
+[openalex.org/settings/api](https://openalex.org/settings/api) raises the
+budget tenfold; set it as `OPENALEX_API_KEY` and it is used by the
+`openalex` provider and every preprint-server provider. `scholar
+providers check` then shows how much of the day's budget is left, and a
+search that hits the spent budget reports the reset time instead of a
+bare 429.
+
 Some providers require API keys set as environment variables:
 
 | Provider | Environment Variable | Required | How to Get |
 |----------|---------------------|----------|------------|
 | Semantic Scholar | `S2_API_KEY` | No | [api.semanticscholar.org](https://api.semanticscholar.org) |
-| OpenAlex | `SCHOLAR_EMAIL` | No | Any email (for polite pool) |
+| OpenAlex | `OPENALEX_API_KEY`, `SCHOLAR_EMAIL` | No | [openalex.org/settings/api](https://openalex.org/settings/api) (10x daily budget); any email (polite pool) |
 | DBLP | - | No | No key needed |
 | arXiv | - | No | No key needed |
 | HAL | - | No | No key needed |
