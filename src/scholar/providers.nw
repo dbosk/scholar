@@ -8614,8 +8614,14 @@ def test_each_provider_has_own_cache(self):
   assert ssrn._cache is not biorxiv._cache
 
 def test_check_classifies_statuses(self):
-  """check() maps probe responses to health statuses."""
+  """check() maps probe responses to health statuses.
+
+  The registry instance was built at import time, so it may carry a
+  key from the developer's environment; without a key a 403 is an
+  HTTP error rather than a rejected key.
+  """
   provider = get_provider("ssrn")
+  provider.api_key = None
 
   def response(status_code):
     mock = Mock()
