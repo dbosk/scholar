@@ -115,6 +115,7 @@ the user wants to use OpenAI, Anthropic, local models, or other providers.
 from dataclasses import dataclass, field
 from datetime import datetime
 from typing import Any
+from collections.abc import Callable
 import hashlib
 import json
 import logging
@@ -2020,6 +2021,7 @@ class SynthesisResult:
         references: Paper metadata used to build the bibliography
         theme_sections: Generated theme sections from multi-round synthesis
         conclusion: Generated conclusion text (without heading)
+        bibtex: BibTeX entries for every paper the LaTeX output cites
     """
 
     synthesis: str
@@ -2030,6 +2032,7 @@ class SynthesisResult:
     references: list[dict[str, Any]]
     theme_sections: list[ThemeSectionResult] = field(default_factory=list)
     conclusion: str = ""
+    bibtex: str = ""
 @
 
 \subsubsection{Testing data structures}
@@ -2069,9 +2072,17 @@ For author-year citations, we generate keys like \enquote{[Smith, 2024]} or
 on the number of authors.
 
 For \LaTeX{} output, we also need BibTeX-style keys like [[smith2024]] for use
-with [[\cite{}]] commands.
+with [[\cite{}]] commands. A key is built from the surname, so it inherits
+whatever the surname contains; biber's parser rejects an apostrophe (an
+\enquote{O'Brien} used to abort the whole bibliography) as well as
+whitespace, quotes, braces, parentheses and the BibTeX delimiters. Only
+those characters are stripped, so every key that compiled before is
+unchanged---which matters because cached prose cites keys literally.
 
 <<llm review synthesis>>=
+BIBTEX_KEY_UNSAFE = re.compile(r"""[\s,{}"'#%()=\\]""")
+
+
 def _get_author_surname(author: str) -> str:
     """
     Extract surname from author name.
@@ -2114,7 +2125,7 @@ def _generate_citation_key(
     year = paper.year or "n.d."
 
     # Generate BibTeX-style key (always needed for reference list)
-    bibtex_key = f"{first_surname.lower()}{year}".replace(" ", "")
+    bibtex_key = BIBTEX_KEY_UNSAFE.sub("", f"{first_surname.lower()}{year}")
 
     if output_format == "latex":
         display_key = bibtex_key
@@ -2178,6 +2189,15 @@ def _generate_all_citation_keys(
 
 <<test functions>>=
 class TestSynthesisCitationKeys:
+    def test_generate_citation_key_strips_bibtex_unsafe_chars(self):
+        from scholar.llm_review import _generate_citation_key
+
+        paper = Paper(title="T", authors=["Ann O'Brien"], year=2024)
+        _, key = _generate_citation_key(paper, "latex")
+        assert key == "obrien2024"
+        hyphen = Paper(title="T", authors=["Bo Smith-Jones"], year=2024)
+        assert _generate_citation_key(hyphen, "latex")[1] == "smith-jones2024"
+
     def test_get_author_surname_simple(self):
         from scholar.llm_review import _get_author_surname
 
@@ -2230,6 +2250,128 @@ class TestSynthesisCitationKeys:
         display, bibtex = _generate_citation_key(paper, "latex")
         assert display == "smith2024"
         assert bibtex == "smith2024"
+@
+
+\subsubsection{Keys for the appendix}
+
+The \LaTeX{} synthesis ends with the decision record, which
+[[\fullcite]]s every paper the review touched, so the bibliography must
+hold keys for the discarded papers and for kept papers that
+[[--max-papers]] left out of the prose. Those keys join the same key
+space as the cited papers, and that space must be extended without
+disturbing what is already there: theme sections are cached under
+[[_theme_cache_key]], which hashes paper fingerprints but not the keys,
+and the cached prose contains the keys literally. The extension is safe
+because [[_generate_all_citation_keys]] assigns collision suffixes in
+iteration order---appending papers can suffix later entries, never
+earlier ones---provided the included kept papers come first, in their
+original order.
+
+The space is deduplicated by paper id. A session can hold the same paper
+twice (the loader derives arXiv DOIs from URLs, so two records saved as
+distinct can coincide on reload), and two entries under one key make
+biber abort; keeping the first occurrence resolves both citations to it.
+
+<<llm review synthesis>>=
+def _unique_by_paper_id(
+    decisions: list[ReviewDecision],
+) -> list[ReviewDecision]:
+    """Drop later decisions whose paper id was already seen."""
+    from scholar.notes import get_paper_id
+
+    unique: list[ReviewDecision] = []
+    seen: set[str] = set()
+    for decision in decisions:
+        paper_id = get_paper_id(decision.paper)
+        if paper_id in seen:
+            continue
+        seen.add(paper_id)
+        unique.append(decision)
+    return unique
+
+
+def _synthesis_key_space(
+    session: ReviewSession,
+    kept_decisions: list[ReviewDecision],
+) -> list[ReviewDecision]:
+    """Order all decisions so the keys of `kept_decisions` never change.
+
+    The included kept papers come first in their original order, then
+    the remaining kept papers, then the discarded ones; duplicates by
+    paper id are dropped.
+    """
+    return _unique_by_paper_id(
+        list(kept_decisions)
+        + session.kept_papers()
+        + session.discarded_papers()
+    )
+@
+
+Three papers by different Smiths in the same year make the suffixes
+visible: the kept ones keep their keys when the discarded one joins the
+space, and the discarded one takes the next suffix.
+
+<<test functions>>=
+def _latex_session():
+    session = ReviewSession(
+        query="q", providers=["p"], timestamp=datetime(2026, 1, 1),
+        research_context="Why?", name="A & B",
+    )
+    session.decisions = [
+        ReviewDecision(
+            paper=Paper(title="Cited", authors=["Ann Smith"], year=2024,
+                        doi="10/a"),
+            provider="p", status=DecisionStatus.KEPT, tags=["ml"],
+        ),
+        ReviewDecision(
+            paper=Paper(title="Uncited", authors=["Bob Smith"], year=2024,
+                        doi="10/b"),
+            provider="p", status=DecisionStatus.KEPT, tags=["ml"],
+        ),
+        ReviewDecision(
+            paper=Paper(title="Dropped", authors=["Cy Smith"], year=2024,
+                        doi="10/c"),
+            provider="p", status=DecisionStatus.DISCARDED,
+            tags=["off-topic"],
+        ),
+    ]
+    return session
+
+
+class TestSynthesisKeySpace:
+    def test_kept_keys_stable_when_discarded_added(self):
+        from scholar.llm_review import (
+            _generate_all_citation_keys, _synthesis_key_space,
+        )
+        from scholar.notes import get_paper_id
+
+        session = _latex_session()
+        kept = session.kept_papers()
+        kept_only = _generate_all_citation_keys(kept, "latex")
+        space = _synthesis_key_space(session, kept)
+        full = _generate_all_citation_keys(space, "latex")
+        for decision in kept:
+            pid = get_paper_id(decision.paper)
+            assert full[pid] == kept_only[pid]
+        assert kept_only[get_paper_id(kept[0].paper)][1] == "smith2024"
+        assert kept_only[get_paper_id(kept[1].paper)][1] == "smith2024b"
+        dropped = session.discarded_papers()[0]
+        assert full[get_paper_id(dropped.paper)][1] == "smith2024c"
+
+    def test_duplicate_paper_ids_collapse(self):
+        from scholar.llm_review import _synthesis_key_space
+
+        session = _latex_session()
+        session.decisions.append(
+            ReviewDecision(
+                paper=session.decisions[0].paper, provider="x",
+                status=DecisionStatus.KEPT,
+            )
+        )
+        space = _synthesis_key_space(session, session.kept_papers())
+        assert [d.paper.title for d in space] == [
+            "Cited", "Uncited", "Dropped",
+        ]
 @
 
 \subsection{Paper Formatting for Synthesis Prompt}
@@ -2952,7 +3094,8 @@ synthesis process:
 \item Group papers by theme (or use an unthemed synthesis if no tags exist)
 \item Generate one synthesis subsection per theme
 \item Generate a conclusion based on the theme summaries
-\item Assemble a full document including provenance and references
+\item Assemble the document: provenance, synthesis, conclusion and
+  references, plus---for \LaTeX{}---the decision record as an appendix
 \end{enumerate}
 
 \paragraph{Theme groupings for merged themes}
@@ -3165,39 +3308,29 @@ def _build_references_markdown(
     return "\n".join(lines)
 
 
-def _format_bibtex_entry(paper: Paper, cite_key: str) -> str:
-    """Format a paper as a BibTeX entry."""
-    from scholar.review import escape_bibtex
+@
 
-    lines = [f"@article{{{cite_key},"]
-    lines.append(f"  title = {{{escape_bibtex(paper.title)}}},")
-    if paper.authors:
-        authors = " and ".join(paper.authors)
-        lines.append(f"  author = {{{escape_bibtex(authors)}}},")
-    if paper.year:
-        lines.append(f"  year = {{{paper.year}}},")
-    if paper.venue:
-        lines.append(f"  journal = {{{escape_bibtex(paper.venue)}}},")
-    if paper.doi:
-        lines.append(f"  doi = {{{paper.doi}}},")
-    if paper.url:
-        lines.append(f"  url = {{{paper.url}}},")
-    lines.append("}")
-    return "\n".join(lines)
+\subsection{Bibliography for the synthesis}
 
+The BibTeX formatter lives in [[review]]: both generators produced
+identical entries and one of them had to own the code. The bibliography
+covers the whole key space rather than only the cited kept papers,
+because the appendix cites the rest.
 
+<<llm review synthesis>>=
 def _build_bibtex_content(
-    kept_decisions: list[ReviewDecision],
+    decisions: list[ReviewDecision],
     citation_keys: dict[str, tuple[str, str]],
 ) -> str:
-    """Build BibTeX content for the included kept papers."""
+    """Build BibTeX content for every decision in `decisions`."""
     from scholar.notes import get_paper_id
+    from scholar.review import format_bibtex_entry
 
     entries: list[str] = []
-    for decision in kept_decisions:
+    for decision in decisions:
         paper_id = get_paper_id(decision.paper)
         _, bibtex_key = citation_keys[paper_id]
-        entries.append(_format_bibtex_entry(decision.paper, bibtex_key))
+        entries.append(format_bibtex_entry(decision.paper, bibtex_key))
 
     return "\n\n".join(entries)
 
@@ -3234,6 +3367,32 @@ def _assemble_markdown_synthesis(
     return "\n".join(parts).strip() + "\n"
 
 
+@
+
+\subsection{Assembling the \LaTeX{} synthesis}
+
+The \LaTeX{} synthesis is the review report's decision record with a
+narrative in front of it, so it is composed from the same pieces as the
+report: the body (research question, synthesis, conclusion) and the
+decision record from [[review.build_review_decisions_latex]], wrapped by
+either [[latex_document]] or [[latex_fragment]]. The front
+\enquote{Research Question} section keeps its search parameters and
+counts; only the per-paper decisions go to the end. (The alternative,
+moving the search parameters to the appendix as well, would be a two-line
+change here but would put the method after the findings.)
+
+Three details of the standalone document are deliberate. The embedded
+bibliography uses [[filecontents*]] with the [[overwrite]] option: \LaTeX{}
+otherwise refuses to regenerate a file that exists, so a [[.bib]] left by
+an earlier fragment run would silently shadow the embedded one. The
+bibliography is printed before the appendix, the conventional order. And
+the decision record sits in its own [[refsection]] so that its
+[[\fullcite]]s---of discarded papers, and of kept papers the prose never
+cited---do not appear in the reference list, which thus lists exactly what
+the synthesis cites. The fragment keeps the [[refsection]] for the same
+reason, protecting the including document's bibliography.
+
+<<llm review synthesis>>=
 def _assemble_latex_synthesis(
     session: ReviewSession,
     theme_sections: list[ThemeSectionResult],
@@ -3242,72 +3401,150 @@ def _assemble_latex_synthesis(
     included_kept_papers: int,
     total_kept_papers: int,
     report_abstract: str,
+    *,
+    cite_key: Callable[[ReviewDecision], str],
+    standalone: bool = True,
+    bib_name: str = "synthesis.bib",
 ) -> str:
-    """Assemble a complete LaTeX synthesis document."""
-    lines: list[str] = []
-
-    # BibTeX file embedded into the generated LaTeX.
-    lines.extend(
-        [
-            r"\begin{filecontents*}{synthesis.bib}",
-            bibtex_content,
-            r"\end{filecontents*}",
-            "",
-        ]
+    """Assemble the LaTeX synthesis as a document or a fragment."""
+    from scholar.review import (
+        LATEX_PACKAGES,
+        build_review_decisions_latex,
+        latex_document,
+        latex_fragment,
+        refsection,
     )
 
-    lines.extend(
-        [
-            r"\documentclass{article}",
-            r"\usepackage[utf8]{inputenc}",
-             r"\usepackage[colorlinks=true,allcolors=blue]{hyperref}",
-            r"\usepackage{enumitem}",
-            r"\usepackage{longtable}",
-            r"\usepackage{booktabs}",
-            r"\usepackage{array}",
-            r"\usepackage[backend=biber,style=authoryear]{biblatex}",
-            r"\addbibresource{synthesis.bib}",
-            "",
-            f"\\title{{{session.name or session.query}}}",
-            f"\\date{{{session.timestamp.strftime('%Y-%m-%d')}}}",
-            "",
-            r"\begin{document}",
-            r"\maketitle",
-            "",
-            r"\begin{abstract}",
-            report_abstract,
-            r"\end{abstract}",
-            r"\clearpage",
-            r"\clearpage",
-            r"\tableofcontents",
-            r"\clearpage",
-            "",
-        ]
-    )
-
-    lines.append(
+    body: list[str] = [
         build_research_question_section_latex(
             session,
             included_kept_papers=included_kept_papers,
             total_kept_papers=total_kept_papers,
-        )
-    )
-    lines.append("")
-
-    lines.extend([r"\section{Synthesis}", ""])
+        ),
+        "",
+        r"\section{Synthesis}",
+        "",
+    ]
     for section in theme_sections:
-        lines.append(section.section.strip())
-        lines.append("")
+        body.extend([section.section.strip(), ""])
+    body.extend([r"\section{Conclusion}", "", conclusion.strip(), ""])
 
-    lines.extend([r"\section{Conclusion}", ""])
-    lines.append(conclusion.strip())
-    lines.append("")
+    appendix = refsection(build_review_decisions_latex(session, cite_key))
 
-    lines.extend([r"\printbibliography", r"\end{document}"])
+    if standalone:
+        lines = [
+            f"\\begin{{filecontents*}}[overwrite]{{{bib_name}}}",
+            bibtex_content,
+            r"\end{filecontents*}",
+            "",
+        ]
+        lines.extend(
+            latex_document(
+                body,
+                title=session.name or session.query,
+                date=session.timestamp.strftime("%Y-%m-%d"),
+                bib_resource=bib_name,
+                abstract=report_abstract,
+                bibliography=r"\printbibliography",
+                appendix=appendix,
+            )
+        )
+    else:
+        lines = latex_fragment(
+            body + appendix,
+            packages=LATEX_PACKAGES,
+            bib_resource=bib_name,
+            abstract=report_abstract,
+            generator="scholar llm synthesize --no-standalone",
+        )
 
     return "\n".join(lines).strip() + "\n"
+@
+
+The assembly needs no model, so we can check both shapes directly. The
+canned theme section cites one of the two kept papers; the other kept
+paper and the discarded one reach the bibliography only through the
+appendix.
+
+<<test functions>>=
+def _assemble(session, **kwargs):
+    from scholar.llm_review import (
+        _assemble_latex_synthesis, _build_bibtex_content,
+        _generate_all_citation_keys, _synthesis_key_space,
+    )
+    from scholar.notes import get_paper_id
+
+    kept = session.kept_papers()
+    space = _synthesis_key_space(session, kept)
+    keys = _generate_all_citation_keys(space, "latex")
+
+    def cite_key(decision):
+        return keys[get_paper_id(decision.paper)][1]
+
+    section = ThemeSectionResult(
+        theme="ml", title="ML",
+        section="\\subsection{ML}\n\\textcite{" + cite_key(kept[0])
+        + "} shows.",
+        summary="s", abstract="a", paper_count=2,
+    )
+    return _assemble_latex_synthesis(
+        session=session, theme_sections=[section], conclusion="Done.",
+        bibtex_content=_build_bibtex_content(space, keys),
+        included_kept_papers=2, total_kept_papers=2,
+        report_abstract="An abstract.", cite_key=cite_key, **kwargs,
+    )
 
 
+class TestAssembleLatexSynthesis:
+    def test_standalone_order(self):
+        text = _assemble(_latex_session(), bib_name="foo.bib")
+        landmarks = [
+            r"\begin{filecontents*}[overwrite]{foo.bib}",
+            "@article{smith2024c,",
+            r"\documentclass{article}",
+            r"\addbibresource{foo.bib}",
+            r"\title{A \& B}",
+            r"\section{Research Question}",
+            r"\section{Synthesis}",
+            r"\textcite{smith2024}",
+            r"\section{Conclusion}",
+            r"\printbibliography",
+            r"\appendix",
+            r"\begin{refsection}",
+            r"\section{Kept Papers}",
+            r"\fullcite{smith2024b}",
+            r"\section{Discarded Papers}",
+            r"\fullcite{smith2024c}",
+            r"\end{refsection}",
+            r"\end{document}",
+        ]
+        positions = [text.index(mark) for mark in landmarks]
+        assert positions == sorted(positions)
+        assert "synthesis.bib" not in text
+
+    def test_fragment(self):
+        text = _assemble(
+            _latex_session(), standalone=False, bib_name="foo.bib"
+        )
+        for absent in (
+            r"\documentclass", "filecontents", r"\appendix",
+            r"\begin{abstract}",
+        ):
+            assert absent not in text
+        lines = text.splitlines()
+        for command in (r"\addbibresource", r"\printbibliography"):
+            assert not any(l.startswith(command) for l in lines)
+        assert "%   \\addbibresource{foo.bib}" in lines
+        assert "%   An abstract." in lines
+        assert text.index(r"\section{Conclusion}") \
+            < text.index(r"\begin{refsection}") \
+            < text.index(r"\section{Kept Papers}") \
+            < text.index(r"\end{refsection}")
+@
+
+With every piece in place, the orchestration follows.
+
+<<llm review synthesis>>=
 def generate_literature_synthesis(
     session: ReviewSession,
     model_selection=None,
@@ -3319,6 +3556,8 @@ def generate_literature_synthesis(
     dry_run: bool = False,
     selected_themes: list[str] | None = None,
     theme_groupings: dict[str, list[str]] | None = None,
+    standalone: bool = True,
+    bib_name: str = "synthesis.bib",
 ) -> SynthesisResult | str:
     """Generate a multi-round literature synthesis from kept papers.
 
@@ -3333,6 +3572,9 @@ def generate_literature_synthesis(
         selected_themes: If provided, only include these themes in synthesis.
         theme_groupings: Maps merged theme names to their constituent original
             themes (e.g., {"Security & Auth": ["security", "authentication"]}).
+        standalone: For LaTeX, emit a compilable document (default) or a
+            fragment meant for input into another document.
+        bib_name: File name the LaTeX output uses for its bibliography.
     """
     from scholar.notes import get_paper_id
 
@@ -3343,9 +3585,9 @@ def generate_literature_synthesis(
             "<context>' to set the research question first."
         )
 
-    kept_all = [
-        d for d in session.decisions if d.status == DecisionStatus.KEPT
-    ]
+    kept_all = _unique_by_paper_id(
+        [d for d in session.decisions if d.status == DecisionStatus.KEPT]
+    )
     if not kept_all:
         raise ValueError(
             "No kept papers to synthesize. Use 'scholar sessions show' to "
@@ -3663,8 +3905,15 @@ def generate_literature_synthesis(
         abstract_response = model.prompt(abstract_prompt)
         report_abstract = parse_report_abstract(abstract_response.text())
 
+    bibtex_content = ""
     if output_format == "latex":
-        bibtex_content = _build_bibtex_content(kept_decisions, citation_keys)
+        key_space = _synthesis_key_space(session, kept_decisions)
+        all_keys = _generate_all_citation_keys(key_space, output_format)
+        bibtex_content = _build_bibtex_content(key_space, all_keys)
+
+        def cite_key(decision: ReviewDecision) -> str:
+            return all_keys[get_paper_id(decision.paper)][1]
+
         synthesis_text = _assemble_latex_synthesis(
             session=session,
             theme_sections=theme_results,
@@ -3673,6 +3922,9 @@ def generate_literature_synthesis(
             included_kept_papers=included_kept_papers,
             total_kept_papers=total_kept_papers,
             report_abstract=report_abstract,
+            cite_key=cite_key,
+            standalone=standalone,
+            bib_name=bib_name,
         )
     else:
         references_markdown = _build_references_markdown(
@@ -3687,8 +3939,7 @@ def generate_literature_synthesis(
             total_kept_papers=total_kept_papers,
         )
 
-    # Persist final output too, since it's cheap and avoids re-assembly.
-    SYNTHESIS_CONCLUSION_CACHE[conclusion_cache_key]["assembled"] = synthesis_text
+    # Persist the report abstract so a cache hit can reuse it.
     SYNTHESIS_CONCLUSION_CACHE[conclusion_cache_key][
         "report_abstract"
     ] = report_abstract
@@ -3702,6 +3953,7 @@ def generate_literature_synthesis(
         references=references,
         theme_sections=theme_results,
         conclusion=conclusion_text,
+        bibtex=bibtex_content,
     )
 @
 
