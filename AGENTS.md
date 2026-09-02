@@ -272,8 +272,9 @@ report body builders (`build_review_provenance_latex`,
   unchanged.
 - `scholar sessions export -f table --lang en|sv --label L --track T
   --theme TAG=NAME -o base` writes `base.tex`, always a fragment: one
-  row per unique title+year (providers merged, the best-placed decision
-  wins). Tags split three ways: category tags (`supports-claim` …),
+  row per unique title+year (case/whitespace-normalised; joined provider
+  strings like `openalex; dblp` are split, mapped to codes and
+  deduplicated; the best-placed decision wins). Tags split three ways: category tags (`supports-claim` …),
   note tags (`AUDIT_STRINGS[lang]["notes"]`: `recorded-not-cited`,
   `duplicate-record-of-cited-source`, `extended-tech-report`, …) and
   theme tags (the rest; with `--theme` given, only the listed tags).

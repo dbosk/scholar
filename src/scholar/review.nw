@@ -100,6 +100,7 @@ from typing import Any
 from collections.abc import Callable
 import json
 import logging
+import re
 import textwrap
 
 from cachetools import cachedmethod
@@ -3996,7 +3997,7 @@ AUDIT_STRINGS: dict[str, dict] = {
         "reason": "Reason",
         "cited": "cited",
         "supports-claim": "supports the claim",
-        "qualifies-claim": "qualifies the claim",
+        "qualifies-claim": "qualifies or contradicts the claim",
         "adjacent-subtopic": "adjacent subtopic",
         "off-topic-false-hit": "other topic (false hit)",
         "pending": "pending, unclassified",
@@ -4048,7 +4049,7 @@ AUDIT_STRINGS: dict[str, dict] = {
         "reason": "Skäl",
         "cited": "citerad",
         "supports-claim": "stöder påståendet",
-        "qualifies-claim": "kvalificerar påståendet",
+        "qualifies-claim": "kvalificerar eller motsäger påståendet",
         "adjacent-subtopic": "angränsande delämne",
         "off-topic-false-hit": "annat ämne (felträff)",
         "pending": "ej klassad",
@@ -4073,16 +4074,17 @@ AUDIT_STRINGS: dict[str, dict] = {
     },
 }
 
-PROVIDER_SHORT_NAMES: dict[str, str] = {
+PROVIDER_SHORT_NAMES: dict[str, str] = {   # in caption order
     "openalex": "OA",
     "dblp": "DBLP",
-    "wos": "WoS",
     "ieee": "IEEE",
+    "wos": "WoS",
     "scopus": "Scopus",
     "s2": "S2",
     "arxiv": "arXiv",
     "hal": "HAL",
 }
+PROVIDER_SEPARATORS = re.compile(r"[;,|]")
 
 PROVIDER_FULL_NAMES: dict[str, str] = {
     "openalex": "OpenAlex",
@@ -4261,7 +4263,7 @@ class TestAuditReason:
         assert label == "supports the claim (0.93)"
         assert order == 1
         assert self._reason(DecisionStatus.DISCARDED, ["qualifies-claim"]) \
-            == ("qualifies the claim", 2)
+            == ("qualifies or contradicts the claim", 2)
         assert self._reason(DecisionStatus.DISCARDED, ["adjacent-subtopic"]) \
             == ("adjacent subtopic", 3)
         assert self._reason(
@@ -4289,10 +4291,31 @@ audit table is about papers, not records: rows are merged on title and
 year, the providers are joined, and the best-placed decision wins---a
 cited copy over a category, a category over a note---because the paper
 is what it is whatever the other providers' copies were classified as.
-Titles are truncated before escaping so the cut cannot land inside an
-escape sequence.
+The merge key normalises the title's case and whitespace (a no-break
+space from one provider must not split a paper in two), and titles are
+truncated before escaping so the cut cannot land inside an escape
+sequence.
+
+A decision's [[provider]] is itself a joined string when the session
+merged records at search time (\enquote{openalex; dblp}), so providers
+are split on the separators the session uses, mapped to their codes
+and deduplicated before they are joined again for the cell; an
+unmapped name is kept as written.
 
 <<review report generation>>=
+def provider_short_names(provider: str | None) -> list[str]:
+    """Split a decision's provider string into deduplicated codes."""
+    names: list[str] = []
+    for part in PROVIDER_SEPARATORS.split(provider or ""):
+        part = part.strip()
+        if not part:
+            continue
+        short = PROVIDER_SHORT_NAMES.get(part.lower(), part)
+        if short not in names:
+            names.append(short)
+    return names
+
+
 def collect_audit_rows(
     session: ReviewSession,
     *,
@@ -4305,10 +4328,8 @@ def collect_audit_rows(
         paper = decision.paper
         title = paper.title or ""
         year = str(paper.year) if paper.year else ""
-        key = (title.strip().lower(), year)
-        provider = PROVIDER_SHORT_NAMES.get(
-            decision.provider, decision.provider
-        )
+        key = (" ".join(title.split()).casefold(), year)
+        providers = provider_short_names(decision.provider)
         reason, order = audit_reason(
             decision, theme_names=theme_names, strings=strings
         )
@@ -4317,14 +4338,15 @@ def collect_audit_rows(
             rows[key] = AuditRow(
                 title=escape_latex(title[:AUDIT_TITLE_LENGTH]),
                 year=year,
-                providers=[provider] if provider else [],
+                providers=providers,
                 status=decision.status,
                 reason=reason,
                 order=order,
             )
             continue
-        if provider and provider not in row.providers:
-            row.providers.append(provider)
+        for provider in providers:
+            if provider not in row.providers:
+                row.providers.append(provider)
         if order < row.order:
             row.status, row.reason, row.order = decision.status, reason, order
     return sorted(rows.values(), key=lambda r: (r.order, r.title.lower()))
@@ -4365,6 +4387,48 @@ def _audit_session():
 
 
 class TestCollectAuditRows:
+    def test_provider_strings_are_split_and_mapped(self):
+        assert provider_short_names("openalex; dblp, WOS |ieee|dblp") \
+            == ["OA", "DBLP", "WoS", "IEEE"]
+        assert provider_short_names("mylib") == ["mylib"]
+        assert provider_short_names(None) == []
+
+    def test_titles_merge_across_case_and_whitespace(self):
+        session = ReviewSession(
+            query="q", providers=["openalex"], timestamp=datetime.now(),
+        )
+        session.decisions = [
+            ReviewDecision(
+                paper=Paper(title="Same  Title", authors=["A"], year=2020),
+                provider="openalex; dblp", status=DecisionStatus.KEPT,
+                tags=["ml"],
+            ),
+            ReviewDecision(
+                paper=Paper(title="same\u00a0title", authors=["A"],
+                            year=2020),
+                provider="scopus", status=DecisionStatus.DISCARDED,
+                tags=["off-topic-false-hit"],
+            ),
+        ]
+        rows = collect_audit_rows(
+            session, theme_names={}, strings=AUDIT_STRINGS["en"]
+        )
+        assert len(rows) == 1
+        assert rows[0].providers == ["OA", "DBLP", "Scopus"]
+        assert rows[0].order == AUDIT_ORDER_CITED
+
+    def test_databases_sentence_is_ordered_and_deduplicated(self):
+        rows = [
+            AuditRow("t", "2020", ["Scopus", "WoS"], DecisionStatus.KEPT,
+                     "r", 0),
+            AuditRow("u", "2020", ["IEEE", "OA", "mylib"],
+                     DecisionStatus.KEPT, "r", 0),
+        ]
+        assert audit_databases_sentence(rows, AUDIT_STRINGS["en"]) == (
+            "Databases: OpenAlex (OA; not open access), IEEE Xplore (IEEE), "
+            "Web of Science (WoS), Scopus, mylib."
+        )
+
     def test_merges_duplicates_and_kept_wins(self):
         rows = collect_audit_rows(
             _audit_session(), theme_names={}, strings=AUDIT_STRINGS["en"]
