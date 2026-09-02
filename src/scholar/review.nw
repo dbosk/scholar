@@ -3945,6 +3945,7 @@ AUDIT_CATEGORIES: dict[str, int] = {
     "off-topic-false-hit": 4,
 }
 AUDIT_ORDER_CITED = 0
+AUDIT_ORDER_BEARING = 2      # cited, supports and qualifies bear on the claim
 AUDIT_ORDER_OTHER = 5
 AUDIT_TITLE_LENGTH = 180
 
@@ -3970,6 +3971,16 @@ AUDIT_STRINGS: dict[str, dict[str, str]] = {
         "pending": "pending, unclassified",
         "continued": "(cont.)",
         "continued_next": "continued on next page",
+        "bearing": (
+            "Records bearing on the claim{track} (session "
+            "\\texttt{{{session}}}; {cited} cited, {supports} supporting "
+            "and {qualifies} qualifying or contradicting it, out of {n} "
+            "unique hits; the {adjacent} adjacent and {offtopic} false "
+            "hits{not_listed} are not listed). The last column gives the "
+            "reason for each inclusion; for machine-classified rows the "
+            "model's confidence is given."
+        ),
+        "not_listed_other": ", {other} unclassified",
     },
     "sv": {
         "caption": (
@@ -3992,6 +4003,16 @@ AUDIT_STRINGS: dict[str, dict[str, str]] = {
         "pending": "ej klassad",
         "continued": "(forts.)",
         "continued_next": "forts.\\ på nästa sida",
+        "bearing": (
+            "Träffar som rör påståendet{track} (session "
+            "\\texttt{{{session}}}; {cited} citerade, {supports} som stöder "
+            "påståendet och {qualifies} som kvalificerar eller motsäger "
+            "det, av {n} unika träffar; de {adjacent} angränsande och "
+            "{offtopic} felträffarna{not_listed} listas inte). Skälet till "
+            "varje inkludering står i sista kolumnen; för maskinklassade "
+            "rader anges modellens konfidens."
+        ),
+        "not_listed_other": ", {other} ej klassade",
     },
 }
 
@@ -4248,6 +4269,13 @@ the counts per category so the reader gets the outcome before the rows.
 Both the caption and the labels are localised; the label argument becomes
 the [[\label]] the surrounding text refers to.
 
+A topic-driven session can hold thousands of records, and a table of all
+of them runs to dozens of pages that say \enquote{false hit} over and
+over.  [[bearing_only]] therefore lists only the rows that bear on the
+claim---cited, supporting, qualifying---and moves the adjacent,
+off-topic and unclassified records into the caption as counts, so the
+appendix still accounts for every record without printing it.
+
 <<review report generation>>=
 def build_audit_table_latex(
     session: ReviewSession,
@@ -4256,6 +4284,7 @@ def build_audit_table_latex(
     lang: str = "en",
     track: str | None = None,
     theme_names: dict[str, str] | None = None,
+    bearing_only: bool = False,
 ) -> list[str]:
     """Build the audit longtable as LaTeX lines."""
     if lang not in AUDIT_STRINGS:
@@ -4265,17 +4294,28 @@ def build_audit_table_latex(
         session, theme_names=theme_names or {}, strings=strings
     )
     counts = {
-        order: sum(1 for r in rows if r.order == order) for order in range(5)
+        order: sum(1 for r in rows if r.order == order) for order in range(6)
     }
-    caption = strings["caption"].format(
+    if bearing_only:
+        template = strings["bearing"]
+        rows = [r for r in rows if r.order <= AUDIT_ORDER_BEARING]
+    else:
+        template = strings["caption"]
+    not_listed = ""
+    if bearing_only and counts[AUDIT_ORDER_OTHER]:
+        not_listed = strings["not_listed_other"].format(
+            other=counts[AUDIT_ORDER_OTHER]
+        )
+    caption = template.format(
         track=f", {escape_latex(track)}" if track else "",
         session=escape_latex(session.name or session.query),
-        n=len(rows),
+        n=sum(counts.values()),
         cited=counts[0],
         supports=counts[1],
         qualifies=counts[2],
         adjacent=counts[3],
         offtopic=counts[4],
+        not_listed=not_listed,
     )
     header = (
         f"{strings['title']} & {strings['year']} & "
@@ -4328,10 +4368,12 @@ def generate_audit_table(
     lang: str = "en",
     track: str | None = None,
     theme_names: dict[str, str] | None = None,
+    bearing_only: bool = False,
 ) -> None:
     """Write the audit table for `session` as a LaTeX fragment."""
     body = build_audit_table_latex(
-        session, label=label, lang=lang, track=track, theme_names=theme_names
+        session, label=label, lang=lang, track=track,
+        theme_names=theme_names, bearing_only=bearing_only,
     )
     lines = latex_fragment(
         body,
@@ -4362,6 +4404,23 @@ class TestAuditTable:
         assert "Waiting & 2024 & OA & ej klassad" in text
         assert "forts.\\ på nästa sida" in text
         assert lines[-1] == r"\endgroup"
+
+    def test_bearing_only_lists_bearing_rows_and_counts_the_rest(self):
+        lines = build_audit_table_latex(
+            _audit_session(), label="x", bearing_only=True
+        )
+        text = "\n".join(lines)
+        assert "Dup & 2023" in text
+        assert "Supports " in text
+        assert "Waiting" not in text
+        assert "Records bearing on the claim (session \\texttt{aud}; " \
+            "1 cited, 1 supporting and 0 qualifying or contradicting it, " \
+            "out of 3 unique hits; the 0 adjacent and 0 false hits, " \
+            "1 unclassified are not listed)" in text
+        sv = "\n".join(build_audit_table_latex(
+            _audit_session(), label="x", lang="sv", bearing_only=True
+        ))
+        assert "listas inte" in sv and ", 1 ej klassade" in sv
 
     def test_english_default_and_unknown_language(self):
         lines = build_audit_table_latex(_audit_session(), label="x")

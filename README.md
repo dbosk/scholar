@@ -94,6 +94,8 @@ scholar sessions export "machine learning" -f latex --no-standalone -o review
 # always a fragment; --lang en|sv, --theme TAG=NAME gives themes readable names)
 scholar sessions export "machine learning" -f table --lang sv --label sok-A \
     --track "sökspår 1" --theme ml=maskininlärning -o review-full
+# ... listing only the cited/supporting/qualifying rows, the rest as counts
+scholar sessions export "machine learning" -f table --bearing-only -o review-bearing
 ```
 
 ### Paper Notes

@@ -4751,6 +4751,14 @@ def sessions_export(
                  "(repeatable).",
         ),
     ] = None,
+    bearing_only: Annotated[
+        bool,
+        typer.Option(
+            "--bearing-only",
+            help="Audit table: list only cited, supporting and qualifying "
+                 "rows; the rest appear as counts in the caption.",
+        ),
+    ] = False,
 ) -> None:
     """
     Export a saved session to file(s).
@@ -4761,7 +4769,9 @@ def sessions_export(
     fragment for \\input, with the bibliography in a sibling .bib.
     The table format writes an audit table (one row per paper with the
     reason it was kept or excluded) meant for a backing appendix; it is
-    always a fragment and takes --lang, --label, --track and --theme.
+    always a fragment and takes --lang, --label, --track and --theme;
+    --bearing-only keeps only the rows that bear on the claim and states
+    the other counts in the caption.
 
     Examples:
         scholar sessions export "my review" -f all
@@ -4844,6 +4854,7 @@ def sessions_export(
             lang=lang,
             track=track,
             theme_names=theme_names,
+            bearing_only=bearing_only,
         )
         files_created.append(table_path)
 
@@ -4994,6 +5005,20 @@ class TestSessionsExport:
         assert r"\emph{citerad}: maskin" in content
         assert "stöder påståendet (0.93)" in content
         assert "ej klassad" in content
+
+    def test_table_bearing_only(self, monkeypatch, tmp_path):
+        self._save(monkeypatch, tmp_path)
+        out = tmp_path / "tab"
+        result = runner.invoke(
+            app, ["sessions", "export", "exp", "-f", "table",
+                  "--bearing-only", "-o", str(out)],
+        )
+        assert result.exit_code == 0, result.stdout
+        content = out.with_suffix(".tex").read_text()
+        assert "Kept & 2024" in content
+        assert "Supports & 2023" in content
+        assert "Later" not in content
+        assert "1 unclassified are not listed" in content
 
     def test_table_rejects_bad_theme_and_lang(self, monkeypatch, tmp_path):
         self._save(monkeypatch, tmp_path)

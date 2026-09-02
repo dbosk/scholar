@@ -280,7 +280,9 @@ report body builders (`build_review_provenance_latex`,
   for unreviewed LLM rows; an LLM keep is a candidate, not a citation.
   Order: cited (0), `supports-claim` (1), `qualifies-claim` (2),
   `adjacent-subtopic` (3), `off-topic-false-hit` (4), pending/unknown
-  (5). `all` stays csv + latex.
+  (5). `--bearing-only` lists only orders 0-2 and states the adjacent,
+  off-topic and unclassified counts in the caption. `all` stays csv +
+  latex.
 - The TUI's `prompt_for_report` keeps the standalone default.
 
 ## Testing
