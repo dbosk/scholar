@@ -102,6 +102,7 @@ import json
 import logging
 import re
 import textwrap
+import unicodedata
 
 from cachetools import cachedmethod
 
@@ -2763,14 +2764,21 @@ set up for use with LaTeX}. Rather than asking users to patch the preamble
 with [[\DeclareUnicodeCharacter]] for every new symbol, we normalise text
 before it is written.
 
-Both escapers make a single pass over the characters. A character is
-either a \LaTeX{} special (escaped), a piece of Unicode punctuation with a
-\TeX{} equivalent (mapped through [[LATEX_UNICODE_PUNCTUATION]]), a symbol
-beyond U+2100 (dropped, since the Latin and accented letters that
-[[inputenc]] handles all lie below that point), or ordinary text. A single
-pass matters: the naive alternative of mapping punctuation first and then
-escaping specials would re-escape the backslash and braces of the
-[[\dots{}]] the mapping just inserted.
+Both escapers make a single pass over the characters, after normalising
+the text to composed form (a provider that ships \enquote{e} plus a
+combining acute would otherwise hand pdf\LaTeX{} a combining mark it
+cannot set). A character is then either a \LaTeX{} special (escaped), a
+piece of Unicode punctuation with a \TeX{} equivalent (mapped through
+[[LATEX_UNICODE_PUNCTUATION]]), a Greek letter or a common mathematical
+symbol (set in math mode, since titles like \enquote{$\pi$-ARL} are
+common and pdf\LaTeX{} has no text Greek without extra packages), a
+letter beyond the Latin ranges that [[inputenc]] and the T1 encoding
+cover (dropped: pdf\LaTeX{} cannot set it, and a hard error in the
+middle of an appendix is worse than a gap), or ordinary text. The tables
+are written with [[\u]] escapes because this very file is woven into a
+pdf\LaTeX{} document. A single pass matters: the naive alternative of
+mapping punctuation first and then escaping specials would re-escape the
+backslash and braces of the [[\dots{}]] the mapping just inserted.
 
 The BibTeX escaper is deliberately narrower than the \LaTeX{} one: BibTeX
 fields are braced already, and braces inside them carry meaning (they
@@ -2795,7 +2803,40 @@ LATEX_UNICODE_PUNCTUATION: dict[str, str] = {
     "\ufeff": "",            # byte order mark
 }
 
-LATEX_SYMBOL_CUTOFF = 0x2100
+LATEX_LATIN_CUTOFF = 0x024F     # end of Latin Extended-B
+
+# Greek letters, keyed by code point, set as math macros.
+GREEK_LETTER_NAMES: dict[str, str] = {
+    "\u03b1": "alpha", "\u03b2": "beta", "\u03b3": "gamma",
+    "\u03b4": "delta", "\u03b5": "varepsilon", "\u03b6": "zeta",
+    "\u03b7": "eta", "\u03b8": "theta", "\u03b9": "iota",
+    "\u03ba": "kappa", "\u03bb": "lambda", "\u03bc": "mu",
+    "\u03bd": "nu", "\u03be": "xi", "\u03c0": "pi",
+    "\u03c1": "rho", "\u03c3": "sigma", "\u03c2": "varsigma",
+    "\u03c4": "tau", "\u03c5": "upsilon", "\u03c6": "varphi",
+    "\u03d5": "phi", "\u03c7": "chi", "\u03c8": "psi",
+    "\u03c9": "omega", "\u0393": "Gamma", "\u0394": "Delta",
+    "\u0398": "Theta", "\u039b": "Lambda", "\u039e": "Xi",
+    "\u03a0": "Pi", "\u03a3": "Sigma", "\u03a5": "Upsilon",
+    "\u03a6": "Phi", "\u03a8": "Psi", "\u03a9": "Omega",
+}
+# Greek capitals that look like Latin ones have no macro; use the Latin.
+GREEK_LATIN_LOOKALIKES: dict[str, str] = {
+    "\u0391": "A", "\u0392": "B", "\u0395": "E", "\u0396": "Z",
+    "\u0397": "H", "\u0399": "I", "\u039a": "K", "\u039c": "M",
+    "\u039d": "N", "\u039f": "O", "\u03a1": "P", "\u03a4": "T",
+    "\u03a7": "X", "\u03bf": "o",
+}
+# Mathematical symbols; macros get \ensuremath, plain text does not.
+LATEX_MATH_SYMBOLS: dict[str, str] = {
+    "\u2264": r"\le", "\u2265": r"\ge", "\u2260": r"\ne",
+    "\u2248": r"\approx", "\u221e": r"\infty", "\u221a": r"\surd",
+    "\u2211": r"\sum", "\u220f": r"\prod", "\u2208": r"\in",
+    "\u2192": r"\rightarrow", "\u2190": r"\leftarrow",
+    "\u2194": r"\leftrightarrow",
+    "\u21d2": r"\Rightarrow", "\u2200": r"\forall", "\u2203": r"\exists",
+    "\u2205": r"\emptyset", "\u2212": "-", "\u2217": "*",
+}
 
 LATEX_SPECIALS: dict[str, str] = {
     "\\": r"\textbackslash{}",
@@ -2822,12 +2863,22 @@ BIBTEX_SPECIALS: dict[str, str] = {
 def _escape_chars(text: str, specials: dict[str, str]) -> str:
     """Escape `text` for TeX in one pass using the `specials` map."""
     out: list[str] = []
-    for char in text:
+    for char in unicodedata.normalize("NFC", text):
         if char in specials:
             out.append(specials[char])
         elif char in LATEX_UNICODE_PUNCTUATION:
             out.append(LATEX_UNICODE_PUNCTUATION[char])
-        elif ord(char) > LATEX_SYMBOL_CUTOFF:
+        elif char in GREEK_LETTER_NAMES:
+            out.append(f"\\ensuremath{{\\{GREEK_LETTER_NAMES[char]}}}")
+        elif char in GREEK_LATIN_LOOKALIKES:
+            out.append(GREEK_LATIN_LOOKALIKES[char])
+        elif char in LATEX_MATH_SYMBOLS:
+            macro = LATEX_MATH_SYMBOLS[char]
+            out.append(
+                f"\\ensuremath{{{macro}}}" if macro.startswith("\\")
+                else macro
+            )
+        elif ord(char) > LATEX_LATIN_CUTOFF:
             continue
         else:
             out.append(char)
@@ -2866,6 +2917,20 @@ class TestLatexEscaping:
         result = escape_latex("star \u2606 here")
         assert "\u2606" not in result
         assert result == "star  here"
+        assert escape_latex("\u4e2d\u6587 title") == " title"
+
+    def test_escape_latex_sets_greek_and_math_in_math_mode(self):
+        assert escape_latex("\u03c0-ARL") == r"\ensuremath{\pi}-ARL"
+        assert escape_latex("\u03a9(n)") == r"\ensuremath{\Omega}(n)"
+        assert escape_latex("\u0391 and \u03bf") == "A and o"
+        assert escape_latex("x \u2264 y \u2192 z") \
+            == r"x \ensuremath{\le} y \ensuremath{\rightarrow} z"
+        assert escape_latex("a \u2212 b") == "a - b"
+
+    def test_escape_latex_composes_combining_accents(self):
+        assert escape_latex("Le\u0301on") == "L\u00e9on"
+        assert escape_bibtex("L\u00e9on \u03bb") \
+            == "L\u00e9on \\ensuremath{\\lambda}"
 
     def test_escape_bibtex_drops_exotic_symbols(self):
         result = escape_bibtex("A \u2606 B & C")
