@@ -9168,9 +9168,42 @@ We provide actionable messages for the most common failure modes:
 authentication errors (401), permission issues (403), and rate limiting
 (429).
 
+One failure deserves its own message because its text points the wrong
+way. Elsevier binds an API key to the subscribing institution's IP
+range; a request from anywhere else without an institutional token is
+not refused with a 401 but answered with HTTP 400, [[INVALID_INPUT]],
+\enquote{Error translating query}---for every query, a bare word
+included. Two days of a review's Scopus cells were once lost to
+debugging query syntax over this. The provider recognises that body and
+says what actually helps: run from the institution's network, or set
+[[SCOPUS_INST_TOKEN]].
+
+<<scopus helpers>>=
+SCOPUS_UNTRANSLATABLE = "Error translating query"
+SCOPUS_ENTITLEMENT_HINT = (
+    "Scopus answered HTTP 400 'Error translating query'. With a valid "
+    "key this is Elsevier's reply to requests from outside the "
+    "subscribing institution's IP range: run from that network (or a "
+    "VPN into it), or set SCOPUS_INST_TOKEN to an institutional token."
+)
+
+
+def scopus_entitlement_hint(response) -> str | None:
+    """Explain Scopus's misleading 400 for requests outside the institution."""
+    if getattr(response, "status_code", None) != 400:
+        return None
+    text = getattr(response, "text", "") or ""
+    if SCOPUS_UNTRANSLATABLE not in text:
+        return None
+    return SCOPUS_ENTITLEMENT_HINT
+@
+
 <<scopus handle response errors>>=
 if response.status_code != 200:
-    if response.status_code == 401:
+    hint = scopus_entitlement_hint(response)
+    if hint:
+        logger.warning("scopus: %s", hint)
+    elif response.status_code == 401:
         logger.warning(
             "scopus: Authentication failed (HTTP 401). "
             "Check your SCOPUS_API_KEY at "
@@ -9537,7 +9570,9 @@ def _convert_entry(self, entry: dict) -> Paper:
 
 Scopus authenticates via the [[X-ELS-APIKey]] header (plus the optional
 institutional token, which we forward so the probe sees the same access level
-as real searches).  Any 401/403 points at [[SCOPUS_API_KEY]].
+as real searches).  Any 401/403 points at [[SCOPUS_API_KEY]]; the
+untranslatable-query 400 gets the entitlement hint instead of a bare
+status code, since it is the failure a valid key meets most often.
 
 <<scopus provider>>=
 
@@ -9555,6 +9590,9 @@ as real searches).  Any 401/403 points at [[SCOPUS_API_KEY]].
             params={"query": "TITLE-ABS-KEY(test)", "count": 1},
             timeout=30,
         )
+        hint = scopus_entitlement_hint(response)
+        if hint:
+            return HEALTH_HTTP_ERROR, hint
         return classify_check_response(
             response, authenticated=True, key_hint="SCOPUS_API_KEY"
         )
@@ -9588,6 +9626,33 @@ pagination, filter application, and institutional token support.
 <<test functions>>=
 class TestScopusProvider:
     """Tests for the Scopus provider."""
+
+    def test_untranslatable_query_400_explains_entitlement(self, caplog):
+        """The IP-binding 400 is explained in search and in the check."""
+        import logging
+
+        provider = ScopusProvider(api_key="k")
+        response = Mock()
+        response.status_code = 400
+        response.ok = False
+        response.headers = {}
+        response.text = (
+            '{"service-error":{"status":{"statusCode":"INVALID_INPUT",'
+            '"statusText":"Error translating query"}}}'
+        )
+        response.raise_for_status.side_effect = requests.HTTPError(
+            response=response
+        )
+        with patch("requests.get", return_value=response):
+            with caplog.at_level(logging.WARNING):
+                assert provider.search("refinement") == []
+        assert "SCOPUS_INST_TOKEN" in caplog.text
+        with patch("requests.get", return_value=response):
+            status, message = provider.check()
+        assert status == HEALTH_HTTP_ERROR
+        assert "SCOPUS_INST_TOKEN" in message
+        plain = Mock(status_code=400, text="something else")
+        assert scopus_entitlement_hint(plain) is None
 
     def test_is_available_false_without_key(self):
         """Scopus is unavailable without API key."""
@@ -9882,6 +9947,7 @@ DEFAULT_LIMIT = 100
 <<wos constants>>
 <<ieee constants>>
 <<scopus constants>>
+<<scopus helpers>>
 <<arxiv constants>>
 <<preprint source constants>>
 <<hal constants>>
