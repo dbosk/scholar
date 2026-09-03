@@ -211,7 +211,7 @@ Some providers require API keys set as environment variables:
 | SSRN, bioRxiv, medRxiv, ChemRxiv, Research Square, Preprints.org, IACR | `SCHOLAR_EMAIL` | No | Any email (they search via OpenAlex) |
 | Web of Science | `WOS_EXPANDED_API_KEY` or `WOS_STARTER_API_KEY` | Yes | [developer.clarivate.com](https://developer.clarivate.com) |
 | IEEE Xplore | `IEEE_API_KEY` | Yes | [developer.ieee.org](https://developer.ieee.org) |
-| Scopus | `SCOPUS_API_KEY` | Yes | [dev.elsevier.com](https://dev.elsevier.com); the key is bound to the institution's IP range, so run from that network (or VPN) or set `SCOPUS_INST_TOKEN` |
+| Scopus | `SCOPUS_API_KEY` | Yes | [dev.elsevier.com](https://dev.elsevier.com); the key is IP-bound to the institution, so off campus set `SCOPUS_INST_TOKEN`. A 400 "Error translating query" on every query means Elsevier's search service refuses the key, not that the query is wrong |
 
 View provider status:
 
