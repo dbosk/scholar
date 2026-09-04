@@ -4759,6 +4759,14 @@ def sessions_export(
                  "rows; the rest appear as counts in the caption.",
         ),
     ] = False,
+    truncate_titles: Annotated[
+        bool,
+        typer.Option(
+            "--truncate-titles/--no-truncate-titles",
+            help="Audit table: cut long titles at a word boundary (about "
+                 "180 characters) with an ellipsis; off by default.",
+        ),
+    ] = False,
 ) -> None:
     """
     Export a saved session to file(s).
@@ -4771,7 +4779,8 @@ def sessions_export(
     reason it was kept or excluded) meant for a backing appendix; it is
     always a fragment and takes --lang, --label, --track and --theme;
     --bearing-only keeps only the rows that bear on the claim and states
-    the other counts in the caption.
+    the other counts in the caption; --truncate-titles shortens long
+    titles, which are otherwise printed whole.
 
     Examples:
         scholar sessions export "my review" -f all
@@ -4855,6 +4864,7 @@ def sessions_export(
             track=track,
             theme_names=theme_names,
             bearing_only=bearing_only,
+            truncate_titles=truncate_titles,
         )
         files_created.append(table_path)
 
@@ -5019,6 +5029,21 @@ class TestSessionsExport:
         assert "Supports & 2023" in content
         assert "Later" not in content
         assert "1 unclassified are not listed" in content
+
+    def test_table_truncates_titles_on_request(self, monkeypatch, tmp_path):
+        from scholar import review
+
+        self._save(monkeypatch, tmp_path)
+        session = review.load_session("exp")
+        session.decisions[0].paper.title = ("long word " * 30).strip()
+        review.save_session(session)
+        out = tmp_path / "tab"
+        result = runner.invoke(
+            app, ["sessions", "export", "exp", "-f", "table",
+                  "--truncate-titles", "-o", str(out)],
+        )
+        assert result.exit_code == 0, result.stdout
+        assert r"word\dots{} & 2024" in out.with_suffix(".tex").read_text()
 
     def test_table_rejects_bad_theme_and_lang(self, monkeypatch, tmp_path):
         self._save(monkeypatch, tmp_path)
@@ -6285,6 +6310,22 @@ def llm_classify(
             "text, not just the abstract (needs a research context).",
         ),
     ] = False,
+    tag: Annotated[
+        Optional[list[str]],
+        typer.Option(
+            "--tag", "-t",
+            help="Add TAG to the vocabulary the model must use (repeatable; "
+                 "tags already used in the session are always included).",
+        ),
+    ] = None,
+    allow_new_tags: Annotated[
+        bool,
+        typer.Option(
+            "--allow-new-tags",
+            help="Let the model propose tags outside the vocabulary instead "
+                 "of dropping them.",
+        ),
+    ] = False,
 ) -> None:
     """
     Classify pending papers using LLM.
@@ -6300,10 +6341,18 @@ def llm_classify(
     against the research context) are added to the prompt, so classification
     can go beyond the abstract.
 
+    The tags already used in the session form the vocabulary the model must
+    stay within; tags it invents are dropped (with a warning) and the batch
+    is retried once. --tag adds tags to that vocabulary, so a fresh session
+    can be constrained from the first batch; --allow-new-tags asks the model
+    to prefer the vocabulary but lets it add tags when none fits.
+
     Example:
         scholar llm classify "my review" --count 20
         scholar llm classify "my review" --no-examples
         scholar llm classify "my review" --full-text
+        scholar llm classify "my review" -t supports-claim -t qualifies-claim
+        scholar llm classify "my review" --allow-new-tags
     """
     import scholar.review as review
     from scholar.review import save_session
@@ -6336,6 +6385,8 @@ def llm_classify(
             dry_run=dry_run,
             require_examples=not no_examples,
             use_fulltext=full_text,
+            vocabulary=set(tag) if tag else None,
+            allow_new_tags=allow_new_tags,
         )
 
         if dry_run:
@@ -7011,6 +7062,38 @@ class TestLLMCommands:
         result = runner.invoke(app, ["llm", "classify", "nonexistent"])
         assert result.exit_code == 1
         assert "not found" in result.stdout.lower()
+
+    def test_llm_classify_passes_vocabulary_options(self, monkeypatch):
+        """--tag and --allow-new-tags reach the classifier."""
+        from datetime import datetime
+        from scholar import llm_review, review
+        import scholar.cli as cli_module
+
+        session = review.ReviewSession(
+            query="t", providers=["p"], timestamp=datetime.now(),
+            research_context="ctx", name="s",
+        )
+        monkeypatch.setattr(review, "load_session", lambda x: session)
+        seen = {}
+
+        def fake_classify(**kwargs):
+            seen.update(kwargs)
+            return "PROMPT"
+
+        monkeypatch.setattr(
+            llm_review, "classify_papers_with_llm", fake_classify
+        )
+        if hasattr(cli_module, "classify_papers_with_llm"):
+            monkeypatch.setattr(
+                cli_module, "classify_papers_with_llm", fake_classify
+            )
+        result = runner.invoke(app, [
+            "llm", "classify", "s", "--dry-run",
+            "--tag", "a", "-t", "b", "--allow-new-tags",
+        ])
+        assert result.exit_code == 0, result.output
+        assert seen["vocabulary"] == {"a", "b"}
+        assert seen["allow_new_tags"] is True
 
     def test_llm_synthesize_session_not_found(self):
         """llm synthesize shows error for missing session."""

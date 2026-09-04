@@ -164,12 +164,14 @@ class LLMDecision:
         tags: Themes (kept) or motivations (discarded) assigned
         confidence: LLM's confidence in the decision (0.0-1.0)
         reasoning: Brief explanation of the classification
+        dropped_tags: Tags the model proposed outside the vocabulary
     """
     paper_id: str
     status: str  # "kept" or "discarded"
     tags: list[str]
     confidence: float
     reasoning: str
+    dropped_tags: list[str] = field(default_factory=list)
 @
 
 
@@ -690,6 +692,8 @@ def build_classification_prompt(
     available_themes: set[str] | None = None,
     available_motivations: set[str] | None = None,
     paper_quotes: list[list] | None = None,
+    extra_tags: set[str] | None = None,
+    allow_new_tags: bool = False,
 ) -> str:
     """
     Construct the LLM prompt for paper classification.
@@ -704,6 +708,10 @@ def build_classification_prompt(
         paper_quotes: Optional supporting passages per paper, aligned by
             index with ``papers_to_classify``; entry ``i`` holds the quotes
             for paper ``i`` (or is empty when none were found)
+        extra_tags: Tags allowed for any decision, in addition to the
+            themes and motivations already in use
+        allow_new_tags: Tell the model to prefer the listed tags but let
+            it add one when none fits, instead of forbidding new tags
 
     Returns:
         Complete prompt string for the LLM
@@ -734,6 +742,24 @@ def build_classification_prompt(
             f"\n## Available Motivations (for discarded papers)\n\n"
             f"{motivations_list}"
         )
+
+    if extra_tags:
+        extra_list = ", ".join(sorted(extra_tags))
+        sections.append(
+            f"\n## Allowed Tags (kept or discarded)\n\n{extra_list}"
+        )
+
+    if available_themes or available_motivations or extra_tags:
+        if allow_new_tags:
+            sections.append(
+                "\nPrefer tags from the lists above, exactly as written; "
+                "add a new tag only when none of them fits."
+            )
+        else:
+            sections.append(
+                "\nUse only tags from the lists above, exactly as written; "
+                "do not invent new tags."
+            )
 
     # Kept examples
     if kept_examples:
@@ -922,9 +948,28 @@ The LLM returns JSON which we parse into [[LLMDecision]] objects. We need
 to handle potential parsing errors gracefully.
 
 <<llm review llm interaction>>=
+def _restrict_tags(
+    tags: list, allowed: set[str] | None
+) -> tuple[list[str], list[str]]:
+    """Split `tags` into vocabulary tags (canonical spelling) and the rest."""
+    if not allowed:
+        return [str(t) for t in tags], []
+    canonical = {t.casefold(): t for t in allowed}
+    kept: list[str] = []
+    dropped: list[str] = []
+    for tag in tags:
+        match = canonical.get(str(tag).strip().casefold())
+        if match is None:
+            dropped.append(str(tag))
+        elif match not in kept:
+            kept.append(match)
+    return kept, dropped
+
+
 def parse_llm_response(
     response_text: str,
     papers: list[ReviewDecision],
+    allowed_tags: set[str] | None = None,
 ) -> list[LLMDecision]:
     """
     Parse JSON response from LLM into decisions.
@@ -932,6 +977,9 @@ def parse_llm_response(
     Args:
         response_text: Raw text response from LLM
         papers: The papers that were classified (for ID lookup)
+        allowed_tags: When given, tags outside this vocabulary are
+            dropped (case-insensitively matched) and recorded in
+            `LLMDecision.dropped_tags`
 
     Returns:
         List of LLMDecision objects
@@ -981,10 +1029,16 @@ def parse_llm_response(
             logger.warning(f"Invalid decision '{status}', defaulting to kept")
             status = "kept"
 
-        # Ensure tags are present
+        # Ensure tags are present, and inside the vocabulary if given
         tags = item.get("tags", [])
         if not isinstance(tags, list):
             tags = [str(tags)]
+        tags, dropped = _restrict_tags(tags, allowed_tags)
+        if dropped:
+            logger.warning(
+                "Paper %d: dropped tags outside the vocabulary: %s",
+                paper_index, ", ".join(dropped),
+            )
 
         # Validate confidence
         confidence = item.get("confidence", 0.5)
@@ -1000,6 +1054,7 @@ def parse_llm_response(
                 status=status,
                 tags=tags,
                 confidence=confidence,
+                dropped_tags=dropped,
                 reasoning=item.get("reasoning", ""),
             )
         )
@@ -1071,6 +1126,8 @@ def classify_papers_with_llm(
     require_examples: bool = True,
     use_fulltext: bool = False,
     max_quotes: int = 3,
+    vocabulary: set[str] | None = None,
+    allow_new_tags: bool = False,
 ) -> LLMBatchResult | str:
     """
     Classify pending papers using LLM.
@@ -1089,6 +1146,10 @@ def classify_papers_with_llm(
         count: Number of papers to classify in this batch
         model_selection: LLM model selection policy (task override → base → llm default)
         model_id: Deprecated compatibility alias for selecting the analytic model
+        vocabulary: Tags the model may use besides the session's existing
+            themes and motivations (seeds a fresh session's vocabulary)
+        allow_new_tags: Let the model propose tags outside the vocabulary
+            instead of dropping them and retrying
         enrich_missing: Whether to auto-enrich papers without abstracts
         dry_run: If True, return the prompt without calling LLM
         require_examples: If True (default), gather tagged example papers
@@ -1186,6 +1247,8 @@ def classify_papers_with_llm(
         available_themes=themes,
         available_motivations=motivations,
         paper_quotes=paper_quotes,
+        extra_tags=vocabulary,
+        allow_new_tags=allow_new_tags,
     )
 
     if dry_run:
@@ -1193,12 +1256,14 @@ def classify_papers_with_llm(
 
     # Import llm and call
     try:
-        import llm
+        import llm as llm_module
     except ImportError:
         raise ImportError(
             "The 'llm' package is required for LLM classification. "
             "Install it with: pip install llm"
         )
+
+    llm = globals().get("llm", llm_module)
 
     from scholar.utils import select_model_id
 
@@ -1224,8 +1289,27 @@ def classify_papers_with_llm(
     response = model.prompt(prompt)
     response_text = response.text()
 
-    # Parse response
-    decisions = parse_llm_response(response_text, to_classify)
+    # Parse response, keeping the model inside the vocabulary unless new
+    # tags are welcome
+    known = themes | motivations | set(vocabulary or ())
+    allowed = None if allow_new_tags else (known or None)
+    decisions = parse_llm_response(
+        response_text, to_classify, allowed_tags=allowed
+    )
+    if allowed and any(d.dropped_tags and not d.tags for d in decisions):
+        logger.warning(
+            "Some papers were left without tags; retrying once with the "
+            "vocabulary spelled out"
+        )
+        reminder = (
+            "\n\nIMPORTANT: use only these tags, exactly as written: "
+            + ", ".join(sorted(known))
+        )
+        response = model.prompt(prompt + reminder)
+        response_text = response.text()
+        decisions = parse_llm_response(
+            response_text, to_classify, allowed_tags=allowed
+        )
 
     return LLMBatchResult(
         decisions=decisions,
@@ -1234,6 +1318,200 @@ def classify_papers_with_llm(
         prompt_tokens=getattr(response, "prompt_tokens", None),
         completion_tokens=getattr(response, "completion_tokens", None),
     )
+@
+
+\subsection{Keeping the classifier inside the vocabulary}
+
+A session's existing themes and motivations are the vocabulary its
+tables and appendices are built on, and a tag the model invents
+(\enquote{Machine Learning} beside an existing \enquote{ml}) silently
+falls outside every count. The prompt already lists the vocabulary;
+now it also says to use nothing else, [[parse_llm_response]] maps each
+returned tag onto the vocabulary case-insensitively and drops what does
+not match (recording it in [[dropped_tags]] and warning), and when a
+paper would be left without any tag the batch is sent once more with
+the vocabulary spelled out, since a second attempt is cheaper than a
+paper that has to be tagged by hand. A session without tags yet
+imposes nothing, so the first round is free to propose themes---unless
+the caller seeds the vocabulary: [[vocabulary]] (the [[--tag]] option)
+adds tags that count as known from the first batch on, which is how a
+two-sided claim review constrains a fresh session to its four
+categories. The opposite is sometimes wanted too: with
+[[allow_new_tags]] (the [[--allow-new-tags]] option) the prompt asks
+the model to prefer the listed tags but to add one when none fits, and
+nothing is dropped or retried, so an exploratory first pass can grow
+the vocabulary.
+
+<<test functions>>=
+class TestClassifierVocabulary:
+    def test_restrict_tags_matches_case_insensitively(self):
+        from scholar.llm_review import _restrict_tags
+
+        kept, dropped = _restrict_tags(
+            ["ML", "Machine Learning", "ml", " off-topic "],
+            {"ml", "off-topic"},
+        )
+        assert kept == ["ml", "off-topic"]
+        assert dropped == ["Machine Learning"]
+        assert _restrict_tags(["anything"], None) == (["anything"], [])
+
+    def test_parse_drops_out_of_vocabulary_tags(self):
+        decision = ReviewDecision(
+            paper=Paper(title="P", authors=["A"]), provider="p",
+        )
+        response = json.dumps({"classifications": [{
+            "paper_index": 0, "decision": "kept",
+            "tags": ["Machine Learning", "ML"], "confidence": 0.9,
+            "reasoning": "r",
+        }]})
+        parsed = parse_llm_response(response, [decision], {"ml"})
+        assert parsed[0].tags == ["ml"]
+        assert parsed[0].dropped_tags == ["Machine Learning"]
+
+    def test_classify_retries_once_when_a_paper_loses_all_tags(
+        self, monkeypatch
+    ):
+        session = ReviewSession(
+            query="q", providers=["p"], timestamp=datetime.now(),
+            research_context="Why?",
+        )
+        session.decisions = [
+            ReviewDecision(
+                paper=Paper(title="Kept", authors=["A"], abstract="a"),
+                provider="p", status=DecisionStatus.KEPT, tags=["ml"],
+            ),
+            ReviewDecision(
+                paper=Paper(title="Dropped", authors=["B"], abstract="b"),
+                provider="p", status=DecisionStatus.DISCARDED,
+                tags=["off-topic"],
+            ),
+            ReviewDecision(
+                paper=Paper(title="New", authors=["C"], abstract="c"),
+                provider="p",
+            ),
+        ]
+
+        def answer(tags):
+            return json.dumps({"classifications": [{
+                "paper_index": 0, "decision": "kept", "tags": tags,
+                "confidence": 0.8, "reasoning": "r",
+            }]})
+
+        class FakeResponse:
+            def __init__(self, text):
+                self._text = text
+
+            def text(self):
+                return self._text
+
+        class FakeModel:
+            model_id = "fake"
+
+            def __init__(self):
+                self.prompts = []
+
+            def prompt(self, prompt):
+                self.prompts.append(prompt)
+                if len(self.prompts) == 1:
+                    return FakeResponse(answer(["Machine Learning"]))
+                return FakeResponse(answer(["ML"]))
+
+        fake_model = FakeModel()
+
+        class FakeLLMModule:
+            def get_model(self, _model_id=None):
+                return fake_model
+
+        import scholar.llm_review as llm_review
+
+        monkeypatch.setattr(
+            llm_review, "llm", FakeLLMModule(), raising=False
+        )
+        result = classify_papers_with_llm(
+            session, model_id="fake", enrich_missing=False,
+            require_examples=False,
+        )
+        assert len(fake_model.prompts) == 2
+        assert "exactly as written: ml, off-topic" in fake_model.prompts[1]
+        assert result.decisions[0].tags == ["ml"]
+
+    def _fresh_session(self):
+        session = ReviewSession(
+            query="q", providers=["p"], timestamp=datetime.now(),
+            research_context="Why?",
+        )
+        session.decisions = [
+            ReviewDecision(
+                paper=Paper(title="New", authors=["C"], abstract="c"),
+                provider="p",
+            ),
+        ]
+        return session
+
+    def _fake_llm(self, monkeypatch, answers):
+        class FakeResponse:
+            def __init__(self, text):
+                self._text = text
+
+            def text(self):
+                return self._text
+
+        class FakeModel:
+            model_id = "fake"
+
+            def __init__(self):
+                self.prompts = []
+
+            def prompt(self, prompt):
+                self.prompts.append(prompt)
+                tags = answers[min(len(self.prompts), len(answers)) - 1]
+                return FakeResponse(json.dumps({"classifications": [{
+                    "paper_index": 0, "decision": "kept", "tags": tags,
+                    "confidence": 0.8, "reasoning": "r",
+                }]}))
+
+        fake_model = FakeModel()
+
+        class FakeLLMModule:
+            def get_model(self, _model_id=None):
+                return fake_model
+
+        import scholar.llm_review as llm_review
+
+        monkeypatch.setattr(
+            llm_review, "llm", FakeLLMModule(), raising=False
+        )
+        return fake_model
+
+    def test_seed_vocabulary_constrains_a_fresh_session(self, monkeypatch):
+        fake_model = self._fake_llm(monkeypatch, [["Supports-Claim"]])
+        result = classify_papers_with_llm(
+            self._fresh_session(), model_id="fake", enrich_missing=False,
+            require_examples=False,
+            vocabulary={"supports-claim", "off-topic-false-hit"},
+        )
+        assert len(fake_model.prompts) == 1
+        assert "## Allowed Tags" in fake_model.prompts[0]
+        assert "do not invent new tags" in fake_model.prompts[0]
+        assert result.decisions[0].tags == ["supports-claim"]
+
+    def test_allow_new_tags_keeps_the_models_tags(self, monkeypatch):
+        fake_model = self._fake_llm(monkeypatch, [["novel-theme"]])
+        session = self._fresh_session()
+        session.decisions.append(
+            ReviewDecision(
+                paper=Paper(title="Kept", authors=["A"], abstract="a"),
+                provider="p", status=DecisionStatus.KEPT, tags=["ml"],
+            )
+        )
+        result = classify_papers_with_llm(
+            session, model_id="fake", enrich_missing=False,
+            require_examples=False, allow_new_tags=True,
+        )
+        assert len(fake_model.prompts) == 1
+        assert "Prefer tags from the lists above" in fake_model.prompts[0]
+        assert result.decisions[0].tags == ["novel-theme"]
+        assert result.decisions[0].dropped_tags == []
 @
 
 

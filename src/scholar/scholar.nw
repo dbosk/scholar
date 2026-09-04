@@ -2816,6 +2816,7 @@ def execute(
         expand_provider_names,
     )
     from scholar.ratelimit import format_retry, limiter_for
+    from scholar.utils import clean_paper_text
 
     timestamp = datetime.now().isoformat()
 
@@ -2844,6 +2845,8 @@ def execute(
             continue
         logger.debug(f"Querying {provider.name} with limit={limit}")
         papers = provider.search(self.query, limit=limit, filters=filters)
+        for paper in papers:
+            clean_paper_text(paper)
         logger.info(f"{provider.name}: Retrieved {len(papers)} papers")
         result = SearchResult(
             query=self.query,
@@ -2897,6 +2900,28 @@ class TestSearch:
             # Explicitly specify the mock provider since "mock" is not a default
             results = s.execute(providers=["mock"])
             assert len(results) > 0
+@
+
+Results are cleaned as they arrive: provider markup and mojibake in
+titles, venues and abstracts are undone by [[clean_paper_text]] before
+anything downstream---sessions, notes, exports---sees the paper. The
+providers' caches hold the same objects, so a cache hit is cleaned too.
+
+<<test functions>>=
+    def test_execute_cleans_provider_text(self, monkeypatch):
+        """Search.execute strips provider markup from the results."""
+        with isolated_registry():
+            from scholar import providers
+
+            mock_provider = Mock()
+            mock_provider.name = "mock"
+            mock_provider.search.return_value = [
+                Paper(title="A &amp; <i>B</i>", authors=["Author"])
+            ]
+            monkeypatch.setattr(providers, "PROVIDERS", {"mock": mock_provider})
+
+            results = Search("q").execute(providers=["mock"])
+            assert results[0].papers[0].title == "A & B"
 @
 
 Each result must record the per-provider limit it was run with, since that

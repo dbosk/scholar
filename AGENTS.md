@@ -286,8 +286,9 @@ report body builders (`build_review_provenance_latex`,
   unreviewed and human-confirmed LLM rows, not for changed ones. The
   escapers decode HTML entities, strip inline markup, repair
   cp1252/Latin-1 mojibake and turn `"` into `\textquotedbl{}` (babel
-  shorthand). An empty table logs a warning. The CSV's last column is
-  `paper_id` for `decide --paper-id`. Tags split three ways: category tags (`supports-claim` …),
+  shorthand). Titles are printed whole unless `--truncate-titles`
+  (word boundary near 180 characters, ellipsis). An empty table logs a
+  warning. The CSV's last column is `paper_id` for `decide --paper-id`. Tags split three ways: category tags (`supports-claim` …),
   note tags (`AUDIT_STRINGS[lang]["notes"]`: `recorded-not-cited`,
   `duplicate-record-of-cited-source`, `extended-tech-report`, …) and
   theme tags (the rest; with `--theme` given, only the listed tags).
@@ -303,6 +304,30 @@ report body builders (`build_review_provenance_latex`,
   present. `--bearing-only` lists only orders 0-2 and states the other
   counts in the caption. `all` stays csv + latex.
 - The TUI's `prompt_for_report` keeps the standalone default.
+
+### Provider Text Cleaning
+
+`utils.clean_metadata_text` / `clean_paper_text` decode HTML entities,
+strip inline tags (`<i>`, `<sup>`, …) and repair cp1252/Latin-1 mojibake
+by a checked round trip. Applied at ingest in `Search.execute`,
+`ReviewSession.add_papers_from_snowball` and at the end of
+`enrich_paper`; the LaTeX escapers apply it too, for sessions recorded
+earlier. A DOI-less paper's hash id derives from the cleaned title, so a
+record with markup ingested before this change gets a new id when it is
+searched again.
+
+### Classifier Vocabulary
+
+`llm classify` tells the model to use only the session's existing
+themes and motivations; `parse_llm_response(allowed_tags=…)` maps tags
+case-insensitively onto that vocabulary, drops the rest with a warning
+(`LLMDecision.dropped_tags`), and `classify_papers_with_llm` retries the
+batch once with the vocabulary spelled out when a paper would be left
+without tags. A session without tags imposes nothing unless
+`llm classify --tag` (the `vocabulary=` argument) seeds it; with
+`--allow-new-tags` (`allow_new_tags=`) the prompt asks the model to
+prefer the vocabulary but nothing is dropped or retried. The `llm`
+module is looked up via `globals()` so tests can substitute a fake model.
 
 ## Testing
 

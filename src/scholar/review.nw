@@ -98,7 +98,6 @@ from enum import Enum
 from pathlib import Path
 from typing import Any
 from collections.abc import Callable
-import html
 import json
 import logging
 import re
@@ -115,7 +114,10 @@ from scholar.notes import (
     ReviewDecisionRecord,
 )
 
-from scholar.utils import derive_arxiv_doi, legacy_hash_paper_id
+from scholar.utils import (
+    clean_metadata_text, clean_paper_text, derive_arxiv_doi,
+    legacy_hash_paper_id,
+)
 
 logger = logging.getLogger(__name__)
 @
@@ -701,6 +703,7 @@ def add_papers_from_snowball(
     added_count = 0
 
     for paper in papers:
+        clean_paper_text(paper)
         paper_id = get_paper_id(paper)
         if paper_id not in existing_ids:
             decision = ReviewDecision(
@@ -2781,16 +2784,13 @@ pdf\LaTeX{} document. A single pass matters: the naive alternative of
 mapping punctuation first and then escaping specials would re-escape the
 backslash and braces of the [[\dots{}]] the mapping just inserted.
 
-Before the pass, the text is cleaned of what providers leave in titles:
-HTML entities ([[&apos;]], [[&amp;]]) and inline markup ([[<i>]]) from
-DBLP, OpenAlex and Web of Science, and the mojibake of UTF-8 read as
-Latin-1 (an en dash arriving as \enquote{â} followed by two control
-characters). The mojibake repair re-encodes the text as cp1252 or
-Latin-1 and decodes it as UTF-8, and keeps the result only when that
-round trip succeeds, so genuine accented text is never touched. A plain
-double quote is a special too: under [[babel]]'s Swedish shorthands it
-is an active character that turns \enquote{"object"} into
-\enquote{öbject}, so it becomes [[\textquotedbl{}]].
+Before the pass, the text goes through [[clean_metadata_text]] from
+[[utils]] (\cref{sec:clean-provider-text}): entities, inline markup and
+mojibake are undone at ingest for new records, and here once more for
+sessions recorded before that existed. A plain double quote is a
+special too: under [[babel]]'s Swedish shorthands it is an active
+character that turns \enquote{"object"} into \enquote{öbject}, so it
+becomes [[\textquotedbl{}]].
 
 The BibTeX escaper is deliberately narrower than the \LaTeX{} one: BibTeX
 fields are braced already, and braces inside them carry meaning (they
@@ -2872,32 +2872,6 @@ BIBTEX_SPECIALS: dict[str, str] = {
     "#": r"\#",
     "_": r"\_",
 }
-
-
-HTML_INLINE_TAGS = re.compile(
-    r"</?\s*(?:i|b|em|strong|sup|sub|sc|scp|inf|span|tt|u)\b[^>]*>",
-    re.IGNORECASE,
-)
-MOJIBAKE_MARKERS = ("Ã", "â", "Â")
-
-
-def repair_mojibake(text: str) -> str:
-    """Undo UTF-8 text that was decoded as cp1252 or Latin-1, if it was."""
-    if not any(marker in text for marker in MOJIBAKE_MARKERS):
-        return text
-    for encoding in ("cp1252", "latin-1"):
-        try:
-            return text.encode(encoding).decode("utf-8")
-        except (UnicodeEncodeError, UnicodeDecodeError):
-            continue
-    return text
-
-
-def clean_metadata_text(text: str) -> str:
-    """Decode entities, strip inline markup and repair mojibake."""
-    text = html.unescape(text or "")
-    text = HTML_INLINE_TAGS.sub("", text)
-    return repair_mojibake(text)
 
 
 def _escape_chars(text: str, specials: dict[str, str]) -> str:
@@ -4454,8 +4428,13 @@ and capitalisation differ between providers for the same work, and the
 year is left out on purpose: a preprint and its journal article, or
 OpenAlex's DOI-registration year against the publication year, are the
 same work to a reader of the appendix, and counting them twice inflated
-the numbers the appendices quoted. Titles are truncated before escaping
-so the cut cannot land inside an escape sequence.
+the numbers the appendices quoted.
+
+Titles are kept whole by default: the table exists so a reader can look
+a hit up, and a title cut at 180 characters is one that cannot be
+found. A caller with a narrow column can ask for truncation, which
+then cuts at a word boundary before escaping, so the cut cannot land
+inside an escape sequence, and marks the cut with an ellipsis.
 
 A decision's [[provider]] is itself a joined string when the session
 merged records at search time (\enquote{openalex; dblp}), so providers
@@ -4491,11 +4470,20 @@ def audit_work_key(paper: Paper) -> tuple[str, str]:
     return letters(paper.title), letters(surname)
 
 
+def shorten_title(title: str, limit: int | None) -> str:
+    """Cut `title` at a word boundary within `limit`, marking the cut."""
+    if limit is None or len(title) <= limit:
+        return title
+    cut = title[:limit].rsplit(" ", 1)[0] or title[:limit]
+    return cut.rstrip() + "\u2026"
+
+
 def collect_audit_rows(
     session: ReviewSession,
     *,
     theme_names: dict[str, str],
     strings: dict[str, str],
+    title_limit: int | None = None,
 ) -> list[AuditRow]:
     """Merge the session's decisions into sorted audit rows."""
     rows: dict[tuple[str, str], AuditRow] = {}
@@ -4511,7 +4499,7 @@ def collect_audit_rows(
         row = rows.get(key)
         if row is None:
             rows[key] = AuditRow(
-                title=escape_latex(title[:AUDIT_TITLE_LENGTH]),
+                title=escape_latex(shorten_title(title, title_limit)),
                 year=year,
                 providers=providers,
                 status=decision.status,
@@ -4632,6 +4620,30 @@ class TestCollectAuditRows:
             "Web of Science (WoS), Scopus, mylib."
         )
 
+    def test_titles_are_whole_unless_truncation_is_asked_for(self):
+        long_title = "word " * 50
+        session = ReviewSession(
+            query="q", providers=["p"], timestamp=datetime.now(),
+        )
+        session.decisions = [
+            ReviewDecision(
+                paper=Paper(title=long_title.strip(), authors=["A"],
+                            year=2020),
+                provider="p", status=DecisionStatus.KEPT, tags=["ml"],
+            ),
+        ]
+        whole = collect_audit_rows(
+            session, theme_names={}, strings=AUDIT_STRINGS["en"]
+        )
+        assert whole[0].title == long_title.strip()
+        short = collect_audit_rows(
+            session, theme_names={}, strings=AUDIT_STRINGS["en"],
+            title_limit=AUDIT_TITLE_LENGTH,
+        )
+        assert short[0].title.endswith(r"word\dots{}")
+        assert len(short[0].title) < AUDIT_TITLE_LENGTH + 10
+        assert shorten_title("short", 10) == "short"
+
     def test_merges_duplicates_and_kept_wins(self):
         rows = collect_audit_rows(
             _audit_session(), theme_names={}, strings=AUDIT_STRINGS["en"]
@@ -4699,13 +4711,15 @@ def build_audit_table_latex(
     track: str | None = None,
     theme_names: dict[str, str] | None = None,
     bearing_only: bool = False,
+    truncate_titles: bool = False,
 ) -> list[str]:
     """Build the audit longtable as LaTeX lines."""
     if lang not in AUDIT_STRINGS:
         raise ValueError(f"Unsupported language: {lang}")
     strings = AUDIT_STRINGS[lang]
     rows = collect_audit_rows(
-        session, theme_names=theme_names or {}, strings=strings
+        session, theme_names=theme_names or {}, strings=strings,
+        title_limit=AUDIT_TITLE_LENGTH if truncate_titles else None,
     )
     counts = {
         order: sum(1 for r in rows if r.order == order) for order in range(7)
@@ -4792,11 +4806,13 @@ def generate_audit_table(
     track: str | None = None,
     theme_names: dict[str, str] | None = None,
     bearing_only: bool = False,
+    truncate_titles: bool = False,
 ) -> None:
     """Write the audit table for `session` as a LaTeX fragment."""
     body = build_audit_table_latex(
         session, label=label, lang=lang, track=track,
         theme_names=theme_names, bearing_only=bearing_only,
+        truncate_titles=truncate_titles,
     )
     lines = latex_fragment(
         body,

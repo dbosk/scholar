@@ -342,6 +342,12 @@ For large result sets, Scholar can use LLMs to assist with paper classification:
 # In the TUI, press 'L' to invoke LLM classification
 # Or use the CLI command directly
 scholar llm classify "session-name" --count 10
+
+# Constrain the tags to a vocabulary (tags already in the session count too)
+scholar llm classify "session-name" -t supports-claim -t qualifies-claim \
+    -t adjacent-subtopic -t off-topic-false-hit
+# ... or let the model add tags of its own when none of them fits
+scholar llm classify "session-name" --allow-new-tags
 ```
 
 ### How It Works
