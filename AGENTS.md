@@ -58,7 +58,7 @@ Providers self-register via `register_provider()` at module load time.
 | Provider | Name | API | Auth |
 |----------|------|-----|------|
 | Semantic Scholar | `s2` | `semanticscholar` client | `S2_API_KEY` (optional) |
-| OpenAlex | `openalex` | `pyalex` client | `SCHOLAR_EMAIL` (optional) |
+| OpenAlex | `openalex` | `pyalex` client | `OPENALEX_API_KEY` (optional, 10x daily budget), `SCHOLAR_EMAIL` (optional) |
 | DBLP | `dblp` | REST API | None required |
 | Web of Science | `wos` | REST API | `WOS_API_KEY` (required) |
 | IEEE Xplore | `ieee` | REST API | `IEEE_API_KEY` (required) |
@@ -121,6 +121,12 @@ one: OpenAlex and Crossref (polite pools, optional) and Unpaywall
 (mandatory). `scholar.utils.contact_email(*override_vars)` resolves it;
 `OPENALEX_EMAIL` / `CROSSREF_MAILTO` still work as per-service overrides.
 The test `conftest.py` unsets all three so unit tests never make live calls.
+
+OpenAlex additionally reads `OPENALEX_API_KEY` (free key from
+openalex.org/settings/api; ten times the metered daily budget). The
+provider hands it to `pyalex.config.api_key` (sent as a bearer token);
+the health probe sends it as the `api_key` query parameter; `conftest.py`
+unsets it too.
 
 ### Open-Access Lookup (Unpaywall)
 
@@ -383,6 +389,14 @@ requests/day and each `scholar` run is a fresh process.
 - Tests: `tests/conftest.py` isolates `SCHOLAR_DATA_DIR` per test and
   no-ops the pacing sleep; `test_ratelimit.py` controls time via the
   module's `_now`/`_sleep` seams.
+- OpenAlex meters requests in credits (a search is 10 credits, $0.001;
+  the keyed budget is 10000/day, reset at midnight UTC). `LIMITS` is
+  therefore empty and the state comes from OpenAlex: the health probe's
+  `X-RateLimit-Remaining`/`X-RateLimit-Reset` headers are synced via
+  `record_response`, a keyed probe also reads `/rate-limit` for the
+  detail column, and a search 429 with `X-RateLimit-Remaining-USD: 0`
+  becomes a quota block until `X-RateLimit-Reset` (`_note_http_error`),
+  logged with the reset time and a key hint.
 - Phase 2 (not done): migrate S2/OpenAlex/DBLP/arXiv in-process pacing
   (and crossref/unpaywall) into the limiter; wire WoS/Scopus extended
   methods (citations/references) through `acquire()`.
