@@ -98,6 +98,7 @@ from enum import Enum
 from pathlib import Path
 from typing import Any
 from collections.abc import Callable
+import html
 import json
 import logging
 import re
@@ -2780,6 +2781,17 @@ pdf\LaTeX{} document. A single pass matters: the naive alternative of
 mapping punctuation first and then escaping specials would re-escape the
 backslash and braces of the [[\dots{}]] the mapping just inserted.
 
+Before the pass, the text is cleaned of what providers leave in titles:
+HTML entities ([[&apos;]], [[&amp;]]) and inline markup ([[<i>]]) from
+DBLP, OpenAlex and Web of Science, and the mojibake of UTF-8 read as
+Latin-1 (an en dash arriving as \enquote{â} followed by two control
+characters). The mojibake repair re-encodes the text as cp1252 or
+Latin-1 and decodes it as UTF-8, and keeps the result only when that
+round trip succeeds, so genuine accented text is never touched. A plain
+double quote is a special too: under [[babel]]'s Swedish shorthands it
+is an active character that turns \enquote{"object"} into
+\enquote{öbject}, so it becomes [[\textquotedbl{}]].
+
 The BibTeX escaper is deliberately narrower than the \LaTeX{} one: BibTeX
 fields are braced already, and braces inside them carry meaning (they
 protect capitalisation), so we leave braces and backslashes alone there.
@@ -2840,6 +2852,7 @@ LATEX_MATH_SYMBOLS: dict[str, str] = {
 
 LATEX_SPECIALS: dict[str, str] = {
     "\\": r"\textbackslash{}",
+    '"': r"\textquotedbl{}",
     "&": r"\&",
     "%": r"\%",
     "$": r"\$",
@@ -2852,6 +2865,7 @@ LATEX_SPECIALS: dict[str, str] = {
 }
 
 BIBTEX_SPECIALS: dict[str, str] = {
+    '"': r"\textquotedbl{}",
     "&": r"\&",
     "%": r"\%",
     "$": r"\$",
@@ -2860,9 +2874,36 @@ BIBTEX_SPECIALS: dict[str, str] = {
 }
 
 
+HTML_INLINE_TAGS = re.compile(
+    r"</?\s*(?:i|b|em|strong|sup|sub|sc|scp|inf|span|tt|u)\b[^>]*>",
+    re.IGNORECASE,
+)
+MOJIBAKE_MARKERS = ("Ã", "â", "Â")
+
+
+def repair_mojibake(text: str) -> str:
+    """Undo UTF-8 text that was decoded as cp1252 or Latin-1, if it was."""
+    if not any(marker in text for marker in MOJIBAKE_MARKERS):
+        return text
+    for encoding in ("cp1252", "latin-1"):
+        try:
+            return text.encode(encoding).decode("utf-8")
+        except (UnicodeEncodeError, UnicodeDecodeError):
+            continue
+    return text
+
+
+def clean_metadata_text(text: str) -> str:
+    """Decode entities, strip inline markup and repair mojibake."""
+    text = html.unescape(text or "")
+    text = HTML_INLINE_TAGS.sub("", text)
+    return repair_mojibake(text)
+
+
 def _escape_chars(text: str, specials: dict[str, str]) -> str:
     """Escape `text` for TeX in one pass using the `specials` map."""
     out: list[str] = []
+    text = clean_metadata_text(text)
     for char in unicodedata.normalize("NFC", text):
         if char in specials:
             out.append(specials[char])
@@ -2926,6 +2967,25 @@ class TestLatexEscaping:
         assert escape_latex("x \u2264 y \u2192 z") \
             == r"x \ensuremath{\le} y \ensuremath{\rightarrow} z"
         assert escape_latex("a \u2212 b") == "a - b"
+
+    def test_escape_latex_decodes_entities_and_strips_markup(self):
+        title = "Developers&apos; <i>Perceptions</i> &amp; &quot;XML&quot;"
+        assert escape_latex(title) == (
+            r"Developers' Perceptions \& \textquotedbl{}XML\textquotedbl{}"
+        )
+        assert escape_latex("x < y and a > b") == "x < y and a > b"
+
+    def test_escape_latex_repairs_mojibake(self):
+        latin1 = "Thinking \u00e2\u0080\u0093 Developing"
+        cp1252 = "Thinking \u00e2\u20ac\u201c Developing"
+        assert escape_latex(latin1) == "Thinking -- Developing"
+        assert escape_latex(cp1252) == "Thinking -- Developing"
+        assert escape_latex("Café résumé") \
+            == "Café résumé"
+
+    def test_escape_bibtex_neutralises_babel_quotes(self):
+        assert escape_bibtex('"object"') \
+            == r"\textquotedbl{}object\textquotedbl{}"
 
     def test_escape_latex_composes_combining_accents(self):
         assert escape_latex("Le\u0301on") == "L\u00e9on"
@@ -4191,6 +4251,17 @@ Without the list, every tag that is not a category or a note is a
 theme. Notes are appended in parentheses to whatever reason the row
 has; a row with only notes is filed among the \enquote{other} rows.
 
+When a row carries several category tags, the \emph{last} one is the
+decision: tags accumulate in the order they were given, so a reviewer
+who changes an LLM's \enquote{supports} to \enquote{false hit} leaves
+both, and taking the first once counted an explicitly rejected paper as
+supporting evidence in a published appendix. The confidence is shown
+for the rows whose category is the machine's: unreviewed LLM decisions
+and the ones a human confirmed as they stood. A human who changed the
+decision owns the new label, so no confidence goes with it. Finally, a
+theme that merely repeats the word \enquote{cited} adds nothing and is
+not repeated.
+
 The confidence is shown only for decisions the LLM made and nobody has
 reviewed yet: once a human confirms or changes a decision it is a human
 decision, and the number would misrepresent it.
@@ -4205,7 +4276,9 @@ def audit_reason(
     """Return the reason label and sort order for `decision`."""
     tags = list(decision.tags)
     notes = strings["notes"]
-    category = next((t for t in tags if t in AUDIT_CATEGORIES), None)
+    category = next(
+        (t for t in reversed(tags) if t in AUDIT_CATEGORIES), None
+    )
     note_texts = [notes[t] for t in tags if t in notes]
     if theme_names:
         theme_tags = [t for t in tags if t in theme_names]
@@ -4220,20 +4293,21 @@ def audit_reason(
         ]
     human_decision = decision.source != ReviewSource.LLM_UNREVIEWED
     kept = decision.status == DecisionStatus.KEPT
+    machine_label = decision.source == ReviewSource.LLM_UNREVIEWED or (
+        decision.source == ReviewSource.LLM_REVIEWED
+        and not decision.is_example
+    )
     confidence = ""
-    if (
-        decision.source == ReviewSource.LLM_UNREVIEWED
-        and decision.llm_confidence is not None
-    ):
+    if machine_label and decision.llm_confidence is not None:
         confidence = f" ({decision.llm_confidence:.2f})"
 
     if decision.status == DecisionStatus.PENDING:
         return strings["pending"], AUDIT_ORDER_PENDING
     if kept and human_decision and theme_tags:
-        theme = theme_tags[0]
-        label = f"\\emph{{{strings['cited']}}}: " + escape_latex(
-            theme_names.get(theme, theme)
-        )
+        theme = theme_names.get(theme_tags[0], theme_tags[0])
+        label = f"\\emph{{{strings['cited']}}}"
+        if theme.casefold() != strings["cited"].casefold():
+            label += ": " + escape_latex(theme)
         order = AUDIT_ORDER_CITED
     elif kept and human_decision and not tags:
         label, order = f"\\emph{{{strings['cited']}}}", AUDIT_ORDER_CITED
@@ -4249,7 +4323,6 @@ def audit_reason(
     if note_texts:
         label += " (" + "; ".join(note_texts) + ")"
     return label, order
-
 @
 
 Each category, the confidence suffix and the fall-through cases are
@@ -4258,11 +4331,11 @@ checked in turn:
 <<test functions>>=
 class TestAuditReason:
     def _reason(self, status, tags, source=ReviewSource.HUMAN, conf=None,
-                theme_names=None):
+                theme_names=None, is_example=False):
         decision = ReviewDecision(
             paper=Paper(title="P", authors=["A"], year=2024),
             provider="p", status=status, tags=tags, source=source,
-            llm_confidence=conf,
+            llm_confidence=conf, is_example=is_example,
         )
         return audit_reason(
             decision, theme_names=theme_names or {},
@@ -4335,12 +4408,31 @@ class TestAuditReason:
             DecisionStatus.DISCARDED, ["off-topic-false-hit"]
         ) == ("other topic (false hit)", 4)
 
-    def test_reviewed_llm_decision_hides_confidence(self):
+    def test_confirmed_llm_decision_keeps_confidence(self):
         label, _ = self._reason(
             DecisionStatus.DISCARDED, ["supports-claim"],
             source=ReviewSource.LLM_REVIEWED, conf=0.93,
         )
+        assert label == "supports the claim (0.93)"
+
+    def test_changed_llm_decision_hides_confidence(self):
+        label, _ = self._reason(
+            DecisionStatus.DISCARDED, ["supports-claim"],
+            source=ReviewSource.LLM_REVIEWED, conf=0.93, is_example=True,
+        )
         assert label == "supports the claim"
+
+    def test_latest_category_tag_is_the_decision(self):
+        label, order = self._reason(
+            DecisionStatus.DISCARDED,
+            ["supports-claim", "off-topic-false-hit"],
+            source=ReviewSource.LLM_REVIEWED, conf=0.9, is_example=True,
+        )
+        assert (label, order) == ("other topic (false hit)", 4)
+
+    def test_theme_equal_to_the_label_is_not_repeated(self):
+        assert self._reason(DecisionStatus.KEPT, ["cited"]) \
+            == (r"\emph{cited}", AUDIT_ORDER_CITED)
 
     def test_pending_and_unknown_tags_sort_last(self):
         assert self._reason(DecisionStatus.PENDING, []) \
@@ -4352,14 +4444,18 @@ class TestAuditReason:
 
 The same paper often arrives from several providers, sometimes with and
 sometimes without a DOI, so a session may hold it more than once. The
-audit table is about papers, not records: rows are merged on title and
-year, the providers are joined, and the best-placed decision wins---a
-cited copy over a category, a category over a note---because the paper
-is what it is whatever the other providers' copies were classified as.
-The merge key normalises the title's case and whitespace (a no-break
-space from one provider must not split a paper in two), and titles are
-truncated before escaping so the cut cannot land inside an escape
-sequence.
+audit table is about works, not records: rows are merged on a work key,
+the providers are joined, and the best-placed decision wins---a cited
+copy over a category, a category over a note---because the paper is
+what it is whatever the other providers' copies were classified as. The
+key is the title reduced to its letters and digits, case-folded, plus
+the first author's surname treated the same way. Punctuation, quotes
+and capitalisation differ between providers for the same work, and the
+year is left out on purpose: a preprint and its journal article, or
+OpenAlex's DOI-registration year against the publication year, are the
+same work to a reader of the appendix, and counting them twice inflated
+the numbers the appendices quoted. Titles are truncated before escaping
+so the cut cannot land inside an escape sequence.
 
 A decision's [[provider]] is itself a joined string when the session
 merged records at search time (\enquote{openalex; dblp}), so providers
@@ -4381,6 +4477,20 @@ def provider_short_names(provider: str | None) -> list[str]:
     return names
 
 
+def audit_work_key(paper: Paper) -> tuple[str, str]:
+    """Reduce a paper to the key its audit row is merged on."""
+    def letters(text: str) -> str:
+        cleaned = clean_metadata_text(text or "")
+        folded = unicodedata.normalize("NFKD", cleaned).casefold()
+        return "".join(c for c in folded if c.isalnum())
+
+    surname = ""
+    if paper.authors:
+        first = paper.authors[0] or ""
+        surname = first.split(",")[0] if "," in first else first.split()[-1]
+    return letters(paper.title), letters(surname)
+
+
 def collect_audit_rows(
     session: ReviewSession,
     *,
@@ -4393,7 +4503,7 @@ def collect_audit_rows(
         paper = decision.paper
         title = paper.title or ""
         year = str(paper.year) if paper.year else ""
-        key = (" ".join(title.split()).casefold(), year)
+        key = audit_work_key(paper)
         providers = provider_short_names(decision.provider)
         reason, order = audit_reason(
             decision, theme_names=theme_names, strings=strings
@@ -4412,6 +4522,8 @@ def collect_audit_rows(
         for provider in providers:
             if provider not in row.providers:
                 row.providers.append(provider)
+        if not row.year:
+            row.year = year
         if order < row.order:
             row.status, row.reason, row.order = decision.status, reason, order
     return sorted(rows.values(), key=lambda r: (r.order, r.title.lower()))
@@ -4457,6 +4569,32 @@ class TestCollectAuditRows:
             == ["OA", "DBLP", "WoS", "IEEE"]
         assert provider_short_names("mylib") == ["mylib"]
         assert provider_short_names(None) == []
+
+    def test_same_work_merges_across_providers_and_years(self):
+        session = ReviewSession(
+            query="q", providers=["openalex"], timestamp=datetime.now(),
+        )
+        session.decisions = [
+            ReviewDecision(
+                paper=Paper(title="FROM BABBAGE TO BABEL: A HISTORY",
+                            authors=["Ada K. Lovelace"], year=2024),
+                provider="openalex", status=DecisionStatus.DISCARDED,
+                tags=["supports-claim"],
+            ),
+            ReviewDecision(
+                paper=Paper(title="From Babbage to Babel – a history",
+                            authors=["Lovelace, Ada"], year=2023),
+                provider="dblp", status=DecisionStatus.DISCARDED,
+                tags=["supports-claim"],
+            ),
+        ]
+        rows = collect_audit_rows(
+            session, theme_names={}, strings=AUDIT_STRINGS["en"]
+        )
+        assert len(rows) == 1
+        assert rows[0].providers == ["OA", "DBLP"]
+        assert audit_work_key(session.decisions[0].paper) \
+            == ("frombabbagetobabelahistory", "lovelace")
 
     def test_titles_merge_across_case_and_whitespace(self):
         session = ReviewSession(
@@ -4578,6 +4716,12 @@ def build_audit_table_latex(
         rows = [r for r in rows if r.order <= AUDIT_ORDER_BEARING]
     else:
         template = strings["caption"]
+    if not rows:
+        logger.warning(
+            "audit table for %s is empty%s",
+            session.name or session.query,
+            " (no row bears on the claim)" if bearing_only else "",
+        )
     extra = ""
     if counts[AUDIT_ORDER_PENDING]:
         extra += strings["extra_pending"].format(
@@ -4713,6 +4857,25 @@ class TestAuditTable:
         with pytest.raises(ValueError):
             build_audit_table_latex(_audit_session(), label="x", lang="de")
 
+    def test_empty_table_warns(self, caplog):
+        import logging
+
+        session = ReviewSession(
+            query="q", providers=["p"], timestamp=datetime.now(), name="e",
+        )
+        session.decisions = [
+            ReviewDecision(
+                paper=Paper(title="P", authors=["A"], year=2024),
+                provider="p", status=DecisionStatus.PENDING,
+            ),
+        ]
+        with caplog.at_level(logging.WARNING):
+            lines = build_audit_table_latex(
+                session, label="x", bearing_only=True
+            )
+        assert "is empty (no row bears on the claim)" in caplog.text
+        assert r"\end{longtable}" in lines
+
     def test_generate_audit_table_is_fragment(self, tmp_path):
         path = tmp_path / "table.tex"
         generate_audit_table(_audit_session(), path, label="x")
@@ -4729,7 +4892,9 @@ class TestAuditTable:
 
 The CSV carries every field the other artefacts summarise, including the
 LLM provenance columns, so that a spreadsheet or a script can recompute
-any of the tables above.
+any of the tables above. The last column is the session's paper id, the
+selector [[sessions decide --paper-id]] accepts, so a record without a
+DOI can be decided from the CSV without opening the TUI.
 
 <<review report generation>>=
 def generate_csv_report(session: ReviewSession, output_path: Path) -> None:
@@ -4791,6 +4956,7 @@ def generate_csv_report(session: ReviewSession, output_path: Path) -> None:
                 "llm_confidence",
                 "llm_review_outcome",
                 "llm_change_direction",
+                "paper_id",
             ]
         )
 
@@ -4817,6 +4983,7 @@ def generate_csv_report(session: ReviewSession, output_path: Path) -> None:
                     ),
                     llm_review_outcome(decision),
                     llm_change_direction(decision),
+                    get_paper_id(paper),
                 ]
             )
 @

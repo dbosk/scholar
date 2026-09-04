@@ -272,9 +272,16 @@ report body builders (`build_review_provenance_latex`,
   unchanged.
 - `scholar sessions export -f table --lang en|sv --label L --track T
   --theme TAG=NAME -o base` writes `base.tex`, always a fragment: one
-  row per unique title+year (case/whitespace-normalised; joined provider
-  strings like `openalex; dblp` are split, mapped to codes and
-  deduplicated; the best-placed decision wins). Tags split three ways: category tags (`supports-claim` …),
+  row per *work* (`audit_work_key`: title and first-author surname
+  reduced to case-folded letters and digits, year ignored; joined
+  provider strings like `openalex; dblp` are split, mapped to codes and
+  deduplicated; the best-placed decision wins). The *last* category tag
+  is the decision (`decide -t` appends); confidence is shown for
+  unreviewed and human-confirmed LLM rows, not for changed ones. The
+  escapers decode HTML entities, strip inline markup, repair
+  cp1252/Latin-1 mojibake and turn `"` into `\textquotedbl{}` (babel
+  shorthand). An empty table logs a warning. The CSV's last column is
+  `paper_id` for `decide --paper-id`. Tags split three ways: category tags (`supports-claim` …),
   note tags (`AUDIT_STRINGS[lang]["notes"]`: `recorded-not-cited`,
   `duplicate-record-of-cited-source`, `extended-tech-report`, …) and
   theme tags (the rest; with `--theme` given, only the listed tags).
