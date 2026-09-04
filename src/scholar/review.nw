@@ -97,8 +97,13 @@ from datetime import datetime
 from enum import Enum
 from pathlib import Path
 from typing import Any
+from collections.abc import Callable
+import html
 import json
 import logging
+import re
+import textwrap
+import unicodedata
 
 from cachetools import cachedmethod
 
@@ -2729,46 +2734,279 @@ class TestFilterDecisions:
 
 \section{Report Generation}
 
-The module provides \LaTeX\ report generation with theme and motivation
-groupings, enabling systematic documentation of review decisions. When a session
-has multiple query-provider pairs (from using different queries with different
-providers), the report shows them as a table mapping providers to their
-respective queries, rather than a single query field.
+The module produces three \LaTeX{} artefacts from a review session, plus a
+CSV dump: a \emph{review report} (provenance and the per-paper decision
+record), an \emph{audit table} (one row per paper with the reason it was
+kept or excluded, meant for a paper's backing appendix), and---through
+[[llm_review]]---the literature synthesis, which reuses the decision record
+as its appendix. Each of them can be written either as a compilable
+standalone document or as a fragment for [[\input]] into a larger document.
+
+The section is organised bottom-up. Escaping comes first, because every
+piece of text that reaches \LaTeX{} passes through it. Then the heading
+helper and the two document skeletons (standalone and fragment), which are
+shared by all artefacts. The report-specific helpers follow: citation
+keys, BibTeX entries, the summary tables, and the two body builders
+(provenance and decision record) that the report and the synthesis
+compose in different ways. The report assembly and the audit table close
+the section. When a session has multiple query-provider pairs (from using
+different queries with different providers), the report shows them as a
+table mapping providers to their respective queries, rather than a single
+query field.
+
+\subsection{Escaping for BibTeX and \LaTeX}
+
+Titles, tags and queries come from external metadata and from users, so
+they contain characters that \LaTeX{} treats as syntax, and increasingly
+characters that pdf\LaTeX{} cannot typeset at all: curly quotes, dashes,
+ellipses, and symbols such as $\star$ that publishers put into titles.
+The latter used to abort compilation with \enquote{Unicode character not
+set up for use with LaTeX}. Rather than asking users to patch the preamble
+with [[\DeclareUnicodeCharacter]] for every new symbol, we normalise text
+before it is written.
+
+Both escapers make a single pass over the characters, after normalising
+the text to composed form (a provider that ships \enquote{e} plus a
+combining acute would otherwise hand pdf\LaTeX{} a combining mark it
+cannot set). A character is then either a \LaTeX{} special (escaped), a
+piece of Unicode punctuation with a \TeX{} equivalent (mapped through
+[[LATEX_UNICODE_PUNCTUATION]]), a Greek letter or a common mathematical
+symbol (set in math mode, since titles like \enquote{$\pi$-ARL} are
+common and pdf\LaTeX{} has no text Greek without extra packages), a
+letter beyond the Latin ranges that [[inputenc]] and the T1 encoding
+cover (dropped: pdf\LaTeX{} cannot set it, and a hard error in the
+middle of an appendix is worse than a gap), or ordinary text. The tables
+are written with [[\u]] escapes because this very file is woven into a
+pdf\LaTeX{} document. A single pass matters: the naive alternative of
+mapping punctuation first and then escaping specials would re-escape the
+backslash and braces of the [[\dots{}]] the mapping just inserted.
+
+Before the pass, the text is cleaned of what providers leave in titles:
+HTML entities ([[&apos;]], [[&amp;]]) and inline markup ([[<i>]]) from
+DBLP, OpenAlex and Web of Science, and the mojibake of UTF-8 read as
+Latin-1 (an en dash arriving as \enquote{â} followed by two control
+characters). The mojibake repair re-encodes the text as cp1252 or
+Latin-1 and decodes it as UTF-8, and keeps the result only when that
+round trip succeeds, so genuine accented text is never touched. A plain
+double quote is a special too: under [[babel]]'s Swedish shorthands it
+is an active character that turns \enquote{"object"} into
+\enquote{öbject}, so it becomes [[\textquotedbl{}]].
+
+The BibTeX escaper is deliberately narrower than the \LaTeX{} one: BibTeX
+fields are braced already, and braces inside them carry meaning (they
+protect capitalisation), so we leave braces and backslashes alone there.
 
 <<review report generation>>=
-def escape_bibtex(text: str) -> str:
-    """Escape special BibTeX characters."""
-    text = text.replace('&', r'\&')
-    text = text.replace('%', r'\%')
-    text = text.replace('$', r'\$')
-    text = text.replace('#', r'\#')
-    text = text.replace('_', r'\_')
+LATEX_UNICODE_PUNCTUATION: dict[str, str] = {
+    "\u201c": "``",          # left double quotation mark
+    "\u201d": "''",          # right double quotation mark
+    "\u2018": "`",           # left single quotation mark
+    "\u2019": "'",           # right single quotation mark
+    "\u02bc": "'",           # modifier letter apostrophe
+    "\u2032": "'",           # prime
+    "\u2013": "--",          # en dash
+    "\u2014": "---",         # em dash
+    "\u2026": r"\dots{}",    # horizontal ellipsis
+    "\u00a0": " ",           # no-break space
+    "\u2009": " ",           # thin space
+    "\u202f": " ",           # narrow no-break space
+    "\u200b": "",            # zero width space
+    "\u00ad": "",            # soft hyphen
+    "\ufeff": "",            # byte order mark
+}
+
+LATEX_LATIN_CUTOFF = 0x024F     # end of Latin Extended-B
+
+# Greek letters, keyed by code point, set as math macros.
+GREEK_LETTER_NAMES: dict[str, str] = {
+    "\u03b1": "alpha", "\u03b2": "beta", "\u03b3": "gamma",
+    "\u03b4": "delta", "\u03b5": "varepsilon", "\u03b6": "zeta",
+    "\u03b7": "eta", "\u03b8": "theta", "\u03b9": "iota",
+    "\u03ba": "kappa", "\u03bb": "lambda", "\u03bc": "mu",
+    "\u03bd": "nu", "\u03be": "xi", "\u03c0": "pi",
+    "\u03c1": "rho", "\u03c3": "sigma", "\u03c2": "varsigma",
+    "\u03c4": "tau", "\u03c5": "upsilon", "\u03c6": "varphi",
+    "\u03d5": "phi", "\u03c7": "chi", "\u03c8": "psi",
+    "\u03c9": "omega", "\u0393": "Gamma", "\u0394": "Delta",
+    "\u0398": "Theta", "\u039b": "Lambda", "\u039e": "Xi",
+    "\u03a0": "Pi", "\u03a3": "Sigma", "\u03a5": "Upsilon",
+    "\u03a6": "Phi", "\u03a8": "Psi", "\u03a9": "Omega",
+}
+# Greek capitals that look like Latin ones have no macro; use the Latin.
+GREEK_LATIN_LOOKALIKES: dict[str, str] = {
+    "\u0391": "A", "\u0392": "B", "\u0395": "E", "\u0396": "Z",
+    "\u0397": "H", "\u0399": "I", "\u039a": "K", "\u039c": "M",
+    "\u039d": "N", "\u039f": "O", "\u03a1": "P", "\u03a4": "T",
+    "\u03a7": "X", "\u03bf": "o",
+}
+# Mathematical symbols; macros get \ensuremath, plain text does not.
+LATEX_MATH_SYMBOLS: dict[str, str] = {
+    "\u2264": r"\le", "\u2265": r"\ge", "\u2260": r"\ne",
+    "\u2248": r"\approx", "\u221e": r"\infty", "\u221a": r"\surd",
+    "\u2211": r"\sum", "\u220f": r"\prod", "\u2208": r"\in",
+    "\u2192": r"\rightarrow", "\u2190": r"\leftarrow",
+    "\u2194": r"\leftrightarrow",
+    "\u21d2": r"\Rightarrow", "\u2200": r"\forall", "\u2203": r"\exists",
+    "\u2205": r"\emptyset", "\u2212": "-", "\u2217": "*",
+}
+
+LATEX_SPECIALS: dict[str, str] = {
+    "\\": r"\textbackslash{}",
+    '"': r"\textquotedbl{}",
+    "&": r"\&",
+    "%": r"\%",
+    "$": r"\$",
+    "#": r"\#",
+    "_": r"\_",
+    "{": r"\{",
+    "}": r"\}",
+    "~": r"\textasciitilde{}",
+    "^": r"\textasciicircum{}",
+}
+
+BIBTEX_SPECIALS: dict[str, str] = {
+    '"': r"\textquotedbl{}",
+    "&": r"\&",
+    "%": r"\%",
+    "$": r"\$",
+    "#": r"\#",
+    "_": r"\_",
+}
+
+
+HTML_INLINE_TAGS = re.compile(
+    r"</?\s*(?:i|b|em|strong|sup|sub|sc|scp|inf|span|tt|u)\b[^>]*>",
+    re.IGNORECASE,
+)
+MOJIBAKE_MARKERS = ("Ã", "â", "Â")
+
+
+def repair_mojibake(text: str) -> str:
+    """Undo UTF-8 text that was decoded as cp1252 or Latin-1, if it was."""
+    if not any(marker in text for marker in MOJIBAKE_MARKERS):
+        return text
+    for encoding in ("cp1252", "latin-1"):
+        try:
+            return text.encode(encoding).decode("utf-8")
+        except (UnicodeEncodeError, UnicodeDecodeError):
+            continue
     return text
+
+
+def clean_metadata_text(text: str) -> str:
+    """Decode entities, strip inline markup and repair mojibake."""
+    text = html.unescape(text or "")
+    text = HTML_INLINE_TAGS.sub("", text)
+    return repair_mojibake(text)
+
+
+def _escape_chars(text: str, specials: dict[str, str]) -> str:
+    """Escape `text` for TeX in one pass using the `specials` map."""
+    out: list[str] = []
+    text = clean_metadata_text(text)
+    for char in unicodedata.normalize("NFC", text):
+        if char in specials:
+            out.append(specials[char])
+        elif char in LATEX_UNICODE_PUNCTUATION:
+            out.append(LATEX_UNICODE_PUNCTUATION[char])
+        elif char in GREEK_LETTER_NAMES:
+            out.append(f"\\ensuremath{{\\{GREEK_LETTER_NAMES[char]}}}")
+        elif char in GREEK_LATIN_LOOKALIKES:
+            out.append(GREEK_LATIN_LOOKALIKES[char])
+        elif char in LATEX_MATH_SYMBOLS:
+            macro = LATEX_MATH_SYMBOLS[char]
+            out.append(
+                f"\\ensuremath{{{macro}}}" if macro.startswith("\\")
+                else macro
+            )
+        elif ord(char) > LATEX_LATIN_CUTOFF:
+            continue
+        else:
+            out.append(char)
+    return "".join(out)
+
+
+def escape_bibtex(text: str) -> str:
+    """Escape special BibTeX characters and normalise Unicode punctuation."""
+    return _escape_chars(text, BIBTEX_SPECIALS)
 
 
 def escape_latex(text: str) -> str:
-    """
-    Escape special LaTeX characters.
-    
-    Order matters: backslash must be escaped first to avoid double-escaping.
-    """
-    text = text.replace('\\', r'\textbackslash{}')
-    replacements = {
-        '&': r'\&',
-        '%': r'\%',
-        '$': r'\$',
-        '#': r'\#',
-        '_': r'\_',
-        '{': r'\{',
-        '}': r'\}',
-        '~': r'\textasciitilde{}',
-        '^': r'\textasciicircum{}',
-    }
-    for char, replacement in replacements.items():
-        text = text.replace(char, replacement)
-    return text
+    """Escape special LaTeX characters and normalise Unicode punctuation."""
+    return _escape_chars(text, LATEX_SPECIALS)
+@
 
+Let's verify the single pass: the backslash and braces of an inserted
+[[\dots{}]] must survive, and a symbol beyond the cutoff must vanish
+without taking its neighbours with it.
 
+<<test functions>>=
+class TestLatexEscaping:
+    """Tests for the LaTeX and BibTeX escapers."""
+
+    def test_escape_latex_specials(self):
+        assert escape_latex("a & b_c 100%") == r"a \& b\_c 100\%"
+
+    def test_escape_latex_backslash_single_pass(self):
+        assert escape_latex("a\\b") == r"a\textbackslash{}b"
+
+    def test_escape_latex_maps_unicode_punctuation(self):
+        text = "“quoted” – dash…"
+        assert escape_latex(text) == "``quoted'' -- dash\\dots{}"
+
+    def test_escape_latex_drops_exotic_symbols(self):
+        result = escape_latex("star \u2606 here")
+        assert "\u2606" not in result
+        assert result == "star  here"
+        assert escape_latex("\u4e2d\u6587 title") == " title"
+
+    def test_escape_latex_sets_greek_and_math_in_math_mode(self):
+        assert escape_latex("\u03c0-ARL") == r"\ensuremath{\pi}-ARL"
+        assert escape_latex("\u03a9(n)") == r"\ensuremath{\Omega}(n)"
+        assert escape_latex("\u0391 and \u03bf") == "A and o"
+        assert escape_latex("x \u2264 y \u2192 z") \
+            == r"x \ensuremath{\le} y \ensuremath{\rightarrow} z"
+        assert escape_latex("a \u2212 b") == "a - b"
+
+    def test_escape_latex_decodes_entities_and_strips_markup(self):
+        title = "Developers&apos; <i>Perceptions</i> &amp; &quot;XML&quot;"
+        assert escape_latex(title) == (
+            r"Developers' Perceptions \& \textquotedbl{}XML\textquotedbl{}"
+        )
+        assert escape_latex("x < y and a > b") == "x < y and a > b"
+
+    def test_escape_latex_repairs_mojibake(self):
+        latin1 = "Thinking \u00e2\u0080\u0093 Developing"
+        cp1252 = "Thinking \u00e2\u20ac\u201c Developing"
+        assert escape_latex(latin1) == "Thinking -- Developing"
+        assert escape_latex(cp1252) == "Thinking -- Developing"
+        assert escape_latex("Café résumé") \
+            == "Café résumé"
+
+    def test_escape_bibtex_neutralises_babel_quotes(self):
+        assert escape_bibtex('"object"') \
+            == r"\textquotedbl{}object\textquotedbl{}"
+
+    def test_escape_latex_composes_combining_accents(self):
+        assert escape_latex("Le\u0301on") == "L\u00e9on"
+        assert escape_bibtex("L\u00e9on \u03bb") \
+            == "L\u00e9on \\ensuremath{\\lambda}"
+
+    def test_escape_bibtex_drops_exotic_symbols(self):
+        result = escape_bibtex("A \u2606 B & C")
+        assert result == r"A  B \& C"
+
+    def test_escape_bibtex_keeps_braces(self):
+        assert escape_bibtex("{DNA} & RNA") == r"{DNA} \& RNA"
+@
+
+\subsection{Markdown and heading levels}
+
+The research context is written by the user in Markdown, so it goes
+through pandoc when available; the fallback is escaped plain text, which
+loses formatting but never breaks the build.
+
+<<review report generation>>=
 def markdown_to_latex(markdown_text: str) -> str:
     """
     Convert Markdown text to LaTeX using pypandoc.
@@ -2780,8 +3018,49 @@ def markdown_to_latex(markdown_text: str) -> str:
         return pypandoc.convert_text(markdown_text, 'latex', format='markdown')
     except Exception:
         return escape_latex(markdown_text)
+@
+
+A section builder that emits a heading and a nested sub-heading cannot
+hard-code either level: the same builder serves the standalone report,
+where it sits at [[\section]] level, and the synthesis, which places the
+same content one level down. The Markdown builders already derive the
+nested level with [[heading_level + 1]]; [[sub_heading]] is the \LaTeX{}
+counterpart. Unknown commands pass through unchanged so a caller can hand
+in a custom sectioning command without breaking anything.
+
+<<review report generation>>=
+LATEX_SUB_HEADINGS: dict[str, str] = {
+    r"\section": r"\subsection",
+    r"\subsection": r"\subsubsection",
+    r"\subsubsection": r"\paragraph",
+}
 
 
+def sub_heading(heading_command: str) -> str:
+    """Return the sectioning command one level below `heading_command`."""
+    return LATEX_SUB_HEADINGS.get(heading_command, heading_command)
+@
+
+The mapping and the passthrough are quick to pin down:
+
+<<test functions>>=
+class TestSubHeading:
+    def test_mappings(self):
+        assert sub_heading(r"\section") == r"\subsection"
+        assert sub_heading(r"\subsection") == r"\subsubsection"
+        assert sub_heading(r"\subsubsection") == r"\paragraph"
+
+    def test_passthrough(self):
+        assert sub_heading(r"\chapter") == r"\chapter"
+@
+
+\subsection{Search parameters and research context}
+
+Sessions built before query-provider pairs were recorded only have the
+base query and the provider list, so the pairs are reconstructed from
+those when missing.
+
+<<review report generation>>=
 def get_query_provider_pairs(session: ReviewSession) -> list[tuple[str, str]]:
     """Return query/provider pairs with backward-compatible fallback."""
     if session.query_provider_pairs:
@@ -2793,8 +3072,16 @@ def provider_queries_differ(session: ReviewSession) -> bool:
     """Whether any provider-specific query differs from the base query."""
     pairs = get_query_provider_pairs(session)
     return any(query != session.query for query, _ in pairs)
+@
 
+The research context and the search parameters exist in a Markdown and a
+\LaTeX{} flavour because the synthesis offers both output formats. The
+\LaTeX{} builders take the heading command as a parameter for the reason
+given above; the provider table only appears when at least one provider
+ran a query different from the base query, since otherwise it would
+repeat the base query once per provider.
 
+<<review report generation>>=
 def build_research_context_markdown(
     session: ReviewSession,
     heading_level: int = 3,
@@ -2878,7 +3165,7 @@ def build_search_parameters_latex(
     if provider_queries_differ(session):
         lines.extend(
             [
-                r"\subsection{Provider-specific queries}",
+                f"{sub_heading(heading_command)}{{Provider-specific queries}}",
                 r"\begin{longtable}{lp{10cm}}",
                 r"\toprule",
                 r"Provider & Query \\",
@@ -2898,8 +3185,743 @@ def build_search_parameters_latex(
         )
 
     return lines
+@
+
+The provider table must nest under the search-parameters heading rather
+than appear as its sibling:
+
+<<test functions>>=
+class TestSearchParametersHeadings:
+    def test_provider_table_nests_under_heading(self):
+        session = ReviewSession(
+            query="a", providers=["openalex", "dblp"],
+            timestamp=datetime.now(),
+        )
+        session.add_query_provider_pair("a", "openalex")
+        session.add_query_provider_pair("b", "dblp")
+        lines = build_search_parameters_latex(
+            session, heading_command=r"\subsection"
+        )
+        assert r"\subsection{Search Parameters}" in lines
+        assert r"\subsubsection{Provider-specific queries}" in lines
+@
+
+\subsection{Standalone documents and fragments}
+
+Both the report and the synthesis used to carry their own copy of the
+preamble, and the copies had drifted: the report loads [[amssymb]] and
+[[graphicx]] for its matrix tables, the synthesis did not, so pasting the
+report's tables into a synthesis would have failed on [[\checkmark]] and
+[[\rotatebox]]. One package list, the union of both, removes that class
+of error. [[enumitem]] is loaded although nothing here uses it, to keep
+existing output unchanged.
+
+<<review report generation>>=
+LATEX_PACKAGES: list[str] = [
+    r"\usepackage[utf8]{inputenc}",
+    r"\usepackage[colorlinks=true,allcolors=blue]{hyperref}",
+    r"\usepackage{enumitem}",
+    r"\usepackage{longtable}",
+    r"\usepackage{booktabs}",
+    r"\usepackage{array}",
+    r"\usepackage{amssymb}",
+    r"\usepackage{graphicx}",
+    r"\usepackage[backend=biber,style=authoryear]{biblatex}",
+]
+@
+
+A standalone document wraps a body in the skeleton a reader expects from a
+report: title page, abstract, table of contents, the body, an optional
+bibliography command and an optional appendix. The title is escaped here
+because session names are free text (an ampersand in a session name used
+to be a hard \LaTeX{} error). The bibliography command is passed as a
+literal string rather than a flag so a caller can choose its options; the
+review report passes none, since it cites everything with [[\fullcite]]
+and has no reference list of its own.
+
+<<review report generation>>=
+def latex_document(
+    body: list[str],
+    *,
+    title: str,
+    date: str,
+    bib_resource: str,
+    abstract: str | None = None,
+    bibliography: str | None = None,
+    appendix: list[str] | None = None,
+) -> list[str]:
+    """Wrap `body` in a compilable LaTeX document."""
+    lines: list[str] = [r"\documentclass{article}"]
+    lines.extend(LATEX_PACKAGES)
+    lines.extend(
+        [
+            f"\\addbibresource{{{bib_resource}}}",
+            "",
+            f"\\title{{{escape_latex(title)}}}",
+            f"\\date{{{date}}}",
+            "",
+            r"\begin{document}",
+            r"\maketitle",
+            "",
+        ]
+    )
+    if abstract is not None:
+        lines.extend([r"\begin{abstract}", abstract, r"\end{abstract}"])
+    lines.extend(
+        [r"\clearpage", r"\clearpage", r"\tableofcontents", r"\clearpage", ""]
+    )
+    lines.extend(body)
+    if bibliography:
+        lines.extend([bibliography, ""])
+    if appendix:
+        lines.append(r"\appendix")
+        lines.extend(appendix)
+    lines.append(r"\end{document}")
+    return lines
+@
+
+A fragment is the same body without the skeleton, meant to be read by
+[[\input]] from another document's body. It cannot set anything up for
+itself: biblatex refuses [[\addbibresource]] outside the preamble, and
+package loading is the including document's business. So instead of
+declaring, the fragment \emph{instructs}: a comment header lists the
+packages the including preamble must load (minus [[inputenc]], which the
+includer has already decided on and which is hostile to Xe\LaTeX{}), the
+[[\addbibresource]] line, and the need for biber. An abstract cannot be
+emitted either, because an [[abstract]] environment belongs to the
+including document; it is preserved as comment lines so that text written
+by an LLM is not silently lost. Callers may add further comment lines
+for facts that must reach the author but never the compiled page, such
+as the session a table was made from.
+
+<<review report generation>>=
+FRAGMENT_COMMENT_WIDTH = 76
 
 
+def latex_fragment(
+    body: list[str],
+    *,
+    packages: list[str],
+    bib_resource: str | None = None,
+    abstract: str | None = None,
+    generator: str = "",
+    comments: list[str] | None = None,
+) -> list[str]:
+    """Wrap `body` in an input-able fragment with an instructional header."""
+    lines: list[str] = [r"% --- scholar LaTeX fragment " + "-" * 44]
+    if generator:
+        lines.append(f"% Generated by: {generator}")
+    for comment in comments or []:
+        lines.append(f"% {comment}")
+    lines.append(r"% \input this file from the body of a document whose")
+    lines.append("% preamble loads:")
+    for package in packages:
+        if "inputenc" in package:
+            continue
+        lines.append(f"%   {package}")
+    if bib_resource:
+        lines.append(f"%   \\addbibresource{{{bib_resource}}}")
+        lines.append("% and which is compiled with biber.")
+    if r"\begin{refsection}" in body:
+        lines.extend(
+            [
+                "% Citations in this fragment sit in their own refsection,",
+                r"% so the including document's \printbibliography is not",
+                "% affected. Refsections cannot nest: \\input this file",
+                "% outside any refsection of your own.",
+            ]
+        )
+    if abstract:
+        lines.append("% Abstract (not emitted; abstracts belong to the")
+        lines.append("% including document):")
+        for wrapped in textwrap.wrap(abstract, FRAGMENT_COMMENT_WIDTH):
+            lines.append(f"%   {wrapped}")
+    lines.append("% " + "-" * 70)
+    lines.append("")
+    lines.extend(body)
+    return lines
+@
+
+The decision record cites every paper the review touched with
+[[\fullcite]], including the discarded ones. In a document that prints a
+bibliography, those citations would drag every discarded paper into the
+reference list, and a reader could no longer tell which papers the text
+actually draws on. biblatex's reference sections solve this cleanly: a
+[[refsection]] environment gives its citations their own numbering, and
+[[\printbibliography]] defaults to the section it is called in. Wrapping
+the decision record therefore keeps the bibliography equal to what the
+prose cites, and [[\fullcite]] needs no bibliography to resolve. The same
+wrapping protects an including document from a fragment.
+
+<<review report generation>>=
+def refsection(lines: list[str]) -> list[str]:
+    """Wrap `lines` in a biblatex `refsection` environment."""
+    return [r"\begin{refsection}", *lines, r"\end{refsection}"]
+@
+
+Let's verify the skeletons: the document has the wrapper and an escaped
+title, the fragment has neither the wrapper nor a live
+[[\addbibresource]] command, and the header carries the instructions.
+
+<<test functions>>=
+class TestLatexSkeleton:
+    def test_document_has_skeleton_and_escaped_title(self):
+        lines = latex_document(
+            [r"\section{Body}"], title="A & B", date="2026-01-01",
+            bib_resource="x.bib", abstract="Abs.",
+            bibliography=r"\printbibliography",
+            appendix=[r"\section{App}"],
+        )
+        assert lines[0] == r"\documentclass{article}"
+        assert r"\addbibresource{x.bib}" in lines
+        assert r"\title{A \& B}" in lines
+        assert lines[-1] == r"\end{document}"
+        assert lines.index(r"\section{Body}") \
+            < lines.index(r"\printbibliography") \
+            < lines.index(r"\appendix") \
+            < lines.index(r"\section{App}")
+
+    def test_fragment_has_no_skeleton(self):
+        lines = latex_fragment(
+            refsection([r"\section{Body}"]), packages=LATEX_PACKAGES,
+            bib_resource="x.bib", abstract="An abstract.",
+            generator="scholar test", comments=["Session: s & t"],
+        )
+        text = "\n".join(lines)
+        assert "% Session: s & t" in lines
+        assert r"\documentclass" not in text
+        assert r"\begin{document}" not in text
+        assert not any(l.startswith(r"\addbibresource") for l in lines)
+        assert r"%   \addbibresource{x.bib}" in lines
+        assert "% Generated by: scholar test" in lines
+        assert not any("inputenc" in l for l in lines)
+        assert any("booktabs" in l for l in lines)
+        assert "%   An abstract." in lines
+        assert any("cannot nest" in l for l in lines)
+        assert lines[-3:] == [
+            r"\begin{refsection}", r"\section{Body}", r"\end{refsection}",
+        ]
+@
+
+\subsection{Citation keys for the report}
+
+The report keeps its own key scheme, [[surname{year}_{index}]], and keys
+the map by [[id(decision)]] rather than by paper id. Both are deliberate.
+The index suffix makes keys unique by construction, which matters because
+[[load_session]] can hand back two decisions that resolve to the same
+paper id (it derives arXiv DOIs from URLs at load time, so two entries
+that were distinct when saved may coincide afterwards); keying by object
+identity keeps both, whereas a paper-id map would silently drop one and
+biber would then reject the duplicate entry key. The scheme is not shared
+with the synthesis because the synthesis caches LLM prose that contains
+its keys literally; changing either scheme to match the other would make
+cached prose cite keys that no longer exist.
+
+<<review report generation>>=
+def report_cite_keys(decisions: list[ReviewDecision]) -> dict[int, str]:
+    """Map `id(decision)` to a unique citation key for each decision."""
+    keys: dict[int, str] = {}
+    for index, decision in enumerate(decisions):
+        paper = decision.paper
+        if paper.authors:
+            first_author = paper.authors[0].split()[-1].lower()
+            first_author = ''.join(c for c in first_author if c.isalnum())
+        else:
+            first_author = "unknown"
+        year = paper.year or "nd"
+        keys[id(decision)] = f"{first_author}{year}_{index}"
+    return keys
+@
+
+Keying by object identity is what keeps two decisions for one paper
+apart:
+
+<<test functions>>=
+class TestReportCiteKeys:
+    def test_same_paper_twice_gets_distinct_keys(self):
+        paper = Paper(title="Twice", authors=["Ann Smith"], year=2024)
+        decisions = [
+            ReviewDecision(paper=paper, provider="a",
+                           status=DecisionStatus.KEPT),
+            ReviewDecision(paper=paper, provider="b",
+                           status=DecisionStatus.DISCARDED),
+        ]
+        keys = report_cite_keys(decisions)
+        assert len(set(keys.values())) == 2
+        assert keys[id(decisions[0])] == "smith2024_0"
+@
+
+\subsection{BibTeX entries}
+
+Every paper becomes an [[@article]] entry: the metadata we hold does not
+distinguish entry types reliably, and biblatex renders an article with
+missing fields gracefully. The formatter is shared with the synthesis,
+which used to carry a byte-for-byte copy.
+
+The venue is coerced to a string before escaping. Some DBLP proceedings
+records carry a two-element venue list (series and volume title), which
+survives into the session file; the escaper then died on the list after
+the CSV had already been written, leaving a half-finished export. The
+provider should normalise this at ingest, but the exporter must not be
+the place where a stray list turns into a traceback.
+
+<<review report generation>>=
+def format_bibtex_entry(paper: Paper, cite_key: str) -> str:
+    """Format a paper as a BibTeX entry under `cite_key`."""
+    lines = [f"@article{{{cite_key},"]
+    lines.append(f"  title = {{{escape_bibtex(paper.title)}}},")
+    if paper.authors:
+        authors = " and ".join(paper.authors)
+        lines.append(f"  author = {{{escape_bibtex(authors)}}},")
+    if paper.year:
+        lines.append(f"  year = {{{paper.year}}},")
+    venue = paper.venue
+    if isinstance(venue, (list, tuple)):
+        venue = "; ".join(str(v) for v in venue)
+    if venue:
+        lines.append(f"  journal = {{{escape_bibtex(venue)}}},")
+    if paper.doi:
+        lines.append(f"  doi = {{{paper.doi}}},")
+    if paper.url:
+        lines.append(f"  url = {{{paper.url}}},")
+    lines.append("}")
+    return "\n".join(lines)
+
+
+def build_report_bibtex(
+    decisions: list[ReviewDecision],
+    cite_key: Callable[[ReviewDecision], str],
+) -> str:
+    """Build the BibTeX file contents for `decisions`."""
+    return "\n\n".join(
+        format_bibtex_entry(d.paper, cite_key(d)) for d in decisions
+    )
+@
+
+Let's check the entry shape, and that entries are separated by a blank
+line as BibTeX readers expect:
+
+<<test functions>>=
+class TestBibtexEntries:
+    def test_format_bibtex_entry(self):
+        paper = Paper(title="T & U", authors=["A B", "C D"], year=2020,
+                      venue="V", doi="10.1/x")
+        entry = format_bibtex_entry(paper, "b2020")
+        assert entry.startswith("@article{b2020,")
+        assert r"  title = {T \& U}," in entry
+        assert "  author = {A B and C D}," in entry
+        assert "  journal = {V}," in entry
+        assert entry.endswith("}")
+
+    def test_list_valued_venue_is_joined(self):
+        paper = Paper(title="T", authors=["A"], year=2020,
+                      venue=["IIH-MSP", "Smart Innovation"])
+        entry = format_bibtex_entry(paper, "a2020")
+        assert "  journal = {IIH-MSP; Smart Innovation}," in entry
+
+    def test_build_report_bibtex_joins_entries(self):
+        decisions = [
+            ReviewDecision(paper=Paper(title="One", authors=["A"]),
+                           provider="p", status=DecisionStatus.KEPT),
+            ReviewDecision(paper=Paper(title="Two", authors=["B"]),
+                           provider="p", status=DecisionStatus.KEPT),
+        ]
+        keys = report_cite_keys(decisions)
+        bib = build_report_bibtex(decisions, lambda d: keys[id(d)])
+        assert bib.count("@article{") == 2
+        assert "\n\n@article{" in bib
+@
+
+\subsection{Summary tables}
+
+The overview tables use [[\citetitle]] rather than the raw title so that
+biblatex owns the formatting and the title stays consistent with the
+bibliography entry. The matrix table has one column per tag, which does
+not fit a page with horizontal headers, hence the rotated headers; a
+[[\checkmark]] marks membership because an empty cell reads more easily
+than a word in a dense grid.
+
+<<review report generation>>=
+def format_list_table(
+    decisions: list[ReviewDecision],
+    cite_key: Callable[[ReviewDecision], str],
+    tag_label: str,
+) -> list[str]:
+    """Generate a longtable with Title, Year and tag columns."""
+    lines = [
+        r"\begin{longtable}{>{\raggedright\arraybackslash}p{0.55\textwidth}"
+        r"c>{\raggedright\arraybackslash}p{0.25\textwidth}}",
+        r"\toprule",
+        f"\\textbf{{Title}} & \\textbf{{Year}} & \\textbf{{{tag_label}}} \\\\",
+        r"\midrule",
+        r"\endhead",
+        r"\bottomrule",
+        r"\endlastfoot",
+    ]
+    for decision in decisions:
+        year = decision.paper.year or "---"
+        tags = ", ".join(escape_latex(t) for t in sorted(decision.tags))
+        lines.append(
+            f"\\citetitle{{{cite_key(decision)}}} & {year} & {tags} \\\\"
+        )
+    lines.append(r"\end{longtable}")
+    return lines
+
+
+def format_matrix_table(
+    decisions: list[ReviewDecision],
+    cite_key: Callable[[ReviewDecision], str],
+    tags: set[str],
+) -> list[str]:
+    """Generate a papers-by-tags cross-tabulation as a longtable."""
+    sorted_tags = sorted(tags)
+    num_tags = len(sorted_tags)
+
+    # Build column spec: title column + one centered column per tag
+    col_spec = r">{\raggedright\arraybackslash}p{0.4\textwidth}" + "c" * num_tags
+
+    lines = [
+        f"\\begin{{longtable}}{{{col_spec}}}",
+        r"\toprule",
+    ]
+
+    # Header row with rotated tag names
+    header_cells = [r"\textbf{Title}"]
+    for tag in sorted_tags:
+        header_cells.append(f"\\rotatebox{{90}}{{{escape_latex(tag)}}}")
+    lines.append(" & ".join(header_cells) + r" \\")
+    lines.append(r"\midrule")
+    lines.append(r"\endhead")
+    lines.append(r"\bottomrule")
+    lines.append(r"\endlastfoot")
+
+    # Data rows
+    for decision in decisions:
+        row_cells = [f"\\citetitle{{{cite_key(decision)}}}"]
+        for tag in sorted_tags:
+            if decision.has_tag(tag):
+                row_cells.append(r"$\checkmark$")
+            else:
+                row_cells.append("")
+        lines.append(" & ".join(row_cells) + r" \\")
+
+    lines.append(r"\end{longtable}")
+    return lines
+@
+
+\subsection{Provenance sections}
+
+The report body has two halves that other documents want separately. The
+provenance half describes how the corpus was assembled: research context,
+search parameters, counts, and snowballing rounds. The synthesis has its
+own version of this, written for a reader of the synthesis rather than an
+auditor of the search, so only the report uses this builder.
+
+<<review report generation>>=
+def build_review_provenance_latex(
+    session: ReviewSession,
+    *,
+    heading_command: str = r"\section",
+) -> list[str]:
+    """Build research context, search parameters, summary and snowballing."""
+    lines: list[str] = []
+    lines.extend(
+        build_research_context_latex(session, heading_command=heading_command)
+    )
+    lines.extend(
+        build_search_parameters_latex(session, heading_command=heading_command)
+    )
+    <<add summary counts>>
+    <<add snowballing section>>
+    return lines
+@
+
+When the LLM took part in the review, the summary reports how many of its
+decisions the reviewer confirmed or changed, split by direction; a session
+without LLM decisions omits those lines so the table does not suggest a
+step that never happened. A changed decision is recognised by
+[[is_example]]: corrected decisions become training examples for later
+LLM rounds, which is exactly the set we want to count.
+
+<<add summary counts>>=
+has_llm_decisions = any(
+    d.source in (ReviewSource.LLM_UNREVIEWED, ReviewSource.LLM_REVIEWED)
+    for d in session.decisions
+)
+
+llm_confirmed = 0
+llm_changed_total = 0
+llm_changed_kept_to_discarded = 0
+llm_changed_discarded_to_kept = 0
+
+if has_llm_decisions:
+    llm_confirmed = sum(
+        1
+        for d in session.decisions
+        if d.source == ReviewSource.LLM_REVIEWED and not d.is_example
+    )
+    llm_changed_total = sum(
+        1
+        for d in session.decisions
+        if d.source == ReviewSource.LLM_REVIEWED and d.is_example
+    )
+    llm_changed_kept_to_discarded = sum(
+        1
+        for d in session.decisions
+        if d.source == ReviewSource.LLM_REVIEWED
+        and d.is_example
+        and d.status == DecisionStatus.DISCARDED
+    )
+    llm_changed_discarded_to_kept = sum(
+        1
+        for d in session.decisions
+        if d.source == ReviewSource.LLM_REVIEWED
+        and d.is_example
+        and d.status == DecisionStatus.KEPT
+    )
+
+summary_items = [
+    f"\\item[Kept] {len(session.kept_papers())}",
+    f"\\item[Discarded] {len(session.discarded_papers())}",
+    f"\\item[Pending] {len(session.pending_papers())}",
+]
+
+if has_llm_decisions:
+    summary_items.extend(
+        [
+            f"\\item[LLM confirmed] {llm_confirmed}",
+            f"\\item[LLM changed] {llm_changed_total}",
+            f"\\item[LLM changed (kept->discarded)] {llm_changed_kept_to_discarded}",
+            f"\\item[LLM changed (discarded->kept)] {llm_changed_discarded_to_kept}",
+        ]
+    )
+
+lines.extend(
+    [
+        r"\begin{description}",
+        f"\\item[Date] {session.timestamp.strftime('%Y-%m-%d %H:%M')}",
+        f"\\item[Total Papers] {len(session.decisions)}",
+        r"\end{description}",
+        r"",
+        f"{heading_command}{{Summary}}",
+        r"\begin{description}",
+        *summary_items,
+        r"\end{description}",
+        r"",
+    ]
+)
+@
+
+Snowballing rounds only appear when they happened. The papers they added
+are recognisable by their tags, so the tally at the end of the section
+comes from the kept papers rather than from the round records.
+
+<<add snowballing section>>=
+if session.snowball_rounds:
+    lines.extend([
+        f"{heading_command}{{Snowballing}}",
+        r"",
+        r"Manual snowballing was performed to discover additional papers",
+        r"through citations and references of kept papers.",
+        r"",
+        r"\begin{longtable}{llcl}",
+        r"\toprule",
+        r"Round & Direction & Papers Added & Source Papers \\",
+        r"\midrule",
+    ])
+    for i, round_info in enumerate(session.snowball_rounds, 1):
+        direction = "References" if round_info.direction == "references" else "Citations"
+        source_count = len(round_info.source_papers)
+        source_label = f"{source_count} paper{'s' if source_count != 1 else ''}"
+        lines.append(
+            f"{i} & {direction} & {round_info.papers_added} & {source_label} \\\\"
+        )
+    lines.extend([
+        r"\bottomrule",
+        r"\end{longtable}",
+        r"",
+    ])
+
+    snowball_refs = [d for d in session.kept_papers() if d.has_tag("snowball-refs")]
+    snowball_cite = [d for d in session.kept_papers() if d.has_tag("snowball-cites")]
+    if snowball_refs or snowball_cite:
+        lines.extend([
+            f"{sub_heading(heading_command)}{{Papers Added via Snowballing}}",
+            r"\begin{description}",
+        ])
+        if snowball_refs:
+            lines.append(
+                f"\\item[From references] {len(snowball_refs)} papers"
+            )
+        if snowball_cite:
+            lines.append(
+                f"\\item[From citations] {len(snowball_cite)} papers"
+            )
+        lines.extend([
+            r"\end{description}",
+            r"",
+        ])
+@
+
+\subsection{The decision record}
+
+The second half is the decision record: what was decided about each
+paper. The synthesis appends exactly this as its appendix, so it takes the
+citation-key resolver as a parameter instead of computing keys itself;
+the synthesis and the report use different key schemes and each document
+must cite with its own.
+
+<<review report generation>>=
+def build_review_decisions_latex(
+    session: ReviewSession,
+    cite_key: Callable[[ReviewDecision], str],
+    *,
+    heading_command: str = r"\section",
+) -> list[str]:
+    """Build the summary tables and the kept/discarded paper lists."""
+    lines: list[str] = []
+    sub = sub_heading(heading_command)
+    <<add summary tables>>
+    <<add kept papers by theme>>
+    <<add discarded papers by motivation>>
+    return lines
+@
+
+The overview tables come first because they answer the quick questions
+(how many, which themes) before the full lists. The matrix is skipped when
+no paper carries a tag, since a title-only grid says nothing.
+
+<<add summary tables>>=
+if session.kept_papers() or session.discarded_papers():
+    lines.extend([
+        f"{heading_command}{{Summary Tables}}",
+        r"",
+    ])
+
+    if session.kept_papers():
+        lines.extend([
+            f"{sub}{{Kept Papers Overview}}",
+            r"",
+        ])
+        lines.extend(format_list_table(
+            session.kept_papers(), cite_key, "Themes"
+        ))
+        lines.append(r"")
+        themes = session.all_themes()
+        if themes:
+            lines.extend(format_matrix_table(
+                session.kept_papers(), cite_key, themes
+            ))
+            lines.append(r"")
+
+    if session.discarded_papers():
+        lines.extend([
+            f"{sub}{{Discarded Papers Overview}}",
+            r"",
+        ])
+        lines.extend(format_list_table(
+            session.discarded_papers(), cite_key, "Motivations"
+        ))
+        lines.append(r"")
+        motivations = session.all_motivations()
+        if motivations:
+            lines.extend(format_matrix_table(
+                session.discarded_papers(), cite_key, motivations
+            ))
+            lines.append(r"")
+@
+
+Kept papers are grouped by theme and discarded papers by motivation, one
+list per tag. A paper with several tags appears under each of them; that
+repetition is intended, because a reader looking up one theme should see
+everything filed under it. Without tags the papers form a single list.
+
+<<add kept papers by theme>>=
+if session.kept_papers():
+    lines.extend([
+        f"{heading_command}{{Kept Papers}}",
+    ])
+
+    themes = session.all_themes()
+    if themes:
+        for theme in sorted(themes):
+            papers_with_theme = [
+                d for d in session.kept_papers() if d.has_tag(theme)
+            ]
+            lines.append(f"{sub}{{{escape_latex(theme)}}}")
+            lines.append(r"\begin{enumerate}")
+            for decision in papers_with_theme:
+                lines.append(f"\\item \\fullcite{{{cite_key(decision)}}}")
+            lines.append(r"\end{enumerate}")
+            lines.append("")
+    else:
+        lines.append(r"\begin{enumerate}")
+        for decision in session.kept_papers():
+            lines.append(f"\\item \\fullcite{{{cite_key(decision)}}}")
+        lines.append(r"\end{enumerate}")
+        lines.append("")
+@
+
+Discarded papers follow the same shape, grouped by motivation:
+
+<<add discarded papers by motivation>>=
+if session.discarded_papers():
+    lines.extend([
+        f"{heading_command}{{Discarded Papers}}",
+    ])
+
+    motivations = session.all_motivations()
+    if motivations:
+        for motivation in sorted(motivations):
+            papers_with_motivation = [
+                d for d in session.discarded_papers() if d.has_tag(motivation)
+            ]
+            lines.append(f"{sub}{{{escape_latex(motivation)}}}")
+            lines.append(r"\begin{enumerate}")
+            for decision in papers_with_motivation:
+                lines.append(f"\\item \\fullcite{{{cite_key(decision)}}}")
+            lines.append(r"\end{enumerate}")
+            lines.append("")
+    else:
+        lines.append(r"\begin{enumerate}")
+        for decision in session.discarded_papers():
+            lines.append(f"\\item \\fullcite{{{cite_key(decision)}}}")
+        lines.append(r"\end{enumerate}")
+        lines.append("")
+@
+
+Let's verify that the decision record follows the requested heading level
+all the way down:
+
+<<test functions>>=
+class TestReviewDecisionsBuilder:
+    def test_headings_follow_heading_command(self):
+        session = ReviewSession(
+            query="q", providers=["p"], timestamp=datetime.now(),
+        )
+        session.decisions = [
+            ReviewDecision(
+                paper=Paper(title="P", authors=["A"], year=2024),
+                provider="p", status=DecisionStatus.KEPT, tags=["ml"],
+            ),
+        ]
+        lines = build_review_decisions_latex(
+            session, lambda d: "k", heading_command=r"\subsection"
+        )
+        assert r"\subsection{Summary Tables}" in lines
+        assert r"\subsubsection{Kept Papers Overview}" in lines
+        assert r"\subsection{Kept Papers}" in lines
+        assert r"\subsubsection{ml}" in lines
+        assert r"\item \fullcite{k}" in lines
+@
+
+\subsection{Assembling the report}
+
+The report's abstract is deterministic: it restates the research question
+and the counts, which is all a reader needs to decide whether to open the
+document.
+
+<<review report generation>>=
 def build_review_report_abstract(session: ReviewSession) -> str:
     """Build a deterministic one-paragraph abstract for the review report."""
     kept = len(session.kept_papers())
@@ -2924,394 +3946,957 @@ def build_review_report_abstract(session: ReviewSession) -> str:
         summary += " Manual snowballing was used to discover additional papers."
 
     return summary
+@
 
+The [[.bib]] file is written in both modes: a fragment cannot embed its
+bibliography (the [[\addbibresource]] that would read it is preamble-only),
+and a standalone document that carries the same sibling file keeps the two
+modes interchangeable. The fragment's body sits in a [[refsection]] so an
+including document's bibliography is unaffected by the [[\fullcite]]s; the
+standalone report has no bibliography command, so it needs no such
+protection and its output is unchanged from before fragments existed.
 
-def generate_latex_report(session: ReviewSession, output_path: Path) -> None:
+<<review report generation>>=
+def generate_latex_report(
+    session: ReviewSession,
+    output_path: Path,
+    *,
+    standalone: bool = True,
+) -> None:
     """
     Generate a LaTeX report of the review session.
-    
-    The report includes:
-    - Search parameters (query, providers, date)
-    - Research context (if available)
-    - Summary statistics
-    - Kept papers grouped by theme
-    - Discarded papers grouped by motivation
-    
-    Also generates a .bib file with the same base name.
-    
+
+    The report includes the search parameters and research context,
+    summary statistics, and the kept and discarded papers grouped by
+    theme and motivation. A `.bib` file with the same base name is
+    always written. With `standalone` the `.tex` is a compilable
+    document; otherwise it is a fragment for `\\input`, whose header
+    says what the including document must set up.
+
     Args:
         session: The ReviewSession to report on.
         output_path: Path for the .tex file (will also create .bib).
+        standalone: Emit a compilable document (default) or a fragment.
     """
-    def make_cite_key(paper: Paper, index: int) -> str:
-        """Generate a unique citation key for a paper."""
-        if paper.authors:
-            first_author = paper.authors[0].split()[-1].lower()
-            first_author = ''.join(c for c in first_author if c.isalnum())
-        else:
-            first_author = "unknown"
-        year = paper.year or "nd"
-        return f"{first_author}{year}_{index}"
-    
-    def format_bibtex_entry(paper: Paper, cite_key: str) -> str:
-        """Format a paper as a BibTeX entry."""
-        lines = [f"@article{{{cite_key},"]
-        lines.append(f"  title = {{{escape_bibtex(paper.title)}}},")
-        if paper.authors:
-            authors = " and ".join(paper.authors)
-            lines.append(f"  author = {{{escape_bibtex(authors)}}},")
-        if paper.year:
-            lines.append(f"  year = {{{paper.year}}},")
-        if paper.venue:
-            lines.append(f"  journal = {{{escape_bibtex(paper.venue)}}},")
-        if paper.doi:
-            lines.append(f"  doi = {{{paper.doi}}},")
-        if paper.url:
-            lines.append(f"  url = {{{paper.url}}},")
-        lines.append("}")
-        return "\n".join(lines)
+    decisions = session.kept_papers() + session.discarded_papers()
+    keys = report_cite_keys(decisions)
 
-    def format_list_table(
-        decisions: list[ReviewDecision],
-        cite_keys: dict[int, str],
-        tag_label: str,
-    ) -> list[str]:
-        """
-        Generate LaTeX for a list table with Title, Year, Tags columns.
+    def cite_key(decision: ReviewDecision) -> str:
+        return keys[id(decision)]
 
-        Uses \\citetitle for paper titles to leverage biblatex formatting.
-        """
-        lines = [
-            r"\begin{longtable}{>{\raggedright\arraybackslash}p{0.55\textwidth}"
-            r"c>{\raggedright\arraybackslash}p{0.25\textwidth}}",
-            r"\toprule",
-            f"\\textbf{{Title}} & \\textbf{{Year}} & \\textbf{{{tag_label}}} \\\\",
-            r"\midrule",
-            r"\endhead",
-            r"\bottomrule",
-            r"\endlastfoot",
-        ]
-        for decision in decisions:
-            cite_key = cite_keys[id(decision)]
-            year = decision.paper.year or "---"
-            tags = ", ".join(escape_latex(t) for t in sorted(decision.tags))
-            lines.append(
-                f"\\citetitle{{{cite_key}}} & {year} & {tags} \\\\"
-            )
-        lines.append(r"\end{longtable}")
-        return lines
+    bib_path = output_path.with_suffix(".bib")
+    bib_path.write_text(build_report_bibtex(decisions, cite_key))
 
-    def format_matrix_table(
-        decisions: list[ReviewDecision],
-        cite_keys: dict[int, str],
-        tags: set[str],
-    ) -> list[str]:
-        """
-        Generate LaTeX for a cross-tabulation matrix (papers x tags).
+    body = build_review_provenance_latex(session)
+    body.extend(build_review_decisions_latex(session, cite_key))
+    abstract = build_review_report_abstract(session)
 
-        Uses \\citetitle for paper titles and \\checkmark for presence.
-        """
-        sorted_tags = sorted(tags)
-        num_tags = len(sorted_tags)
-
-        # Build column spec: title column + one centered column per tag
-        col_spec = r">{\raggedright\arraybackslash}p{0.4\textwidth}" + "c" * num_tags
-
-        lines = [
-            f"\\begin{{longtable}}{{{col_spec}}}",
-            r"\toprule",
-        ]
-
-        # Header row with rotated tag names
-        header_cells = [r"\textbf{Title}"]
-        for tag in sorted_tags:
-            header_cells.append(f"\\rotatebox{{90}}{{{escape_latex(tag)}}}")
-        lines.append(" & ".join(header_cells) + r" \\")
-        lines.append(r"\midrule")
-        lines.append(r"\endhead")
-        lines.append(r"\bottomrule")
-        lines.append(r"\endlastfoot")
-
-        # Data rows
-        for decision in decisions:
-            cite_key = cite_keys[id(decision)]
-            row_cells = [f"\\citetitle{{{cite_key}}}"]
-            for tag in sorted_tags:
-                if decision.has_tag(tag):
-                    row_cells.append(r"$\checkmark$")
-                else:
-                    row_cells.append("")
-            lines.append(" & ".join(row_cells) + r" \\")
-
-        lines.append(r"\end{longtable}")
-        return lines
-
-    # Generate citation keys for all papers
-    all_decisions = session.kept_papers() + session.discarded_papers()
-    cite_keys: dict[int, str] = {}
-    for i, decision in enumerate(all_decisions):
-        cite_keys[id(decision)] = make_cite_key(decision.paper, i)
-    
-    # Generate .bib file
-    bib_entries = []
-    for decision in all_decisions:
-        cite_key = cite_keys[id(decision)]
-        bib_entries.append(format_bibtex_entry(decision.paper, cite_key))
-    
-    bib_path = output_path.with_suffix('.bib')
-    bib_path.write_text("\n\n".join(bib_entries))
-    
-    # Generate .tex file
-    lines = [
-        r"\documentclass{article}",
-        r"\usepackage[utf8]{inputenc}",
-        r"\usepackage[colorlinks=true,allcolors=blue]{hyperref}",
-        r"\usepackage{enumitem}",
-        r"\usepackage{longtable}",
-        r"\usepackage{booktabs}",
-        r"\usepackage{array}",
-        r"\usepackage{amssymb}",
-        r"\usepackage{graphicx}",
-        r"\usepackage[backend=biber,style=authoryear]{biblatex}",
-        f"\\addbibresource{{{bib_path.name}}}",
-        r"",
-        r"\title{Literature Review Report}",
-        f"\\date{{{session.timestamp.strftime('%Y-%m-%d')}}}",
-        r"",
-        r"\begin{document}",
-        r"\maketitle",
-        r"",
-        r"\begin{abstract}",
-        build_review_report_abstract(session),
-        r"\end{abstract}",
-        r"\clearpage",
-        r"\clearpage",
-        r"\tableofcontents",
-        r"\clearpage",
-        r"",
-    ]
-
-    lines.extend(build_research_context_latex(session, heading_command=r"\section"))
-    lines.extend(build_search_parameters_latex(session, heading_command=r"\section"))
-
-    has_llm_decisions = any(
-        d.source in (ReviewSource.LLM_UNREVIEWED, ReviewSource.LLM_REVIEWED)
-        for d in session.decisions
-    )
-
-    llm_confirmed = 0
-    llm_changed_total = 0
-    llm_changed_kept_to_discarded = 0
-    llm_changed_discarded_to_kept = 0
-
-    if has_llm_decisions:
-        llm_confirmed = sum(
-            1
-            for d in session.decisions
-            if d.source == ReviewSource.LLM_REVIEWED and not d.is_example
+    if standalone:
+        lines = latex_document(
+            body,
+            title="Literature Review Report",
+            date=session.timestamp.strftime("%Y-%m-%d"),
+            bib_resource=bib_path.name,
+            abstract=abstract,
         )
-        llm_changed_total = sum(
-            1
-            for d in session.decisions
-            if d.source == ReviewSource.LLM_REVIEWED and d.is_example
-        )
-        llm_changed_kept_to_discarded = sum(
-            1
-            for d in session.decisions
-            if d.source == ReviewSource.LLM_REVIEWED
-            and d.is_example
-            and d.status == DecisionStatus.DISCARDED
-        )
-        llm_changed_discarded_to_kept = sum(
-            1
-            for d in session.decisions
-            if d.source == ReviewSource.LLM_REVIEWED
-            and d.is_example
-            and d.status == DecisionStatus.KEPT
+    else:
+        lines = latex_fragment(
+            refsection(body),
+            packages=LATEX_PACKAGES,
+            bib_resource=bib_path.name,
+            abstract=abstract,
+            generator="scholar sessions export --no-standalone",
         )
 
-    summary_items = [
-        f"\\item[Kept] {len(session.kept_papers())}",
-        f"\\item[Discarded] {len(session.discarded_papers())}",
-        f"\\item[Pending] {len(session.pending_papers())}",
-    ]
-
-    if has_llm_decisions:
-        summary_items.extend(
-            [
-                f"\\item[LLM confirmed] {llm_confirmed}",
-                f"\\item[LLM changed] {llm_changed_total}",
-                f"\\item[LLM changed (kept->discarded)] {llm_changed_kept_to_discarded}",
-                f"\\item[LLM changed (discarded->kept)] {llm_changed_discarded_to_kept}",
-            ]
-        )
-
-    lines.extend(
-        [
-            r"\begin{description}",
-            f"\\item[Date] {session.timestamp.strftime('%Y-%m-%d %H:%M')}",
-            f"\\item[Total Papers] {len(session.decisions)}",
-            r"\end{description}",
-            r"",
-            r"\section{Summary}",
-            r"\begin{description}",
-            *summary_items,
-            r"\end{description}",
-            r"",
-        ]
-    )
-
-    # Snowballing section (if any rounds were performed)
-    if session.snowball_rounds:
-        lines.extend([
-            r"\section{Snowballing}",
-            r"",
-            r"Manual snowballing was performed to discover additional papers",
-            r"through citations and references of kept papers.",
-            r"",
-            r"\begin{longtable}{llcl}",
-            r"\toprule",
-            r"Round & Direction & Papers Added & Source Papers \\",
-            r"\midrule",
-        ])
-        for i, round_info in enumerate(session.snowball_rounds, 1):
-            direction = "References" if round_info.direction == "references" else "Citations"
-            source_count = len(round_info.source_papers)
-            source_label = f"{source_count} paper{'s' if source_count != 1 else ''}"
-            lines.append(
-                f"{i} & {direction} & {round_info.papers_added} & {source_label} \\\\"
-            )
-        lines.extend([
-            r"\bottomrule",
-            r"\end{longtable}",
-            r"",
-        ])
-
-        # Summary of snowball-tagged papers
-        snowball_refs = [d for d in session.kept_papers() if d.has_tag("snowball-refs")]
-        snowball_cite = [d for d in session.kept_papers() if d.has_tag("snowball-cites")]
-        if snowball_refs or snowball_cite:
-            lines.extend([
-                r"\subsection{Papers Added via Snowballing}",
-                r"\begin{description}",
-            ])
-            if snowball_refs:
-                lines.append(
-                    f"\\item[From references] {len(snowball_refs)} papers"
-                )
-            if snowball_cite:
-                lines.append(
-                    f"\\item[From citations] {len(snowball_cite)} papers"
-                )
-            lines.extend([
-                r"\end{description}",
-                r"",
-            ])
-
-    # Summary Tables section
-    if session.kept_papers() or session.discarded_papers():
-        lines.extend([
-            r"\section{Summary Tables}",
-            r"",
-        ])
-
-        if session.kept_papers():
-            lines.extend([
-                r"\subsection{Kept Papers Overview}",
-                r"",
-            ])
-            lines.extend(format_list_table(
-                session.kept_papers(), cite_keys, "Themes"
-            ))
-            lines.append(r"")
-            themes = session.all_themes()
-            if themes:
-                lines.extend(format_matrix_table(
-                    session.kept_papers(), cite_keys, themes
-                ))
-                lines.append(r"")
-
-        if session.discarded_papers():
-            lines.extend([
-                r"\subsection{Discarded Papers Overview}",
-                r"",
-            ])
-            lines.extend(format_list_table(
-                session.discarded_papers(), cite_keys, "Motivations"
-            ))
-            lines.append(r"")
-            motivations = session.all_motivations()
-            if motivations:
-                lines.extend(format_matrix_table(
-                    session.discarded_papers(), cite_keys, motivations
-                ))
-                lines.append(r"")
-
-    # Kept papers section - grouped by theme
-    if session.kept_papers():
-        lines.extend([
-            r"\section{Kept Papers}",
-        ])
-        
-        themes = session.all_themes()
-        if themes:
-            # Group by theme
-            for theme in sorted(themes):
-                papers_with_theme = [
-                    d for d in session.kept_papers() if d.has_tag(theme)
-                ]
-                lines.append(f"\\subsection{{{escape_latex(theme)}}}")
-                lines.append(r"\begin{enumerate}")
-                for decision in papers_with_theme:
-                    cite_key = cite_keys[id(decision)]
-                    lines.append(f"\\item \\fullcite{{{cite_key}}}")
-                lines.append(r"\end{enumerate}")
-                lines.append("")
-        else:
-            # No themes, just list papers
-            lines.append(r"\begin{enumerate}")
-            for decision in session.kept_papers():
-                cite_key = cite_keys[id(decision)]
-                lines.append(f"\\item \\fullcite{{{cite_key}}}")
-            lines.append(r"\end{enumerate}")
-            lines.append("")
-
-    # Discarded papers section - grouped by motivation
-    if session.discarded_papers():
-        lines.extend([
-            r"\section{Discarded Papers}",
-        ])
-
-        motivations = session.all_motivations()
-        if motivations:
-            # Group by motivation
-            for motivation in sorted(motivations):
-                papers_with_motivation = [
-                    d for d in session.discarded_papers() if d.has_tag(motivation)
-                ]
-                lines.append(f"\\subsection{{{escape_latex(motivation)}}}")
-                lines.append(r"\begin{enumerate}")
-                for decision in papers_with_motivation:
-                    cite_key = cite_keys[id(decision)]
-                    lines.append(f"\\item \\fullcite{{{cite_key}}}")
-                lines.append(r"\end{enumerate}")
-                lines.append("")
-        else:
-            # No motivations, just list papers
-            lines.append(r"\begin{enumerate}")
-            for decision in session.discarded_papers():
-                cite_key = cite_keys[id(decision)]
-                lines.append(f"\\item \\fullcite{{{cite_key}}}")
-            lines.append(r"\end{enumerate}")
-            lines.append("")
-    
-    lines.extend([
-        r"\end{document}",
-    ])
-    
     output_path.write_text("\n".join(lines))
+@
+
+Let's verify both modes, pinning the default so that a future change
+cannot silently turn reports into fragments:
+
+<<test functions>>=
+class TestReportModes:
+    def _session(self):
+        session = ReviewSession(
+            query="q", providers=["p"], timestamp=datetime.now(),
+        )
+        session.decisions = [
+            ReviewDecision(
+                paper=Paper(title="P", authors=["A"], year=2024),
+                provider="p", status=DecisionStatus.KEPT, tags=["ml"],
+            ),
+        ]
+        return session
+
+    def test_default_is_standalone(self, tmp_path):
+        path = tmp_path / "report.tex"
+        generate_latex_report(self._session(), path)
+        content = path.read_text()
+        assert content.startswith(r"\documentclass{article}")
+        assert r"\addbibresource{report.bib}" in content
+        assert r"\begin{refsection}" not in content
+        assert content.rstrip().endswith(r"\end{document}")
+
+    def test_fragment_omits_skeleton_and_writes_bib(self, tmp_path):
+        path = tmp_path / "report.tex"
+        generate_latex_report(self._session(), path, standalone=False)
+        content = path.read_text()
+        assert r"\documentclass" not in content
+        assert r"\begin{document}" not in content
+        assert "\n\\addbibresource" not in content
+        assert "report.bib" in content
+        assert r"\begin{refsection}" in content
+        assert r"\section{Kept Papers}" in content
+        assert (tmp_path / "report.bib").read_text().startswith("@article{")
+@
+
+\subsection{Audit table}
+
+A backing appendix in a paper must let a reader without access to the
+session see every candidate the search returned and why each one was
+kept or excluded. The review report is too long for that and is a
+document of its own; what the appendix needs is one table. Its rows are
+papers, its last column is the reason, and it is always a fragment
+because it is meant to be [[\input]] next to the claim it backs.
+
+The reason column encodes the review's own vocabulary. A paper a human
+kept is \emph{cited}, under the theme its tags name; the caller may map
+theme tags to readable names. The remaining papers were classified, by a
+human or by [[scholar llm classify]], into one of four categories that a
+two-sided literature search produces: the paper supports the claim,
+qualifies or contradicts it, belongs to an adjacent subtopic, or is a
+false hit from another field. The order of the categories doubles as the
+sort order, so the table reads from the strongest evidence downwards.
+Papers still pending sort after them, and last come the rows that are
+only bookkeeping: a review also tags records it deliberately does not
+cite---a duplicate record, a reprint, the thesis behind a cited paper,
+a record judged on its title alone---and those tags are \emph{notes},
+not themes. Treating them as themes once inflated a cited count from
+thirteen to seventeen.
+
+The caption never names the session: session names are the author's
+bookkeeping and must not appear in compiled text. The fragment carries
+the name in a comment instead, and the [[--track]] text identifies the
+table for the reader.
+
+<<review report generation>>=
+AUDIT_CATEGORIES: dict[str, int] = {
+    "supports-claim": 1,
+    "qualifies-claim": 2,
+    "adjacent-subtopic": 3,
+    "off-topic-false-hit": 4,
+}
+AUDIT_ORDER_CITED = 0
+AUDIT_ORDER_BEARING = 2      # cited, supports and qualifies bear on the claim
+AUDIT_ORDER_PENDING = 5
+AUDIT_ORDER_OTHER = 6        # notes only, or a tag the review does not know
+AUDIT_TITLE_LENGTH = 180
+
+AUDIT_STRINGS: dict[str, dict] = {
+    "en": {
+        "caption": (
+            "Full hit list{track} ({n} unique hits: {cited} cited, "
+            "{supports} supporting the claim, {qualifies} qualifying or "
+            "contradicting it, {adjacent} adjacent, {offtopic} false "
+            "hits{extra}). The last column gives the reason for each "
+            "inclusion or exclusion; for machine-classified rows the "
+            "model's confidence is given. {databases}"
+        ),
+        "bearing": (
+            "Records bearing on the claim{track} ({cited} cited, {supports} "
+            "supporting and {qualifies} qualifying or contradicting it, out "
+            "of {n} unique hits; the {adjacent} adjacent and {offtopic} "
+            "false hits{extra} are not listed). The last column gives the "
+            "reason for each inclusion; for machine-classified rows the "
+            "model's confidence is given. {databases}"
+        ),
+        "extra_pending": ", {pending} unclassified",
+        "extra_other": (
+            ", {other} duplicates or other versions of cited sources"
+        ),
+        "databases": "Databases: {list}.",
+        "openalex_note": "not open access",
+        "title": "Title",
+        "year": "Year",
+        "provider": "Provider",
+        "reason": "Reason",
+        "cited": "cited",
+        "supports-claim": "supports the claim",
+        "qualifies-claim": "qualifies or contradicts the claim",
+        "adjacent-subtopic": "adjacent subtopic",
+        "off-topic-false-hit": "other topic (false hit)",
+        "pending": "pending, unclassified",
+        "continued": "(cont.)",
+        "continued_next": "continued on next page",
+        "notes": {
+            "duplicate-record-of-cited-source":
+                "duplicate record of a cited source",
+            "duplicate-reprint-of-cited-source": "reprint of a cited source",
+            "extended-tech-report":
+                "extended report version of a cited source",
+            "earlier-version-of-cited-source":
+                "earlier version of a cited source",
+            "superseded-by-journal-version":
+                "superseded by the journal version",
+            "thesis-of-cited-source": "thesis behind a cited source",
+            "erratum-to-cited-source": "erratum to a cited source",
+            "recorded-not-cited": "recorded, not cited",
+            "no-abstract-title-only":
+                "judged on title, no abstract available",
+        },
+    },
+    "sv": {
+        "caption": (
+            "Fullständig träfflista{track} ({n} unika träffar: {cited} "
+            "citerade, {supports} stöder påståendet, {qualifies} "
+            "kvalificerar eller motsäger det, {adjacent} angränsande, "
+            "{offtopic} felträffar{extra}). Skälet till varje in- eller "
+            "uteslutning står i sista kolumnen; för maskinklassade rader "
+            "anges modellens konfidens. {databases}"
+        ),
+        "bearing": (
+            "Träffar som rör påståendet{track} ({cited} citerade, {supports} "
+            "som stöder påståendet och {qualifies} som kvalificerar eller "
+            "motsäger det, av {n} unika träffar; de {adjacent} angränsande "
+            "och {offtopic} felträffarna{extra} listas inte). Skälet till "
+            "varje inkludering står i sista kolumnen; för maskinklassade "
+            "rader anges modellens konfidens. {databases}"
+        ),
+        "extra_pending": ", {pending} ej klassade",
+        "extra_other": (
+            ", {other} dubbletter eller andra versioner av citerade källor"
+        ),
+        "databases": "Databaser: {list}.",
+        "openalex_note": "inte open access",
+        "title": "Titel",
+        "year": "År",
+        "provider": "Leverantör",
+        "reason": "Skäl",
+        "cited": "citerad",
+        "supports-claim": "stöder påståendet",
+        "qualifies-claim": "kvalificerar eller motsäger påståendet",
+        "adjacent-subtopic": "angränsande delämne",
+        "off-topic-false-hit": "annat ämne (felträff)",
+        "pending": "ej klassad",
+        "continued": "(forts.)",
+        "continued_next": "forts.\\ på nästa sida",
+        "notes": {
+            "duplicate-record-of-cited-source":
+                "dubblettpost av citerad källa",
+            "duplicate-reprint-of-cited-source": "omtryck av citerad källa",
+            "extended-tech-report":
+                "utökad rapportversion av citerad källa",
+            "earlier-version-of-cited-source":
+                "tidigare version av citerad källa",
+            "superseded-by-journal-version":
+                "ersatt av tidskriftsversionen",
+            "thesis-of-cited-source": "avhandling bakom citerad källa",
+            "erratum-to-cited-source": "erratum till citerad källa",
+            "recorded-not-cited": "noterad, inte citerad",
+            "no-abstract-title-only":
+                "bedömd på titel, sammanfattning saknas",
+        },
+    },
+}
+
+PROVIDER_SHORT_NAMES: dict[str, str] = {   # in caption order
+    "openalex": "OA",
+    "dblp": "DBLP",
+    "ieee": "IEEE",
+    "wos": "WoS",
+    "scopus": "Scopus",
+    "s2": "S2",
+    "arxiv": "arXiv",
+    "hal": "HAL",
+}
+PROVIDER_SEPARATORS = re.compile(r"[;,|]")
+
+PROVIDER_FULL_NAMES: dict[str, str] = {
+    "openalex": "OpenAlex",
+    "dblp": "DBLP",
+    "wos": "Web of Science",
+    "ieee": "IEEE Xplore",
+    "scopus": "Scopus",
+    "s2": "Semantic Scholar",
+    "arxiv": "arXiv",
+    "hal": "HAL",
+}
 
 
+@dataclass
+class AuditRow:
+    """One row of the audit table: a unique paper and its reason."""
+
+    title: str
+    year: str
+    providers: list[str]
+    status: DecisionStatus
+    reason: str
+    order: int
+@
+
+Three facts about how decisions are recorded shape the cited rule.
+First, [[sessions decide -t]] appends to a row's tags, so a human who
+keeps an LLM-classified [[supports-claim]] paper under a theme leaves
+both tags on it; looking only at the first tag would file the paper
+under the category and count no cited rows at all. The rule therefore
+splits the tags into category tags, note tags and theme tags and takes
+the theme from the last group. Second, an LLM keep is a candidate, not
+a citation: only a decision a human made (or reviewed) counts as cited,
+which is also what the [[decision_source]] column of the CSV export
+says. Third, when the caller names its themes with [[--theme]], that
+list is an allowlist: any other tag that is neither a category nor a
+known note is shown as a note, so a stray tag cannot pass for a theme.
+Without the list, every tag that is not a category or a note is a
+theme. Notes are appended in parentheses to whatever reason the row
+has; a row with only notes is filed among the \enquote{other} rows.
+
+When a row carries several category tags, the \emph{last} one is the
+decision: tags accumulate in the order they were given, so a reviewer
+who changes an LLM's \enquote{supports} to \enquote{false hit} leaves
+both, and taking the first once counted an explicitly rejected paper as
+supporting evidence in a published appendix. The confidence is shown
+for the rows whose category is the machine's: unreviewed LLM decisions
+and the ones a human confirmed as they stood. A human who changed the
+decision owns the new label, so no confidence goes with it. Finally, a
+theme that merely repeats the word \enquote{cited} adds nothing and is
+not repeated.
+
+The confidence is shown only for decisions the LLM made and nobody has
+reviewed yet: once a human confirms or changes a decision it is a human
+decision, and the number would misrepresent it.
+
+<<review report generation>>=
+def audit_reason(
+    decision: ReviewDecision,
+    *,
+    theme_names: dict[str, str],
+    strings: dict,
+) -> tuple[str, int]:
+    """Return the reason label and sort order for `decision`."""
+    tags = list(decision.tags)
+    notes = strings["notes"]
+    category = next(
+        (t for t in reversed(tags) if t in AUDIT_CATEGORIES), None
+    )
+    note_texts = [notes[t] for t in tags if t in notes]
+    if theme_names:
+        theme_tags = [t for t in tags if t in theme_names]
+        note_texts += [
+            escape_latex(t) for t in tags
+            if t not in AUDIT_CATEGORIES and t not in notes
+            and t not in theme_names
+        ]
+    else:
+        theme_tags = [
+            t for t in tags if t not in AUDIT_CATEGORIES and t not in notes
+        ]
+    human_decision = decision.source != ReviewSource.LLM_UNREVIEWED
+    kept = decision.status == DecisionStatus.KEPT
+    machine_label = decision.source == ReviewSource.LLM_UNREVIEWED or (
+        decision.source == ReviewSource.LLM_REVIEWED
+        and not decision.is_example
+    )
+    confidence = ""
+    if machine_label and decision.llm_confidence is not None:
+        confidence = f" ({decision.llm_confidence:.2f})"
+
+    if decision.status == DecisionStatus.PENDING:
+        return strings["pending"], AUDIT_ORDER_PENDING
+    if kept and human_decision and theme_tags:
+        theme = theme_names.get(theme_tags[0], theme_tags[0])
+        label = f"\\emph{{{strings['cited']}}}"
+        if theme.casefold() != strings["cited"].casefold():
+            label += ": " + escape_latex(theme)
+        order = AUDIT_ORDER_CITED
+    elif kept and human_decision and not tags:
+        label, order = f"\\emph{{{strings['cited']}}}", AUDIT_ORDER_CITED
+    elif category is not None:
+        label = strings[category] + confidence
+        order = AUDIT_CATEGORIES[category]
+    elif note_texts:
+        return "; ".join(note_texts), AUDIT_ORDER_OTHER
+    elif not tags:
+        return strings["pending"], AUDIT_ORDER_PENDING
+    else:
+        return escape_latex(tags[0]) + confidence, AUDIT_ORDER_OTHER
+    if note_texts:
+        label += " (" + "; ".join(note_texts) + ")"
+    return label, order
+@
+
+Each category, the confidence suffix and the fall-through cases are
+checked in turn:
+
+<<test functions>>=
+class TestAuditReason:
+    def _reason(self, status, tags, source=ReviewSource.HUMAN, conf=None,
+                theme_names=None, is_example=False):
+        decision = ReviewDecision(
+            paper=Paper(title="P", authors=["A"], year=2024),
+            provider="p", status=status, tags=tags, source=source,
+            llm_confidence=conf, is_example=is_example,
+        )
+        return audit_reason(
+            decision, theme_names=theme_names or {},
+            strings=AUDIT_STRINGS["en"],
+        )
+
+    def test_kept_theme_is_cited_with_readable_name(self):
+        label, order = self._reason(
+            DecisionStatus.KEPT, ["ml"], theme_names={"ml": "machine learning"}
+        )
+        assert label == r"\emph{cited}: machine learning"
+        assert order == AUDIT_ORDER_CITED
+
+    def test_kept_without_tags(self):
+        assert self._reason(DecisionStatus.KEPT, []) == (r"\emph{cited}", 0)
+
+    def test_human_keep_over_llm_category_is_cited(self):
+        label, order = self._reason(
+            DecisionStatus.KEPT, ["supports-claim", "ml"],
+            source=ReviewSource.LLM_REVIEWED, conf=0.9,
+        )
+        assert (label, order) == (r"\emph{cited}: ml", AUDIT_ORDER_CITED)
+
+    def test_llm_keep_is_a_candidate_not_a_citation(self):
+        assert self._reason(
+            DecisionStatus.KEPT, ["supports-claim"],
+            source=ReviewSource.LLM_UNREVIEWED, conf=0.9,
+        ) == ("supports the claim (0.90)", 1)
+        assert self._reason(
+            DecisionStatus.KEPT, ["ml"],
+            source=ReviewSource.LLM_UNREVIEWED, conf=0.8,
+        ) == ("ml (0.80)", AUDIT_ORDER_OTHER)
+
+    def test_note_tags_are_notes_not_themes(self):
+        assert self._reason(DecisionStatus.KEPT, ["recorded-not-cited"]) \
+            == ("recorded, not cited", AUDIT_ORDER_OTHER)
+        label, order = self._reason(
+            DecisionStatus.KEPT, ["ml", "extended-tech-report"],
+            theme_names={"ml": "ML"},
+        )
+        assert label == r"\emph{cited}: ML (extended report version of " \
+            "a cited source)"
+        assert order == AUDIT_ORDER_CITED
+        assert self._reason(
+            DecisionStatus.DISCARDED,
+            ["supports-claim", "no-abstract-title-only"],
+        ) == (
+            "supports the claim (judged on title, no abstract available)", 1
+        )
+
+    def test_theme_list_is_an_allowlist(self):
+        assert self._reason(
+            DecisionStatus.KEPT, ["stray-tag"], theme_names={"ml": "ML"}
+        ) == ("stray-tag", AUDIT_ORDER_OTHER)
+        assert self._reason(DecisionStatus.KEPT, ["stray-tag"]) \
+            == (r"\emph{cited}: stray-tag", AUDIT_ORDER_CITED)
+
+    def test_categories_with_llm_confidence(self):
+        label, order = self._reason(
+            DecisionStatus.DISCARDED, ["supports-claim"],
+            source=ReviewSource.LLM_UNREVIEWED, conf=0.93,
+        )
+        assert label == "supports the claim (0.93)"
+        assert order == 1
+        assert self._reason(DecisionStatus.DISCARDED, ["qualifies-claim"]) \
+            == ("qualifies or contradicts the claim", 2)
+        assert self._reason(DecisionStatus.DISCARDED, ["adjacent-subtopic"]) \
+            == ("adjacent subtopic", 3)
+        assert self._reason(
+            DecisionStatus.DISCARDED, ["off-topic-false-hit"]
+        ) == ("other topic (false hit)", 4)
+
+    def test_confirmed_llm_decision_keeps_confidence(self):
+        label, _ = self._reason(
+            DecisionStatus.DISCARDED, ["supports-claim"],
+            source=ReviewSource.LLM_REVIEWED, conf=0.93,
+        )
+        assert label == "supports the claim (0.93)"
+
+    def test_changed_llm_decision_hides_confidence(self):
+        label, _ = self._reason(
+            DecisionStatus.DISCARDED, ["supports-claim"],
+            source=ReviewSource.LLM_REVIEWED, conf=0.93, is_example=True,
+        )
+        assert label == "supports the claim"
+
+    def test_latest_category_tag_is_the_decision(self):
+        label, order = self._reason(
+            DecisionStatus.DISCARDED,
+            ["supports-claim", "off-topic-false-hit"],
+            source=ReviewSource.LLM_REVIEWED, conf=0.9, is_example=True,
+        )
+        assert (label, order) == ("other topic (false hit)", 4)
+
+    def test_theme_equal_to_the_label_is_not_repeated(self):
+        assert self._reason(DecisionStatus.KEPT, ["cited"]) \
+            == (r"\emph{cited}", AUDIT_ORDER_CITED)
+
+    def test_pending_and_unknown_tags_sort_last(self):
+        assert self._reason(DecisionStatus.PENDING, []) \
+            == ("pending, unclassified", AUDIT_ORDER_PENDING)
+        assert self._reason(DecisionStatus.DISCARDED, ["needs_fulltext"]) \
+            == (r"needs\_fulltext", AUDIT_ORDER_OTHER)
+        assert AUDIT_ORDER_PENDING < AUDIT_ORDER_OTHER
+@
+
+The same paper often arrives from several providers, sometimes with and
+sometimes without a DOI, so a session may hold it more than once. The
+audit table is about works, not records: rows are merged on a work key,
+the providers are joined, and the best-placed decision wins---a cited
+copy over a category, a category over a note---because the paper is
+what it is whatever the other providers' copies were classified as. The
+key is the title reduced to its letters and digits, case-folded, plus
+the first author's surname treated the same way. Punctuation, quotes
+and capitalisation differ between providers for the same work, and the
+year is left out on purpose: a preprint and its journal article, or
+OpenAlex's DOI-registration year against the publication year, are the
+same work to a reader of the appendix, and counting them twice inflated
+the numbers the appendices quoted. Titles are truncated before escaping
+so the cut cannot land inside an escape sequence.
+
+A decision's [[provider]] is itself a joined string when the session
+merged records at search time (\enquote{openalex; dblp}), so providers
+are split on the separators the session uses, mapped to their codes
+and deduplicated before they are joined again for the cell; an
+unmapped name is kept as written.
+
+<<review report generation>>=
+def provider_short_names(provider: str | None) -> list[str]:
+    """Split a decision's provider string into deduplicated codes."""
+    names: list[str] = []
+    for part in PROVIDER_SEPARATORS.split(provider or ""):
+        part = part.strip()
+        if not part:
+            continue
+        short = PROVIDER_SHORT_NAMES.get(part.lower(), part)
+        if short not in names:
+            names.append(short)
+    return names
+
+
+def audit_work_key(paper: Paper) -> tuple[str, str]:
+    """Reduce a paper to the key its audit row is merged on."""
+    def letters(text: str) -> str:
+        cleaned = clean_metadata_text(text or "")
+        folded = unicodedata.normalize("NFKD", cleaned).casefold()
+        return "".join(c for c in folded if c.isalnum())
+
+    surname = ""
+    if paper.authors:
+        first = paper.authors[0] or ""
+        surname = first.split(",")[0] if "," in first else first.split()[-1]
+    return letters(paper.title), letters(surname)
+
+
+def collect_audit_rows(
+    session: ReviewSession,
+    *,
+    theme_names: dict[str, str],
+    strings: dict[str, str],
+) -> list[AuditRow]:
+    """Merge the session's decisions into sorted audit rows."""
+    rows: dict[tuple[str, str], AuditRow] = {}
+    for decision in session.decisions:
+        paper = decision.paper
+        title = paper.title or ""
+        year = str(paper.year) if paper.year else ""
+        key = audit_work_key(paper)
+        providers = provider_short_names(decision.provider)
+        reason, order = audit_reason(
+            decision, theme_names=theme_names, strings=strings
+        )
+        row = rows.get(key)
+        if row is None:
+            rows[key] = AuditRow(
+                title=escape_latex(title[:AUDIT_TITLE_LENGTH]),
+                year=year,
+                providers=providers,
+                status=decision.status,
+                reason=reason,
+                order=order,
+            )
+            continue
+        for provider in providers:
+            if provider not in row.providers:
+                row.providers.append(provider)
+        if not row.year:
+            row.year = year
+        if order < row.order:
+            row.status, row.reason, row.order = decision.status, reason, order
+    return sorted(rows.values(), key=lambda r: (r.order, r.title.lower()))
+@
+
+The fixture holds a duplicate across two providers (one copy kept), a
+title with a symbol pdf\LaTeX{} cannot typeset, and a pending paper; the
+merge must keep the kept decision and sort it first:
+
+<<test functions>>=
+def _audit_session():
+    session = ReviewSession(
+        query="q", providers=["openalex", "dblp"], timestamp=datetime.now(),
+        name="aud",
+    )
+    llm = ReviewSource.LLM_UNREVIEWED
+    session.decisions = [
+        ReviewDecision(
+            paper=Paper(title="Dup", authors=["A"], year=2023, doi="10/a"),
+            provider="dblp", status=DecisionStatus.DISCARDED,
+            tags=["off-topic-false-hit"], source=llm, llm_confidence=0.5,
+        ),
+        ReviewDecision(
+            paper=Paper(title="Dup", authors=["A"], year=2023),
+            provider="openalex", status=DecisionStatus.KEPT, tags=["ml"],
+        ),
+        ReviewDecision(
+            paper=Paper(title="Supports \u2606", authors=["B"], year=2021),
+            provider="dblp", status=DecisionStatus.DISCARDED,
+            tags=["supports-claim"], source=llm, llm_confidence=0.93,
+        ),
+        ReviewDecision(
+            paper=Paper(title="Waiting", authors=["C"], year=2024),
+            provider="openalex", status=DecisionStatus.PENDING,
+        ),
+    ]
+    return session
+
+
+class TestCollectAuditRows:
+    def test_provider_strings_are_split_and_mapped(self):
+        assert provider_short_names("openalex; dblp, WOS |ieee|dblp") \
+            == ["OA", "DBLP", "WoS", "IEEE"]
+        assert provider_short_names("mylib") == ["mylib"]
+        assert provider_short_names(None) == []
+
+    def test_same_work_merges_across_providers_and_years(self):
+        session = ReviewSession(
+            query="q", providers=["openalex"], timestamp=datetime.now(),
+        )
+        session.decisions = [
+            ReviewDecision(
+                paper=Paper(title="FROM BABBAGE TO BABEL: A HISTORY",
+                            authors=["Ada K. Lovelace"], year=2024),
+                provider="openalex", status=DecisionStatus.DISCARDED,
+                tags=["supports-claim"],
+            ),
+            ReviewDecision(
+                paper=Paper(title="From Babbage to Babel – a history",
+                            authors=["Lovelace, Ada"], year=2023),
+                provider="dblp", status=DecisionStatus.DISCARDED,
+                tags=["supports-claim"],
+            ),
+        ]
+        rows = collect_audit_rows(
+            session, theme_names={}, strings=AUDIT_STRINGS["en"]
+        )
+        assert len(rows) == 1
+        assert rows[0].providers == ["OA", "DBLP"]
+        assert audit_work_key(session.decisions[0].paper) \
+            == ("frombabbagetobabelahistory", "lovelace")
+
+    def test_titles_merge_across_case_and_whitespace(self):
+        session = ReviewSession(
+            query="q", providers=["openalex"], timestamp=datetime.now(),
+        )
+        session.decisions = [
+            ReviewDecision(
+                paper=Paper(title="Same  Title", authors=["A"], year=2020),
+                provider="openalex; dblp", status=DecisionStatus.KEPT,
+                tags=["ml"],
+            ),
+            ReviewDecision(
+                paper=Paper(title="same\u00a0title", authors=["A"],
+                            year=2020),
+                provider="scopus", status=DecisionStatus.DISCARDED,
+                tags=["off-topic-false-hit"],
+            ),
+        ]
+        rows = collect_audit_rows(
+            session, theme_names={}, strings=AUDIT_STRINGS["en"]
+        )
+        assert len(rows) == 1
+        assert rows[0].providers == ["OA", "DBLP", "Scopus"]
+        assert rows[0].order == AUDIT_ORDER_CITED
+
+    def test_databases_sentence_is_ordered_and_deduplicated(self):
+        rows = [
+            AuditRow("t", "2020", ["Scopus", "WoS"], DecisionStatus.KEPT,
+                     "r", 0),
+            AuditRow("u", "2020", ["IEEE", "OA", "mylib"],
+                     DecisionStatus.KEPT, "r", 0),
+        ]
+        assert audit_databases_sentence(rows, AUDIT_STRINGS["en"]) == (
+            "Databases: OpenAlex (OA; not open access), IEEE Xplore (IEEE), "
+            "Web of Science (WoS), Scopus, mylib."
+        )
+
+    def test_merges_duplicates_and_kept_wins(self):
+        rows = collect_audit_rows(
+            _audit_session(), theme_names={}, strings=AUDIT_STRINGS["en"]
+        )
+        assert [r.title for r in rows] == ["Dup", "Supports ", "Waiting"]
+        dup = rows[0]
+        assert dup.providers == ["DBLP", "OA"]
+        assert dup.status == DecisionStatus.KEPT
+        assert dup.reason == r"\emph{cited}: ml"
+        assert [r.order for r in rows] == [0, 1, 5]
+@
+
+The caption closes by naming the databases behind the provider codes,
+full name first, because the code \enquote{OA} reads as \enquote{open
+access} to anyone who has not met OpenAlex; the sentence is built from
+the providers that actually occur in the rows, so a session that never
+asked Scopus does not claim to have.
+
+<<review report generation>>=
+def audit_databases_sentence(rows: list[AuditRow], strings: dict) -> str:
+    """Name the databases behind the provider codes used in `rows`."""
+    used: list[str] = []
+    for row in rows:
+        for provider in row.providers:
+            if provider not in used:
+                used.append(provider)
+    names: list[str] = []
+    for key, short in PROVIDER_SHORT_NAMES.items():
+        if short not in used:
+            continue
+        full = PROVIDER_FULL_NAMES[key]
+        if key == "openalex":
+            names.append(f"{full} ({short}; {strings['openalex_note']})")
+        elif full == short:
+            names.append(full)
+        else:
+            names.append(f"{full} ({short})")
+        used.remove(short)
+    names.extend(escape_latex(p) for p in used)
+    if not names:
+        return ""
+    return strings["databases"].format(list=", ".join(names))
+@
+
+The table itself follows the conventions of the appendix it is meant for:
+a [[longtable]] with a repeated header and a \enquote{continued} footer,
+set in [[\footnotesize]] so four columns fit, with a caption that states
+the counts per category so the reader gets the outcome before the rows.
+Both the caption and the labels are localised; the label argument becomes
+the [[\label]] the surrounding text refers to.
+
+A topic-driven session can hold thousands of records, and a table of all
+of them runs to dozens of pages that say \enquote{false hit} over and
+over.  [[bearing_only]] therefore lists only the rows that bear on the
+claim---cited, supporting, qualifying---and moves the adjacent,
+off-topic and unclassified records into the caption as counts, so the
+appendix still accounts for every record without printing it.
+
+<<review report generation>>=
+def build_audit_table_latex(
+    session: ReviewSession,
+    *,
+    label: str,
+    lang: str = "en",
+    track: str | None = None,
+    theme_names: dict[str, str] | None = None,
+    bearing_only: bool = False,
+) -> list[str]:
+    """Build the audit longtable as LaTeX lines."""
+    if lang not in AUDIT_STRINGS:
+        raise ValueError(f"Unsupported language: {lang}")
+    strings = AUDIT_STRINGS[lang]
+    rows = collect_audit_rows(
+        session, theme_names=theme_names or {}, strings=strings
+    )
+    counts = {
+        order: sum(1 for r in rows if r.order == order) for order in range(7)
+    }
+    databases = audit_databases_sentence(rows, strings)
+    if bearing_only:
+        template = strings["bearing"]
+        rows = [r for r in rows if r.order <= AUDIT_ORDER_BEARING]
+    else:
+        template = strings["caption"]
+    if not rows:
+        logger.warning(
+            "audit table for %s is empty%s",
+            session.name or session.query,
+            " (no row bears on the claim)" if bearing_only else "",
+        )
+    extra = ""
+    if counts[AUDIT_ORDER_PENDING]:
+        extra += strings["extra_pending"].format(
+            pending=counts[AUDIT_ORDER_PENDING]
+        )
+    if counts[AUDIT_ORDER_OTHER]:
+        extra += strings["extra_other"].format(other=counts[AUDIT_ORDER_OTHER])
+    caption = template.format(
+        track=f", {escape_latex(track)}" if track else "",
+        n=sum(counts.values()),
+        cited=counts[0],
+        supports=counts[1],
+        qualifies=counts[2],
+        adjacent=counts[3],
+        offtopic=counts[4],
+        extra=extra,
+        databases=databases,
+    )
+    header = (
+        f"{strings['title']} & {strings['year']} & "
+        f"{strings['provider']} & {strings['reason']} \\\\"
+    )
+    lines = [
+        r"\begingroup\footnotesize",
+        r"\begin{longtable}{@{}%",
+        r"  >{\raggedright\arraybackslash}p{0.44\textwidth}c%",
+        r"  >{\raggedright\arraybackslash}p{0.13\textwidth}%",
+        r"  >{\raggedright\arraybackslash}p{0.26\textwidth}@{}}",
+        f"\\caption{{{caption}}}\\label{{tab:{label}}}\\\\",
+        r"\toprule",
+        header,
+        r"\midrule",
+        r"\endfirsthead",
+        "\\multicolumn{4}{@{}l}{\\emph{\\tablename~\\thetable{} "
+        f"{strings['continued']}}}}}\\\\",
+        r"\toprule",
+        header,
+        r"\midrule",
+        r"\endhead",
+        f"\\midrule \\multicolumn{{4}}{{r@{{}}}}"
+        f"{{\\emph{{{strings['continued_next']}}}}}\\\\",
+        r"\endfoot",
+        r"\bottomrule",
+        r"\endlastfoot",
+    ]
+    for row in rows:
+        providers = ", ".join(row.providers)
+        lines.append(
+            f"{row.title} & {row.year} & {providers} & {row.reason} \\\\"
+        )
+    lines.extend([r"\end{longtable}", r"\endgroup"])
+    return lines
+
+
+AUDIT_TABLE_PACKAGES: list[str] = [
+    r"\usepackage{longtable}",
+    r"\usepackage{booktabs}",
+    r"\usepackage{array}",
+]
+
+
+def generate_audit_table(
+    session: ReviewSession,
+    output_path: Path,
+    *,
+    label: str,
+    lang: str = "en",
+    track: str | None = None,
+    theme_names: dict[str, str] | None = None,
+    bearing_only: bool = False,
+) -> None:
+    """Write the audit table for `session` as a LaTeX fragment."""
+    body = build_audit_table_latex(
+        session, label=label, lang=lang, track=track,
+        theme_names=theme_names, bearing_only=bearing_only,
+    )
+    lines = latex_fragment(
+        body,
+        packages=AUDIT_TABLE_PACKAGES,
+        generator="scholar sessions export -f table",
+        comments=[f"Session: {session.name or session.query}"],
+    )
+    output_path.write_text("\n".join(lines) + "\n")
+@
+
+Finally the whole table, in Swedish and in English:
+
+<<test functions>>=
+class TestAuditTable:
+    def test_swedish_table(self):
+        lines = build_audit_table_latex(
+            _audit_session(), label="sok-A", lang="sv",
+            track="sökspår 1", theme_names={"ml": "maskininlärning"},
+        )
+        text = "\n".join(lines)
+        assert lines[0] == r"\begingroup\footnotesize"
+        assert r"\label{tab:sok-A}" in text
+        assert "Fullständig träfflista, sökspår 1 (3 unika träffar: " \
+            "1 citerade, 1 stöder påståendet, 0 kvalificerar eller " \
+            "motsäger det, 0 angränsande, 0 felträffar, 1 ej klassade)." \
+            in text
+        assert "Databaser: OpenAlex (OA; inte open access), DBLP." in text
+        assert "aud" not in text.replace("Databaser", "")
+        assert "Titel & År & Leverantör & Skäl \\\\" in text
+        assert r"Dup & 2023 & DBLP, OA & \emph{citerad}: maskininlärning \\" \
+            in text
+        assert "stöder påståendet (0.93)" in text
+        assert "Waiting & 2024 & OA & ej klassad" in text
+        assert "forts.\\ på nästa sida" in text
+        assert lines[-1] == r"\endgroup"
+
+    def test_bearing_only_lists_bearing_rows_and_counts_the_rest(self):
+        lines = build_audit_table_latex(
+            _audit_session(), label="x", bearing_only=True
+        )
+        text = "\n".join(lines)
+        assert "Dup & 2023" in text
+        assert "Supports " in text
+        assert "Waiting" not in text
+        assert "Records bearing on the claim (1 cited, 1 supporting and " \
+            "0 qualifying or contradicting it, out of 3 unique hits; the " \
+            "0 adjacent and 0 false hits, 1 unclassified are not listed)." \
+            " The last column" in text
+        assert "Databases: OpenAlex (OA; not open access), DBLP." in text
+        sv = "\n".join(build_audit_table_latex(
+            _audit_session(), label="x", lang="sv", bearing_only=True
+        ))
+        assert "listas inte" in sv and ", 1 ej klassade" in sv
+
+    def test_english_default_and_unknown_language(self):
+        lines = build_audit_table_latex(_audit_session(), label="x")
+        assert "Title & Year & Provider & Reason \\\\" in lines
+        with pytest.raises(ValueError):
+            build_audit_table_latex(_audit_session(), label="x", lang="de")
+
+    def test_empty_table_warns(self, caplog):
+        import logging
+
+        session = ReviewSession(
+            query="q", providers=["p"], timestamp=datetime.now(), name="e",
+        )
+        session.decisions = [
+            ReviewDecision(
+                paper=Paper(title="P", authors=["A"], year=2024),
+                provider="p", status=DecisionStatus.PENDING,
+            ),
+        ]
+        with caplog.at_level(logging.WARNING):
+            lines = build_audit_table_latex(
+                session, label="x", bearing_only=True
+            )
+        assert "is empty (no row bears on the claim)" in caplog.text
+        assert r"\end{longtable}" in lines
+
+    def test_generate_audit_table_is_fragment(self, tmp_path):
+        path = tmp_path / "table.tex"
+        generate_audit_table(_audit_session(), path, label="x")
+        content = path.read_text()
+        assert r"\documentclass" not in content
+        assert "% Generated by: scholar sessions export -f table" in content
+        assert "% Session: aud" in content
+        assert "%   \\usepackage{longtable}" in content
+        assert r"\addbibresource" not in content
+        assert r"\begin{longtable}" in content
+@
+
+\subsection{CSV report}
+
+The CSV carries every field the other artefacts summarise, including the
+LLM provenance columns, so that a spreadsheet or a script can recompute
+any of the tables above. The last column is the session's paper id, the
+selector [[sessions decide --paper-id]] accepts, so a record without a
+DOI can be decided from the CSV without opening the TUI.
+
+<<review report generation>>=
 def generate_csv_report(session: ReviewSession, output_path: Path) -> None:
     """
     Generate a CSV report of the review session.
@@ -3371,6 +4956,7 @@ def generate_csv_report(session: ReviewSession, output_path: Path) -> None:
                 "llm_confidence",
                 "llm_review_outcome",
                 "llm_change_direction",
+                "paper_id",
             ]
         )
 
@@ -3397,6 +4983,7 @@ def generate_csv_report(session: ReviewSession, output_path: Path) -> None:
                     ),
                     llm_review_outcome(decision),
                     llm_change_direction(decision),
+                    get_paper_id(paper),
                 ]
             )
 @

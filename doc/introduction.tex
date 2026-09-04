@@ -243,6 +243,18 @@ scholar sessions export "privacy-ml-review" -f all
 \end{verbatim}
 This generates \texttt{.tex}, \texttt{.bib}, and \texttt{.csv} files 
 documenting all decisions with motivations and notes.
+The \LaTeX{} report is a compilable document; with
+\texttt{--no-standalone} it becomes a fragment for \verb|\input| in a
+paper or thesis (the \texttt{.bib} is written next to it), and
+\texttt{-f table} writes an audit table for a backing appendix, one row
+per paper with the reason it was kept or excluded:
+\begin{verbatim}
+scholar sessions export "privacy-ml-review" -f latex --no-standalone -o review
+scholar sessions export "privacy-ml-review" -f table --label review -o review-full
+\end{verbatim}
+The same \texttt{--standalone}/\texttt{--no-standalone} choice applies to
+\texttt{scholar llm synthesize --format latex}, whose document ends with
+the decision record as an appendix.
 
 
 \section{Command Reference}
