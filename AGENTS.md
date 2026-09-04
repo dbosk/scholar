@@ -304,6 +304,27 @@ report body builders (`build_review_provenance_latex`,
   counts in the caption. `all` stays csv + latex.
 - The TUI's `prompt_for_report` keeps the standalone default.
 
+### Provider Text Cleaning
+
+`utils.clean_metadata_text` / `clean_paper_text` decode HTML entities,
+strip inline tags (`<i>`, `<sup>`, …) and repair cp1252/Latin-1 mojibake
+by a checked round trip. Applied at ingest in `Search.execute`,
+`ReviewSession.add_papers_from_snowball` and at the end of
+`enrich_paper`; the LaTeX escapers apply it too, for sessions recorded
+earlier. A DOI-less paper's hash id derives from the cleaned title, so a
+record with markup ingested before this change gets a new id when it is
+searched again.
+
+### Classifier Vocabulary
+
+`llm classify` tells the model to use only the session's existing
+themes and motivations; `parse_llm_response(allowed_tags=…)` maps tags
+case-insensitively onto that vocabulary, drops the rest with a warning
+(`LLMDecision.dropped_tags`), and `classify_papers_with_llm` retries the
+batch once with the vocabulary spelled out when a paper would be left
+without tags. A session without tags imposes nothing. The `llm` module
+is looked up via `globals()` so tests can substitute a fake model.
+
 ## Testing
 
 ```bash
