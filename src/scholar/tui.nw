@@ -2511,6 +2511,9 @@ The report generation functions ([[generate_latex_report]] and
 [[generate_csv_report]]) are provided by the [[review]] module
 (\autoref{review-module}). The TUI only provides the interactive prompt
 that asks users if they want to save reports after a review session.
+It always asks for the standalone document: an interactive user wants a
+file to compile straight away, and the fragment mode of
+[[sessions export]] exists for scripted inclusion into a larger document.
 
 <<tui report generation>>=
 def prompt_for_report(session: ReviewSession) -> None:

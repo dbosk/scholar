@@ -313,7 +313,8 @@ def enrich_paper(
     if fetch_refs_cites and result.doi:
         result = _fetch_refs_cites(result)
 
-    return result
+    # Fetched text carries provider markup like search results do.
+    return clean_paper_text(result)
 
 
 @
@@ -1283,7 +1284,7 @@ from typing import Any, Callable, cast
 
 from scholar import Paper, preprint, unpaywall
 from scholar.providers import get_provider
-from scholar.utils import derive_arxiv_doi
+from scholar.utils import clean_paper_text, derive_arxiv_doi
 <<enrichment cache imports>>
 
 logger = logging.getLogger(__name__)

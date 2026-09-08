@@ -86,6 +86,16 @@ scholar sessions resume "machine learning"
 
 # Export session to reports
 scholar sessions export "machine learning" -f all
+
+# LaTeX report as an \input-able fragment (writes review.tex + review.bib)
+scholar sessions export "machine learning" -f latex --no-standalone -o review
+
+# Audit table for a backing appendix (one row per paper with the reason;
+# always a fragment; --lang en|sv, --theme TAG=NAME gives themes readable names)
+scholar sessions export "machine learning" -f table --lang sv --label sok-A \
+    --track "sökspår 1" --theme ml=maskininlärning -o review-full
+# ... listing only the cited/supporting/qualifying rows, the rest as counts
+scholar sessions export "machine learning" -f table --bearing-only -o review-bearing
 ```
 
 ### Paper Notes
@@ -199,12 +209,21 @@ faster responses, and Unpaywall (open-access lookup during
 `scholar enrich` and `scholar pdf open <doi>`) requires it. `OPENALEX_EMAIL`
 and `CROSSREF_MAILTO` are still honoured as per-service overrides.
 
+OpenAlex meters requests against a daily budget (a search costs $0.001,
+reset at midnight UTC). A free API key from
+[openalex.org/settings/api](https://openalex.org/settings/api) raises the
+budget tenfold; set it as `OPENALEX_API_KEY` and it is used by the
+`openalex` provider and every preprint-server provider. `scholar
+providers check` then shows how much of the day's budget is left, and a
+search that hits the spent budget reports the reset time instead of a
+bare 429.
+
 Some providers require API keys set as environment variables:
 
 | Provider | Environment Variable | Required | How to Get |
 |----------|---------------------|----------|------------|
 | Semantic Scholar | `S2_API_KEY` | No | [api.semanticscholar.org](https://api.semanticscholar.org) |
-| OpenAlex | `SCHOLAR_EMAIL` | No | Any email (for polite pool) |
+| OpenAlex | `OPENALEX_API_KEY`, `SCHOLAR_EMAIL` | No | [openalex.org/settings/api](https://openalex.org/settings/api) (10x daily budget); any email (polite pool) |
 | DBLP | - | No | No key needed |
 | arXiv | - | No | No key needed |
 | HAL | - | No | No key needed |
@@ -248,6 +267,15 @@ scholar sessions resume "privacy-ml-review"
 
 # 4. Generate reports
 scholar sessions export "privacy-ml-review" -f all
+
+# 5. Synthesise the kept papers (needs a research context); the LaTeX
+#    document ends with the decision record as an appendix
+scholar llm context "privacy-ml-review" "How is privacy preserved in ML?"
+scholar llm synthesize "privacy-ml-review" -f latex -o synthesis.tex
+
+# ... or as a fragment to \input into a thesis chapter (also writes
+#     synthesis.bib; add \addbibresource{synthesis.bib} to the preamble)
+scholar llm synthesize "privacy-ml-review" -f latex --no-standalone -o synthesis.tex
 ```
 
 ### Enriching Results
@@ -314,6 +342,12 @@ For large result sets, Scholar can use LLMs to assist with paper classification:
 # In the TUI, press 'L' to invoke LLM classification
 # Or use the CLI command directly
 scholar llm classify "session-name" --count 10
+
+# Constrain the tags to a vocabulary (tags already in the session count too)
+scholar llm classify "session-name" -t supports-claim -t qualifies-claim \
+    -t adjacent-subtopic -t off-topic-false-hit
+# ... or let the model add tags of its own when none of them fits
+scholar llm classify "session-name" --allow-new-tags
 ```
 
 ### How It Works

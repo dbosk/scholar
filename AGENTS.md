@@ -58,7 +58,7 @@ Providers self-register via `register_provider()` at module load time.
 | Provider | Name | API | Auth |
 |----------|------|-----|------|
 | Semantic Scholar | `s2` | `semanticscholar` client | `S2_API_KEY` (optional) |
-| OpenAlex | `openalex` | `pyalex` client | `SCHOLAR_EMAIL` (optional) |
+| OpenAlex | `openalex` | `pyalex` client | `OPENALEX_API_KEY` (optional, 10x daily budget), `SCHOLAR_EMAIL` (optional) |
 | DBLP | `dblp` | REST API | None required |
 | Web of Science | `wos` | REST API | `WOS_API_KEY` (required) |
 | IEEE Xplore | `ieee` | REST API | `IEEE_API_KEY` (required) |
@@ -121,6 +121,12 @@ one: OpenAlex and Crossref (polite pools, optional) and Unpaywall
 (mandatory). `scholar.utils.contact_email(*override_vars)` resolves it;
 `OPENALEX_EMAIL` / `CROSSREF_MAILTO` still work as per-service overrides.
 The test `conftest.py` unsets all three so unit tests never make live calls.
+
+OpenAlex additionally reads `OPENALEX_API_KEY` (free key from
+openalex.org/settings/api; ten times the metered daily budget). The
+provider hands it to `pyalex.config.api_key` (sent as a bearer token);
+the health probe sends it as the `api_key` query parameter; `conftest.py`
+unsets it too.
 
 ### Open-Access Lookup (Unpaywall)
 
@@ -205,6 +211,10 @@ confirmation goes to stderr so `-f json`/`-f bibtex` stdout stays pure.
 `scholar sessions decide <name> --keep|--discard --doi ...|--paper-id ...
 --tag ...` records decisions non-interactively; discarding requires a tag
 (motivation), and if any selector matches nothing the batch aborts unsaved.
+`--source llm` stores the decision as an unreviewed LLM decision
+(agent-driven screening that the TUI still queues for confirmation); a
+human `decide` on such a row marks it `llm_reviewed`, with `is_example`
+set when the status changed, mirroring the TUI.
 Together these let scripted/agent-driven systematic reviews produce the same
 session record and `sessions export` audit trail as TUI reviews.
 
@@ -227,6 +237,97 @@ A note is parsed into ordered segments — `personal` (verbatim) or `prov`
 reconstructing a `Paper` from the `.bib` fields and reusing `Paper.id`
 (DOI, else title+author hash). All round-trip code lives in `cli.nw`'s
 `<<formatter classes>>` and `<<prov command>>` chunks.
+
+### LaTeX Output: Standalone, Fragment, Audit Table
+
+`review.py` owns the shared LaTeX pieces: the escapers (`escape_latex`,
+`escape_bibtex`: one pass, Unicode punctuation mapped to TeX, symbols
+above U+2100 dropped so pdflatex never sees `☆`), `LATEX_PACKAGES`,
+`latex_document` (compilable skeleton, escaped title), `latex_fragment`
+(body plus a `%` header telling the includer which packages,
+`\addbibresource` line and biber run it needs; `\addbibresource` is
+preamble-only, so a fragment can only instruct), `refsection`, the two
+report body builders (`build_review_provenance_latex`,
+`build_review_decisions_latex`) and the audit table
+(`build_audit_table_latex` / `generate_audit_table`).
+
+- `scholar sessions export -f latex [--standalone|--no-standalone]` →
+  `generate_latex_report(session, path, standalone=True)`. Always writes
+  the sibling `.bib`. Standalone output is byte-identical to before; the
+  fragment wraps its body in a `refsection` so the host's
+  `\printbibliography` is not polluted by the report's `\fullcite`s.
+- `scholar llm synthesize -f latex [--standalone|--no-standalone]`: the
+  document ends with the decision record (`build_review_decisions_latex`)
+  as `\appendix` inside a `refsection`, after `\printbibliography`, so the
+  References list exactly what the prose cites (discarded and uncited
+  kept papers stay out). Standalone embeds the bib via
+  `\begin{filecontents*}[overwrite]{<stem>.bib}` (`overwrite`: LaTeX
+  otherwise keeps a stale file of that name); `--no-standalone` requires
+  `--output`, writes `<stem>.bib` next to the `.tex` from
+  `SynthesisResult.bibtex`, and is rejected for markdown.
+- **Key-stability rule.** The theme cache stores LLM prose containing
+  literal `\textcite{key}`s, so `_synthesis_key_space` orders the key
+  space as included kept papers (original order), then remaining kept,
+  then discarded, deduplicated by paper id; suffixes are assigned in
+  iteration order, so kept keys never change. The report keeps its own
+  `surname{year}_{index}` scheme keyed by `id(decision)` (a loaded
+  session can hold one paper twice); builders take a `cite_key`
+  resolver so the two schemes never have to agree. Synthesis keys strip
+  only the characters biber rejects (apostrophes, quotes, braces,
+  delimiters), so `O'Brien` yields `obrien2024` while all other keys are
+  unchanged.
+- `scholar sessions export -f table --lang en|sv --label L --track T
+  --theme TAG=NAME -o base` writes `base.tex`, always a fragment: one
+  row per *work* (`audit_work_key`: title and first-author surname
+  reduced to case-folded letters and digits, year ignored; joined
+  provider strings like `openalex; dblp` are split, mapped to codes and
+  deduplicated; the best-placed decision wins). The *last* category tag
+  is the decision (`decide -t` appends); confidence is shown for
+  unreviewed and human-confirmed LLM rows, not for changed ones. The
+  escapers decode HTML entities, strip inline markup, repair
+  cp1252/Latin-1 mojibake and turn `"` into `\textquotedbl{}` (babel
+  shorthand). Titles are printed whole unless `--truncate-titles`
+  (word boundary near 180 characters, ellipsis). An empty table logs a
+  warning. The CSV's last column is `paper_id` for `decide --paper-id`. Tags split three ways: category tags (`supports-claim` …),
+  note tags (`AUDIT_STRINGS[lang]["notes"]`: `recorded-not-cited`,
+  `duplicate-record-of-cited-source`, `extended-tech-report`, …) and
+  theme tags (the rest; with `--theme` given, only the listed tags).
+  *Cited* = kept by a human decision (source `human` or `llm_reviewed`)
+  with a theme tag or no tags; otherwise the first category tag, with
+  the confidence for unreviewed LLM rows; notes are appended in
+  parentheses, note-only rows are "other". An LLM keep is a candidate,
+  not a citation. Order: cited (0), `supports-claim` (1),
+  `qualifies-claim` (2), `adjacent-subtopic` (3),
+  `off-topic-false-hit` (4), pending (5), other (6). The caption never
+  names the session (it is a `%` comment in the fragment) and ends with
+  a full-name-first "Databases:" sentence built from the providers
+  present. `--bearing-only` lists only orders 0-2 and states the other
+  counts in the caption. `all` stays csv + latex.
+- The TUI's `prompt_for_report` keeps the standalone default.
+
+### Provider Text Cleaning
+
+`utils.clean_metadata_text` / `clean_paper_text` decode HTML entities,
+strip inline tags (`<i>`, `<sup>`, …) and repair cp1252/Latin-1 mojibake
+by a checked round trip. Applied at ingest in `Search.execute`,
+`ReviewSession.add_papers_from_snowball` and at the end of
+`enrich_paper`; the LaTeX escapers apply it too, for sessions recorded
+earlier. A DOI-less paper's hash id derives from the cleaned title, so a
+record with markup ingested before this change gets a new id when it is
+searched again.
+
+### Classifier Vocabulary
+
+`llm classify` tells the model to use only the session's existing
+themes and motivations; `parse_llm_response(allowed_tags=…)` maps tags
+case-insensitively onto that vocabulary, drops the rest with a warning
+(`LLMDecision.dropped_tags`), and `classify_papers_with_llm` retries the
+batch once with the vocabulary spelled out when a paper would be left
+without tags. A session without tags imposes nothing unless
+`llm classify --tag` (the `vocabulary=` argument) seeds it; with
+`--allow-new-tags` (`allow_new_tags=`) the prompt asks the model to
+prefer the vocabulary but nothing is dropped or retried. The `llm`
+module is looked up via `globals()` so tests can substitute a fake model.
 
 ## Testing
 
@@ -313,6 +414,14 @@ requests/day and each `scholar` run is a fresh process.
 - Tests: `tests/conftest.py` isolates `SCHOLAR_DATA_DIR` per test and
   no-ops the pacing sleep; `test_ratelimit.py` controls time via the
   module's `_now`/`_sleep` seams.
+- OpenAlex meters requests in credits (a search is 10 credits, $0.001;
+  the keyed budget is 10000/day, reset at midnight UTC). `LIMITS` is
+  therefore empty and the state comes from OpenAlex: the health probe's
+  `X-RateLimit-Remaining`/`X-RateLimit-Reset` headers are synced via
+  `record_response`, a keyed probe also reads `/rate-limit` for the
+  detail column, and a search 429 with `X-RateLimit-Remaining-USD: 0`
+  becomes a quota block until `X-RateLimit-Reset` (`_note_http_error`),
+  logged with the reset time and a key hint.
 - Phase 2 (not done): migrate S2/OpenAlex/DBLP/arXiv in-process pacing
   (and crossref/unpaywall) into the limiter; wire WoS/Scopus extended
   methods (citations/references) through `acquire()`.
