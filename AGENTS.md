@@ -212,6 +212,9 @@ confirmation goes to stderr so `-f json`/`-f bibtex` stdout stays pure.
 `scholar sessions decide <name> --keep|--discard --doi ...|--paper-id ...
 --tag ...` records decisions non-interactively; discarding requires a tag
 (motivation), and if any selector matches nothing the batch aborts unsaved.
+`sessions show` prints each paper's id (`doi:…`/`hash:…`, the value
+`--paper-id` takes) under its title, and `show -f json` carries `doi` and
+`paper_id`, so a decision never needs a CSV detour.
 `--source llm` stores the decision as an unreviewed LLM decision
 (agent-driven screening that the TUI still queues for confirmation); a
 human `decide` on such a row marks it `llm_reviewed`, with `is_example`

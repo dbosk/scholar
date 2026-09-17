@@ -4540,7 +4540,34 @@ directly to a Rich console. This avoids the color encoding issues that arise
 from rendering to a string buffer with ANSI codes and then re-printing---Rich
 handles the terminal detection and styling correctly when printing directly.
 
+Every paper is printed with its identifier on a second, dimmed line.
+[[sessions decide]] addresses papers by [[--doi]] or [[--paper-id]], and
+[[show]] is the command a person (or an agent) reads before deciding, so it
+has to be possible to go from the listing to a decision without a detour
+through a CSV export (which was the only place the DOI used to appear).
+We print [[Paper.id]] rather than the bare DOI: it is exactly the string
+[[--paper-id]] accepts, it exists for every paper (a DOI-less paper gets a
+[[hash:]] id), and for DOI papers the DOI is readable inside it.
+The three decision groups print the same line, so one helper builds it;
+only the tags differ, and a pending paper simply has none.
+
 <<sessions command>>=
+def session_paper_line(decision) -> str:
+    """Return the Rich markup `sessions show` prints for one paper.
+
+    Two lines: the title with provider and tags, then the paper id that
+    `sessions decide --paper-id` accepts (`doi:...` or `hash:...`).
+    """
+    paper = decision.paper
+    provider = f" [dim]({decision.provider})[/dim]" if decision.provider else ""
+    tag_list = ", ".join(escape(t) for t in decision.tags)
+    tags = f" [dim]\\[{tag_list}][/dim]" if decision.tags else ""
+    return (
+        f"  • {escape(paper.title or '')}{provider}{tags}\n"
+        f"    [dim]{escape(paper.id)}[/dim]"
+    )
+
+
 @sessions_app.command("show")
 def sessions_show(
     name: Annotated[
@@ -4562,7 +4589,8 @@ def sessions_show(
     """
     Show details of a saved review session.
 
-    Displays all papers with their decisions, themes, and motivations.
+    Displays all papers with their decisions, themes, and motivations,
+    each with the paper id that `sessions decide --paper-id` accepts.
     Uses a pager for interactive viewing when output is a terminal.
     """
     import sys
@@ -4596,6 +4624,8 @@ def sessions_show(
                     "title": d.paper.title,
                     "authors": d.paper.authors,
                     "year": d.paper.year,
+                    "doi": d.paper.doi,
+                    "paper_id": d.paper.id,
                     "status": d.status.value,
                     "tags": d.tags,
                     "provider": d.provider,
@@ -4649,12 +4679,7 @@ def sessions_show(
             if kept:
                 con.print(f"[green bold]Kept ({len(kept)}):[/green bold]")
                 for d in kept:
-                    provider = f" [dim]({d.provider})[/dim]" if d.provider else ""
-                    tag_list = ", ".join(escape(t) for t in d.tags) if d.tags else ""
-                    tags = f" [dim]\\[{tag_list}][/dim]" if d.tags else ""
-                    con.print(
-                        f"  • {escape(d.paper.title or '')}{provider}{tags}"
-                    )
+                    con.print(session_paper_line(d))
                 con.print()
 
             # Show discarded papers
@@ -4664,12 +4689,7 @@ def sessions_show(
                     f"[red bold]Discarded ({len(discarded)}):[/red bold]"
                 )
                 for d in discarded:
-                    provider = f" [dim]({d.provider})[/dim]" if d.provider else ""
-                    tag_list = ", ".join(escape(t) for t in d.tags) if d.tags else ""
-                    tags = f" [dim]\\[{tag_list}][/dim]" if d.tags else ""
-                    con.print(
-                        f"  • {escape(d.paper.title or '')}{provider}{tags}"
-                    )
+                    con.print(session_paper_line(d))
                 con.print()
 
             # Show pending papers
@@ -4679,10 +4699,7 @@ def sessions_show(
                     f"[yellow bold]Pending ({len(pending)}):[/yellow bold]"
                 )
                 for d in pending:
-                    provider = f" [dim]({d.provider})[/dim]" if d.provider else ""
-                    con.print(
-                        f"  • {escape(d.paper.title or '')}{provider}"
-                    )
+                    con.print(session_paper_line(d))
 
         # Use pager if TTY, otherwise print directly
         if sys.stdout.isatty():
@@ -5567,6 +5584,41 @@ class TestSessionsCommand:
         assert "Kept Paper" in result.output
         assert "Discarded Paper" in result.output
         assert "Pending Paper" in result.output
+
+    def test_sessions_show_prints_paper_ids(self, tmp_path, monkeypatch):
+        """Each paper carries the id that decide --paper-id accepts."""
+        monkeypatch.setenv("SCHOLAR_DATA_DIR", str(tmp_path))
+        from scholar.review import (
+            ReviewSession, ReviewDecision, DecisionStatus, save_session,
+        )
+
+        session = ReviewSession(
+            query="ids", providers=["openalex"], timestamp=datetime.now(),
+            name="ids",
+        )
+        session.decisions.extend([
+            ReviewDecision(
+                paper=Paper(title="With DOI", authors=["Ann"], doi="10.1/X"),
+                provider="openalex", status=DecisionStatus.PENDING,
+            ),
+            ReviewDecision(
+                paper=Paper(title="Without DOI", authors=["Bo"]),
+                provider="openalex", status=DecisionStatus.PENDING,
+            ),
+        ])
+        save_session(session)
+
+        result = runner.invoke(app, ["sessions", "show", "ids"])
+        assert result.exit_code == 0
+        assert "doi:10.1/x" in result.output
+        assert "hash:" in result.output
+
+        as_json = runner.invoke(app, ["sessions", "show", "ids", "-f", "json"])
+        decisions = json.loads(as_json.output)["decisions"]
+        assert decisions[0]["doi"] == "10.1/X"
+        assert decisions[0]["paper_id"] == "doi:10.1/x"
+        assert decisions[1]["doi"] is None
+        assert decisions[1]["paper_id"].startswith("hash:")
 
     def test_sessions_show_displays_search_filters(
         self, tmp_path, monkeypatch
