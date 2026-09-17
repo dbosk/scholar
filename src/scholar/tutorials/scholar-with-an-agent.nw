@@ -1,0 +1,520 @@
+\chapter{Tutorial: Backing claims with an agent}
+\label{ch:tutorial-scholar-with-an-agent}
+
+The other tutorials teach a person to drive Scholar.
+This one teaches a person to \emph{delegate} the driving to an agent
+and still stay in charge.
+The [[backing-claims]] skill (a Claude Code skill) makes an agent back
+every factual claim with a small two-sided literature review: it
+searches for support and for refutation, reads the sources, records why
+each one was picked, and leaves an audit trail a reader can follow.
+Scholar is the tool the skill prefers, because Scholar records the
+query, the providers and the decisions for it.
+The agent never touches the TUI; it uses the non-interactive commands
+only, and every one of them is available to the person too.
+
+The object of learning is therefore the \emph{trail}, not the search:
+what a claim session looks like after the agent has worked, and which
+command reveals each part of it.
+The learner runs each move of the skill's find--verify--record protocol
+once, by hand, so that the same command in an agent's transcript is
+recognisable later.
+The arc follows the protocol's order:
+\begin{enumerate}
+\item check which databases are alive (step~1),
+\item search in both directions under one named session (steps~2--3),
+\item record a decision as the agent would, then confirm it as the
+  human (steps~4--5),
+\item reconstruct where a source came from and export the audit table
+  (steps~6--7), and
+\item name the protocol's required fields and the way to start the
+  agent (steps~8--9).
+\end{enumerate}
+The invariant across steps~2--7 is the session name [[claim-literate]]:
+one claim, one session, and every command reads or writes that one
+record.
+What varies is who is meant to run the command in real use---the agent
+in steps~1--4 and~6--7, the person in step~5---and the prose of each
+step says which.
+That contrast is the point: the person sees that the agent's work and
+their own review land in the same place.
+
+\section{Tutorial source}
+
+The whole tutorial is one tangled root chunk.
+Each step lives in its own named sub-chunk so the prose between them can
+describe that step's role without breaking the Markdown output.
+
+<<[[scholar-with-an-agent.md]]>>=
+---
+id: scholar-with-an-agent
+title: Backing claims with an agent
+summary: See what an agent does in Scholar to back a claim, and audit it.
+---
+
+<<providers check step>>
+
+<<support search step>>
+
+<<counter search step>>
+
+<<llm decision step>>
+
+<<human confirmation step>>
+
+<<found-via step>>
+
+<<audit table step>>
+
+<<provenance fields question step>>
+
+<<start the agent question step>>
+@
+
+\section{Step 1: Check the providers first}
+
+The skill's first instruction is to run [[scholar providers check]]
+before any search and to record the result.
+The reason is a failure mode that is invisible otherwise: a rejected
+key (an expired Semantic Scholar key answering HTTP~403, say) makes
+Scholar fall back or skip that database with only a warning, so a claim
+that was \enquote{not found} may simply never have been looked for
+there.
+The step also asks for [[echo $?]] because the exit code is what an
+agent's script gates on: it is~1 exactly when a \emph{configured}
+provider fails, so a missing optional key is not a failure but a dead
+key is.
+
+The anchors are the report's title and the word [[ok]]; the learner's
+provider set is unknown, so nothing else in the table is predictable.
+
+<<providers check step>>=
+# Check the providers first
+
+```tutorial-step
+required_patterns:
+  - mode: regex
+    pattern: (?:^|\s)scholar\s+providers\s+check\b
+  - Provider Health
+  - ok
+  - mode: regex
+    pattern: (?:^|\s)echo\s+\$\?
+hint: "The providers group has a verb that probes every database with one request; run it, then print the exit code with `echo $?`."
+```
+
+Run `scholar providers check`, then `echo $?`.
+
+This is the agent's pre-flight. Every provider is probed with a
+one-result request and reported as `ok`, `key rejected`, `rate limited`,
+`http error`, `network error` or `not configured`. A database whose key
+is dead would otherwise drop out of every search with only a warning,
+and a claim that is "not found" would be no real negative.
+
+The exit code is `1` exactly when a *configured* provider fails, so a
+script can stop before it spends a whole session searching blind.
+@
+
+\section{Step 2: Search for support under a named session}
+
+Backing a claim starts with a topic-driven search, and the skill asks
+that every search of one claim run under one named session
+([[-n <claim-slug>]]) so support and counter queries land in one
+auditable record.
+The output format [[bibtex+prov]] is the second thing the learner should
+notice: each entry comes wrapped in a provenance comment block with
+[[FOUND-VIA]] and [[DATE]] already filled from the query.
+The remaining fields are [[TODO]] on purpose---[[CLAIM]], [[PICKED]],
+[[QUOTE]] and [[VERIFIED]] can only be written after the agent has read
+the source, and the block makes that debt visible.
+
+The query is narrower than the one the earlier tutorials use because a
+claim is narrower than a topic; the prose says so, so the learner does
+not read the difference as arbitrary.
+The anchors are the block delimiter and the [[FOUND-VIA]] label, which
+appear for every entry regardless of what the provider returns.
+
+<<support search step>>=
+# Search for support under a named session
+
+```tutorial-step
+required_patterns:
+  - mode: regex
+    pattern: (?:^|\s)scholar\s+search\s+.*-n\s+claim-literate\b
+  - mode: regex
+    pattern: -f\s+bibtex\+prov\b
+  - "% === provenance:"
+  - "FOUND-VIA:"
+hint: "Name the session after the claim with `-n claim-literate`, and ask for the `bibtex+prov` format so each entry comes with its provenance block."
+```
+
+Run:
+
+```
+scholar search "literate programming readability" -p openalex -l 5 \
+    -n claim-literate -f bibtex+prov
+```
+
+Say the claim is "literate programming makes programs easier to read".
+The query names the claim's concepts, not an author: discovery is
+topic-driven, and a search that starts from expected names only finds
+what one already believed.
+
+`-n claim-literate` records the search in a session named after the
+claim. `-f bibtex+prov` prints each entry under a provenance comment
+block:
+
+```
+ % === provenance: knuth1984 ===
+ % CLAIM: TODO
+ % FOUND-VIA: scholar search 'literate programming readability' -p openalex --limit 5
+ % PICKED: TODO
+ % QUOTE (<loc>): TODO
+ % VERIFIED: TODO
+ % DATE: 2026-09-17
+ @article{knuth1984, ...}
+```
+
+`FOUND-VIA` and `DATE` are filled in from the query. The `TODO` fields
+are the agent's debt: they can only be written after reading the source.
+@
+
+\section{Step 3: Search against the claim, into the same session}
+
+One agreeable source is confirmation, not backing.
+The skill requires a counter-search for every load-bearing claim: a
+query phrased to surface literature that refutes or qualifies it, run
+on the same providers.
+This step is the tutorial's central contrast.
+The command is the same as in step~2 except for the query, and the
+session name is deliberately unchanged, so when the learner then runs
+[[scholar sessions show claim-literate]] the record lists both queries
+under \enquote{Queries by provider}.
+Query varies, session invariant: that is how one session becomes the
+audit record for both directions of a claim.
+
+The anchors are the two commands and the [[Queries by provider:]]
+heading; the paper list is left unanchored because provider ranking
+changes.
+
+<<counter search step>>=
+# Search against the claim, into the same session
+
+```tutorial-step
+required_patterns:
+  - mode: regex
+    pattern: (?:^|\s)scholar\s+search\s+.*criticism.*-n\s+claim-literate\b
+  - mode: regex
+    pattern: (?:^|\s)scholar\s+sessions\s+show\s+claim-literate\b
+  - "Queries by provider:"
+hint: "Rerun the search with a query aimed at refutation, keeping `-n claim-literate` and the format, then show the session to see both queries listed."
+```
+
+Run the counter-search into the same session, then show the session:
+
+```
+scholar search "literate programming criticism limitations" -p openalex \
+    -l 5 -n claim-literate -f bibtex+prov
+scholar sessions show claim-literate
+```
+
+Only the query changed. The session name stayed, so `sessions show`
+lists both searches under "Queries by provider" and the papers of both
+in one pending list. Support and counter queries belong to the same
+claim, so they belong to the same record.
+
+The counter-search has three outcomes and the agent must record all of
+them: refuting work found (soften the claim or cite both sides),
+qualifying work found (narrow the claim's scope), or nothing found
+(record the query and its emptiness). An unrun counter-search is not a
+negative result.
+@
+
+\section{Step 4: Record a decision the way the agent does}
+
+An agent that screens the hit list records its decisions with
+[[scholar sessions decide --source llm]].
+The flag is the design point of this step: such a decision is stored as
+an \emph{unreviewed} LLM decision, and the TUI queues it for
+confirmation instead of treating it as settled.
+The learner sees the same thing in [[scholar llm status]], where the row
+counts as \enquote{LLM (unreviewed)}.
+
+The decision needs a DOI, and neither [[sessions show]] nor its JSON
+form prints DOIs.
+Rather than teach a workaround, the step reuses what step~2 taught: the
+search is reproducible, so running it again (without [[-n]], so nothing
+new is recorded; and instantly, because the cache holds the response)
+and grepping the [[doi =]] lines yields a DOI to copy.
+The pattern accepts any DOI because the learner's result list is not
+predictable.
+
+<<llm decision step>>=
+# Record a decision the way the agent does
+
+```tutorial-step
+required_patterns:
+  - mode: regex
+    pattern: (?:^|\s)scholar\s+sessions\s+decide\s+claim-literate\s+.*--source\s+llm\b
+  - mode: regex
+    pattern: --doi\s+10\.\S+
+  - mode: regex
+    pattern: marked kept
+  - mode: regex
+    pattern: (?:^|\s)scholar\s+llm\s+status\s+claim-literate\b
+hint: "Get a DOI from the `doi =` lines of the support search, keep the paper with `sessions decide` and `--source llm --tag supports-claim`, then look at `scholar llm status`."
+```
+
+First find a DOI to decide on. The support search is cached, so
+rerunning it costs nothing; leave out `-n` so nothing is recorded twice:
+
+```
+scholar search "literate programming readability" -p openalex -l 5 \
+    -f bibtex | grep 'doi ='
+```
+
+Pick one DOI and keep that paper as the agent would:
+
+```
+scholar sessions decide claim-literate --source llm --keep \
+    --doi <the DOI> --tag supports-claim
+scholar llm status claim-literate
+```
+
+`--source llm` records an *unreviewed* decision: the status report
+counts it under "LLM (unreviewed)", and the TUI would queue it for your
+confirmation rather than treat it as final. The tag is one of the
+skill's two-sided categories: `supports-claim`, `qualifies-claim`,
+`adjacent-subtopic` or `off-topic-false-hit`.
+@
+
+\section{Step 5: Confirm it as the human}
+
+The human's part of the loop is the same command without
+[[--source]].
+A human decision on a paper that carries an unreviewed LLM decision
+marks it reviewed (and flags it as a changed example if the status
+differs), which is exactly what pressing a key in the TUI would do.
+Repeating the command with one flag removed makes the division of
+labour concrete: the agent proposes, the person confirms, and both
+actions write to the same session.
+The learner then reads the effect in [[scholar llm status]], where the
+count moves from unreviewed to reviewed.
+
+<<human confirmation step>>=
+# Confirm it as the human
+
+```tutorial-step
+required_patterns:
+  - mode: regex
+    pattern: (?:^|\s)scholar\s+sessions\s+decide\s+claim-literate\s+(?!.*--source)
+  - mode: regex
+    pattern: --doi\s+10\.\S+
+  - mode: regex
+    pattern: (?:^|\s)scholar\s+llm\s+status\s+claim-literate\b
+  - "LLM (reviewed)"
+hint: "Repeat the decision for the same DOI without `--source`, then check the status report again."
+```
+
+Confirm the same paper yourself, then look at the status again:
+
+```
+scholar sessions decide claim-literate --keep --doi <the same DOI> \
+    --tag supports-claim
+scholar llm status claim-literate
+```
+
+Without `--source` the decision is a human one. Because the paper
+already had an unreviewed LLM decision, yours marks it reviewed: the
+count moves from "LLM (unreviewed)" to "LLM (reviewed)". Had you
+discarded it instead, it would also be recorded as a changed decision,
+which later classification rounds use as an example.
+
+The agent proposes, you confirm, and both of you write to the same
+session.
+@
+
+\section{Step 6: Reconstruct where a source came from}
+
+Provenance must be reproducible: the skill's [[FOUND-VIA]] field is a
+command that surfaces the paper again.
+[[scholar prov found-via]] prints that line for one paper from the
+session record, so the learner sees that the block of step~2 is not
+special output of the search command but a view of what the session
+stores.
+The prose also names [[prov export]] and [[prov import]], the
+round-trip between provenance blocks in a [[.bib]] file and Scholar's
+notes, because that is how an agent's finished blocks get back into
+Scholar; running them needs a [[.bib]] file the learner does not have
+yet, so they are described rather than required.
+
+<<found-via step>>=
+# Reconstruct where a source came from
+
+```tutorial-step
+required_patterns:
+  - mode: regex
+    pattern: (?:^|\s)scholar\s+prov\s+found-via\s+
+  - "FOUND-VIA:"
+  - (session "claim-literate")
+hint: "The prov group has a verb that prints the FOUND-VIA line for one paper; give it the DOI prefixed with `doi:`."
+```
+
+Run, with the DOI you decided on:
+
+```
+scholar prov found-via "doi:<the DOI>"
+```
+
+The output is the `FOUND-VIA` line for that paper, rebuilt from the
+session record: the query, the provider and the session name. This is
+what makes the provenance block of a search reproducible, and it is
+available for any paper in any session, long after the search output
+has scrolled away.
+
+The other two `prov` verbs close the loop with a `.bib` file:
+`scholar prov import refs.bib` pulls the provenance blocks an agent
+wrote above each entry into Scholar's notes, and
+`scholar prov export refs.bib` writes them back. You will meet them
+when you have a `.bib` to hand.
+@
+
+\section{Step 7: Export the audit table}
+
+When the claim belongs to a paper, the skill asks for a backing
+appendix with the classified hit list as a table, generated by
+[[scholar sessions export -f table]].
+The step uses [[--bearing-only]] because that is the form the skill
+prescribes: rows that bear on the claim (cited, supporting, qualifying)
+are listed, the rest are counted in the caption.
+The learner has one kept paper and the rest pending, so the table
+will be short, but the file exists and its shape is right; the anchor
+is the file name in the [[Exported:]] list.
+
+<<audit table step>>=
+# Export the audit table
+
+```tutorial-step
+required_patterns:
+  - mode: regex
+    pattern: (?:^|\s)scholar\s+sessions\s+export\s+claim-literate\s+.*-f\s+table\b
+  - --bearing-only
+  - claim-table.tex
+hint: "Export the session in the `table` format with `--bearing-only`, `--lang en`, a `--label` and `-o claim-table`."
+```
+
+Run:
+
+```
+scholar sessions export claim-literate -f table --bearing-only \
+    --lang en --label claim -o claim-table
+```
+
+`claim-table.tex` is a LaTeX fragment: one row per work with the
+reason it was kept or excluded, ready to `\input` into the backing
+appendix of a paper. `--bearing-only` lists only the rows that bear on
+the claim and states the other counts in the caption.
+
+In a real run the agent classifies the whole session first
+(`scholar llm classify`), so every row carries a category and a
+confidence; here most rows are still pending, so the table is short.
+@
+
+\section{Step 8: Name the required provenance fields}
+
+The question steps close the tutorial by asking the learner to state,
+rather than perform, what they have seen.
+The skill's required fields are [[CLAIM]], [[FOUND-VIA]], [[PICKED]],
+[[QUOTE]] and [[VERIFIED]]; [[DATE]] is recommended and [[COUNTER]] is
+required for load-bearing claims.
+The distractors [[ABSTRACT]] and [[RATING]] are chosen because they
+are plausible things to record about a paper that the protocol
+deliberately does not ask for: an abstract is not a verbatim supporting
+quote, and a rating is not a written reason.
+Picking them out is how the learner shows that the fields are about
+\emph{auditability}, not about describing the paper.
+
+<<provenance fields question step>>=
+# Name the required provenance fields
+
+```tutorial-step
+kind: multi_select
+options:
+  - CLAIM
+  - FOUND-VIA
+  - PICKED
+  - QUOTE
+  - VERIFIED
+  - ABSTRACT
+  - RATING
+answers:
+  - CLAIM
+  - FOUND-VIA
+  - PICKED
+  - QUOTE
+  - VERIFIED
+hint: "Five fields are required above every entry; each records something a reader could check. An abstract and a rating are not among them."
+```
+
+Which fields must every provenance block carry?
+
+The block you saw in step 2 had `TODO` for the fields only a reader of
+the source can fill: the claim the entry backs, why this source was
+picked over the alternatives, a verbatim quote with its location, and
+how the source was verified. `FOUND-VIA` was already filled from the
+search. `DATE` is recommended, and `COUNTER` (the counter-search and
+its outcome) is required for load-bearing claims.
+@
+
+\section{Step 9: Start the agent}
+
+The final step turns the tutorial back into its purpose.
+Everything so far was done by hand so that an agent's work is
+recognisable; the way to get that work done is to load the skill and
+hand over the claim.
+The answer is a [[kind: input]] question rather than a shell step
+because starting an agent is not something the tutorial shell can
+verify, and because what matters is that the learner knows the skill's
+name.
+The regex therefore accepts any answer that names [[backing-claims]],
+whether as a slash command or in a sentence.
+The body summarises what the agent will do in the terms of steps~1--7,
+so the learner can map the agent's transcript back onto this tutorial,
+and it repeats the skill's own rule that the interactive TUIs are never
+driven by an agent.
+
+<<start the agent question step>>=
+# Start the agent
+
+```tutorial-step
+kind: input
+answers:
+  - mode: regex
+    pattern: backing-claims
+hint: "Name the skill: it is the one about backing claims."
+```
+
+Type how you would start an agent on a claim in Claude Code.
+
+Ask for the skill by name: `/backing-claims`, or "load the
+backing-claims skill and back this claim: ...". Then give it the claim
+as one sentence.
+
+With the skill loaded, the agent does what you just did, for real:
+
+- runs `scholar providers check` and records which databases are alive;
+- searches for support and for refutation under one named session per
+  claim, on the same providers, with `-f bibtex+prov`;
+- reads each candidate source and captures a verbatim quote, screens
+  the hits into supports, qualifies and refutes, and records its
+  decisions with `sessions decide --source llm`;
+- fills in the provenance blocks (`CLAIM`, `PICKED`, `QUOTE`,
+  `VERIFIED`, `COUNTER`) and classifies and exports the session so
+  the audit table can be generated.
+
+You review its trail with the commands from this tutorial:
+`sessions show`, `llm status`, `sessions decide` to confirm or
+overturn, `prov found-via`, and `sessions export`.
+
+The agent never drives the interactive parts of Scholar: `search
+--review`, `sessions resume`, `snowball` and `tuxedo` are yours.
+@

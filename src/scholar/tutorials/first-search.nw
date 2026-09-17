@@ -1,0 +1,381 @@
+\chapter{Tutorial: Your first search}
+\label{ch:tutorial-first-search}
+
+[[first-search]] is the lesson a newcomer meets first.
+Its object of learning is that a search in Scholar is a \emph{record}, not
+a screenful of hits: the same words sent to two databases are two different
+searches, the same search printed in two formats is one search, and a
+session is such a record kept for later.
+A learner who has understood this reads every later lesson correctly,
+because sessions, decisions and exports all build on the recorded search.
+
+The arc separates the three parts of the record one at a time, then fuses
+them:
+\begin{enumerate}
+\item find out what databases there are (step~1), and run one query
+  against one of them (step~2);
+\item hold the query fixed and vary the database (step~3), then hold the
+  hits fixed and vary the output format (step~4), so the learner
+  experiences which of the two changes the result and which does not;
+\item see why the database matters, through the syntax table (step~5);
+\item keep the search as a session (step~6) and look at what was kept
+  (step~7);
+\item say, in one answer, what Scholar records (step~8).
+\end{enumerate}
+Steps~3 and~4 are the heart of the lesson: they are variation theory's
+contrast pattern applied to the two aspects a learner most often confuses.
+Both keep the query invariant, and each varies exactly one thing---the
+provider or the format---so the learner can attribute the difference they
+see to that one thing.
+The order (provider first, format second) is deliberate: the provider
+contrast produces a visibly different table, which is a strong experience,
+and the format contrast then shows that a weaker-looking change (the same
+papers, printed differently) is not a different search at all.
+
+Every search in the lesson uses the query \enquote{literate programming}
+and a limit of five.
+The query is a stable, well-indexed topic whose top hit on OpenAlex is
+Knuth's 1984 paper, so the learner sees a recognisable result, and the
+small limit keeps each command fast.
+The query text is never repeated in a required pattern with a title,
+because rankings change; the patterns anchor on the command the learner
+typed and on Scholar's own fixed output strings.
+Only keyless providers appear, so the lesson runs on a fresh install.
+
+\section{Tutorial source}
+
+The whole tutorial is one tangled root chunk.
+Each step lives in its own named chunk so the prose between them can
+describe that step's role without breaking the Markdown that pytorial
+reads.
+
+<<[[first-search.md]]>>=
+---
+id: first-search
+title: Your first search
+summary: Run a search, see what varies between databases and formats, and keep it as a session.
+---
+
+<<providers step>>
+
+<<first search step>>
+
+<<other provider step>>
+
+<<output format step>>
+
+<<syntax step>>
+
+<<named session step>>
+
+<<sessions list step>>
+
+<<what is recorded step>>
+@
+
+\section{Step 1: See which databases you can search}
+
+The lesson opens with [[scholar providers list]] because it is the only
+command that needs nothing: no query, no key, no session.
+Its table is also the map for everything that follows---the learner needs
+the provider names [[openalex]] and [[arxiv]] to type the next steps, and
+the [[Configured]] column is where they first see that some databases
+need a key and some do not.
+The required patterns ask for the two providers the lesson will use, so
+the check doubles as a sanity check that the install can see them.
+
+<<providers step>>=
+# See which databases you can search
+
+```tutorial-step
+required_patterns:
+  - mode: regex
+    pattern: (?:^|\s)scholar\s+providers\s+list\b
+  - Available Search Providers
+  - openalex
+  - arxiv
+hint: "Ask the providers group to list what is available."
+```
+
+Run `scholar providers list`.
+
+Scholar searches several bibliographic databases, called *providers*.
+The table shows each provider's name, whether it is configured, and
+whether it needs an API key. Some providers work without any key; this
+tutorial only uses those, so it works on a fresh install.
+
+Note the names `openalex` and `arxiv`. You will use them next.
+@
+
+\section{Step 2: Search one database}
+
+The first search is scoped to one provider and five results.
+Scoping is not a simplification for the learner's sake alone: the default
+(every configured provider) would produce a long merged table in which the
+role of the provider is invisible, and the next step needs a table that
+came from exactly one database so that changing the database changes the
+table.
+The [[-l 5]] limit keeps the whole lesson quick and makes the table fit on
+one screen.
+The patterns anchor on the command with its provider flag and on the table
+title Scholar prints, [[Results for:]], which does not depend on which
+papers come back.
+
+<<first search step>>=
+# Search one database
+
+```tutorial-step
+required_patterns:
+  - mode: regex
+    pattern: (?:^|\s)scholar\s+search\s+.*-p\s+openalex\b
+  - "Results for: literate programming"
+hint: "Quote the query, pick the provider with -p, and cap the hits with -l."
+```
+
+Run:
+
+```
+scholar search "literate programming" -p openalex -l 5
+```
+
+`-p openalex` sends the query to one provider only, and `-l 5` asks for
+at most five results from it. Without `-p`, Scholar would query every
+provider it can reach and merge the results.
+
+Look at the table: title, authors, year, DOI. The first hit should be
+Knuth's 1984 paper that coined the term.
+@
+
+\section{Step 3: Same query, another database}
+
+This is the first contrast.
+Everything stays as in step~2 except the provider, and the table changes
+completely: arXiv indexes preprints, so \enquote{literate programming}
+finds different papers there, some only loosely related.
+The learner experiences that a provider is a lens, not a neutral
+pipe---the thing they need to know before they ever trust a
+\enquote{not found}.
+The prose asks them to compare, but does not tell them what they will
+see; the pattern only requires the [[arxiv]] flag and the table title.
+
+<<other provider step>>=
+# Same query, another database
+
+```tutorial-step
+required_patterns:
+  - mode: regex
+    pattern: (?:^|\s)scholar\s+search\s+.*-p\s+arxiv\b
+  - "Results for: literate programming"
+hint: "Change only the provider name after -p; keep the query and the limit."
+```
+
+Run the same search against arXiv:
+
+```
+scholar search "literate programming" -p arxiv -l 5
+```
+
+Compare the two tables. The query is identical, but the papers are not:
+each provider indexes different literature and ranks it differently.
+This is why a serious search asks several providers, and why a paper that
+one provider does not return may still exist.
+@
+
+\section{Step 4: Same search, another format}
+
+The second contrast varies the output format while holding everything
+else fixed, including the provider.
+BibTeX first, because a bibliography entry is the form the learner most
+likely wants eventually and because [[@article{]] is unmistakable; then
+JSON, piped through [[head]], to show the same search as data.
+Seeing the identical DOI in the table, the BibTeX entry and the JSON
+record is what makes the point: the format changes how the record is
+printed, not what was searched.
+The prose also explains the [[auto]] format, because a learner who later
+redirects output to a file will otherwise be surprised to get CSV.
+Both required patterns anchor on the format flag and one fixed token of
+each format.
+
+<<output format step>>=
+# Same search, another format
+
+```tutorial-step
+required_patterns:
+  - mode: regex
+    pattern: (?:^|\s)scholar\s+search\s+.*-f\s+bibtex\b
+  - "@article{"
+  - mode: regex
+    pattern: (?:^|\s)scholar\s+search\s+.*-f\s+json\b
+  - '"papers"'
+hint: "Run the openalex search twice more, once with -f bibtex and once with -f json piped into head."
+```
+
+Run the OpenAlex search again, twice, changing only the output format:
+
+```
+scholar search "literate programming" -p openalex -l 5 -f bibtex
+scholar search "literate programming" -p openalex -l 5 -f json | head -20
+```
+
+The papers are the same as in step 2; only the presentation differs.
+BibTeX gives you entries to paste into a bibliography. JSON gives you the
+full record, including the query, provider, timestamp and limit that
+produced it.
+
+The default format is `auto`: a table when the output goes to a
+terminal, CSV when it goes to a file or a pipe. Pick a format explicitly
+whenever you script Scholar.
+@
+
+\section{Step 5: Why the database matters}
+
+Step~3 showed \emph{that} providers differ; this step shows one reason
+\emph{why}.
+[[scholar syntax]] prints, per provider, which boolean operators, phrase
+search and wildcards are understood.
+Placing it after the contrast rather than before it follows the
+try-first-tell-later order: the learner has already seen two providers
+disagree, so the table answers a question they now have.
+The lesson does not ask them to use any operator---that would introduce a
+third varying aspect---but the prose points at the row for a provider
+that treats [[AND]] as a plain word, which is the most common trap.
+
+<<syntax step>>=
+# Why the database matters
+
+```tutorial-step
+required_patterns:
+  - mode: regex
+    pattern: (?:^|\s)scholar\s+syntax\b
+  - Query Syntax Reference
+hint: "There is a command that prints the query syntax each provider understands."
+```
+
+Run `scholar syntax`.
+
+Each provider has its own query language. The reference shows which of
+them understand `AND`, `OR`, `NOT`, grouping, quoted phrases and
+wildcards. Some treat operators as ordinary words, and one strips them
+out entirely.
+
+So the same words can mean a different query on different providers,
+which is one more reason the tables in steps 2 and 3 differ.
+@
+
+\section{Step 6: Keep the search as a session}
+
+Only now, with the record understood, does the learner keep one.
+The step repeats the step~2 command with a single addition, [[-n]],
+so the difference between \enquote{search} and \enquote{search and keep}
+is exactly one flag.
+The confirmation line goes to standard error, which the prose mentions
+because the previous step just taught that standard output can be
+redirected; a learner who redirects this command still sees the
+confirmation.
+The required pattern anchors on the flag and on [[Saved session:]] alone,
+not on the count that follows it, because Rich may wrap the long path
+that separates the two.
+
+<<named session step>>=
+# Keep the search as a session
+
+```tutorial-step
+required_patterns:
+  - mode: regex
+    pattern: (?:^|\s)scholar\s+search\s+.*-n\s+my-first-review\b
+  - "Saved session:"
+hint: "Repeat the openalex search and name the session with -n."
+```
+
+Run the OpenAlex search once more, this time giving it a name:
+
+```
+scholar search "literate programming" -p openalex -l 5 -n my-first-review
+```
+
+`-n my-first-review` saves the search as a *review session*: the query,
+the provider, the limit, the time, and every paper found, each waiting
+for a keep-or-discard decision. The confirmation is printed on standard
+error, so it still shows when you redirect the results to a file.
+
+Searching again with the same `-n` name appends to the session instead
+of replacing it. That is how one review collects several searches.
+@
+
+\section{Step 7: Look at what was kept}
+
+Two commands, one step: [[sessions list]] shows that the session exists,
+[[sessions show]] shows what is inside it.
+Because the tutorial shell keeps Scholar's data directory inside the
+tutorial's own workspace, the list contains exactly the session the
+learner just made---the lesson can promise this, and a learner who has
+used Scholar before is not confused by their real sessions.
+The [[show]] output opens the recorded queries with the line
+[[Queries by provider:]] and lists every paper as pending; the pattern
+requires both, which confirms that the record holds the query and the
+hits, the two things step~8 will ask about.
+In a terminal [[show]] uses a pager, so the prose tells the learner how
+to leave it.
+
+<<sessions list step>>=
+# Look at what was kept
+
+```tutorial-step
+required_patterns:
+  - mode: regex
+    pattern: (?:^|\s)scholar\s+sessions\s+list\b
+  - my-first-review
+  - mode: regex
+    pattern: (?:^|\s)scholar\s+sessions\s+show\s+my-first-review\b
+  - "Queries by provider:"
+  - "Pending (5)"
+hint: "The sessions group has a list verb and a show verb; give show the session name."
+```
+
+Run:
+
+```
+scholar sessions list
+scholar sessions show my-first-review
+```
+
+The list holds exactly one session, because this tutorial keeps its own
+data directory; your real sessions are untouched.
+
+`show` prints the recorded queries, provider by provider, and then every
+paper with its status. All five are *pending*: found, but not yet judged.
+If the output opens in a pager, press `q` to leave it.
+@
+
+\section{Step 8: What does Scholar record?}
+
+The closing question is the fusion move: after separating provider,
+format and session, the learner names the record as a whole.
+The options are built so that each wrong answer corresponds to one of the
+lesson's contrasts.
+\enquote{Only the query} is refuted by step~3, where the same query gave
+two different results; \enquote{only the papers} is refuted by step~7,
+where [[show]] printed the queries before the papers.
+The correct option lists the parts the learner saw in the JSON of step~4
+and the [[show]] output of step~7.
+
+<<what is recorded step>>=
+# What does Scholar record?
+
+```tutorial-step
+kind: single_select
+options:
+  - Only the query text
+  - The query, the provider, the limit, the time and the papers found
+  - Only the papers found
+answers:
+  - The query, the provider, the limit, the time and the papers found
+hint: "Think of what `sessions show` printed before the paper list, and of the JSON in step 4."
+```
+
+Which of these does a saved search record, so that it can be repeated
+later?
+
+Pick the answer that matches what you saw in `sessions show` and in the
+JSON output.
+@

@@ -2,6 +2,8 @@
 # Only .nw source files should be committed
 src/**/*.py
 src/**/*.tex
+src/scholar/tutorials/*.md
+src/scholar/tutorials/ltxobj/
 tests/*.py
 doc/*.pdf
 doc/ltxobj/

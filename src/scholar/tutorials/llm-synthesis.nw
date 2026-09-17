@@ -1,0 +1,635 @@
+\chapter{Tutorial: From a session to a literature overview}
+\label{ch:tutorial-llm-synthesis}
+
+[[llm-synthesis]] teaches the [[scholar llm]] subcommands as one
+pipeline with a human in the loop: configure a model once through the
+[[llm]] command, give the model a research context, let it classify the
+session's papers with a confidence, confirm or correct its calls, and
+finally have it write the kept papers up as prose.
+The object of learning is that boundary between the machine's work and
+the learner's: which stages cost a model call, which stages the learner
+must do for the result to mean anything, and how a paid stage can be
+previewed before it is paid for.
+
+The arc has four phases:
+\begin{enumerate}
+\item configure (steps 1--3 set up the [[llm]] command: the CLI is
+  available, a key is stored, a default model is chosen),
+\item tell the model what the review is about (steps 4--5 seed a
+  session and set its research context),
+\item classify with a preview first (steps 6--8 run the classifier
+  dry, then for real, then confirm one of its decisions by hand),
+\item synthesize with a preview first (steps 9--10 do the same for the
+  literature overview), and a closing question (step 11) that asks the
+  learner to sort the commands by whether they spend a call.
+\end{enumerate}
+Two contrasts carry the lesson.
+Steps 6 and 7, and again steps 9 and 10, run the \emph{same} command with
+one flag removed: [[--dry-run]] prints the prompt the model would see and
+stops.
+Holding everything else invariant makes the flag the only thing that
+varies, so the learner experiences exactly where the cost boundary lies
+and what the model is actually asked.
+Steps 7 and 8 then hold the \emph{paper} invariant and vary who decided:
+the classifier's keep is a candidate carrying a confidence, and the same
+keep entered by the learner turns it into a reviewed decision.
+Seeing the status table change while the paper does not is what makes
+the human-in-the-loop rule concrete rather than a slogan.
+
+The session lives in the tutorial's sandboxed data directory, but the
+[[llm]] configuration in steps 2--3 does not: keys and the default model
+belong to the [[llm]] package's own configuration files and are meant to
+outlive the tutorial.
+The learner is told so in the step text.
+Steps 7 and 10 make real model calls; the session is small (five
+papers), and both steps say beforehand that they spend a call.
+
+\section{Tutorial source}
+
+The whole tutorial file is one tangled root chunk.
+Each step lives in its own named sub-chunk so the prose between them can
+describe that step's role without breaking the Markdown output.
+
+<<[[llm-synthesis.md]]>>=
+---
+id: llm-synthesis
+title: From a session to a literature overview
+summary: Set up the llm command, then classify, confirm and synthesize a session into a literature overview.
+---
+
+<<check llm step>>
+
+<<configure key step>>
+
+<<default model step>>
+
+<<seed session step>>
+
+<<research context step>>
+
+<<dry run classify step>>
+
+<<classify step>>
+
+<<confirm decision step>>
+
+<<dry run synthesis step>>
+
+<<synthesize step>>
+
+<<paid calls question step>>
+@
+
+\section{Step 1: Check that the llm command is available}
+
+Scholar does not talk to model providers itself.
+It reads the configuration of Simon Willison's [[llm]] package---the
+stored keys and the default model---so the [[llm]] command line is the
+surface on which the learner configures Scholar's model access.
+The first step therefore only asks whether that command exists.
+The required pattern is the version banner, which every [[llm]] release
+prints in the same shape, so the step is a presence check that does not
+break when the version number changes.
+
+The step text has to cover two installations.
+Scholar's tutorial shell puts the running interpreter's directory first
+on [[PATH]] (\cref{sec:tutorial-command}), which is where [[llm]] lands
+when Scholar was installed with [[uv]] or with
+[[pipx install --include-deps scholarcli]]; a plain [[pipx install
+scholarcli]] does not expose it, and then [[pipx install llm]] is the
+fix.
+Saying this here, rather than in a later step, means a learner who
+lacks the command stops before storing a key that Scholar could not
+read.
+
+<<check llm step>>=
+# Check that the llm command is available
+
+```tutorial-step
+required_patterns:
+  - mode: regex
+    pattern: (?:^|\s)llm\s+--version\b
+  - "llm, version"
+hint: "The command has a version flag; if the shell cannot find it, install it with pipx first."
+```
+
+Run `llm --version`.
+
+Scholar's LLM features use the configuration of the `llm` package:
+the API keys you store and the default model you pick. So the `llm`
+command is where you set that up, once.
+
+If the shell says the command is not found: Scholar installed with
+`uv` or with `pipx install --include-deps scholarcli` brings `llm`
+along, but a plain `pipx install scholarcli` does not. In that case
+install it separately with `pipx install llm`, then run the version
+command again.
+@
+
+\section{Step 2: Store an API key}
+
+The key is the first of two configuration values, and it is separated
+from the model choice in step~3 on purpose: a key says \emph{who} pays
+for the calls, a model says \emph{what} answers them, and learners who
+meet the two in one command tend to conflate them.
+[[llm keys set]] prompts for the key interactively, so the transcript
+never contains the key itself; the required pattern anchors on the
+listing command that follows, which only prints key \emph{names}.
+This also makes the step idempotent: a learner who already has a key
+stored runs the listing and passes.
+
+Scholar installs the provider plugins with itself ([[llm-openai-plugin]],
+[[llm-anthropic]], [[llm-gemini]], [[llm-mistral]], [[llm-azure]],
+[[llm-github-copilot]], [[llm-gpt4all]] and [[llm-openai-via-codex]]), so
+the learner never installs one; [[llm plugins]] lists them.
+One of them changes the shape of this step: [[llm-openai-via-codex]]
+reaches OpenAI models through a Codex subscription with a login flow of
+its own, and needs no stored key at all.
+The required pattern therefore accepts either the key listing or the
+plugin listing, so a learner without any API key still passes the step
+after confirming which plugins are present, and the [[llm keys set]] part
+of the text is explicitly optional.
+
+This is the one place where the tutorial changes state outside its
+sandbox.
+The shell's data directory keeps Scholar's sessions inside the
+workspace, but the [[llm]] configuration files are the learner's own,
+and a key that vanished with the tutorial would defeat the purpose.
+The step text says so plainly so the learner is not surprised later.
+
+<<configure key step>>=
+# Store an API key
+
+```tutorial-step
+required_patterns:
+  - mode: regex
+    pattern: (?:^|\s)llm\s+(?:keys\s+list|plugins)\b
+hint: "Store a key with the set verb if you have one (it prompts for the value), then confirm with the keys list verb; with a Codex subscription, list the plugins instead."
+```
+
+Scholar installs the `llm` provider plugins with itself: OpenAI,
+Anthropic, Gemini, Mistral, Azure, GitHub Copilot, local GPT4All
+models, and OpenAI through a Codex subscription. See them with
+`llm plugins`; `llm models` (next step) lists the models they provide.
+
+If you have an API key for a provider, store it, for example:
+
+```
+llm keys set openai
+```
+
+The command asks for the key on its own prompt, so it never ends up in
+your shell history. Use the provider's name as `llm` knows it. If you
+have stored a key before, skip straight to the check.
+
+If you have a Codex subscription rather than an API key, you need no
+`llm keys set`: the `llm-openai-via-codex` plugin has its own login
+flow, described in its README, and its models then show up in
+`llm models`.
+
+Then confirm with `llm keys list`, which prints only the names of the
+stored keys, or with `llm plugins` if you rely on the Codex plugin.
+
+Unlike the sessions you create in this tutorial, a key is stored in
+your real `llm` configuration on purpose: Scholar reads it there, in
+this tutorial and afterwards.
+@
+
+\section{Step 3: Choose a default model}
+
+Scholar uses whatever [[llm]] considers the default model unless a
+command overrides it, so choosing that default is the last piece of
+configuration.
+The step asks for three commands---list the models, set one as default,
+show the default---because the middle one is silent, and the learner
+needs the third to see that it took effect.
+The required patterns anchor on the listing and on a [[default]]
+invocation followed by a token, which accepts both the setting command
+and a bare check whose output is the model name.
+
+The step text also introduces the per-command overrides, [[-m]],
+[[--model-analytic]] and [[--model-writing]], but only in prose.
+They contrast with the global default along one axis---scope---and
+naming them here, where the default is set, lets the learner see that
+the default is a fallback rather than a lock-in.
+Scholar distinguishes \emph{analytic} tasks (classification, query
+generation) from \emph{writing} tasks (synthesis) because a cheap model
+is often good enough for the first and rarely for the second.
+
+<<default model step>>=
+# Choose a default model
+
+```tutorial-step
+required_patterns:
+  - mode: regex
+    pattern: (?:^|\s)llm\s+models\b
+  - mode: regex
+    pattern: (?:^|\s)llm\s+models\s+default\s+\S+
+hint: "List the models, pick one with the default verb, then run the default verb again without an argument to see it."
+```
+
+List the models your keys unlock:
+
+```
+llm models
+```
+
+Pick one as the default, for example:
+
+```
+llm models default gpt-4o-mini
+```
+
+Then run `llm models default` with no argument: it prints the model
+Scholar will use from now on.
+
+The default is a fallback, not a lock-in. Every `scholar llm` command
+accepts `-m MODEL` for one run, and two narrower overrides:
+`--model-analytic` for classification and query generation, and
+`--model-writing` for synthesis. A small model is often fine for the
+analytic tasks; the writing usually deserves a stronger one.
+@
+
+\section{Step 4: Seed a session}
+
+Everything the model does in this tutorial acts on one session, so the
+session is created up front and is then held invariant through steps
+5--10.
+The search is the same small query the earlier tutorials use, on the
+keyless [[openalex]] provider with a limit of five, so the classifier
+has little to read, the synthesis has little to cite, and the model
+calls in steps 7 and 10 stay cheap.
+The required patterns anchor on the [[-n]] flag with the session name
+and on Scholar's own save line, which is printed regardless of output
+format.
+
+<<seed session step>>=
+# Seed a session
+
+```tutorial-step
+required_patterns:
+  - mode: regex
+    pattern: (?:^|\s)scholar\s+search\s+.*-n\s+llm-overview\b
+  - "Saved session:"
+hint: "A search with -n saves its hits to a named session; keep the provider keyless and the limit small."
+```
+
+Create the session the rest of this tutorial works on:
+
+```
+scholar search "literate programming" -p openalex -l 5 -n llm-overview
+```
+
+Five papers from one provider are enough to see every stage, and they
+keep the model calls later in this tutorial small.
+
+The session lives in this tutorial's own data directory, so it will not
+appear in your real session list afterwards.
+@
+
+\section{Step 5: Set the research context}
+
+A classifier needs a criterion.
+Scholar stores it as the session's \emph{research context}: a short
+statement of the research question and what makes a paper relevant to
+it.
+The step sets the context and then reads it back with the same command
+without an argument, so the learner sees that the context is part of
+the session record rather than a one-off argument.
+The required patterns anchor on Scholar's confirmation line and on the
+read-back.
+
+The context given here is a question rather than a topic on purpose.
+The dry run in step~6 will show it inside the prompt, and a question
+makes it visible that the model is asked to judge relevance \emph{to
+something}, not to sort papers by subject.
+The same context is what [[scholar rq]] would have recorded had the
+session started from a research question; the tutorial mentions that
+shortcut at the end, once the learner has seen what it automates.
+
+<<research context step>>=
+# Set the research context
+
+```tutorial-step
+required_patterns:
+  - mode: regex
+    pattern: (?:^|\s)scholar\s+llm\s+context\s+llm-overview\s+["']
+  - "Research context updated."
+  - "Research context:"
+hint: "The context verb takes the session and a quoted question; run it again without the question to read it back."
+```
+
+Tell the model what the review is about:
+
+```
+scholar llm context llm-overview "Which tools and practices make literate programming usable in practice?"
+scholar llm context llm-overview
+```
+
+The second command, without a question, reads the context back.
+
+The research context is stored in the session. Every LLM command on
+this session---classification and synthesis---puts it in front of the
+model, so write it as the question you actually want answered, not as
+a list of keywords.
+@
+
+\section{Step 6: Preview the classification prompt}
+
+This is the first half of the tutorial's central contrast.
+[[--dry-run]] makes the classify command print the prompt it would send
+and stop, so the learner reads exactly what the model will be asked:
+the research context from step~5 and the tag vocabulary the model must
+stay within.
+The required patterns anchor on Scholar's dry-run banner and on the
+context heading inside the prompt, which ties the preview back to the
+value the learner just set.
+
+[[--no-examples]] is given because a fresh session has no human
+decisions to learn from; without the flag Scholar would warn about the
+missing examples and proceed anyway, and the warning would distract from
+the prompt.
+The three [[-t]] tags are the two-sided vocabulary that the
+agent-facing tutorial (\cref{ch:tutorial-scholar-with-an-agent}) relies
+on; seeding them here shows in the prompt as an explicit allowed list,
+which is the point: the learner sees that the model cannot invent tags.
+
+<<dry run classify step>>=
+# Preview the classification prompt
+
+```tutorial-step
+required_patterns:
+  - mode: regex
+    pattern: (?:^|\s)scholar\s+llm\s+classify\s+llm-overview\s+.*--dry-run\b
+  - "Prompt (dry run):"
+  - "## Research Context"
+hint: "Add --dry-run to the classify command to print the prompt instead of sending it."
+```
+
+Before spending a model call, look at what the model would be asked:
+
+```
+scholar llm classify llm-overview --no-examples --dry-run \
+    -t supports-claim -t adjacent-subtopic -t off-topic-false-hit
+```
+
+`--dry-run` prints the prompt and stops. Find your research context in
+it, and the list of allowed tags: the model must pick from that list
+and cannot invent tags of its own.
+
+`--no-examples` skips the training examples, because a new session has
+no human decisions to learn from yet. The `-t` flags seed the tag
+vocabulary; tags already used in the session are always included.
+@
+
+\section{Step 7: Classify for real}
+
+The second half of the contrast: the same command without
+[[--dry-run]].
+Now the model answers, and Scholar records one decision per paper with
+a confidence.
+The step asks for the status table straight after, because the status
+table is where the tutorial's rule becomes visible: the new rows count
+as \emph{LLM (unreviewed)}, not as decisions.
+The required patterns anchor on Scholar's summary line and on that
+status row.
+
+The step text says before the command that it spends a model call.
+The tutorial has been free up to here, and a learner should never
+discover a cost afterwards.
+
+<<classify step>>=
+# Classify for real
+
+```tutorial-step
+required_patterns:
+  - mode: regex
+    pattern: Classified \d+ papers
+  - mode: regex
+    pattern: (?:^|\s)scholar\s+llm\s+status\s+llm-overview\b
+  - "LLM (unreviewed)"
+hint: "Run the classify command without --dry-run, then look at the session with the status verb."
+```
+
+This step makes a real model call (five short papers, so a small one).
+
+Run the classification without the dry-run flag:
+
+```
+scholar llm classify llm-overview --no-examples \
+    -t supports-claim -t adjacent-subtopic -t off-topic-false-hit
+```
+
+Then show where the session stands:
+
+```
+scholar llm status llm-overview
+```
+
+The papers the model classified appear as *LLM (unreviewed)*. Each
+carries the model's confidence, but none is a decision yet: the model
+proposed, and someone still has to dispose.
+@
+
+\section{Step 8: Confirm one decision as a human}
+
+Here the paper stays the same and the decider changes.
+The learner records a keep on a paper the model already kept, with the
+non-interactive [[sessions decide]] command, and the status table moves
+that row from \emph{LLM (unreviewed)} to \emph{LLM (reviewed)}.
+[[sessions decide]] is used rather than the TUI because it keeps this
+tutorial free of screen-driven steps and because it is the form an
+agent would use; the review tutorial
+(\cref{ch:tutorial-reviewing-in-the-tui}) covers the keys that do the
+same thing interactively.
+The required patterns anchor on the decide command with a [[--doi]]
+selector, on Scholar's confirmation line and on the reviewed row.
+The decide command needs a DOI, and [[sessions show]] prints titles, not
+DOIs; rather than teach a workaround, the step reruns the seeding search
+without [[-n]] in BibTeX format and greps the [[doi =]] lines.
+The search is served from the cache and records nothing, which quietly
+repeats the first tutorial's lesson that a search without [[-n]] leaves
+no trace.
+
+The step text also states the iteration rule: a reviewed decision the
+learner \emph{changed} becomes a training example for the next
+classification round, which is why the next round can drop
+[[--no-examples]].
+That closes the loop the README describes, and the learner has now
+produced each of its parts by hand.
+
+<<confirm decision step>>=
+# Confirm one decision as a human
+
+```tutorial-step
+required_patterns:
+  - mode: regex
+    pattern: (?:^|\s)scholar\s+sessions\s+decide\s+llm-overview\s+--keep\s+--doi\s+\S+
+  - "marked kept"
+  - "LLM (reviewed)"
+hint: "Pick a DOI from the session, record a keep for it with the decide verb, then check the status table again."
+```
+
+First get a DOI to decide on. `sessions show` lists titles, so rerun
+the seeding search in BibTeX form; it is served from the cache and,
+without `-n`, records nothing:
+
+```
+scholar search "literate programming" -p openalex -l 5 -f bibtex | grep 'doi ='
+```
+
+Pick the DOI of a paper the model kept (compare with `sessions show`)
+and record the same keep yourself:
+
+```
+scholar sessions decide llm-overview --keep --doi <the DOI> --tag supports-claim
+```
+
+Then run `scholar llm status llm-overview` again.
+
+The paper has moved from *LLM (unreviewed)* to *LLM (reviewed)*: the
+model's proposal is now your decision. A reviewed decision that you
+changed (a discard where the model kept, or the reverse) becomes a
+training example, so the next `scholar llm classify` on this session
+can drop `--no-examples` and learn from your corrections. In the
+review TUI, the keys `K` and `d` on a queued paper do exactly this.
+@
+
+\section{Step 9: Preview the synthesis prompt}
+
+Synthesis repeats the dry-run contrast at the second paid stage, so the
+learner meets the pattern twice and can generalise it: any [[scholar
+llm]] command that would call a model accepts [[--dry-run]].
+The preview also shows the two preconditions in action.
+The synthesis needs a research context (set in step~5) and at least one
+kept paper (there are some after steps 7--8); with either missing,
+Scholar refuses instead of writing prose about nothing.
+The required patterns anchor on the dry-run banner and on the research
+question heading inside the prompt, so the learner sees the same
+context from step~5 reappear in a different role: as the question the
+synthesis answers rather than the criterion it classifies by.
+
+<<dry run synthesis step>>=
+# Preview the synthesis prompt
+
+```tutorial-step
+required_patterns:
+  - mode: regex
+    pattern: (?:^|\s)scholar\s+llm\s+synthesize\s+llm-overview\s+.*--dry-run\b
+  - "Prompt (dry run):"
+  - "## Research Question"
+hint: "The synthesize verb takes --dry-run too; the prompt shows the research question and the kept papers."
+```
+
+Preview the synthesis the same way:
+
+```
+scholar llm synthesize llm-overview --dry-run
+```
+
+The prompt opens with your research question and lists the kept papers
+with their abstracts. When the kept papers carry tags, the synthesis is
+organised by them, and the preview shows one prompt per theme.
+
+Synthesis needs two things, and refuses without them: a research
+context, and at least one kept paper. This session has both.
+@
+
+\section{Step 10: Write the literature overview}
+
+The last paid stage.
+The command writes the overview to a file, and the step asks the
+learner to look at its head, because the structure is the point: the
+output always starts with a \emph{Research Question} section that
+carries the provenance (the query and provider pairs, the timestamp, the
+review statistics), then the synthesis, a conclusion and a
+deterministic reference list.
+The required patterns anchor on Scholar's confirmation line and on that
+first heading.
+
+Markdown is the default because it is readable as-is.
+The step text contrasts it with [[-f latex]] in prose only, so the
+learner knows the LaTeX output exists without having to compile it: a
+standalone document embeds its own BibTeX file and needs [[biber]],
+while [[--no-standalone]] gives a fragment for [[\input]] with the
+bibliography written next to it.
+Finally the text names [[scholar rq]], which starts from a research
+question and runs steps 4--7 in one go; it is mentioned last so that the
+learner meets the shortcut only after having done each of its parts.
+
+<<synthesize step>>=
+# Write the literature overview
+
+```tutorial-step
+required_patterns:
+  - mode: regex
+    pattern: (?:^|\s)scholar\s+llm\s+synthesize\s+llm-overview\s+.*-o\s+overview\.md\b
+  - "Synthesis written to"
+  - "Research Question"
+hint: "Run the synthesize verb with -o to write a Markdown file, then look at the top of that file."
+```
+
+This step makes a real model call.
+
+Write the overview to a file:
+
+```
+scholar llm synthesize llm-overview -o overview.md
+```
+
+Then read the beginning of it with `head -20 overview.md`.
+
+The overview always opens with a *Research Question* section carrying
+the provenance: which queries ran on which providers, when, and the
+review statistics. The synthesis follows, organised by theme when the
+kept papers carry tags, then a conclusion and a reference list.
+
+Markdown is the default. With `-f latex` you get a compilable document
+that embeds its own BibTeX file (compile it with biber), and with
+`-f latex --no-standalone -o part.tex` a fragment for `\input` with the
+bibliography written next to it.
+
+If you start from a research question rather than a query, `scholar rq
+"..."` does steps 4 to 7 in one go: it generates provider-specific
+queries, runs them, stores the question as the research context and
+classifies the hits.
+@
+
+\section{Step 11: Which commands spend a call?}
+
+The closing question is the fusion step.
+Having varied one flag at a time, the learner is now asked to sort the
+whole [[scholar llm]] surface along the axis the tutorial was about:
+which commands spend a model call.
+The options mix the free commands ([[context]], [[status]]) with the
+paid ones ([[classify]], [[synthesize]]) and add [[scholar rq]] and a
+[[--dry-run]] variant as the two cases most likely to be misjudged: the
+former because it was only mentioned in prose, the latter because it
+looks like the paid command it previews.
+A [[multi_select]] with literal option text is used so the answer is
+checked against the commands, not against their position.
+
+<<paid calls question step>>=
+# Which commands spend a call?
+
+```tutorial-step
+kind: multi_select
+options:
+  - scholar llm context
+  - scholar llm classify
+  - scholar llm classify --dry-run
+  - scholar llm status
+  - scholar llm synthesize
+  - scholar rq
+answers:
+  - scholar llm classify
+  - scholar llm synthesize
+  - scholar rq
+hint: "A command spends a call only when a model actually answers; previews, settings and status tables do not."
+```
+
+Pick every command in this list that makes a model call.
+
+Think back over what you ran: which commands returned immediately with
+something Scholar already had, and which ones waited for a model?
+@

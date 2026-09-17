@@ -35,6 +35,7 @@ DOC+=		llm_review.tex
 .PHONY: all clean distclean
 
 all: ${MODULES} ${DOC}
+	${MAKE} -C tutorials all
 
 __init__.py: scholar.nw
 	${NOTANGLE.py}
@@ -47,5 +48,7 @@ include ${INCLUDE_MAKEFILES}/noweb.mk
 
 clean:
 	${RM} ${MODULES} ${DOC}
+	${MAKE} -C tutorials clean
 
 distclean:
+	${MAKE} -C tutorials distclean
