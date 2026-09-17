@@ -3,10 +3,10 @@ revision = 3
 requires-python = ">=3.12, <4.0"
 resolution-markers = [
     "python_full_version >= '3.15' and sys_platform == 'win32'",
-    "python_full_version == '3.14.*' and sys_platform == 'win32'",
     "python_full_version >= '3.15' and sys_platform == 'emscripten'",
-    "python_full_version == '3.14.*' and sys_platform == 'emscripten'",
     "python_full_version >= '3.15' and sys_platform != 'emscripten' and sys_platform != 'win32'",
+    "python_full_version == '3.14.*' and sys_platform == 'win32'",
+    "python_full_version == '3.14.*' and sys_platform == 'emscripten'",
     "python_full_version == '3.14.*' and sys_platform != 'emscripten' and sys_platform != 'win32'",
     "python_full_version < '3.14' and sys_platform == 'win32'",
     "python_full_version < '3.14' and sys_platform == 'emscripten'",
@@ -1040,6 +1040,19 @@ wheels = [
 ]
 
 [[package]]
+name = "llm-openai-via-codex"
+version = "0.1a0"
+source = { registry = "https://pypi.org/simple" }
+dependencies = [
+    { name = "llm" },
+    { name = "openai" },
+]
+sdist = { url = "https://files.pythonhosted.org/packages/87/22/a896216d58ca1b201ce9152e0c9eba8cee453bc8682a65362e64c30f9b8b/llm_openai_via_codex-0.1a0.tar.gz", hash = "sha256:930187bf61b1ff570d722a9dac2ce419d5c12b3cdf380c825a5167330a3a7abe", size = 10656, upload-time = "2026-04-23T19:23:35.598Z" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/cf/f7/1c1bc95ad83c8fbb830caefa94cae28aa7c1dff6de3dbc2c58e50488a87f/llm_openai_via_codex-0.1a0-py3-none-any.whl", hash = "sha256:35a6f9ba393d296005cdd89934baa3af6c99134a455299cc068f7053d58d5675", size = 10563, upload-time = "2026-04-23T19:23:34.473Z" },
+]
+
+[[package]]
 name = "lxml"
 version = "6.1.1"
 source = { registry = "https://pypi.org/simple" }
@@ -2013,6 +2026,7 @@ dependencies = [
     { name = "llm-gpt4all" },
     { name = "llm-mistral" },
     { name = "llm-openai-plugin" },
+    { name = "llm-openai-via-codex" },
     { name = "openai" },
     { name = "pandas" },
     { name = "platformdirs" },
@@ -2054,6 +2068,7 @@ requires-dist = [
     { name = "llm-gpt4all", specifier = ">=0.4" },
     { name = "llm-mistral", specifier = ">=0.15,<0.16" },
     { name = "llm-openai-plugin", specifier = ">=0.7" },
+    { name = "llm-openai-via-codex", specifier = ">=0.1a0" },
     { name = "openai", specifier = ">=1.0.0" },
     { name = "pandas", specifier = ">=2.0.0" },
     { name = "platformdirs", specifier = ">=4.5.1" },
