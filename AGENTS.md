@@ -35,6 +35,7 @@ Providers self-register via `register_provider()` at module load time.
 | `src/scholar/ratelimit.nw` | Literate source for rate-limit tracking |
 | `src/scholar/cli.py` | CLI commands and output formatters |
 | `src/scholar/cli.nw` | Literate programming source for CLI |
+| `src/scholar/tutorials/*.nw` | Literate sources of the interactive tutorials (tangle to `*.md`, weave to chapters) |
 
 ### Data Models
 
@@ -329,6 +330,43 @@ without tags. A session without tags imposes nothing unless
 prefer the vocabulary but nothing is dropped or retried. The `llm`
 module is looked up via `globals()` so tests can substitute a fake model.
 
+### Interactive Tutorials (`scholar tutorial`)
+
+`scholar tutorial list|run|review` is [pytorial](https://github.com/dbosk/pytorial)
+mounted through `pytorial.cli.add_typer_subcommand` in `cli.nw`
+(`<<tutorial command>>`, namespace `scholar`). It serves pytorial's own
+`using-tutorials` lesson plus the files named in `TUTORIAL_FILES`, in that
+order (the order is the lesson order; a directory would list
+alphabetically). An untangled checkout mounts nothing instead of failing.
+
+- **Sources.** `src/scholar/tutorials/<id>.nw` tangles to `<id>.md` (what
+  pytorial runs; gitignored, shipped as package data via
+  `[tool.setuptools.package-data]`) and weaves to `<id>.tex` (a chapter in
+  the Tutorials part of `doc/scholar.pdf`). The `.md` is the learner's
+  text; the woven chapter explains *how the lesson teaches* (what a step
+  varies, what it holds invariant, why the order), and that reasoning is
+  the chapter's own content, so it goes in body prose, not `\ltnote`.
+- **Sandbox.** `tutorial_shell_runner` sets `SCHOLAR_DATA_DIR` to
+  `<workspace>/scholar-data` (per run, so `--restart` is a clean slate
+  and practice sessions never reach the real session list) and prepends
+  the interpreter's bin dir to `PATH` (so `uv run scholar tutorial run`
+  finds the same `scholar` and `llm`). The cache is shared on purpose.
+  Rate-limit memory lives in the data dir, so lessons only use keyless
+  providers (openalex, arxiv). Hook subprocesses (`check_command`,
+  `post_command`) inherit the process environment, which the runner also
+  updates; lessons validate with `required_patterns` only.
+- **Anchors.** Steps validate on a regex for the command typed plus
+  Scholar's own fixed output strings (`Saved session:`,
+  `Queries by provider:`, `Exported:`, `Prompt (dry run):`, ...), never
+  on ranking-dependent titles. Inside a code chunk a line must not start
+  with `@` or `<<` (noweb markup): indent BibTeX examples by one space.
+- **Adding a lesson.** Write `src/scholar/tutorials/<id>.nw` with root
+  chunk `<<[[<id>.md]]>>=` and `id: <id>` in the front matter; add it to
+  `src/scholar/tutorials/Makefile` (`MODULES` and `DOC` plus the two
+  dependency lines), `TUTORIAL_FILES` in `cli.nw`, `SRC_TEX` in
+  `doc/Makefile`, and an `\input` in `doc/scholar.tex`. The parametrised
+  test in `cli.nw` then loads it with pytorial's parser.
+
 ## Testing
 
 ```bash
@@ -433,6 +471,8 @@ requests/day and each `scholar` run is a fresh process.
 - `rich` - Terminal formatting
 - `semanticscholar`, `pyalex` - Provider-specific clients
 - `cachetools` - Caching with decorators
+- `pytorial` - Interactive tutorial runner behind `scholar tutorial`
+- `llm` and its plugins (`llm-openai-plugin`, `llm-anthropic`, `llm-gemini`, `llm-mistral`, `llm-azure`, `llm-github-copilot`, `llm-gpt4all`, `llm-openai-via-codex`) - model access for `scholar rq` and `scholar llm`
 - `platformdirs` - Platform-appropriate cache directory
 
 
