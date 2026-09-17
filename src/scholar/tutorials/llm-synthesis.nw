@@ -444,12 +444,10 @@ agent would use; the review tutorial
 same thing interactively.
 The required patterns anchor on the decide command with a [[--doi]]
 selector, on Scholar's confirmation line and on the reviewed row.
-The decide command needs a DOI, and [[sessions show]] prints titles, not
-DOIs; rather than teach a workaround, the step reruns the seeding search
-without [[-n]] in BibTeX format and greps the [[doi =]] lines.
-The search is served from the cache and records nothing, which quietly
-repeats the first tutorial's lesson that a search without [[-n]] leaves
-no trace.
+The decide command needs a DOI, and [[sessions show]] prints one under
+every title as the paper id ([[doi:...]]), which is also what
+[[--paper-id]] accepts; the step has the learner read the listing first,
+so the identifier is met where it is later needed.
 
 The step text also states the iteration rule: a reviewed decision the
 learner \emph{changed} becomes a training example for the next
@@ -470,16 +468,15 @@ required_patterns:
 hint: "Pick a DOI from the session, record a keep for it with the decide verb, then check the status table again."
 ```
 
-First get a DOI to decide on. `sessions show` lists titles, so rerun
-the seeding search in BibTeX form; it is served from the cache and,
-without `-n`, records nothing:
+Find a paper the model kept and its DOI: `sessions show` prints each
+paper's id under its title, `doi:` followed by the DOI.
 
 ```
-scholar search "literate programming" -p openalex -l 5 -f bibtex | grep 'doi ='
+scholar sessions show llm-overview
 ```
 
-Pick the DOI of a paper the model kept (compare with `sessions show`)
-and record the same keep yourself:
+Record the same keep yourself, filling in that DOI (without the `doi:`
+prefix; `--paper-id` takes the whole id instead):
 
 ```
 scholar sessions decide llm-overview --keep --doi <the DOI> --tag supports-claim

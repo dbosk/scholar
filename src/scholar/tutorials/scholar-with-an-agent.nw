@@ -239,12 +239,11 @@ confirmation instead of treating it as settled.
 The learner sees the same thing in [[scholar llm status]], where the row
 counts as \enquote{LLM (unreviewed)}.
 
-The decision needs a DOI, and neither [[sessions show]] nor its JSON
-form prints DOIs.
-Rather than teach a workaround, the step reuses what step~2 taught: the
-search is reproducible, so running it again (without [[-n]], so nothing
-new is recorded; and instantly, because the cache holds the response)
-and grepping the [[doi =]] lines yields a DOI to copy.
+The decision needs a DOI, and the learner has just seen [[sessions
+show]] print one under every title as the paper id ([[doi:...]]), so the
+step sends them back to that listing rather than to the search output.
+This is also how an agent finds its selectors: [[show -f json]] carries
+the same [[doi]] and [[paper_id]] fields.
 The pattern accepts any DOI because the learner's result list is not
 predictable.
 
@@ -261,18 +260,12 @@ required_patterns:
     pattern: marked kept
   - mode: regex
     pattern: (?:^|\s)scholar\s+llm\s+status\s+claim-literate\b
-hint: "Get a DOI from the `doi =` lines of the support search, keep the paper with `sessions decide` and `--source llm --tag supports-claim`, then look at `scholar llm status`."
+hint: "Take a DOI from the `doi:` ids in `sessions show`, keep the paper with `sessions decide` and `--source llm --tag supports-claim`, then look at `scholar llm status`."
 ```
 
-First find a DOI to decide on. The support search is cached, so
-rerunning it costs nothing; leave out `-n` so nothing is recorded twice:
-
-```
-scholar search "literate programming readability" -p openalex -l 5 \
-    -f bibtex | grep 'doi ='
-```
-
-Pick one DOI and keep that paper as the agent would:
+Pick a DOI from the session listing of the previous step (the `doi:`
+line under a title; `scholar sessions show claim-literate` prints it
+again) and keep that paper as the agent would:
 
 ```
 scholar sessions decide claim-literate --source llm --keep \
