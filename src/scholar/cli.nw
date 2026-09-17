@@ -25,6 +25,8 @@ The CLI exposes every major Scholar capability as a subcommand:
 \item[[scholar themes]] Explore themes across review sessions.
 \item[[scholar enrich]] Fetch missing abstracts for papers.
 \item[[scholar llm]] Run LLM-assisted classification.
+\item[[scholar tutorial]] Run the interactive tutorials that teach
+  these workflows at the terminal.
 \end{description}
 
 This chapter presents the implementation of each command.
@@ -78,6 +80,7 @@ across bibliographic databases.
 <<themes command>>
 <<sessions command>>
 <<prov command>>
+<<tutorial command>>
 <<llm command helpers>>
 <<llm command>>
 <<submodule registration>>
@@ -8563,6 +8566,224 @@ class TestProvExportCommand:
         assert "% === provenance: alice2024 ===" in result.output
         assert "% CLAIM: privacy matters" in result.output
         assert "private thoughts" not in result.output
+@
+
+
+\section{Interactive Tutorials}
+\label{sec:tutorial-command}
+
+The README and this document tell a newcomer what the commands do, but
+neither makes them \emph{do} anything.
+The [[tutorial]] subcommand embeds pytorial, an interactive tutorial
+runner: each step opens a shell in a per-run workspace, the learner types
+the command the step asks for, and the transcript is checked against the
+step's required patterns before the lesson moves on.
+That is the try-first-tell-later arc the rest of this project uses, applied
+to the tool itself.
+The lessons are literate sources under [[src/scholar/tutorials/]]; each
+tangles to the Markdown pytorial reads and weaves to a chapter of this
+document that explains the lesson's design (the Tutorials part).
+
+pytorial's embedding entry point mounts only what the host hands it,
+prepends its own [[using-tutorials]] lesson (how the runner itself works),
+hides the standalone-only [[install]] command and ignores the user's
+installed-tutorial directory, so [[scholar tutorial]] serves exactly what
+Scholar ships.
+We hand it the tangled files by name, in lesson order: a directory would
+be listed alphabetically, and the order matters because the later lessons
+assume the earlier ones (the LLM lesson assumes the learner has seen a
+session; the agent lesson assumes decisions and exports).
+The existence filter is not defensive decoration: pytorial raises when a
+configured path is missing, so a source checkout that has not been tangled
+would otherwise break every [[scholar tutorial]] call instead of merely
+listing fewer lessons.
+
+<<tutorial command>>=
+TUTORIAL_DIR = Path(__file__).with_name("tutorials")
+TUTORIAL_FILES = (
+    "first-search.md",
+    "reviewing-in-the-tui.md",
+    "enrich-verify-export.md",
+    "llm-synthesis.md",
+    "scholar-with-an-agent.md",
+)
+
+
+def bundled_tutorial_paths() -> tuple[Path, ...]:
+    """Return the tangled tutorial files that exist, in lesson order.
+
+    An untangled source checkout mounts nothing rather than breaking
+    every `scholar tutorial` call.
+    """
+    candidates = (TUTORIAL_DIR / name for name in TUTORIAL_FILES)
+    return tuple(path for path in candidates if path.exists())
+@
+
+\subsection{Sandboxing the tutorial shell}
+
+A lesson that creates review sessions must not leave them in the learner's
+real session list, and running a lesson twice must start from the same
+state both times.
+Both follow from giving the tutorial shell its own [[SCHOLAR_DATA_DIR]]
+inside pytorial's workspace: workspaces are created per run, so
+[[tutorial run --restart]] is a clean slate, and a step that asks the
+learner to run [[scholar sessions list]] can promise exactly which sessions
+appear.
+The search cache is deliberately \emph{not} sandboxed---it holds provider
+responses, not user state, and sharing it makes a repeated run fast and
+mostly offline.
+The price is that the rate-limit bookkeeping of \cref{ch:ratelimit}, which
+also lives in the data directory, starts empty in every run; the lessons
+therefore only drive keyless providers, where that memory does not matter.
+
+The shell must also find the same [[scholar]] that started the tutorial.
+Under pipx it is on the user's [[PATH]] already, but a developer running
+[[uv run scholar tutorial run ...]] gets a nested bash whose [[PATH]] does
+not include the project's virtual environment.
+Prepending the running interpreter's directory covers both cases (and
+brings the [[llm]] command along, which the LLM lesson needs).
+
+<<tutorial command>>=
+def tutorial_shell_environment(workspace: str | Path) -> dict[str, str]:
+    """Return the environment overrides for a tutorial shell in `workspace`.
+
+    Scholar's data directory is kept inside the workspace, so tutorial
+    sessions never reach the user's real session list, and the running
+    interpreter's directory is put first on `PATH` so the nested shell
+    finds the same `scholar` (and `llm`) that started the tutorial.
+    """
+    data_dir = Path(workspace) / "scholar-data"
+    data_dir.mkdir(parents=True, exist_ok=True)
+    bin_dir = str(Path(sys.executable).parent)
+    path = os.environ.get("PATH", "")
+    return {
+        "SCHOLAR_DATA_DIR": str(data_dir),
+        "PATH": bin_dir if not path else f"{bin_dir}{os.pathsep}{path}",
+    }
+@
+
+pytorial builds the shell's environment by copying the process environment
+and updating it with whatever [[env]] the runner passes, so the overrides
+above are an overlay, not a replacement.
+We also apply them to the process environment itself.
+A step's [[check_command]] and [[post_command]] hooks run as plain
+subprocesses of the [[scholar]] process, not inside the tutorial shell, and
+would otherwise look at the learner's real session store.
+The [[**kwargs]] is load-bearing: pytorial inspects the runner's signature
+and forwards the per-tutorial prompt name and any [[pre_command]] only to a
+runner that accepts them, so a wrapper with a fixed signature would silently
+lose both.
+
+<<tutorial command>>=
+def tutorial_shell_runner(*, workspace: str | Path, **kwargs):
+    """Open pytorial's interactive shell with Scholar sandboxed in `workspace`."""
+    overrides = tutorial_shell_environment(workspace)
+    os.environ.update(overrides)
+    kwargs.pop("env", None)
+    return pytorial.shell.run_interactive_shell(
+        workspace=workspace, env=overrides, **kwargs
+    )
+@
+
+The subcommand is mounted at import time, like the other command groups.
+The [[scholar]] namespace keeps pytorial's progress records apart from
+those of a standalone pytorial installation, and [[allow_shell]] is on
+because the only tutorials ever mounted are the ones shipped here.
+
+<<tutorial command>>=
+pytorial.cli.add_typer_subcommand(
+    app,
+    name="tutorial",
+    namespace="scholar",
+    tutorial_paths=bundled_tutorial_paths(),
+    shell_runner=tutorial_shell_runner,
+    allow_shell=True,
+)
+<<cli imports>>=
+import os
+import sys
+
+import pytorial.cli
+import pytorial.shell
+@
+
+pytorial defers its heavy imports to the point of use precisely so that a
+host can import it on every invocation, so a plain import costs little;
+a guarded import would only turn a broken installation into a silently
+missing subcommand.
+
+Let's verify the wiring.
+The first test is the guard for the others: with an untangled checkout the
+parametrised test below would collect nothing and pass.
+
+<<test functions>>=
+class TestTutorialCommand:
+    """The tutorial subcommand is mounted and serves the bundled lessons."""
+
+    def test_every_bundled_tutorial_is_tangled(self):
+        """All lessons in TUTORIAL_FILES exist on disk."""
+        expected = tuple(TUTORIAL_DIR / name for name in TUTORIAL_FILES)
+        assert bundled_tutorial_paths() == expected
+
+    def test_help_lists_the_subcommands(self):
+        """The group exposes pytorial's list, run and review verbs."""
+        result = runner.invoke(app, ["tutorial", "--help"])
+        assert result.exit_code == 0
+        for verb in ("list", "run", "review"):
+            assert verb in result.output
+        assert "install" not in result.output
+
+    def test_list_names_every_bundled_tutorial(self):
+        """`tutorial list` shows pytorial's own lesson plus ours, in order."""
+        result = runner.invoke(
+            app, ["tutorial", "list"], env={"COLUMNS": "200"}
+        )
+        assert result.exit_code == 0
+        ids = ["using-tutorials"] + [
+            name.removesuffix(".md") for name in TUTORIAL_FILES
+        ]
+        positions = [result.output.index(tid) for tid in ids]
+        assert positions == sorted(positions)
+
+    def test_shell_environment_sandboxes_data_dir(self, tmp_path):
+        """The data directory lives in the workspace; PATH finds scholar."""
+        env = tutorial_shell_environment(tmp_path)
+        assert env["SCHOLAR_DATA_DIR"] == str(tmp_path / "scholar-data")
+        assert (tmp_path / "scholar-data").is_dir()
+        assert env["PATH"].split(os.pathsep)[0] == str(
+            Path(sys.executable).parent
+        )
+
+    def test_shell_runner_forwards_kwargs_and_env(self, tmp_path, monkeypatch):
+        """The wrapper injects the sandbox and keeps pytorial's kwargs."""
+        captured = {}
+
+        def fake_shell(**kwargs):
+            captured.update(kwargs)
+            return None
+
+        monkeypatch.setattr("pytorial.shell.run_interactive_shell", fake_shell)
+        tutorial_shell_runner(workspace=tmp_path, prompt_name="demo")
+        expected = str(tmp_path / "scholar-data")
+        assert captured["workspace"] == tmp_path
+        assert captured["prompt_name"] == "demo"
+        assert captured["env"]["SCHOLAR_DATA_DIR"] == expected
+        assert os.environ["SCHOLAR_DATA_DIR"] == expected
+
+
+@pytest.mark.parametrize("name", TUTORIAL_FILES)
+def test_bundled_tutorial_parses(name):
+    """Every shipped lesson loads with pytorial's own parser and validates."""
+    from pytorial.catalog import load_tutorial_file
+
+    tutorial = load_tutorial_file(TUTORIAL_DIR / name)
+    assert tutorial.id == name.removesuffix(".md")
+    assert tutorial.title and tutorial.summary
+    assert len(tutorial.steps) >= 3
+    for step in tutorial.steps:
+        assert step.required_patterns or step.kind or step.edit_file, (
+            f"{name}: step {step.title!r} has no validation"
+        )
 @
 
 
