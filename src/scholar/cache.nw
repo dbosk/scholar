@@ -457,6 +457,7 @@ def isolate_cache(tmp_path, monkeypatch):
     for var in CONTACT_EMAIL_VARS:
         monkeypatch.delenv(var, raising=False)
     monkeypatch.delenv("OPENALEX_API_KEY", raising=False)
+    monkeypatch.delenv("SCOPUS_VIEW", raising=False)
 @
 
 Rate-limit pacing must not slow the test suite down: once providers

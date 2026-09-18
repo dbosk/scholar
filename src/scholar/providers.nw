@@ -9415,8 +9415,8 @@ Scopus is Elsevier's abstract and citation database, covering over
 27\,000 journals across all disciplines.
 Unlike Semantic Scholar or OpenAlex, Scopus requires an API key
 obtained from \url{https://dev.elsevier.com/}.
-An optional institutional token extends access beyond the standard
-rate limits.
+An optional institutional token carries the institution's entitlement
+to requests made from outside its network (\cref{sec:scopus-view}).
 
 The Scopus Search API differs from other providers in two notable ways:
 \begin{enumerate}
@@ -9427,10 +9427,13 @@ The Scopus Search API differs from other providers in two notable ways:
   modest limits.
 \end{enumerate}
 
-A limitation of the Search API is that it only returns the first author
-([[dc:creator]]).
-Full author lists require a separate Abstract Retrieval API call, which
-we omit here to keep the provider simple and avoid extra API requests.
+How much each result contains depends on the \emph{view} requested.
+The default view gives the title, the venue, the DOI and a single
+author; abstracts, keywords and the full author list come only with the
+[[COMPLETE]] view, which Elsevier serves to the subscribing institution
+alone.
+\Cref{sec:scopus-view} explains how we ask for the richer view whenever
+we are entitled to it, without the user having to say where they are.
 
 \subsection{Error handling}
 
@@ -9516,6 +9519,131 @@ if response.status_code != 200:
     response.raise_for_status()
 @
 
+\subsection{Choosing the view}
+\label{sec:scopus-view}
+
+The same key and the same query give different answers depending on
+where the request comes from.
+From the subscribing institution's IP range (or with its
+[[SCOPUS_INST_TOKEN]]) both views answer 200.
+From anywhere else the default view still answers 200, but
+[[view=COMPLETE]] is refused with HTTP 401.
+So the institution's entitlement decides how much we may \emph{see} of
+each result, not whether we may search.
+
+What [[COMPLETE]] adds is what screening needs: the abstract
+([[dc:description]]), the author keywords and the full, structured
+author list.
+Without it a Scopus-only paper reaches the reviewer with a title and one
+surname.
+Enrichment cannot make up for that in general, since it looks papers up
+by DOI in the other providers and Scopus's strength is precisely what
+those do not index.
+And the richer view costs nothing: it caps a page at 25 results, which
+is the page size we use anyway.
+
+We could let the user assert their entitlement with a flag, but a flag
+can be wrong in both directions and an unattended agent does not know
+which network it is on.
+The service itself knows, and asking costs at most one request: we
+request [[COMPLETE]], and if that is refused we fall back to the default
+view for the rest of the process.
+The [[SCOPUS_VIEW]] environment variable overrides this for the rare
+case where the guess is unwanted: [[standard]] never asks for the
+richer view (saving the one refused request per run), [[complete]]
+insists on it and fails rather than silently returning poorer data.
+
+<<scopus helpers>>=
+SCOPUS_COMPLETE_VIEW = "COMPLETE"
+SCOPUS_VIEW_MODES = ("auto", "complete", "standard")
+
+
+def scopus_view_mode(value: str | None = None) -> str:
+    """Return the view policy from `value` or `SCOPUS_VIEW`.
+
+    One of `auto` (try COMPLETE, fall back), `complete` and `standard`;
+    anything else warns and means `auto`.
+    """
+    raw = value if value is not None else os.environ.get("SCOPUS_VIEW", "")
+    mode = raw.strip().lower() or "auto"
+    if mode not in SCOPUS_VIEW_MODES:
+        logger.warning(
+            "scopus: SCOPUS_VIEW=%r is not one of %s; using auto",
+            raw,
+            "/".join(SCOPUS_VIEW_MODES),
+        )
+        return "auto"
+    return mode
+@
+
+The fallback must fire on the refused view and on nothing else.
+A rejected key is also a 401, and mistaking it for a refused view would
+hide a broken key behind a second request that fails the same way.
+The two differ in the status code inside the body:
+[[AUTHORIZATION_ERROR]] (\enquote{not authorized to access the requested
+view}) against [[AUTHENTICATION_ERROR]] (\enquote{Invalid API Key}).
+The names differ only in their middle, so we match the whole token; the
+[[X-ELS-Status]] header carries the same token and serves when the body
+is missing.
+
+<<scopus helpers>>=
+SCOPUS_VIEW_REFUSED = "AUTHORIZATION_ERROR"
+
+
+def scopus_view_refused(response) -> bool:
+    """Whether Scopus refused the requested view (not the key)."""
+    if getattr(response, "status_code", None) != 401:
+        return False
+    text = getattr(response, "text", "")
+    headers = getattr(response, "headers", None)
+    status = headers.get("X-ELS-Status") if hasattr(headers, "get") else ""
+    return any(
+        isinstance(part, str) and SCOPUS_VIEW_REFUSED in part
+        for part in (text, status)
+    )
+@
+
+Let us check both helpers against the responses the service really
+sends.
+
+<<test functions>>=
+class TestScopusView:
+    """The view policy and the refused-view detection."""
+
+    <<scopus view test methods>>
+<<scopus view test methods>>=
+def test_view_mode_defaults_to_auto(self, monkeypatch, caplog):
+    """Unset and unknown values mean auto; unknown ones warn."""
+    import logging
+
+    monkeypatch.delenv("SCOPUS_VIEW", raising=False)
+    assert scopus_view_mode() == "auto"
+    monkeypatch.setenv("SCOPUS_VIEW", " Standard ")
+    assert scopus_view_mode() == "standard"
+    with caplog.at_level(logging.WARNING):
+        assert scopus_view_mode("campus") == "auto"
+    assert "SCOPUS_VIEW" in caplog.text
+
+def test_only_the_refused_view_counts(self):
+    """A rejected key is a 401 too, and must not trigger the fallback."""
+    view = Mock(status_code=401, headers={}, text=(
+        '{"service-error":{"status":{"statusCode":"AUTHORIZATION_ERROR",'
+        '"statusText":"The requestor is not authorized to access the '
+        'requested view or fields of the resource"}}}'
+    ))
+    key = Mock(status_code=401, headers={}, text=(
+        '{"service-error":{"status":{"statusCode":"AUTHENTICATION_ERROR",'
+        '"statusText":"Invalid API Key"}}}'
+    ))
+    header_only = Mock(status_code=401, text="", headers={
+        "X-ELS-Status": "AUTHORIZATION_ERROR - The requestor is not ..."
+    })
+    assert scopus_view_refused(view)
+    assert scopus_view_refused(header_only)
+    assert not scopus_view_refused(key)
+    assert not scopus_view_refused(Mock(status_code=200, text="", headers={}))
+@
+
 \subsection{Provider implementation}
 
 Authentication uses HTTP headers rather than query parameters---the
@@ -9552,6 +9680,7 @@ class ScopusProvider:
         self,
         api_key: str | None = None,
         inst_token: str | None = None,
+        view: str | None = None,
     ):
         """Initialize the Scopus provider.
 
@@ -9560,6 +9689,8 @@ class ScopusProvider:
                 to SCOPUS_API_KEY environment variable.
             inst_token: Institutional token for extended
                 access. Falls back to SCOPUS_INST_TOKEN.
+            view: View policy (auto, complete or standard).
+                Falls back to SCOPUS_VIEW, then auto.
         """
         self.api_key = (
             api_key or os.environ.get("SCOPUS_API_KEY")
@@ -9568,6 +9699,8 @@ class ScopusProvider:
             inst_token
             or os.environ.get("SCOPUS_INST_TOKEN")
         )
+        self.view_mode = scopus_view_mode(view)
+        self._complete_ok: bool | None = None
         self._cache: dict = load_cache(self.name)
         register_cache(self.name, self._cache)
         self._limiter = limiter_for(self)
@@ -9587,18 +9720,19 @@ class ScopusProvider:
         Fetches multiple pages when the requested limit
         exceeds the per-request maximum of 25 results.
         """
-        cache_key = (
+        standard_key = (
             query,
             limit,
             filters.cache_key() if filters else "",
         )
-        if cache_key in self._cache:
-            return self._cache[cache_key]
+        complete_key = standard_key + (SCOPUS_COMPLETE_VIEW,)
+        <<return cached scopus results the view allows>>
         papers, cacheable = self._search_uncached(
             query, limit, filters
         )
         if cacheable:
-            self._cache[cache_key] = papers
+            key = complete_key if self._complete_ok else standard_key
+            self._cache[key] = papers
         return papers
 
     def _search_uncached(
@@ -9633,29 +9767,14 @@ class ScopusProvider:
                 remaining = limit - len(all_papers)
                 current_count = min(page_size, remaining)
 
-                headers = {
-                    "X-ELS-APIKey": self.api_key,
-                    "Accept": "application/json",
-                }
-                if self.inst_token:
-                    headers["X-ELS-Insttoken"] = (
-                        self.inst_token
-                    )
-
+                headers = self._headers()
                 params = {
                     "query": search_query,
                     "start": start,
                     "count": current_count,
                 }
 
-                self._limiter.acquire()
-                response = requests.get(
-                    SCOPUS_API_URL,
-                    headers=headers,
-                    params=params,
-                    timeout=30,
-                )
-                self._limiter.record_response(response)
+                response = self._get_best_view(headers, params)
                 <<scopus handle response errors>>
                 data = response.json()
 
@@ -9696,6 +9815,135 @@ class ScopusProvider:
         except Exception as e:
             logger.warning("scopus: %s", e)
             return all_papers, False
+@
+
+\subsection{Requesting the best view we are allowed}
+
+Every request, whether a page of results or the health check, goes
+through one method, so that the view policy of \cref{sec:scopus-view}
+lives in one place.
+[[_complete_ok]] records what we have learnt about this process's
+entitlement: [[None]] until a request has told us, then [[True]] or
+[[False]].
+Once it is [[False]] we stop asking, so a whole run off campus spends a
+single refused request, and that one goes through the limiter like any
+other.
+With [[SCOPUS_VIEW=complete]] there is no fallback: the refusal reaches
+the ordinary error handling, the search returns nothing and nothing is
+cached.
+
+<<scopus provider>>=
+
+    def _wants_complete(self) -> bool:
+        """Whether the next request should ask for the COMPLETE view."""
+        if self.view_mode == "auto":
+            return self._complete_ok is not False
+        return self.view_mode == "complete"
+
+    def _get_best_view(
+        self, headers: dict, params: dict, retry: bool = True
+    ):
+        """GET with the richest view allowed; remember a refusal.
+
+        A refused COMPLETE request is repeated in the standard view
+        unless `retry` is false (the caller only wants to learn the
+        entitlement) or the policy forbids falling back.
+        """
+        asked_complete = self._wants_complete()
+        if asked_complete:
+            params = {**params, "view": SCOPUS_COMPLETE_VIEW}
+        response = self._get(headers, params)
+        if asked_complete and scopus_view_refused(response):
+            self._complete_ok = False
+            if self.view_mode == "auto":
+                <<say once that scopus falls back to the standard view>>
+            if self.view_mode == "auto" and retry:
+                params = {
+                    k: v for k, v in params.items() if k != "view"
+                }
+                response = self._get(headers, params)
+        elif asked_complete and response.status_code == 200:
+            self._complete_ok = True
+        return response
+
+    def _get(self, headers: dict, params: dict):
+        """One rate-limited GET against the search endpoint."""
+        self._limiter.acquire()
+        response = requests.get(
+            SCOPUS_API_URL,
+            headers=headers,
+            params=params,
+            timeout=30,
+        )
+        self._limiter.record_response(response)
+        return response
+@
+
+\subsection{Caching per view}
+
+The cache never expires, which turns the view into a caching problem:
+results fetched off campus lack abstracts, and if they answered for the
+query ever after, going to campus would not help.
+So results are stored under the view they were fetched with.
+Default-view results keep the historical three-part key, which means
+that everything cached before views existed is, correctly, read as
+default-view data.
+[[COMPLETE]] results get the view as a fourth part.
+
+Reading is asymmetric, because richer data can stand in for poorer but
+not the other way round.
+[[COMPLETE]] results are served to anyone who has not asked for the
+standard view.
+Default-view results are served only when we cannot do better, and
+whether we can is exactly what [[_complete_ok]] tells us---except at
+the start of a process, when it is still [[None]].
+Re-running the whole search to find out would spend a page per 25
+results on a question that one request answers, so we probe.
+The probe wants only the verdict, so it does not repeat a refused
+request in the standard view.
+If the probe fails (no network, quota spent) we still do not know, and
+serve what we have: a cached result must not become unavailable because
+we hoped for a better one.
+
+<<say once that scopus falls back to the standard view>>=
+logger.info(
+    "scopus: the COMPLETE view is not authorized from this network "
+    "(no abstracts or full author lists); using the standard view. "
+    "On the institution's network or with SCOPUS_INST_TOKEN it is."
+)
+<<return cached scopus results the view allows>>=
+if self.view_mode != "standard" and complete_key in self._cache:
+    return self._cache[complete_key]
+if standard_key in self._cache and not self._complete_confirmed():
+    return self._cache[standard_key]
+<<scopus provider>>=
+
+    def _complete_confirmed(self) -> bool:
+        """Whether the COMPLETE view is known to work, probing if unknown."""
+        if self.view_mode != "auto":
+            return self.view_mode == "complete"
+        if self._complete_ok is None and self.api_key:
+            try:
+                self._get_best_view(
+                    self._headers(),
+                    dict(SCOPUS_PROBE_PARAMS),
+                    retry=False,
+                )
+            except (RateLimited, requests.exceptions.RequestException):
+                pass
+        return self._complete_ok is True
+
+    def _headers(self) -> dict:
+        """Authentication headers, with the institutional token if set."""
+        headers = {
+            "X-ELS-APIKey": self.api_key,
+            "Accept": "application/json",
+        }
+        if self.inst_token:
+            headers["X-ELS-Insttoken"] = self.inst_token
+        return headers
+<<scopus constants>>=
+SCOPUS_PROBE_PARAMS = {"query": "TITLE-ABS-KEY(test)", "count": 1}
 @
 
 \subsection{Applying filters}
@@ -9793,6 +10041,104 @@ The Scopus Search API returns entries with Dublin Core
 Author keywords ([[authkeywords]]) are a pipe-delimited string that
 we split into our [[keywords]] field
 (see \cref{sec:providers-keyword-mapping}).
+They and the abstract ([[dc:description]]) are simply absent in the
+default view, so the conversion needs no knowledge of the view---with
+one exception, the authors.
+
+\subsubsection{Author names}
+
+Scopus writes a name surname first: [[dc:creator]], the only author the
+default view gives, reads \enquote{Fares E.}.
+Stored as it comes, that breaks more than the display.
+A paper without a DOI is identified by its title and the first author's
+surname, which [[legacy_hash_paper_id]] takes to be the \emph{last}
+word of the name, as it is for every other provider.
+For a Scopus name that word is the initial, so the paper hashed as
+\enquote{e.} and could never be recognised as the paper another
+provider returned, nor, in the version-aware deduplication that groups
+by the same hash, as the published version of a preprint.
+
+So we put names in the order the rest of the program expects, with
+[[given_name_first]] (\cref{sec:utils-surname-first}), which moves
+trailing initials to the front and touches nothing else.
+
+<<scopus constants>>=
+from scholar.utils import given_name_first
+@
+
+The [[COMPLETE]] view makes guessing unnecessary: it lists every author
+with [[given-name]] and [[surname]] apart (up to a hundred per paper;
+beyond that Scopus truncates).
+We prefer those, in the order of [[@seq]], and fall back by degrees for
+the records where a part is missing: surname with initials, then the
+surname-first [[authname]], and with no author list at all,
+[[dc:creator]].
+
+<<scopus helpers>>=
+def scopus_authors(entry: dict) -> list[str]:
+    """Return the entry's authors, given name first, in author order."""
+    listed = entry.get("author") or []
+    if isinstance(listed, dict):
+        listed = [listed]
+
+    def position(author: dict) -> int:
+        try:
+            return int(author.get("@seq"))
+        except (TypeError, ValueError):
+            return len(listed)
+
+    names = []
+    for author in sorted(
+        (a for a in listed if isinstance(a, dict)), key=position
+    ):
+        surname = author.get("surname")
+        first = author.get("given-name") or author.get("initials")
+        if surname and first:
+            names.append(f"{first} {surname}")
+        elif surname or author.get("authname"):
+            names.append(given_name_first(surname or author["authname"]))
+    if not names and entry.get("dc:creator"):
+        names.append(given_name_first(entry["dc:creator"]))
+    return names
+@
+
+The point of all this is that a Scopus record and another provider's
+record of the same paper now agree on who the first author is, so let
+us test exactly that.
+
+<<scopus view test methods>>=
+def test_authors_prefer_the_structured_list(self):
+    """COMPLETE's author list wins, in @seq order, else dc:creator."""
+    entry = {
+        "dc:creator": "Fares E.",
+        "author": [
+            {"@seq": "2", "surname": "Bodeveix",
+             "given-name": "Jean Paul", "authname": "Bodeveix J.P."},
+            {"@seq": "1", "surname": "Fares", "given-name": "Elie"},
+            {"@seq": "3", "surname": "Filali", "initials": "M."},
+            {"@seq": "4", "authname": "Doe J."},
+        ],
+    }
+    assert scopus_authors(entry) == [
+        "Elie Fares", "Jean Paul Bodeveix", "M. Filali", "J. Doe",
+    ]
+    assert scopus_authors({"dc:creator": "Fares E."}) == ["E. Fares"]
+    assert scopus_authors({}) == []
+
+def test_scopus_record_hashes_like_other_providers(self):
+    """Without a DOI, both views identify the paper as others do."""
+    from scholar.utils import legacy_hash_paper_id
+
+    title = "Correct pattern-based development"
+    elsewhere = legacy_hash_paper_id(title, ["Elie Fares"])
+    for entry in (
+        {"dc:creator": "Fares E."},
+        {"dc:creator": "Fares E.", "author": [
+            {"@seq": "1", "surname": "Fares", "given-name": "Elie"}]},
+    ):
+        assert legacy_hash_paper_id(title, scopus_authors(entry)) == elsewhere
+    assert legacy_hash_paper_id(title, ["Fares E."]) != elsewhere
+@
 
 <<convert scopus entry>>=
 def _convert_entry(self, entry: dict) -> Paper:
@@ -9805,10 +10151,7 @@ def _convert_entry(self, entry: dict) -> Paper:
         except (ValueError, TypeError):
             pass
 
-    authors = []
-    creator = entry.get("dc:creator")
-    if creator:
-        authors.append(creator)
+    authors = scopus_authors(entry)
 
     url = None
     for link in entry.get("link", []):
@@ -9861,28 +10204,184 @@ as real searches).  Any 401/403 points at [[SCOPUS_API_KEY]]; the
 untranslatable-query 400 gets the hint above instead of a bare status
 code, which would send the user off to debug a query that is fine.
 
+The probe goes through [[_get_best_view]], so it also answers the
+question a user on the move actually has: \emph{will I get abstracts
+from here?}
+A healthy provider therefore says which view it got.
+Off campus that costs the probe a second request, which is the price of
+the answer being true of the searches that follow.
+Going through that method also puts the probe under the limiter, which
+it used to bypass: its requests are now counted and its quota headers
+recorded like any others.
+[[check_provider]] asks the limiter before it probes, so a refusal here
+is a rare race, but it must surface as a status, not as a traceback.
+
 <<scopus provider>>=
 
     def check(self) -> tuple[str, str]:
         """Probe the search endpoint with a one-result query."""
-        headers = {
-            "X-ELS-APIKey": self.api_key,
-            "Accept": "application/json",
-        }
-        if self.inst_token:
-            headers["X-ELS-Insttoken"] = self.inst_token
-        response = requests.get(
-            SCOPUS_API_URL,
-            headers=headers,
-            params={"query": "TITLE-ABS-KEY(test)", "count": 1},
-            timeout=30,
-        )
+        try:
+            response = self._get_best_view(
+                self._headers(), dict(SCOPUS_PROBE_PARAMS)
+            )
+        except RateLimited as e:
+            return HEALTH_RATE_LIMITED, str(e)
         hint = scopus_search_refused_hint(response)
         if hint:
             return HEALTH_HTTP_ERROR, hint
-        return classify_check_response(
+        if scopus_view_refused(response):
+            return HEALTH_HTTP_ERROR, (
+                "SCOPUS_VIEW=complete, but the COMPLETE view is not "
+                "authorized from this network; unset it, use the "
+                "institution's network or set SCOPUS_INST_TOKEN"
+            )
+        status, message = classify_check_response(
             response, authenticated=True, key_hint="SCOPUS_API_KEY"
         )
+        if status == HEALTH_OK and not message:
+            message = (
+                "COMPLETE view (abstracts, all authors)"
+                if self._complete_ok
+                else "standard view (no abstracts, first author only)"
+            )
+        return status, message
+@
+
+With the pieces tested, what remains is their interplay in the provider:
+that the fallback happens once and sticks, that a bad key does not
+trigger it, and that the cache serves each network the best it may have.
+The fake service below answers like the real one does off campus or on
+it, and records what it was asked.
+
+<<scopus view test methods>>=
+@staticmethod
+def service(entitled: bool, calls: list):
+    """A fake `requests.get`: COMPLETE is refused unless `entitled`."""
+    def get(url, headers=None, params=None, timeout=None):
+        calls.append(dict(params))
+        response = Mock(headers={})
+        if params.get("view") == "COMPLETE" and not entitled:
+            response.status_code = 401
+            response.ok = False
+            response.text = '{"statusCode":"AUTHORIZATION_ERROR"}'
+            response.raise_for_status.side_effect = requests.HTTPError(
+                response=response
+            )
+            return response
+        entry = {"dc:title": "T", "dc:creator": "Fares E.",
+                 "prism:doi": "10.1/x"}
+        if params.get("view") == "COMPLETE":
+            entry["dc:description"] = "An abstract."
+            entry["author"] = [
+                {"@seq": "1", "surname": "Fares", "given-name": "Elie"},
+                {"@seq": "2", "surname": "Filali", "given-name": "Mamoun"},
+            ]
+        response.status_code = 200
+        response.ok = True
+        response.text = ""
+        response.json.return_value = {"search-results": {
+            "opensearch:totalResults": "1", "entry": [entry]}}
+        return response
+    return get
+
+def test_entitled_search_gets_abstract_and_all_authors(self):
+    """On campus one request suffices and the result is rich."""
+    calls = []
+    with patch("requests.get", self.service(True, calls)):
+        papers = ScopusProvider(api_key="k").search("q", limit=5)
+    assert [c.get("view") for c in calls] == ["COMPLETE"]
+    assert papers[0].abstract == "An abstract."
+    assert papers[0].authors == ["Elie Fares", "Mamoun Filali"]
+
+def test_refused_view_falls_back_once_and_sticks(self, caplog):
+    """Off campus: one refused request per process, then standard."""
+    import logging
+
+    calls = []
+    provider = ScopusProvider(api_key="k")
+    with patch("requests.get", self.service(False, calls)):
+        with caplog.at_level(logging.INFO):
+            first = provider.search("q", limit=5)
+            provider.search("other", limit=5)
+    assert [c.get("view") for c in calls] == ["COMPLETE", None, None]
+    assert first[0].authors == ["E. Fares"]
+    assert first[0].abstract is None
+    assert caplog.text.count("COMPLETE view is not authorized") == 1
+
+def test_rejected_key_does_not_fall_back(self):
+    """An invalid key is reported as such, not retried."""
+    response = Mock(status_code=401, ok=False, headers={},
+                    text='{"statusCode":"AUTHENTICATION_ERROR"}')
+    response.raise_for_status.side_effect = requests.HTTPError(
+        response=response
+    )
+    with patch("requests.get", return_value=response) as get:
+        assert ScopusProvider(api_key="bad").search("q") == []
+    assert get.call_count == 1
+
+def test_view_policy_can_be_forced(self):
+    """standard never asks; complete asks and does not fall back."""
+    calls = []
+    with patch("requests.get", self.service(False, calls)):
+        ScopusProvider(api_key="k", view="standard").search("q")
+        assert [c.get("view") for c in calls] == [None]
+        forced = ScopusProvider(api_key="k", view="complete")
+        assert forced.search("q") == []
+    assert [c.get("view") for c in calls] == [None, "COMPLETE"]
+    assert not any(len(key) == 4 for key in forced._cache)
+
+@staticmethod
+def process(cache: dict, **kwargs):
+    """A provider as a new process would see it: fresh, same cache."""
+    provider = ScopusProvider(api_key="k", **kwargs)
+    provider._cache = cache
+    return provider
+
+def test_cache_serves_the_best_the_network_allows(self):
+    """Poor results do not shadow rich ones, but rich ones travel."""
+    cache, calls = {}, []
+    with patch("requests.get", self.service(False, calls)):
+        self.process(cache).search("q", limit=5)
+    del calls[:]
+    with patch("requests.get", self.service(False, calls)):
+        again = self.process(cache).search("q", limit=5)
+    assert [c["query"] for c in calls] == ["TITLE-ABS-KEY(test)"]
+    assert again[0].abstract is None
+
+    del calls[:]
+    with patch("requests.get", self.service(True, calls)):
+        campus = self.process(cache).search("q", limit=5)
+    assert campus[0].abstract == "An abstract."
+
+    del calls[:]
+    with patch("requests.get", self.service(False, calls)):
+        home = self.process(cache).search("q", limit=5)
+        standard = self.process(cache, view="standard").search("q", limit=5)
+    assert calls == []
+    assert home[0].abstract == "An abstract."
+    assert standard[0].abstract is None
+
+def test_cached_results_survive_a_failed_probe(self):
+    """Without network the standard results are still served."""
+    cache = {}
+    with patch("requests.get", self.service(False, [])):
+        self.process(cache).search("q", limit=5)
+    with patch("requests.get",
+               side_effect=requests.exceptions.ConnectionError):
+        offline = self.process(cache).search("q", limit=5)
+    assert len(offline) == 1
+
+def test_check_reports_the_view(self):
+    """A healthy provider says how much its searches will return."""
+    for entitled, word in ((True, "COMPLETE view"), (False, "standard view")):
+        with patch("requests.get", self.service(entitled, [])):
+            status, message = ScopusProvider(api_key="k").check()
+        assert status == HEALTH_OK
+        assert word in message
+    with patch("requests.get", self.service(False, [])):
+        status, message = ScopusProvider(api_key="k", view="complete").check()
+    assert status == HEALTH_HTTP_ERROR
+    assert "SCOPUS_VIEW=complete" in message
 @
 
 \subsection{Auto-registration}
@@ -10011,7 +10510,7 @@ class TestScopusProvider:
         assert len(papers) == 1
         paper = papers[0]
         assert paper.title == "Test Paper"
-        assert paper.authors == ["Smith A."]
+        assert paper.authors == ["A. Smith"]
         assert paper.year == 2024
         assert paper.doi == "10.1000/test.123"
         assert paper.abstract == "An abstract."
