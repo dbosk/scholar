@@ -25,6 +25,8 @@ The CLI exposes every major Scholar capability as a subcommand:
 \item[[scholar themes]] Explore themes across review sessions.
 \item[[scholar enrich]] Fetch missing abstracts for papers.
 \item[[scholar llm]] Run LLM-assisted classification.
+\item[[scholar tutorial]] Run the interactive tutorials that teach
+  these workflows at the terminal.
 \end{description}
 
 This chapter presents the implementation of each command.
@@ -78,6 +80,7 @@ across bibliographic databases.
 <<themes command>>
 <<sessions command>>
 <<prov command>>
+<<tutorial command>>
 <<llm command helpers>>
 <<llm command>>
 <<submodule registration>>
@@ -4537,7 +4540,34 @@ directly to a Rich console. This avoids the color encoding issues that arise
 from rendering to a string buffer with ANSI codes and then re-printing---Rich
 handles the terminal detection and styling correctly when printing directly.
 
+Every paper is printed with its identifier on a second, dimmed line.
+[[sessions decide]] addresses papers by [[--doi]] or [[--paper-id]], and
+[[show]] is the command a person (or an agent) reads before deciding, so it
+has to be possible to go from the listing to a decision without a detour
+through a CSV export (which was the only place the DOI used to appear).
+We print [[Paper.id]] rather than the bare DOI: it is exactly the string
+[[--paper-id]] accepts, it exists for every paper (a DOI-less paper gets a
+[[hash:]] id), and for DOI papers the DOI is readable inside it.
+The three decision groups print the same line, so one helper builds it;
+only the tags differ, and a pending paper simply has none.
+
 <<sessions command>>=
+def session_paper_line(decision) -> str:
+    """Return the Rich markup `sessions show` prints for one paper.
+
+    Two lines: the title with provider and tags, then the paper id that
+    `sessions decide --paper-id` accepts (`doi:...` or `hash:...`).
+    """
+    paper = decision.paper
+    provider = f" [dim]({decision.provider})[/dim]" if decision.provider else ""
+    tag_list = ", ".join(escape(t) for t in decision.tags)
+    tags = f" [dim]\\[{tag_list}][/dim]" if decision.tags else ""
+    return (
+        f"  • {escape(paper.title or '')}{provider}{tags}\n"
+        f"    [dim]{escape(paper.id)}[/dim]"
+    )
+
+
 @sessions_app.command("show")
 def sessions_show(
     name: Annotated[
@@ -4559,7 +4589,8 @@ def sessions_show(
     """
     Show details of a saved review session.
 
-    Displays all papers with their decisions, themes, and motivations.
+    Displays all papers with their decisions, themes, and motivations,
+    each with the paper id that `sessions decide --paper-id` accepts.
     Uses a pager for interactive viewing when output is a terminal.
     """
     import sys
@@ -4593,6 +4624,8 @@ def sessions_show(
                     "title": d.paper.title,
                     "authors": d.paper.authors,
                     "year": d.paper.year,
+                    "doi": d.paper.doi,
+                    "paper_id": d.paper.id,
                     "status": d.status.value,
                     "tags": d.tags,
                     "provider": d.provider,
@@ -4646,12 +4679,7 @@ def sessions_show(
             if kept:
                 con.print(f"[green bold]Kept ({len(kept)}):[/green bold]")
                 for d in kept:
-                    provider = f" [dim]({d.provider})[/dim]" if d.provider else ""
-                    tag_list = ", ".join(escape(t) for t in d.tags) if d.tags else ""
-                    tags = f" [dim]\\[{tag_list}][/dim]" if d.tags else ""
-                    con.print(
-                        f"  • {escape(d.paper.title or '')}{provider}{tags}"
-                    )
+                    con.print(session_paper_line(d))
                 con.print()
 
             # Show discarded papers
@@ -4661,12 +4689,7 @@ def sessions_show(
                     f"[red bold]Discarded ({len(discarded)}):[/red bold]"
                 )
                 for d in discarded:
-                    provider = f" [dim]({d.provider})[/dim]" if d.provider else ""
-                    tag_list = ", ".join(escape(t) for t in d.tags) if d.tags else ""
-                    tags = f" [dim]\\[{tag_list}][/dim]" if d.tags else ""
-                    con.print(
-                        f"  • {escape(d.paper.title or '')}{provider}{tags}"
-                    )
+                    con.print(session_paper_line(d))
                 con.print()
 
             # Show pending papers
@@ -4676,10 +4699,7 @@ def sessions_show(
                     f"[yellow bold]Pending ({len(pending)}):[/yellow bold]"
                 )
                 for d in pending:
-                    provider = f" [dim]({d.provider})[/dim]" if d.provider else ""
-                    con.print(
-                        f"  • {escape(d.paper.title or '')}{provider}"
-                    )
+                    con.print(session_paper_line(d))
 
         # Use pager if TTY, otherwise print directly
         if sys.stdout.isatty():
@@ -5564,6 +5584,41 @@ class TestSessionsCommand:
         assert "Kept Paper" in result.output
         assert "Discarded Paper" in result.output
         assert "Pending Paper" in result.output
+
+    def test_sessions_show_prints_paper_ids(self, tmp_path, monkeypatch):
+        """Each paper carries the id that decide --paper-id accepts."""
+        monkeypatch.setenv("SCHOLAR_DATA_DIR", str(tmp_path))
+        from scholar.review import (
+            ReviewSession, ReviewDecision, DecisionStatus, save_session,
+        )
+
+        session = ReviewSession(
+            query="ids", providers=["openalex"], timestamp=datetime.now(),
+            name="ids",
+        )
+        session.decisions.extend([
+            ReviewDecision(
+                paper=Paper(title="With DOI", authors=["Ann"], doi="10.1/X"),
+                provider="openalex", status=DecisionStatus.PENDING,
+            ),
+            ReviewDecision(
+                paper=Paper(title="Without DOI", authors=["Bo"]),
+                provider="openalex", status=DecisionStatus.PENDING,
+            ),
+        ])
+        save_session(session)
+
+        result = runner.invoke(app, ["sessions", "show", "ids"])
+        assert result.exit_code == 0
+        assert "doi:10.1/x" in result.output
+        assert "hash:" in result.output
+
+        as_json = runner.invoke(app, ["sessions", "show", "ids", "-f", "json"])
+        decisions = json.loads(as_json.output)["decisions"]
+        assert decisions[0]["doi"] == "10.1/X"
+        assert decisions[0]["paper_id"] == "doi:10.1/x"
+        assert decisions[1]["doi"] is None
+        assert decisions[1]["paper_id"].startswith("hash:")
 
     def test_sessions_show_displays_search_filters(
         self, tmp_path, monkeypatch
@@ -8563,6 +8618,224 @@ class TestProvExportCommand:
         assert "% === provenance: alice2024 ===" in result.output
         assert "% CLAIM: privacy matters" in result.output
         assert "private thoughts" not in result.output
+@
+
+
+\section{Interactive Tutorials}
+\label{sec:tutorial-command}
+
+The README and this document tell a newcomer what the commands do, but
+neither makes them \emph{do} anything.
+The [[tutorial]] subcommand embeds pytorial, an interactive tutorial
+runner: each step opens a shell in a per-run workspace, the learner types
+the command the step asks for, and the transcript is checked against the
+step's required patterns before the lesson moves on.
+That is the try-first-tell-later arc the rest of this project uses, applied
+to the tool itself.
+The lessons are literate sources under [[src/scholar/tutorials/]]; each
+tangles to the Markdown pytorial reads and weaves to a chapter of this
+document that explains the lesson's design (the Tutorials part).
+
+pytorial's embedding entry point mounts only what the host hands it,
+prepends its own [[using-tutorials]] lesson (how the runner itself works),
+hides the standalone-only [[install]] command and ignores the user's
+installed-tutorial directory, so [[scholar tutorial]] serves exactly what
+Scholar ships.
+We hand it the tangled files by name, in lesson order: a directory would
+be listed alphabetically, and the order matters because the later lessons
+assume the earlier ones (the LLM lesson assumes the learner has seen a
+session; the agent lesson assumes decisions and exports).
+The existence filter is not defensive decoration: pytorial raises when a
+configured path is missing, so a source checkout that has not been tangled
+would otherwise break every [[scholar tutorial]] call instead of merely
+listing fewer lessons.
+
+<<tutorial command>>=
+TUTORIAL_DIR = Path(__file__).with_name("tutorials")
+TUTORIAL_FILES = (
+    "first-search.md",
+    "reviewing-in-the-tui.md",
+    "enrich-verify-export.md",
+    "llm-synthesis.md",
+    "scholar-with-an-agent.md",
+)
+
+
+def bundled_tutorial_paths() -> tuple[Path, ...]:
+    """Return the tangled tutorial files that exist, in lesson order.
+
+    An untangled source checkout mounts nothing rather than breaking
+    every `scholar tutorial` call.
+    """
+    candidates = (TUTORIAL_DIR / name for name in TUTORIAL_FILES)
+    return tuple(path for path in candidates if path.exists())
+@
+
+\subsection{Sandboxing the tutorial shell}
+
+A lesson that creates review sessions must not leave them in the learner's
+real session list, and running a lesson twice must start from the same
+state both times.
+Both follow from giving the tutorial shell its own [[SCHOLAR_DATA_DIR]]
+inside pytorial's workspace: workspaces are created per run, so
+[[tutorial run --restart]] is a clean slate, and a step that asks the
+learner to run [[scholar sessions list]] can promise exactly which sessions
+appear.
+The search cache is deliberately \emph{not} sandboxed---it holds provider
+responses, not user state, and sharing it makes a repeated run fast and
+mostly offline.
+The price is that the rate-limit bookkeeping of \cref{ch:ratelimit}, which
+also lives in the data directory, starts empty in every run; the lessons
+therefore only drive keyless providers, where that memory does not matter.
+
+The shell must also find the same [[scholar]] that started the tutorial.
+Under pipx it is on the user's [[PATH]] already, but a developer running
+[[uv run scholar tutorial run ...]] gets a nested bash whose [[PATH]] does
+not include the project's virtual environment.
+Prepending the running interpreter's directory covers both cases (and
+brings the [[llm]] command along, which the LLM lesson needs).
+
+<<tutorial command>>=
+def tutorial_shell_environment(workspace: str | Path) -> dict[str, str]:
+    """Return the environment overrides for a tutorial shell in `workspace`.
+
+    Scholar's data directory is kept inside the workspace, so tutorial
+    sessions never reach the user's real session list, and the running
+    interpreter's directory is put first on `PATH` so the nested shell
+    finds the same `scholar` (and `llm`) that started the tutorial.
+    """
+    data_dir = Path(workspace) / "scholar-data"
+    data_dir.mkdir(parents=True, exist_ok=True)
+    bin_dir = str(Path(sys.executable).parent)
+    path = os.environ.get("PATH", "")
+    return {
+        "SCHOLAR_DATA_DIR": str(data_dir),
+        "PATH": bin_dir if not path else f"{bin_dir}{os.pathsep}{path}",
+    }
+@
+
+pytorial builds the shell's environment by copying the process environment
+and updating it with whatever [[env]] the runner passes, so the overrides
+above are an overlay, not a replacement.
+We also apply them to the process environment itself.
+A step's [[check_command]] and [[post_command]] hooks run as plain
+subprocesses of the [[scholar]] process, not inside the tutorial shell, and
+would otherwise look at the learner's real session store.
+The [[**kwargs]] is load-bearing: pytorial inspects the runner's signature
+and forwards the per-tutorial prompt name and any [[pre_command]] only to a
+runner that accepts them, so a wrapper with a fixed signature would silently
+lose both.
+
+<<tutorial command>>=
+def tutorial_shell_runner(*, workspace: str | Path, **kwargs):
+    """Open pytorial's interactive shell with Scholar sandboxed in `workspace`."""
+    overrides = tutorial_shell_environment(workspace)
+    os.environ.update(overrides)
+    kwargs.pop("env", None)
+    return pytorial.shell.run_interactive_shell(
+        workspace=workspace, env=overrides, **kwargs
+    )
+@
+
+The subcommand is mounted at import time, like the other command groups.
+The [[scholar]] namespace keeps pytorial's progress records apart from
+those of a standalone pytorial installation, and [[allow_shell]] is on
+because the only tutorials ever mounted are the ones shipped here.
+
+<<tutorial command>>=
+pytorial.cli.add_typer_subcommand(
+    app,
+    name="tutorial",
+    namespace="scholar",
+    tutorial_paths=bundled_tutorial_paths(),
+    shell_runner=tutorial_shell_runner,
+    allow_shell=True,
+)
+<<cli imports>>=
+import os
+import sys
+
+import pytorial.cli
+import pytorial.shell
+@
+
+pytorial defers its heavy imports to the point of use precisely so that a
+host can import it on every invocation, so a plain import costs little;
+a guarded import would only turn a broken installation into a silently
+missing subcommand.
+
+Let's verify the wiring.
+The first test is the guard for the others: with an untangled checkout the
+parametrised test below would collect nothing and pass.
+
+<<test functions>>=
+class TestTutorialCommand:
+    """The tutorial subcommand is mounted and serves the bundled lessons."""
+
+    def test_every_bundled_tutorial_is_tangled(self):
+        """All lessons in TUTORIAL_FILES exist on disk."""
+        expected = tuple(TUTORIAL_DIR / name for name in TUTORIAL_FILES)
+        assert bundled_tutorial_paths() == expected
+
+    def test_help_lists_the_subcommands(self):
+        """The group exposes pytorial's list, run and review verbs."""
+        result = runner.invoke(app, ["tutorial", "--help"])
+        assert result.exit_code == 0
+        for verb in ("list", "run", "review"):
+            assert verb in result.output
+        assert "install" not in result.output
+
+    def test_list_names_every_bundled_tutorial(self):
+        """`tutorial list` shows pytorial's own lesson plus ours, in order."""
+        result = runner.invoke(
+            app, ["tutorial", "list"], env={"COLUMNS": "200"}
+        )
+        assert result.exit_code == 0
+        ids = ["using-tutorials"] + [
+            name.removesuffix(".md") for name in TUTORIAL_FILES
+        ]
+        positions = [result.output.index(tid) for tid in ids]
+        assert positions == sorted(positions)
+
+    def test_shell_environment_sandboxes_data_dir(self, tmp_path):
+        """The data directory lives in the workspace; PATH finds scholar."""
+        env = tutorial_shell_environment(tmp_path)
+        assert env["SCHOLAR_DATA_DIR"] == str(tmp_path / "scholar-data")
+        assert (tmp_path / "scholar-data").is_dir()
+        assert env["PATH"].split(os.pathsep)[0] == str(
+            Path(sys.executable).parent
+        )
+
+    def test_shell_runner_forwards_kwargs_and_env(self, tmp_path, monkeypatch):
+        """The wrapper injects the sandbox and keeps pytorial's kwargs."""
+        captured = {}
+
+        def fake_shell(**kwargs):
+            captured.update(kwargs)
+            return None
+
+        monkeypatch.setattr("pytorial.shell.run_interactive_shell", fake_shell)
+        tutorial_shell_runner(workspace=tmp_path, prompt_name="demo")
+        expected = str(tmp_path / "scholar-data")
+        assert captured["workspace"] == tmp_path
+        assert captured["prompt_name"] == "demo"
+        assert captured["env"]["SCHOLAR_DATA_DIR"] == expected
+        assert os.environ["SCHOLAR_DATA_DIR"] == expected
+
+
+@pytest.mark.parametrize("name", TUTORIAL_FILES)
+def test_bundled_tutorial_parses(name):
+    """Every shipped lesson loads with pytorial's own parser and validates."""
+    from pytorial.catalog import load_tutorial_file
+
+    tutorial = load_tutorial_file(TUTORIAL_DIR / name)
+    assert tutorial.id == name.removesuffix(".md")
+    assert tutorial.title and tutorial.summary
+    assert len(tutorial.steps) >= 3
+    for step in tutorial.steps:
+        assert step.required_patterns or step.kind or step.edit_file, (
+            f"{name}: step {step.title!r} has no validation"
+        )
 @
 
 

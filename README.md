@@ -187,6 +187,30 @@ scholar search "machine learning privacy"
 scholar rq "How do LLMs support novice programming?" --count 20
 ```
 
+### Tutorials
+
+Scholar ships interactive tutorials (built on
+[pytorial](https://github.com/dbosk/pytorial)): each step opens a shell,
+you type the command the step asks for, and the transcript is checked
+before the lesson moves on.
+
+```bash
+scholar tutorial list                 # the lessons and your progress
+scholar tutorial run first-search     # start or resume a lesson
+scholar tutorial run --restart first-search
+scholar tutorial review first-search  # read back what you typed
+```
+
+The lessons, in order: `first-search` (search, providers, output formats,
+saving a session), `reviewing-in-the-tui` (recording decisions),
+`enrich-verify-export` (abstracts and open access, retractions, CSV and
+LaTeX exports), `llm-synthesis` (setting up the `llm` command, LLM
+classification, a literature overview) and `scholar-with-an-agent` (what
+an agent running the `backing-claims` skill does with Scholar, and how to
+audit it). Every lesson runs in its own workspace with its own session
+store, so practice sessions never appear in your real `scholar sessions
+list`.
+
 ## Installation
 
 If you don't use `pipx`, you can install with `pip`:

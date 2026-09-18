@@ -48,6 +48,27 @@ The code is extracted (``tangled'') from this document using noweb.
 
 \input{introduction}
 
+\part{Tutorials}
+
+The chapters in this part are the literate sources of the interactive
+tutorials that \texttt{scholar tutorial} runs.
+Each tangles to the Markdown that pytorial executes and weaves to a
+chapter that explains how the lesson teaches: which aspect of Scholar a
+step lets the learner vary, what it holds invariant, and why the steps
+come in this order.
+That design reasoning is the object of these chapters, so it stands in
+the body text; the learner never sees it, because only the Markdown is
+shipped.
+The tutorials come first because they are the shortest path from a fresh
+install to a finished review; the parts that follow explain how the tool
+does what these chapters teach.
+
+\input{../src/scholar/tutorials/first-search.tex}
+\input{../src/scholar/tutorials/reviewing-in-the-tui.tex}
+\input{../src/scholar/tutorials/enrich-verify-export.tex}
+\input{../src/scholar/tutorials/llm-synthesis.tex}
+\input{../src/scholar/tutorials/scholar-with-an-agent.tex}
+
 \part{Core Functionality}
 
 \input{../src/scholar/scholar.tex}

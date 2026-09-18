@@ -3,10 +3,10 @@ revision = 3
 requires-python = ">=3.12, <4.0"
 resolution-markers = [
     "python_full_version >= '3.15' and sys_platform == 'win32'",
-    "python_full_version == '3.14.*' and sys_platform == 'win32'",
     "python_full_version >= '3.15' and sys_platform == 'emscripten'",
-    "python_full_version == '3.14.*' and sys_platform == 'emscripten'",
     "python_full_version >= '3.15' and sys_platform != 'emscripten' and sys_platform != 'win32'",
+    "python_full_version == '3.14.*' and sys_platform == 'win32'",
+    "python_full_version == '3.14.*' and sys_platform == 'emscripten'",
     "python_full_version == '3.14.*' and sys_platform != 'emscripten' and sys_platform != 'win32'",
     "python_full_version < '3.14' and sys_platform == 'win32'",
     "python_full_version < '3.14' and sys_platform == 'emscripten'",
@@ -1040,6 +1040,19 @@ wheels = [
 ]
 
 [[package]]
+name = "llm-openai-via-codex"
+version = "0.1a0"
+source = { registry = "https://pypi.org/simple" }
+dependencies = [
+    { name = "llm" },
+    { name = "openai" },
+]
+sdist = { url = "https://files.pythonhosted.org/packages/87/22/a896216d58ca1b201ce9152e0c9eba8cee453bc8682a65362e64c30f9b8b/llm_openai_via_codex-0.1a0.tar.gz", hash = "sha256:930187bf61b1ff570d722a9dac2ce419d5c12b3cdf380c825a5167330a3a7abe", size = 10656, upload-time = "2026-04-23T19:23:35.598Z" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/cf/f7/1c1bc95ad83c8fbb830caefa94cae28aa7c1dff6de3dbc2c58e50488a87f/llm_openai_via_codex-0.1a0-py3-none-any.whl", hash = "sha256:35a6f9ba393d296005cdd89934baa3af6c99134a455299cc068f7053d58d5675", size = 10563, upload-time = "2026-04-23T19:23:34.473Z" },
+]
+
+[[package]]
 name = "lxml"
 version = "6.1.1"
 source = { registry = "https://pypi.org/simple" }
@@ -1798,6 +1811,21 @@ wheels = [
 ]
 
 [[package]]
+name = "pytorial"
+version = "0.8.1"
+source = { registry = "https://pypi.org/simple" }
+dependencies = [
+    { name = "platformdirs" },
+    { name = "pyyaml" },
+    { name = "rich" },
+    { name = "typer" },
+]
+sdist = { url = "https://files.pythonhosted.org/packages/5a/58/f70c02e58ab8a67fbe068814cbd4cb75dddb8630cf9e8b555bee2710e536/pytorial-0.8.1.tar.gz", hash = "sha256:4bf2055598660ffe145869387f60ac4ccf234e9f2a8aea03e88b9caf6007057d", size = 12009, upload-time = "2026-09-11T08:00:02.779Z" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/3a/69/8dff151c3f0d4e2952dbd4631ffb2d97c1908a3e8f3e69b9dca42addb595/pytorial-0.8.1-py3-none-any.whl", hash = "sha256:087c6c8fce3f11fe8bb09ff04780abef6ab180babe713138b919e15bac1a373f", size = 40522, upload-time = "2026-09-11T08:00:03.987Z" },
+]
+
+[[package]]
 name = "pytz"
 version = "2026.2"
 source = { registry = "https://pypi.org/simple" }
@@ -2013,6 +2041,7 @@ dependencies = [
     { name = "llm-gpt4all" },
     { name = "llm-mistral" },
     { name = "llm-openai-plugin" },
+    { name = "llm-openai-via-codex" },
     { name = "openai" },
     { name = "pandas" },
     { name = "platformdirs" },
@@ -2021,6 +2050,7 @@ dependencies = [
     { name = "pypandoc" },
     { name = "pypdfium2" },
     { name = "python-dotenv" },
+    { name = "pytorial" },
     { name = "pyyaml" },
     { name = "questionary" },
     { name = "requests" },
@@ -2054,6 +2084,7 @@ requires-dist = [
     { name = "llm-gpt4all", specifier = ">=0.4" },
     { name = "llm-mistral", specifier = ">=0.15,<0.16" },
     { name = "llm-openai-plugin", specifier = ">=0.7" },
+    { name = "llm-openai-via-codex", specifier = ">=0.1a0" },
     { name = "openai", specifier = ">=1.0.0" },
     { name = "pandas", specifier = ">=2.0.0" },
     { name = "platformdirs", specifier = ">=4.5.1" },
@@ -2062,6 +2093,7 @@ requires-dist = [
     { name = "pypandoc", specifier = ">=1.14" },
     { name = "pypdfium2", specifier = ">=4.26.0" },
     { name = "python-dotenv", specifier = ">=1.0.0" },
+    { name = "pytorial", specifier = ">=0.8.1" },
     { name = "pyyaml", specifier = ">=6.0" },
     { name = "questionary", specifier = ">=2.0.0" },
     { name = "requests", specifier = ">=2.32.5" },
