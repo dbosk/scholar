@@ -63,7 +63,7 @@ Providers self-register via `register_provider()` at module load time.
 | DBLP | `dblp` | REST API | None required |
 | Web of Science | `wos` | REST API | `WOS_API_KEY` (required) |
 | IEEE Xplore | `ieee` | REST API | `IEEE_API_KEY` (required) |
-| Scopus | `scopus` | REST API | `SCOPUS_API_KEY` (required); `SCOPUS_INST_TOKEN` (optional: searching works anywhere, only the COMPLETE view is IP-bound to the institution) |
+| Scopus | `scopus` | REST API | `SCOPUS_API_KEY` (required); `SCOPUS_INST_TOKEN`, `SCOPUS_VIEW` (optional, see Scopus Views) |
 | arXiv | `arxiv` | `arxiv` client | None required |
 | HAL | `hal` | REST API (Solr) | None required |
 | SSRN | `ssrn` | OpenAlex (`pyalex`), source-pinned | `SCHOLAR_EMAIL` (optional) |
@@ -114,6 +114,37 @@ become literal search terms). `DBLPProvider` strips operators, parentheses,
 and quotes before sending (warning shows the sent query) and warns when a
 query of ≥4 terms yields zero hits. Queries are never auto-relaxed — results
 stay traceable to the recorded query.
+
+### Scopus Views
+
+Searching Scopus works from any network, but how much each result holds
+depends on the *view*: the default (STANDARD) view has title, venue, DOI
+and the first author only; `view=COMPLETE` adds abstract, author
+keywords and the full structured author list, and Elsevier serves it
+only to the subscribing institution's IP range or with
+`SCOPUS_INST_TOKEN` (elsewhere: HTTP 401 `AUTHORIZATION_ERROR`; a bad
+key is 401 `AUTHENTICATION_ERROR`, and `scopus_view_refused()` tells
+them apart). COMPLETE caps pages at 25, which is `MAX_LIMIT` anyway.
+
+`ScopusProvider._get_best_view()` asks for COMPLETE and, on refusal,
+falls back to the default view for the rest of the process (one INFO
+line, one wasted request). `SCOPUS_VIEW=auto|complete|standard`
+overrides: `standard` never asks, `complete` never falls back.
+`providers check` reports which view it got.
+
+The never-expiring cache is keyed by view: default-view results keep the
+historical 3-tuple key, COMPLETE results add `"COMPLETE"` as a fourth
+part. COMPLETE results are served to everyone (unless
+`SCOPUS_VIEW=standard`); default-view results only when COMPLETE is not
+available, which a new process learns from one `count=1` probe
+(`_complete_confirmed()`); a failed probe still serves the cache.
+
+Scopus writes names surname first (`Fares E.`), which made
+`legacy_hash_paper_id` hash the initial. `scopus_authors()` uses
+COMPLETE's `given-name`/`surname`, else `utils.given_name_first()`
+(moves trailing initials to the front, nothing else). Sessions that
+stored the old form are reconciled at append in `review.py`
+(`given_name_first_id()` + `migrate_paper_id`), keeping decisions.
 
 ### Contact Email
 
