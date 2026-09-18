@@ -183,7 +183,8 @@ from scholar.review import (
     generate_csv_report, generate_latex_report,
 )
 from scholar.pdf import (
-    get_pdf_cache_dir, get_cached_pdf_path, download_pdf, open_pdf, PDFDownloadError,
+    get_pdf_cache_dir, get_cached_pdf_path, download_pdf, get_pdf, open_pdf,
+    PDFDownloadError,
 )
 
 @
@@ -646,24 +647,18 @@ class AbstractScreen(Screen[None]):
     def action_open_pdf(self) -> None:
         """Download and open the PDF."""
         paper = self.decision.paper
-        
-        if not paper.pdf_url:
-            self.notify("No PDF URL available", severity="error")
+
+        if not paper.pdf_url and not paper.doi:
+            self.notify("No PDF URL or DOI available", severity="error")
             return
-        
-        cache_path = get_cached_pdf_path(paper.pdf_url)
-        
-        if cache_path.exists():
-            self.notify(f"Using cached PDF", severity="information")
-        else:
-            self.notify(f"Downloading PDF...", severity="information")
-            try:
-                download_pdf(paper.pdf_url)
-                self.notify("Download complete", severity="information")
-            except PDFDownloadError as e:
-                self.notify(f"Download failed: {e}", severity="error")
-                return
-        
+
+        self.notify("Fetching PDF...", severity="information")
+        try:
+            cache_path = get_pdf(paper)
+        except PDFDownloadError as e:
+            self.notify(f"Download failed: {e}", severity="error")
+            return
+
         if open_pdf(cache_path):
             self.notify("PDF opened", severity="information")
         else:
@@ -926,6 +921,58 @@ class AbstractScreen(Screen[None]):
         """Scroll the abstract view up."""
         scroll = self.query_one(VerticalScroll)
         scroll.scroll_up()
+@
+
+The PDF action hands the whole paper to [[get_pdf]]
+(\cref{sec:pdf-download-doi}) rather than its [[pdf_url]] to
+[[download_pdf]], for two reasons.
+A paper with a DOI but no PDF link used to be refused outright, although
+the DOI's sources might well have it; and a link that fails now falls
+through to those sources instead of ending the attempt.
+The action needs no running app to be checked, only its notifications:
+
+<<test functions>>=
+class TestOpenPDFAction:
+    """The detail screen's PDF action."""
+
+    @staticmethod
+    def screen(**paper_fields):
+        from unittest.mock import MagicMock
+
+        decision = MagicMock()
+        decision.paper = Paper(title="T", authors=["A B"], **paper_fields)
+        screen = AbstractScreen(decision, MagicMock(), False)
+        screen.notify = MagicMock()
+        return screen
+
+    def test_a_doi_is_enough(self, tmp_path):
+        from unittest.mock import patch
+
+        screen = self.screen(doi="10.1/x")
+        with patch("scholar.tui.get_pdf", return_value=tmp_path) as get, \
+             patch("scholar.tui.open_pdf", return_value=True) as viewer:
+            screen.action_open_pdf()
+        get.assert_called_once_with(screen.decision.paper)
+        viewer.assert_called_once_with(tmp_path)
+
+    def test_failure_is_reported_not_raised(self):
+        from unittest.mock import patch
+
+        screen = self.screen(pdf_url="https://dead/")
+        with patch("scholar.tui.get_pdf",
+                   side_effect=PDFDownloadError("no source delivered")), \
+             patch("scholar.tui.open_pdf") as viewer:
+            screen.action_open_pdf()
+        assert not viewer.called
+        assert "no source delivered" in screen.notify.call_args[0][0]
+
+    def test_nothing_to_go_on(self):
+        from unittest.mock import patch
+
+        screen = self.screen()
+        with patch("scholar.tui.get_pdf") as get:
+            screen.action_open_pdf()
+        assert not get.called
 @
 
 \section{Tag Selection Modal}
