@@ -63,7 +63,7 @@ Providers self-register via `register_provider()` at module load time.
 | DBLP | `dblp` | REST API | None required |
 | Web of Science | `wos` | REST API | `WOS_API_KEY` (required) |
 | IEEE Xplore | `ieee` | REST API | `IEEE_API_KEY` (required) |
-| Scopus | `scopus` | REST API | `SCOPUS_API_KEY` (required) |
+| Scopus | `scopus` | REST API | `SCOPUS_API_KEY` (required); `SCOPUS_INST_TOKEN` (optional: searching works anywhere, only the COMPLETE view is IP-bound to the institution) |
 | arXiv | `arxiv` | `arxiv` client | None required |
 | HAL | `hal` | REST API (Solr) | None required |
 | SSRN | `ssrn` | OpenAlex (`pyalex`), source-pinned | `SCHOLAR_EMAIL` (optional) |
