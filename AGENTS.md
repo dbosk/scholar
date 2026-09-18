@@ -41,6 +41,9 @@ Providers self-register via `register_provider()` at module load time.
 
 **Paper** (`scholar.py:14-39`):
 - `title`, `authors`, `year`, `doi`, `abstract`, `venue`, `url`, `source`
+- `affiliations`: institution names (Scopus COMPLETE view, OpenAlex). Merges
+  like `authors` (kept, else filled), **not** unioned like `keywords`: two
+  providers' lists are two spellings of one fact. Names only, no countries.
 
 **SearchResult** (`scholar.py:42-67`):
 - `query`, `provider`, `timestamp`, `papers`, `filters`
