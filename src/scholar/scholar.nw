@@ -470,6 +470,7 @@ class Paper:
     citation_count: int | None = None
     keywords: list[str] | None = None
     tags: list[str] | None = None
+    affiliations: list[str] | None = None
     sources: list[str] = field(default_factory=list)
     references: list["Paper"] | None = None
     citations: list["Paper"] | None = None
@@ -700,6 +701,19 @@ provider exposes them.
 The [[tags]] field stores provider-specific topical labels (e.g., OpenAlex
 concepts or Semantic Scholar fields of study) as a fallback when author keywords
 are not available.
+The [[affiliations]] field lists the institutions the authors wrote from,
+by name, when a provider exposes them (Scopus in its [[COMPLETE]] view,
+OpenAlex).
+It looks like [[keywords]] but merges differently.
+Two providers' keywords complement each other, so we take their union;
+two providers' affiliations are two spellings of one fact
+(\enquote{IRIT} and \enquote{Institut de Recherche en Informatique de
+Toulouse}), and a union would list every institution twice.
+So affiliations merge like [[authors]]: the list we have stands, and
+another provider's is used only when we have none.
+For the same reason we store names only: one provider gives the country
+as a name and another as a code, and a list that mixes them could not
+even be compared.
 The [[sources]] field tracks which databases returned this paper, useful for
 provenance in reports when merging results from multiple providers.
 
@@ -919,6 +933,7 @@ def to_dict(self, include_refs_cites: bool = False) -> dict:
         "citation_count": self.citation_count,
         "keywords": self.keywords,
         "tags": self.tags,
+        "affiliations": self.affiliations,
         "sources": self.sources,
         "updated_by": self.updated_by,
         "newer_versions": self.newer_versions,
@@ -1008,6 +1023,7 @@ def _from_dict_without_registry(cls, data: dict) -> "Paper":
         citation_count=data.get("citation_count"),
         keywords=data.get("keywords"),
         tags=data.get("tags"),
+        affiliations=data.get("affiliations"),
         sources=data.get("sources", []) or [],
         references=references,
         citations=citations,
@@ -1252,6 +1268,7 @@ def merge_with(self, other: "Paper") -> "Paper":
         citation_count=merged_citation_count,
         keywords=self._merge_term_lists(self.keywords, other.keywords),
         tags=self._merge_term_lists(self.tags, other.tags),
+        affiliations=self.affiliations or other.affiliations,
         sources=combined_sources,
         references=self.references if self.references is not None else other.references,
         citations=self.citations if self.citations is not None else other.citations,
@@ -1305,7 +1322,8 @@ def metadata_score(self) -> int:
     for value in (
         self.title, self.year, self.doi, self.abstract, self.venue,
         self.url, self.pdf_url, self.oa_url, self.citation_count,
-        self.keywords, self.tags, self.references, self.citations,
+        self.keywords, self.tags, self.affiliations, self.references,
+        self.citations,
     ):
         if value:
             score += 1
@@ -1463,6 +1481,30 @@ class TestPaperMergeWith:
             assert merged.venue == "Venue"  # From p2
             assert merged.url == "http://example.com"  # From p2
             assert merged.pdf_url == "http://example.com/pdf"  # From p2
+
+    def test_affiliations_fill_a_gap_but_are_not_unioned(self):
+        """Another spelling of our affiliations must not be appended."""
+        from scholar import isolated_registry
+
+        with isolated_registry():
+            doi = "10.1/affiliations"
+            ours = Paper(title="T", authors=["A B"], doi=doi,
+                         affiliations=["IRIT"])
+            theirs = Paper(
+                title="T", authors=["A B"], doi=doi,
+                affiliations=["Institut de Recherche en Informatique"],
+            )
+            bare = Paper(title="T", authors=["A B"], doi=doi)
+            assert ours.merge_with(theirs).affiliations == ["IRIT"]
+            assert (
+                bare.merge_with(theirs).affiliations == theirs.affiliations
+            )
+        with isolated_registry():
+            restored = Paper.from_dict(ours.to_dict())
+            assert restored.affiliations == ["IRIT"]
+        with isolated_registry():
+            old = Paper.from_dict({"title": "Old", "authors": []})
+            assert old.affiliations is None
 
     def test_merge_unions_keywords_and_tags(self):
         """Merging unions keywords/tags, keeping order."""
@@ -2236,6 +2278,7 @@ def merge_version_of(base: Paper, other: Paper) -> Paper:
         abstract=base.abstract or other.abstract,
         keywords=Paper._merge_term_lists(base.keywords, other.keywords),
         tags=Paper._merge_term_lists(base.tags, other.tags),
+        affiliations=base.affiliations or other.affiliations,
         sources=combined_sources,
     )
 @

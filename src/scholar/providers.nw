@@ -2771,17 +2771,25 @@ def _warn_about_filters(self, filters: SearchFilters | None) -> None:
 
 OpenAlex returns works as dictionaries.
 We extract the relevant fields and convert to our [[Paper]] type:
+Institutions hang on each authorship, so a department of five lists its
+university five times; [[Paper.affiliations]] wants each name once, in
+the order the authors introduce them.
 
 <<convert openalex work>>=
 def _convert_work(self, work: dict) -> Paper:
     """Convert an OpenAlex work to our Paper type."""
     # Extract author names from authorships
     authors = []
+    affiliations: list[str] = []
     for authorship in work.get("authorships", []):
         author_info = authorship.get("author", {})
         name = author_info.get("display_name")
         if name:
             authors.append(name)
+        for institution in authorship.get("institutions") or []:
+            where = (institution or {}).get("display_name")
+            if where and where not in affiliations:
+                affiliations.append(where)
 
     # Extract DOI (remove URL prefix if present)
     doi = work.get("doi")
@@ -2851,6 +2859,7 @@ def _convert_work(self, work: dict) -> Paper:
         url=work.get("id"),
         pdf_url=pdf_url,
         tags=tags,
+        affiliations=affiliations or None,
         sources=[self.name],
     )
 
@@ -2879,6 +2888,22 @@ def _reconstruct_abstract(
 
     abstract = " ".join(w for w in words if w).strip()
     return abstract or None
+@
+
+<<test functions>>=
+def test_openalex_affiliations_once_each_in_author_order():
+    """Institutions are collected across authorships without repeats."""
+    work = {"title": "T", "authorships": [
+        {"author": {"display_name": "A"},
+         "institutions": [{"display_name": "KTH"}, {"display_name": "IRIT"}]},
+        {"author": {"display_name": "B"},
+         "institutions": [{"display_name": "KTH"}]},
+        {"author": {"display_name": "C"}, "institutions": None},
+    ]}
+    provider = OpenAlexProvider()
+    assert provider._convert_work(work).affiliations == ["KTH", "IRIT"]
+    bare = {"title": "T", "authorships": [{"author": {"display_name": "A"}}]}
+    assert provider._convert_work(bare).affiliations is None
 @
 
 \subsubsection{DOI lookup}
@@ -10140,6 +10165,43 @@ def test_scopus_record_hashes_like_other_providers(self):
     assert legacy_hash_paper_id(title, ["Fares E."]) != elsewhere
 @
 
+\subsubsection{Affiliations}
+
+The [[COMPLETE]] view also lists the institutions behind a paper, once
+per paper with the authors pointing at them by id.
+We keep the names, in the order given, which is the order of first
+appearance among the authors; who belongs where is more than
+[[Paper.affiliations]] is meant to hold.
+A single affiliation may arrive as an object instead of a list.
+
+<<scopus helpers>>=
+def scopus_affiliations(entry: dict) -> list[str] | None:
+    """Return the entry's institution names, or None if it has none."""
+    listed = entry.get("affiliation") or []
+    if isinstance(listed, dict):
+        listed = [listed]
+    names = []
+    for affiliation in listed:
+        name = affiliation.get("affilname") if isinstance(
+            affiliation, dict
+        ) else None
+        if name and name not in names:
+            names.append(name)
+    return names or None
+<<scopus view test methods>>=
+def test_affiliations_by_name_once_each(self):
+    """Names in order, without repeats; none means None, not []."""
+    entry = {"affiliation": [
+        {"afid": "1", "affilname": "IRIT", "affiliation-country": "France"},
+        {"afid": "2", "affilname": "KTH"},
+        {"afid": "3", "affilname": "IRIT"},
+        {"afid": "4"},
+    ]}
+    assert scopus_affiliations(entry) == ["IRIT", "KTH"]
+    assert scopus_affiliations({"affiliation": {"affilname": "KTH"}}) == ["KTH"]
+    assert scopus_affiliations({}) is None
+@
+
 <<convert scopus entry>>=
 def _convert_entry(self, entry: dict) -> Paper:
     """Convert a Scopus search entry to a Paper."""
@@ -10186,6 +10248,7 @@ def _convert_entry(self, entry: dict) -> Paper:
         url=url,
         citation_count=citation_count,
         keywords=keywords,
+        affiliations=scopus_affiliations(entry),
         sources=[self.name],
     )
 @

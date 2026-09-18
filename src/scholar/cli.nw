@@ -7466,6 +7466,7 @@ class JSONFormatter:
                     {
                         "title": p.title,
                         "authors": p.authors,
+                        "affiliations": p.affiliations,
                         "year": p.year,
                         "doi": p.doi,
                         "abstract": p.abstract,
@@ -7513,6 +7514,18 @@ structure, including the search metadata:
         data = json.loads(capsys.readouterr().out)
         assert data[0]["filters"] == {"year": "2020-2024"}
         assert data[0]["limit"] == 50
+
+    def test_json_formatter_carries_affiliations(self, capsys):
+        """The per-paper field list is written by hand, so check it."""
+        import json
+
+        paper = Paper(title="T", authors=["A B"], affiliations=["KTH"])
+        JSONFormatter().format([SearchResult(
+            query="q", provider="scopus",
+            timestamp="2024-01-01T00:00:00", papers=[paper],
+        )])
+        data = json.loads(capsys.readouterr().out)
+        assert data[0]["papers"][0]["affiliations"] == ["KTH"]
 @
 
 
