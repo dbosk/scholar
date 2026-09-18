@@ -1,0 +1,335 @@
+\chapter{Tutorial: Enrich, verify, export}
+\label{ch:tutorial-enrich-verify-export}
+
+[[enrich-verify-export]] picks up where the first-search tutorial
+(\cref{ch:tutorial-first-search}) leaves off: the learner has a session
+of search hits and now has to turn it into something they can trust and
+hand on.
+The object of learning is that a session becomes more trustworthy in
+\emph{stages}---metadata and open-access links are filled in, currency is
+checked against Crossref, and the record is written out for a reader---and
+that every stage has two faces: one for a person reading a terminal and
+one for a program reading its output.
+
+The arc keeps the session invariant and varies the stage:
+\begin{enumerate}
+\item seed a session (step~1, the same search as the earlier tutorials),
+\item enrich it (step~2),
+\item verify it, first for a person and then for a program (steps~3--4),
+\item export it, first as a document and then as a fragment (steps~5--6),
+\item sort the export formats by that distinction (step~7).
+\end{enumerate}
+Steps~2, 3 and~5 are variation theory's separation pattern: the same
+session passes through three different commands, so the learner sees what
+each stage adds without anything else changing.
+Steps~3--4 and~5--6 are each a contrast pattern with a single varied
+aspect---one flag in the first pair, one format in the second---which is
+what makes the human/machine distinction visible rather than told.
+The closing question is the fusion move: it asks the learner to apply the
+document-versus-fragment distinction across all the formats at once.
+
+\section{Tutorial source}
+
+The whole tutorial is one tangled root chunk, with each step in its own
+named sub-chunk so the prose can explain a step's role without breaking
+the Markdown that pytorial reads.
+
+<<[[enrich-verify-export.md]]>>=
+---
+id: enrich-verify-export
+title: Enrich, verify, export
+summary: Fill in metadata, check for retractions, and export a session for a reader or a program.
+---
+
+<<seed session step>>
+
+<<enrich step>>
+
+<<verify step>>
+
+<<verify json step>>
+
+<<export all step>>
+
+<<export table step>>
+
+<<fragment or document question step>>
+@
+
+\section{Step 1: Seed a session}
+
+Every later step needs a session to act on, and the learner should create
+it rather than find it pre-made: the search line is the one thing this
+tutorial shares verbatim with the earlier ones, and repeating it turns the
+[[-n]] flag from something once seen into something habitual.
+The query, provider and limit are the same as in
+\cref{ch:tutorial-first-search} on purpose---the hits are already cached,
+so the step is fast, and nothing about the \emph{search} is new here.
+Only the session name varies.
+
+The anchor is Scholar's own confirmation line, which is printed
+unconditionally when [[-n]] is given; the number of hits is deliberately
+not part of the anchor, because provider ranking can change and the step
+should not fail for a reason the learner cannot see.
+
+<<seed session step>>=
+# Seed a session to work on
+
+```tutorial-step
+required_patterns:
+  - mode: regex
+    pattern: (?:^|\s)scholar\s+search\s+.*-n\s+check-sources\b
+  - "Saved session:"
+hint: "The same search as before, saved under the session name check-sources with -n."
+```
+
+Run a small search and save it as a session named `check-sources`:
+
+```
+scholar search "literate programming" -p openalex -l 5 -n check-sources
+```
+
+The rest of this tutorial works on that session. Everything here happens
+in a data directory private to the tutorial, so the session will not
+appear in your own session list afterwards.
+@
+
+\section{Step 2: Enrich the session}
+
+Search results are thin: a provider returns what it indexes, which may
+lack an abstract, an open-access link or both.
+[[scholar enrich]] looks each paper up by DOI in the other providers and
+in Unpaywall, and it is the first stage where the learner sees the session
+change without a new search.
+
+Unpaywall requires a contact email, so the outcome of this step depends on
+whether [[SCHOLAR_EMAIL]] is set in the learner's environment.
+Both outcomes are correct behaviour and both are worth seeing: with the
+email, Scholar prints an open-access tally; without it, Scholar prints a
+hint naming the variable and skips only the open-access part.
+The required pattern therefore accepts either line, and the instructions
+say what each means, so a learner without the variable set is not told
+they did something wrong.
+The second anchor, the final [[Enriched]] count, is printed in both
+cases.
+
+<<enrich step>>=
+# Fill in missing metadata
+
+```tutorial-step
+required_patterns:
+  - mode: regex
+    pattern: (?:^|\s)scholar\s+enrich\s+check-sources\b
+  - mode: regex
+    pattern: Open access:|SCHOLAR_EMAIL
+  - Enriched
+hint: "One verb fills in what the search left out; give it the session name."
+```
+
+Run `scholar enrich check-sources`.
+
+Enrichment looks up each paper by DOI to fill in missing abstracts and
+metadata, asks Unpaywall for open-access links, and checks Crossref for
+retractions on the way.
+
+Watch the line about open access:
+
+- `Open access: N of M checked papers` means Unpaywall was consulted.
+- `set SCHOLAR_EMAIL` means it was skipped: Unpaywall requires a contact
+  email, and Scholar only sends requests when `SCHOLAR_EMAIL` is set.
+  Everything else in this step still runs.
+
+The last line, `Enriched N papers.`, counts papers that gained new
+metadata. Zero is normal for well-indexed papers.
+@
+
+\section{Step 3: Verify currency}
+
+Enrichment already checked Crossref for retractions as a side effect.
+This step runs the same check as its own command, because the learner
+should know the check exists independently of enrichment: a session
+enriched months ago can be re-verified without touching its metadata.
+The result is saved back to the session, which is why the report matters
+for the exports later.
+
+The anchors are the two words that appear in every report regardless of
+what was found: the [[retracted]] count is printed even when it is zero,
+and the [[ok]] count follows it.
+Nothing in the anchor assumes the papers are clean.
+
+<<verify step>>=
+# Check for retractions and newer versions
+
+```tutorial-step
+required_patterns:
+  - mode: regex
+    pattern: (?:^|\s)scholar\s+verify\s+check-sources\b(?!.*--json)
+  - retracted
+  - mode: regex
+    pattern: \d+ ok\b
+hint: "Ask Scholar whether any paper in the session has been retracted, corrected or superseded."
+```
+
+Run `scholar verify check-sources`.
+
+Scholar asks Crossref, for every paper with a DOI, whether it has been
+retracted or corrected, or whether a newer version exists. The report
+ends with one line of counts: retracted, corrected, superseded, preprint,
+ok, unknown.
+
+The status is saved into the session, so later exports can show it.
+@
+
+\section{Step 4: The same check, for a program}
+
+This is the first contrast of the tutorial: the command of step~3 with
+one flag added.
+The learner has just read the human-facing report; now the same
+information arrives as a JSON array, one object per paper, and nothing
+else about the command changes.
+Placing the two directly after each other is what lets the learner see
+that the flag changes the \emph{face} of the check and not the check.
+
+The anchor is the [[status]] field of one object.
+It is quoted as it appears in the JSON, because that is exactly the
+detail that differs from the table: a program looks for a key, a person
+looks for a word.
+
+<<verify json step>>=
+# The same check, for a program
+
+```tutorial-step
+required_patterns:
+  - mode: regex
+    pattern: (?:^|\s)scholar\s+verify\s+check-sources\s+--json\b
+  - '"status": "ok"'
+hint: "Same command as before, plus the flag that switches the report to JSON."
+```
+
+Run `scholar verify check-sources --json`.
+
+The check is identical to the previous step, but the report is now a
+JSON array with one object per paper (`doi`, `title`, `status`, and the
+details behind the status). This is the form a script or an agent reads
+when it decides what to do with each paper; the table you saw before is
+the form a person reads.
+@
+
+\section{Step 5: Export the session as documents}
+
+Exporting is the stage where the session leaves Scholar.
+The default format, [[all]], writes three files at once: a CSV for
+spreadsheets and scripts, a LaTeX report, and the BibTeX file the report
+cites.
+The learner lists the directory afterwards so the three files are seen as
+a set, and then looks at the first line of the report, which is
+[[\documentclass]]: the report is a complete document that compiles on its
+own.
+That first line is the set-up for the next step's contrast, so the
+instructions point at it explicitly.
+
+The anchors are Scholar's confirmation and two of the three file names,
+which are derived from the [[-o]] base name and therefore stable.
+
+<<export all step>>=
+# Export the session as documents
+
+```tutorial-step
+required_patterns:
+  - mode: regex
+    pattern: (?:^|\s)scholar\s+sessions\s+export\s+check-sources\s+.*-o\s+check-sources\b
+  - "Exported:"
+  - check-sources.csv
+  - check-sources.tex
+hint: "Export with -f all and the base name check-sources, then list the directory."
+```
+
+Export the session and look at what was written:
+
+```
+scholar sessions export check-sources -f all -o check-sources
+ls
+head -1 check-sources.tex
+```
+
+`-f all` writes a CSV (one row per paper, with the decision, tags and the
+verification status), a LaTeX report, and the BibTeX file the report
+cites. The first line of `check-sources.tex` is `\documentclass`: the
+report is a complete document you can compile as it is.
+@
+
+\section{Step 6: Export the session as a fragment}
+
+The audit table is the export a paper's appendix wants: one row per work
+with the reason it was kept or excluded.
+It differs from the report of step~5 in exactly one way that the learner
+can see at the top of the file---it is not a document but a fragment,
+with a comment header telling the includer which packages the preamble
+must load.
+Showing the two heads one after the other is the contrast that carries the
+step: same session, same command family, one format switch, and the
+output goes from something you compile to something you [[\input]].
+
+The anchors are the fragment header Scholar writes and the table
+environment, both of which are fixed text.
+
+<<export table step>>=
+# Export an audit table for a paper
+
+```tutorial-step
+required_patterns:
+  - mode: regex
+    pattern: (?:^|\s)scholar\s+sessions\s+export\s+check-sources\s+.*-f\s+table\b
+  - scholar LaTeX fragment
+  - longtable
+hint: "The table format takes --lang and --label; write it to the base name check-table and look at its head."
+```
+
+Now write the audit table and look at its head:
+
+```
+scholar sessions export check-sources -f table --lang en --label check -o check-table
+head check-table.tex
+```
+
+The audit table lists one row per work with the reason it was kept or
+excluded, ready for a paper's appendix. Compare its first lines with the
+report from the previous step: this file is a *fragment*, meant to be
+`\input` into a document of yours, and its comment header names the
+packages that document's preamble must load. The table is always a
+fragment; the report is a document by default and becomes a fragment
+only with `--no-standalone`.
+@
+
+\section{Step 7: Sort the formats}
+
+The closing question makes the learner apply the distinction of the last
+two steps to every LaTeX-producing form of the command, including one
+they did not run.
+[[latex]] by default is the compilable document they saw in step~5;
+[[table]] is the fragment they saw in step~6; [[latex --no-standalone]]
+was only mentioned, and it is the option that tests whether the learner
+understood the rule rather than memorised the two examples.
+[[csv]] is the distractor: it is neither, and a learner who picks it has
+confused \enquote{not a document} with \enquote{a fragment}.
+
+<<fragment or document question step>>=
+# Which exports are fragments?
+
+```tutorial-step
+kind: multi_select
+options:
+  - latex
+  - latex --no-standalone
+  - table
+  - csv
+answers:
+  - latex --no-standalone
+  - table
+hint: "A fragment is LaTeX meant to be \\input into your own document; a document compiles on its own; a CSV is neither."
+```
+
+Choose every export format that produces a LaTeX *fragment* meant to be
+`\input` into a document of your own, rather than a document that
+compiles on its own.
+@

@@ -310,7 +310,7 @@ def parse_retry_after(value: str | None) -> float | None:
     Accepts both the delay-seconds and the HTTP-date form.  Returns
     `None` if the value is missing or unparseable.
     """
-    if not value:
+    if not value or not isinstance(value, str):
         return None
     value = value.strip()
     try:
@@ -324,6 +324,19 @@ def parse_retry_after(value: str | None) -> float | None:
     if dt is None:
         return None
     return max(0.0, dt.timestamp() - _now())
+@
+
+The value is checked to be a string before anything else: the header
+lookup tolerates any mapping, including the mocks in the provider tests,
+and a non-string value must read as \enquote{no usable header} rather
+than as an exception deep inside a 429 handler.
+
+<<test functions>>=
+class TestParseRetryAfterTypes:
+    def test_non_string_values_are_ignored(self):
+        assert parse_retry_after(None) is None
+        assert parse_retry_after(object()) is None
+        assert parse_retry_after("30") == 30.0
 @
 
 <<imports>>=

@@ -39,6 +39,8 @@ dependencies = [
     "questionary>=2.0.0",
     "llm-github-copilot>=0.3.1",
     "llm-mistral (>=0.15,<0.16)",
+    "llm-openai-via-codex>=0.1a0",
+    "pytorial>=0.8.1",
 ]
 
 [project.scripts]
@@ -50,6 +52,9 @@ build-backend = "setuptools.build_meta"
 
 [tool.setuptools.packages.find]
 where = ["src"]
+
+[tool.setuptools.package-data]
+scholar = ["tutorials/*.md"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

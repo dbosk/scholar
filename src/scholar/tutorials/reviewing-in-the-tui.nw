@@ -1,0 +1,398 @@
+\chapter{Tutorial: Reviewing papers in the TUI}
+\label{ch:tutorial-reviewing-in-the-tui}
+
+[[reviewing-in-the-tui]] teaches the second half of a review: turning a
+list of hits into decisions.
+Its object of learning is that a decision is a small record---a status
+(kept or discarded), the tags that motivate or theme it, and who made
+it---and that the terminal interface of \cref{tui-module} is merely one
+way to write that record.
+The lesson therefore never asks the learner to look at the screen and
+believe it; every TUI step is followed by a command that reads the saved
+session back, so what the learner verifies is the record, not the frame.
+
+The arc keeps the session invariant and varies the decision:
+\begin{enumerate}
+\item create one session with five papers (step 1), the material every
+  later step works on;
+\item make the simplest possible decision, a quick keep, and read it back
+  (steps 2--3);
+\item make the two decisions that need a tag, a discard with a motivation
+  and a keep with a theme, and read them back (step 4);
+\item see the theme surface outside the session (step 5) and the whole
+  record leave the tool as a file (step 6);
+\item name the rule the tags taught (steps 7--8).
+\end{enumerate}
+This is variation theory's contrast pattern applied to the decision
+record: quick keep, keep with theme and discard share the same shape and
+the same key-then-read-back rhythm, and differ in exactly one aspect
+each, so the learner can see which part of the record each key writes.
+
+A word on validation.
+pytorial checks the transcript of each shell step, and a full-screen
+Textual application draws itself with escape sequences that are not
+stable text.
+The TUI steps are therefore anchored on the command the learner types and
+on the one line Scholar prints before the interface starts; the proof
+that the keys did their work is delegated to the [[sessions show]] steps
+that follow, whose output is plain text.
+That is also the pedagogical point: the interface is transient, the
+record is what remains.
+
+\section{Tutorial source}
+
+The whole tutorial file is one tangled root chunk.
+Each step lives in its own named sub-chunk so the prose between them can
+describe that step's role without breaking the Markdown output.
+
+<<[[reviewing-in-the-tui.md]]>>=
+---
+id: reviewing-in-the-tui
+title: Reviewing papers in the TUI
+summary: Keep, tag and discard papers in the review interface, then read the record back.
+---
+
+<<seed session step>>
+
+<<quick keep step>>
+
+<<read back keep step>>
+
+<<discard and theme step>>
+
+<<themes list step>>
+
+<<export csv step>>
+
+<<discard rule question step>>
+
+<<decision keys question step>>
+@
+
+\section{Step 1: Create the session to review}
+
+The learner runs the seeding search themselves rather than having a
+[[pre_command]] do it.
+Partly this is continuity with the first tutorial
+(\cref{ch:tutorial-first-search}), where [[-n]] was the last thing
+learned; partly it is a property of the runner: a hook runs as a plain
+subprocess of the [[scholar]] process, so it would not be the same
+command the learner later types by hand.
+The query and provider are the same as in the first tutorial so the
+search is served from the shared cache and the five papers are the ones
+the learner has already seen.
+The anchor is Scholar's own confirmation line, printed on standard
+error, together with the pending count; the session name is what every
+later step refers to.
+
+Because the tutorial shell keeps Scholar's data directory inside the
+tutorial's workspace, this session cannot collide with one of the
+learner's real sessions of the same name, and [[--restart]] on the
+tutorial discards it together with the workspace.
+
+<<seed session step>>=
+# Create the session to review
+
+```tutorial-step
+required_patterns:
+  - mode: regex
+    pattern: (?:^|\s)scholar\s+search\s+.*-n\s+tui-review\b
+  - "Saved session:"
+  - 5 pending
+hint: "Search OpenAlex for literate programming, five results, and persist the search under the session name `tui-review` with the `-n` option."
+```
+
+Create the session this lesson reviews:
+
+```
+scholar search "literate programming" -p openalex -l 5 -n tui-review
+```
+
+Scholar reports where the session was saved and that all five papers
+are pending. Pending means no decision has been recorded yet; that is
+what the rest of this lesson changes.
+
+The tutorial shell has its own Scholar data directory, so this session
+lives only inside the tutorial and never appears in your real session
+list.
+@
+
+\section{Step 2: Keep a paper with one key}
+
+The first decision is the smallest one the interface offers: [[K]] keeps
+the highlighted paper without asking anything.
+Starting with the quick keep separates the \emph{status} part of a
+decision from the \emph{tags} part; step 4 then adds tags while keeping
+the key-press shape the same, so the learner meets the two parts of the
+record one at a time.
+
+The required patterns are the [[resume]] command and the
+\enquote{Resuming session} line Scholar prints unconditionally before
+the interface takes over the terminal.
+Nothing from inside the interface is matched: Textual redraws the screen
+with control sequences, and matching on them would make the step fail
+for reasons unrelated to the learner's actions.
+The prose tells the learner to quit with [[q]] explicitly, because the
+session is saved only when the interface exits, and step 3 depends on
+that.
+
+<<quick keep step>>=
+# Keep a paper with one key
+
+```tutorial-step
+required_patterns:
+  - mode: regex
+    pattern: (?:^|\s)scholar\s+sessions\s+resume\s+tui-review\b
+  - "Resuming session"
+hint: "Open the saved session in the review interface with `sessions resume`, press the capital-K key once, then quit with `q`."
+```
+
+Open the session in the review interface:
+
+```
+scholar sessions resume tui-review
+```
+
+The interface lists the five papers with the first one highlighted.
+Move with `j` and `k` (or the arrow keys); `Enter` opens a paper's
+abstract and details, and `q` (or `Escape`) returns to the list.
+
+For this step:
+
+1. Leave the first paper highlighted and press `K` (capital K). This
+   marks it as kept, with no further questions.
+2. Press `q` to quit the interface.
+
+The session is written to disk when the interface closes. The next step
+reads it back.
+@
+
+\section{Step 3: Read the decision back}
+
+This step is the other half of step 2 and the pattern the rest of the
+lesson repeats: a key in the interface, then [[sessions show]] on the
+command line.
+The anchor [[Kept (1)]] is the heading Scholar prints for the kept
+group, with its count; it can only appear if the [[K]] of step 2 was
+saved, so this is where the previous step is actually verified.
+The prose points out that the same title now sits under a different
+heading, so the learner connects the key press to a change in the
+record rather than to a change on the screen.
+
+<<read back keep step>>=
+# Read the decision back
+
+```tutorial-step
+required_patterns:
+  - mode: regex
+    pattern: (?:^|\s)scholar\s+sessions\s+show\s+tui-review\b
+  - "Kept (1)"
+  - "Pending (4)"
+hint: "Print the session with `sessions show`; the paper you kept now appears under its own heading."
+```
+
+Look at what the interface saved:
+
+```
+scholar sessions show tui-review
+```
+
+The paper you pressed `K` on has moved from `Pending` to `Kept (1)`,
+and four papers remain pending. This listing is the review record; the
+interface is only one way to write it.
+@
+
+\section{Step 4: Discard with a motivation, keep with a theme}
+
+Now the learner makes the two decisions that carry tags, in one visit
+to the interface, so the modal that collects tags is seen twice in a
+row with one difference: for a discard it refuses to close without a
+motivation, for a keep with themes it does not.
+That difference is the invariant the tutorial is after---a discard is
+a claim that needs a reason, and the tool enforces it.
+The tag names are prescribed ([[off-topic-false-hit]],
+[[foundations]]) so that the read-back can anchor on them; they are also
+the vocabulary the later tutorials reuse, so the learner meets them here
+first.
+
+The instructions spell out the modal's keys because the modal is the
+one place where the interface is not self-explanatory: with no
+existing tags the input field has focus, typing a name and pressing
+[[Enter]] adds and selects it, and a second [[Enter]] on the empty
+field confirms.
+The read-back anchors on the two group headings and on the theme in
+brackets after the kept paper, which is how [[sessions show]] displays
+a tag.
+
+<<discard and theme step>>=
+# Discard with a motivation, keep with a theme
+
+```tutorial-step
+required_patterns:
+  - mode: regex
+    pattern: (?:^|\s)scholar\s+sessions\s+resume\s+tui-review\b
+  - mode: regex
+    pattern: (?:^|\s)scholar\s+sessions\s+show\s+tui-review\b
+  - "Discarded (1)"
+  - "Kept (2)"
+  - "[foundations]"
+  - "[off-topic-false-hit]"
+hint: "Resume the session, press `d` on one pending paper and give the motivation `off-topic-false-hit`, press `T` on another and give the theme `foundations`, quit, then print the session with `sessions show`."
+```
+
+Resume the session again:
+
+```
+scholar sessions resume tui-review
+```
+
+Now record two decisions that need a tag:
+
+1. Move to a pending paper and press `d` to discard it. A dialog asks
+   for a motivation. Type `off-topic-false-hit` and press `Enter` to
+   add it, then press `Enter` again to confirm. The dialog will not
+   close without at least one motivation: a discard needs a reason.
+2. Move to another pending paper and press `T` to keep it with a
+   theme. The same kind of dialog asks for themes. Type `foundations`,
+   press `Enter` to add it and `Enter` again to confirm.
+3. Press `q` to quit.
+
+Then read the record back:
+
+```
+scholar sessions show tui-review
+```
+
+The listing now has a `Discarded (1)` group and `Kept (2)`, and the
+tags appear in brackets after the titles. `K`, `T` and `d` all write
+the same kind of record; they differ only in the status they set and in
+whether they ask for tags.
+@
+
+\section{Step 5: See the theme outside the session}
+
+Themes are not private to a session: [[scholar themes list]] counts
+them across every saved session, which is what makes them a vocabulary
+rather than a note.
+Placing this step right after the theme was created gives the contrast
+its shortest possible distance: the same word, typed once in a modal,
+now appears in a table that mentions no session.
+The anchor is the theme name and the table title.
+
+<<themes list step>>=
+# See the theme outside the session
+
+```tutorial-step
+required_patterns:
+  - mode: regex
+    pattern: (?:^|\s)scholar\s+themes\s+list\b
+  - "Themes Across Sessions"
+  - foundations
+hint: "The `themes` command group has a `list` verb that counts themes over all saved sessions."
+```
+
+List the themes Scholar knows about:
+
+```
+scholar themes list
+```
+
+The theme you typed in the dialog is now listed with the number of
+papers that carry it. Themes are shared across sessions, so the same
+vocabulary can organise several reviews; `scholar themes show
+foundations` would list the papers behind the count.
+@
+
+\section{Step 6: Export the record}
+
+The last shell step takes the record out of Scholar.
+The CSV export is chosen over the LaTeX report because its first line
+is a header that names the fields of a decision---[[status]],
+[[title]], \ldots, [[tags]]---so [[head -1]] shows the learner the
+shape of the record they have been writing, column by column.
+The anchors are the export confirmation and the start of that header
+line.
+
+<<export csv step>>=
+# Export the record
+
+```tutorial-step
+required_patterns:
+  - mode: regex
+    pattern: (?:^|\s)scholar\s+sessions\s+export\s+tui-review\s+.*-f\s+csv\b
+  - "Exported:"
+  - "status,title"
+hint: "Use `sessions export` with `-f csv` and `-o tui-review`, then show the first line of the resulting file with `head -1`."
+```
+
+Write the session to a file:
+
+```
+scholar sessions export tui-review -f csv -o tui-review
+head -1 tui-review.csv
+```
+
+The first line of the file is the header: one column per part of a
+decision (`status`, the paper's metadata, `tags`, who decided, and a
+`paper_id` you can use to address a paper from a script). Every row
+below it is one decision, exactly as the interface saved it. The
+`latex` format writes a compilable report instead; `-f all` writes
+both.
+@
+
+\section{Step 7: What a discard needs}
+
+The first question step names the rule that step 4 enforced silently.
+It is asked \emph{after} the learner has felt the dialog refuse to
+close, so the answer is a recollection rather than a guess; the two
+distractors are things the interface also offers (notes, PDFs) but
+never requires.
+
+<<discard rule question step>>=
+# What a discard needs
+
+```tutorial-step
+kind: single_select
+options:
+  - A note explaining the decision
+  - At least one motivation tag
+  - A downloaded PDF
+answers:
+  - At least one motivation tag
+hint: "Think about what the dialog refused to close without when you pressed `d`."
+```
+
+Which of these must a discarded paper have before Scholar records the
+decision?
+@
+
+\section{Step 8: Which keys write a decision}
+
+The closing question fuses the lesson: of the keys the learner has seen
+in the interface, which ones change the record?
+[[n]] and [[s]] are the distractors---both were mentioned in the steps,
+and both act on the interface or on notes without setting a status---so
+choosing correctly means distinguishing writing a decision from
+everything else the interface can do.
+
+<<decision keys question step>>=
+# Which keys write a decision
+
+```tutorial-step
+kind: multi_select
+options:
+  - K
+  - T
+  - d
+  - n
+  - s
+answers:
+  - K
+  - T
+  - d
+hint: "Pick the keys that change a paper's status; leave out the ones that edit notes or reorder the list."
+```
+
+Select every key in the review interface that records a keep or a
+discard.
+@

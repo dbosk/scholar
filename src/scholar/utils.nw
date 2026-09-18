@@ -579,6 +579,94 @@ class TestIsPreprintPaper:
         assert not is_preprint_paper(None, None)
 @
 
+\section{Cleaning provider text}
+\label{sec:clean-provider-text}
+
+Providers hand over titles and abstracts with the markup of their own
+systems still in them: HTML entities ([[&apos;]], [[&amp;]]) and inline
+tags ([[<i>]]) from DBLP, OpenAlex and Web of Science, and the mojibake
+of UTF-8 decoded as cp1252 or Latin-1 (an en dash arriving as
+\enquote{â} plus two control characters). Every consumer---the TUI, the
+notes, BibTeX entries, the audit table---would otherwise have to undo
+this, so it is undone once, at ingest, by [[clean_paper_text]]; the
+\LaTeX{} escapers call [[clean_metadata_text]] as well, for sessions
+recorded before this existed. The mojibake repair re-encodes and decodes
+and keeps the result only when the round trip succeeds, so genuine
+accented text is never touched, and the tag pattern names the inline
+tags explicitly so that a title such as \enquote{$x < y$ and $a > b$}
+keeps its angle brackets. The marker tuple is written with [[\u]]
+escapes because this file is woven into a pdf\LaTeX{} document.
+
+One consequence is deliberate: a paper without a DOI is identified by a
+hash of its title, so a record with markup in its title that was
+ingested before this cleaning existed gets a new id when it is searched
+again. That is the price of never storing the markup; DOI-identified
+papers are unaffected.
+
+<<utils functions>>=
+import html
+
+HTML_INLINE_TAGS = re.compile(
+    r"</?\s*(?:i|b|em|strong|sup|sub|sc|scp|inf|span|tt|u)\b[^>]*>",
+    re.IGNORECASE,
+)
+MOJIBAKE_MARKERS = ("Ã", "â", "Â")
+
+
+def repair_mojibake(text: str) -> str:
+    """Undo UTF-8 text that was decoded as cp1252 or Latin-1, if it was."""
+    if not any(marker in text for marker in MOJIBAKE_MARKERS):
+        return text
+    for encoding in ("cp1252", "latin-1"):
+        try:
+            return text.encode(encoding).decode("utf-8")
+        except (UnicodeEncodeError, UnicodeDecodeError):
+            continue
+    return text
+
+
+def clean_metadata_text(text: str) -> str:
+    """Decode entities, strip inline markup and repair mojibake."""
+    text = html.unescape(text or "")
+    text = HTML_INLINE_TAGS.sub("", text)
+    return repair_mojibake(text)
+
+
+def clean_paper_text(paper: Any) -> Any:
+    """Clean the title, venue and abstract of `paper` in place."""
+    for name in ("title", "venue", "abstract"):
+        value = getattr(paper, name, None)
+        if isinstance(value, str):
+            setattr(paper, name, clean_metadata_text(value))
+    return paper
+@
+
+Let's verify the three cleanings and that ordinary text survives them:
+
+<<test functions>>=
+class TestCleanProviderText:
+    def test_entities_and_inline_tags(self):
+        assert clean_metadata_text(
+            "Developers&apos; <i>Perceptions</i> &amp; &quot;XML&quot;"
+        ) == "Developers' Perceptions & \"XML\""
+        assert clean_metadata_text("x < y and a > b") == "x < y and a > b"
+
+    def test_mojibake_round_trips(self):
+        assert clean_metadata_text("Thinking â Developing") \
+            == "Thinking – Developing"
+        assert clean_metadata_text("Thinking â€“ Developing") \
+            == "Thinking – Developing"
+        assert clean_metadata_text("Café résumé") \
+            == "Café résumé"
+
+    def test_clean_paper_text_in_place(self):
+        paper = Paper(title="A &amp; <b>B</b>", authors=["X"],
+                      venue="J &lt;3", abstract="<i>fine</i>")
+        assert clean_paper_text(paper) is paper
+        assert (paper.title, paper.venue, paper.abstract) \
+            == ("A & B", "J <3", "fine")
+@
+
 \section{Contact email for polite API pools}
 \label{sec:contact-email}
 
