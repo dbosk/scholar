@@ -92,8 +92,10 @@ from scholar.pdf import *
 from pathlib import Path
 from typing import Any, Callable
 import hashlib
+import html
 import logging
 import os
+import re
 import subprocess
 import sys
 
@@ -267,6 +269,13 @@ to find an open access PDF. We try multiple sources in order of reliability:
   to a page with a PDF link.
 \end{description}
 
+Finding a URL is not the same as getting a PDF: an open-access link can
+be dead, and a publisher's link answers with a login page to anyone
+outside a subscribing network.
+So the sources do not compete to name \emph{the} URL.
+Each contributes a candidate, and the download
+(\cref{sec:pdf-download-doi}) works through them until one delivers.
+
 \subsection{DOI Detection}
 
 First, we need to detect whether an input string is a DOI. DOIs have a
@@ -416,9 +425,124 @@ def resolve_doi_s2(
         return None
 @
 
+\subsection{DOI Redirect Resolution}
+
+The last source is the publisher itself.
+Following [[https://doi.org/<doi>]] ends at the paper's landing page,
+or, for some repositories, at the PDF.
+Landing pages name their PDF in the [[citation_pdf_url]] meta tag, the
+Highwire convention that publishers follow because Google Scholar reads
+it, so we need no parser and no per-publisher rules: one expression,
+written to accept the two attributes in either order.
+
+This source differs from the other two in what it promises.
+Unpaywall and Semantic Scholar list copies that are open to everyone;
+the publisher's link is open to those the publisher admits.
+It comes last because it is the least likely to deliver, and we should
+be plain about how unlikely.
+Tried on six DOIs from six publishers, from a home network and from a
+subscribing university's, it made no difference where the request came
+from: the large publishers refuse scripted clients outright (HTTP 403
+from ACM, EDP Sciences and World Scientific, whatever the user agent)
+or land on a page that redirects by JavaScript (Elsevier), and the one
+page that did name its PDF named the copy Unpaywall already had.
+So this resolver earns its place with the small publishers and
+repositories that publish the tag and are missing from the two
+indexes, at the cost of one request for a paper we would otherwise
+give up on; it is not a way through a paywall, from campus or
+elsewhere.
+
+We read a bounded prefix of the page.
+The meta tags sit in the head, and an unbounded read of an arbitrary
+URL is not something a fallback should do.
+
+<<pdf constants>>=
+DOI_RESOLVER_URL = "https://doi.org/"
+LANDING_PAGE_BYTES = 512 * 1024
+CITATION_PDF_URL = re.compile(
+    r"""<meta\s+[^>]*?
+        (?:name=["']citation_pdf_url["'][^>]*?content=["']([^"']+)["']
+          |content=["']([^"']+)["'][^>]*?name=["']citation_pdf_url["'])""",
+    re.IGNORECASE | re.VERBOSE,
+)
+<<doi resolution functions>>=
+def resolve_doi_landing(
+    doi: str,
+    progress_callback: Callable[[str], None] | None = None,
+) -> str | None:
+    """
+    Resolve a DOI to a PDF URL through the publisher's landing page.
+
+    Follows the DOI redirect. Returns the final URL if it is a PDF,
+    else the page's `citation_pdf_url`, else None. The URL may be
+    open only from a subscribing institution's network.
+    """
+    if progress_callback:
+        progress_callback("Checking the publisher's page...")
+    response = None
+    try:
+        response = requests.get(
+            DOI_RESOLVER_URL + doi,
+            headers={"Accept": "text/html,application/pdf"},
+            timeout=30,
+            stream=True,
+        )
+        response.raise_for_status()
+        content_type = response.headers.get("content-type", "").lower()
+        if "pdf" in content_type:
+            return response.url
+        if "html" not in content_type:
+            return None
+        head = next(response.iter_content(LANDING_PAGE_BYTES), b"")
+    except requests.exceptions.RequestException as e:
+        logger.debug("DOI landing page failed for %s: %s", doi, e)
+        return None
+    finally:
+        if response is not None:
+            response.close()
+    match = CITATION_PDF_URL.search(head.decode("utf-8", "replace"))
+    if not match:
+        return None
+    return html.unescape(match.group(1) or match.group(2))
+@
+
 \subsection{Combined DOI Resolution}
 
-The main resolution function tries each source in order until it finds a PDF.
+The sources are combined as a generator, so that a source is consulted
+only when the candidates before it have failed to deliver: a paper
+that Unpaywall serves costs no request to Semantic Scholar or the
+publisher.
+
+<<doi resolution functions>>=
+def doi_pdf_candidates(
+    doi: str,
+    progress_callback: Callable[[str], None] | None = None,
+):
+    """
+    Yield `(source, url)` PDF candidates for a DOI, best source first.
+
+    Lazy: each source is asked only when the next candidate is wanted.
+    A URL is yielded once even if several sources name it.
+    """
+    resolvers = (
+        ("Unpaywall", resolve_doi_unpaywall),
+        ("Semantic Scholar", resolve_doi_s2),
+        ("the publisher's page", resolve_doi_landing),
+    )
+    seen = set()
+    for source, resolver in resolvers:
+        url = resolver(doi, progress_callback)
+        if url and url not in seen:
+            seen.add(url)
+            logger.info("Found PDF via %s for DOI %s", source, doi)
+            yield source, url
+@
+
+The order is the order of trust: copies open to everyone first, the
+publisher's own copy last.
+
+[[resolve_doi_to_pdf]] remains for callers that want a URL and not a
+file; it names the first candidate.
 
 <<doi resolution functions>>=
 def resolve_doi_to_pdf(
@@ -428,7 +552,7 @@ def resolve_doi_to_pdf(
     """
     Resolve a DOI to a PDF URL.
     
-    Tries multiple sources in order: Unpaywall, Semantic Scholar.
+    Names the first candidate of `doi_pdf_candidates`.
     
     Args:
         doi: The DOI to resolve.
@@ -441,22 +565,11 @@ def resolve_doi_to_pdf(
         PDFDownloadError: If no PDF URL could be found.
     """
     logger.info("Resolving DOI to PDF: %s", doi)
-    # Try Unpaywall first (best source for legal OA)
-    url = resolve_doi_unpaywall(doi, progress_callback)
-    if url:
+    for source, url in doi_pdf_candidates(doi, progress_callback):
         if progress_callback:
-            progress_callback(f"Found PDF via Unpaywall")
-        logger.info("Found PDF via Unpaywall for DOI %s", doi)
+            progress_callback(f"Found PDF via {source}")
         return url
-    
-    # Try Semantic Scholar
-    url = resolve_doi_s2(doi, progress_callback)
-    if url:
-        if progress_callback:
-            progress_callback(f"Found PDF via Semantic Scholar")
-        logger.info("Found PDF via Semantic Scholar for DOI %s", doi)
-        return url
-    
+
     # No PDF found
     logger.warning("Could not find open access PDF for DOI: %s", doi)
     raise PDFDownloadError(
@@ -543,8 +656,13 @@ class TestDOIResolution:
 
     def test_resolve_doi_to_pdf_no_pdf_raises(self):
         """Raises error when no PDF found."""
+        import requests as real_requests
+
         mock_response = Mock()
         mock_response.status_code = 404
+        mock_response.raise_for_status.side_effect = (
+            real_requests.exceptions.HTTPError(response=mock_response)
+        )
 
         with patch("scholar.pdf.resolve_pdf_url", return_value=None), patch(
             "scholar.pdf.requests.get", return_value=mock_response
@@ -555,6 +673,70 @@ class TestDOIResolution:
         assert "Could not find open access PDF" in str(exc_info.value)
 @
 
+
+The landing-page resolver and the laziness of the candidates are what
+the fall-through rests on, so we test both: that the meta tag is found
+in either attribute order, that a DOI which redirects straight to a PDF
+is recognised, and that a later source is not even asked while an
+earlier candidate is still untried.
+
+<<test functions>>=
+class TestDOICandidates:
+    """Tests for the landing-page resolver and the candidate order."""
+
+    @staticmethod
+    def page(content_type, body=b"", url="https://pub.example/article"):
+        response = MagicMock()
+        response.headers = {"content-type": content_type}
+        response.url = url
+        response.iter_content.return_value = iter([body])
+        return response
+
+    def test_landing_page_names_its_pdf(self):
+        """citation_pdf_url is found whichever attribute comes first."""
+        for tag in (
+            b'<meta name="citation_pdf_url" content="https://p.example/a.pdf?x=1&amp;y=2">',
+            b"<META content='https://p.example/a.pdf?x=1&amp;y=2' name='citation_pdf_url'/>",
+        ):
+            page = self.page("text/html; charset=utf-8", b"<head>" + tag)
+            with patch("scholar.pdf.requests.get", return_value=page):
+                assert resolve_doi_landing("10.1/x") == (
+                    "https://p.example/a.pdf?x=1&y=2"
+                )
+
+    def test_landing_page_without_pdf(self):
+        """No tag, a non-HTML answer and a network error all mean None."""
+        import requests as real_requests
+
+        for response in (
+            self.page("text/html", b"<head><title>Log in</title>"),
+            self.page("application/json", b"{}"),
+        ):
+            with patch("scholar.pdf.requests.get", return_value=response):
+                assert resolve_doi_landing("10.1/x") is None
+        with patch(
+            "scholar.pdf.requests.get",
+            side_effect=real_requests.exceptions.ConnectionError,
+        ):
+            assert resolve_doi_landing("10.1/x") is None
+
+    def test_doi_redirecting_to_a_pdf(self):
+        """A repository DOI may resolve to the PDF itself."""
+        pdf = self.page("application/pdf", url="https://repo.example/a.pdf")
+        with patch("scholar.pdf.requests.get", return_value=pdf):
+            assert resolve_doi_landing("10.1/x") == "https://repo.example/a.pdf"
+
+    def test_candidates_are_lazy_and_distinct(self):
+        """Later sources are asked only on demand; repeats are dropped."""
+        with patch("scholar.pdf.resolve_doi_unpaywall", return_value="u") as up, \
+             patch("scholar.pdf.resolve_doi_s2", return_value="u") as s2, \
+             patch("scholar.pdf.resolve_doi_landing", return_value="p") as lp:
+            candidates = doi_pdf_candidates("10.1/x")
+            assert next(candidates) == ("Unpaywall", "u")
+            assert not s2.called and not lp.called
+            assert next(candidates) == ("the publisher's page", "p")
+            assert s2.called
+@
 
 \section{PDF Download}
 
@@ -641,11 +823,60 @@ def download_pdf(
         raise PDFDownloadError(f"Request failed: {e}\nURL: {url}")
 @
 
+\subsection{Downloading by DOI}
+\label{sec:pdf-download-doi}
+
+A DOI has several candidate URLs (\cref{sec:doi-resolution}) and any of
+them can disappoint: the link is dead, or it answers with HTML because
+we are not on a network the publisher admits.
+[[download_pdf]] already turns each of these into a
+[[PDFDownloadError]], so falling through is a loop around it.
+We keep the reasons, since when every candidate fails the user is best
+served by seeing each source's failure, not only the last; the
+[[skip]] parameter lets a caller exclude a URL it has tried already.
+
+<<pdf download functions>>=
+def download_doi_pdf(
+    doi: str,
+    progress_callback: Callable[[str], None] | None = None,
+    skip: tuple[str, ...] = (),
+) -> Path:
+    """
+    Download the PDF for a DOI, trying each candidate URL in turn.
+
+    Raises:
+        PDFDownloadError: If no source names a PDF, or none delivers;
+            the message lists every attempt.
+    """
+    failures = []
+    for source, url in doi_pdf_candidates(doi, progress_callback):
+        if url in skip:
+            continue
+        try:
+            return download_pdf(url, progress_callback)
+        except PDFDownloadError as e:
+            reason = str(e).splitlines()[0]
+            logger.info("PDF via %s failed for %s: %s", source, doi, reason)
+            failures.append(f"{source}: {reason} ({url})")
+    if not failures:
+        raise PDFDownloadError(
+            f"Could not find open access PDF for DOI: {doi}\n"
+            f"The paper may not be available as open access."
+        )
+    raise PDFDownloadError(
+        f"No source delivered a PDF for DOI: {doi}\n"
+        + "\n".join(failures)
+    )
+@
+
 \subsection{High-level PDF access}
 
 For convenience, we provide a function that accepts a Paper object, a DOI,
 or a URL string, making it easy to use from both programmatic code and
 the CLI/TUI.
+A paper's own [[pdf_url]] is one more candidate, tried first because a
+provider named it for this very record; if it fails and the paper has a
+DOI, the DOI's candidates follow.
 
 <<pdf download functions>>=
 def get_pdf(
@@ -670,40 +901,46 @@ def get_pdf(
     Raises:
         PDFDownloadError: If download fails or no PDF available.
     """
-    url: str | None = None
-    
     if isinstance(source, str):
-        # Check if it's a DOI
         doi = extract_doi(source)
         if doi:
             logger.debug("Source is a DOI: %s", doi)
             if progress_callback:
                 progress_callback(f"Resolving DOI: {doi}")
-            url = resolve_doi_to_pdf(doi, progress_callback)
-        else:
-            # Assume it's a URL
-            logger.debug("Source is a URL: %s", source)
-            url = source
-    else:
-        # Assume it's a Paper object
-        paper_title = getattr(source, "title", "Unknown")
-        logger.debug("Getting PDF for paper: %s", paper_title)
-        # Try pdf_url first, then doi
-        url = getattr(source, "pdf_url", None)
-        if not url:
-            doi = getattr(source, "doi", None)
-            if doi:
-                logger.debug("Paper has no pdf_url, trying DOI: %s", doi)
-                if progress_callback:
-                    progress_callback(f"Resolving DOI: {doi}")
-                url = resolve_doi_to_pdf(doi, progress_callback)
-        if not url:
-            logger.warning("Paper has no PDF URL or DOI: %s", paper_title)
-            raise PDFDownloadError(
-                f"Paper has no PDF URL or DOI: {paper_title}"
-            )
-    
-    return download_pdf(url, progress_callback)
+            return download_doi_pdf(doi, progress_callback)
+        logger.debug("Source is a URL: %s", source)
+        return download_pdf(source, progress_callback)
+
+    paper_title = getattr(source, "title", "Unknown")
+    logger.debug("Getting PDF for paper: %s", paper_title)
+    url = getattr(source, "pdf_url", None)
+    doi = getattr(source, "doi", None)
+    if not url and not doi:
+        logger.warning("Paper has no PDF URL or DOI: %s", paper_title)
+        raise PDFDownloadError(
+            f"Paper has no PDF URL or DOI: {paper_title}"
+        )
+    first_failure = None
+    if url:
+        try:
+            return download_pdf(url, progress_callback)
+        except PDFDownloadError as e:
+            if not doi:
+                raise
+            first_failure = str(e).splitlines()[0]
+            logger.info("pdf_url failed for %s; trying its DOI", paper_title)
+    if progress_callback:
+        progress_callback(f"Resolving DOI: {doi}")
+    try:
+        return download_doi_pdf(
+            doi, progress_callback, skip=(url,) if url else ()
+        )
+    except PDFDownloadError as e:
+        if first_failure is None:
+            raise
+        raise PDFDownloadError(
+            f"{e}\nThe paper's own link: {first_failure} ({url})"
+        ) from e
 @
 
 \subsection{Testing download functions}
@@ -799,6 +1036,82 @@ class TestPDFDownload:
         assert "no PDF URL or DOI" in str(exc_info.value)
 @
 
+
+The point of the candidates is the fall-through, so let us see it: a
+first candidate that answers with a login page must not stop us from
+getting the PDF that the next one has, and when none delivers the error
+must name them all.
+
+<<test functions>>=
+class TestDOIDownload:
+    """Tests for falling through the candidates of a DOI."""
+
+    @staticmethod
+    def web(answers):
+        """A fake `requests.get` answering by URL: bytes are a PDF."""
+        def get(url, **kwargs):
+            response = MagicMock()
+            body = answers[url]
+            if isinstance(body, bytes):
+                response.headers = {"content-type": "application/pdf"}
+                response.iter_content.return_value = [body]
+            else:
+                response.headers = {"content-type": "text/html"}
+            return response
+        return get
+
+    def candidates(self, *urls):
+        return patch(
+            "scholar.pdf.doi_pdf_candidates",
+            return_value=iter([(f"source {u}", u) for u in urls]),
+        )
+
+    def test_falls_through_to_a_candidate_that_delivers(
+        self, tmp_path, monkeypatch
+    ):
+        monkeypatch.setenv("SCHOLAR_CACHE_DIR", str(tmp_path))
+        web = self.web({"https://a/": "login page", "https://b/": b"%PDF"})
+        with self.candidates("https://a/", "https://b/"), \
+             patch("scholar.pdf.requests.get", web):
+            assert download_doi_pdf("10.1/x").read_bytes() == b"%PDF"
+
+    def test_error_lists_every_attempt(self, tmp_path, monkeypatch):
+        monkeypatch.setenv("SCHOLAR_CACHE_DIR", str(tmp_path))
+        web = self.web({"https://a/": "login", "https://b/": "login"})
+        with self.candidates("https://a/", "https://b/"), \
+             patch("scholar.pdf.requests.get", web), \
+             pytest.raises(PDFDownloadError) as error:
+            download_doi_pdf("10.1/x")
+        assert "https://a/" in str(error.value)
+        assert "https://b/" in str(error.value)
+
+    def test_no_candidate_at_all(self):
+        with self.candidates(), pytest.raises(PDFDownloadError) as error:
+            download_doi_pdf("10.1/x")
+        assert "Could not find open access PDF" in str(error.value)
+
+    def test_paper_with_a_dead_pdf_url_falls_back_to_its_doi(
+        self, tmp_path, monkeypatch
+    ):
+        monkeypatch.setenv("SCHOLAR_CACHE_DIR", str(tmp_path))
+        paper = MagicMock(
+            title="T", pdf_url="https://dead/", doi="10.1/x"
+        )
+        web = self.web({"https://dead/": "gone", "https://b/": b"%PDF"})
+        with self.candidates("https://dead/", "https://b/"), \
+             patch("scholar.pdf.requests.get", web) as get:
+            assert get_pdf(paper).read_bytes() == b"%PDF"
+
+    def test_paper_without_doi_reports_its_pdf_url_failure(
+        self, tmp_path, monkeypatch
+    ):
+        monkeypatch.setenv("SCHOLAR_CACHE_DIR", str(tmp_path))
+        paper = MagicMock(title="T", pdf_url="https://dead/", doi=None)
+        with patch("scholar.pdf.requests.get", self.web({"https://dead/": "x"})), \
+             pytest.raises(PDFDownloadError) as error:
+            get_pdf(paper)
+        assert "did not return a PDF" in str(error.value)
+@
 
 \section{Opening PDFs}
 
