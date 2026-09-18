@@ -114,11 +114,20 @@ provider.
   Requires an API key.
 \item[Web of Science] High-quality bibliographic metadata.
   Requires an API key.
+\item[Scopus] Abstracts for venues the others index poorly, but only
+  where Elsevier serves its [[COMPLETE]] view, that is, on the
+  subscribing institution's network or with its token
+  (\cref{sec:scopus-doi-lookup}); elsewhere it declines after a single
+  request.
+  It comes last because its quota is weekly and metered: we spend it
+  only on what the free providers could not supply.
 \end{description}
 
 <<constants>>=
 # Providers to try for DOI-based metadata enrichment (in priority order)
-ENRICHMENT_PROVIDERS = ["s2", "arxiv", "openalex", "ieee", "wos"]
+ENRICHMENT_PROVIDERS = [
+    "s2", "arxiv", "openalex", "ieee", "wos", "scopus",
+]
 
 # Global cache for enriched paper data (refs/cites)
 # Stored in data dir (not cache dir) since fetching refs/cites is expensive
