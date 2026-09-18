@@ -9441,30 +9441,39 @@ authentication errors (401), permission issues (403), and rate limiting
 
 One failure deserves its own message because its text points the wrong
 way. Scopus answers HTTP 400, [[INVALID_INPUT]], \enquote{Error
-translating query} when its search service refuses a key's requests
+translating query} when its search service refuses requests
 outright---for every query, a bare word included---which reads as a
-syntax problem and once cost a review two days of Scopus cells. It is
-not the syntax: the same happened from the subscribing institution's
-own network while the abstract API still honoured the subscription, so
-the cause lies with Elsevier's Search API or the key's access to it.
-The provider recognises that body and says so, quoting the request id
-Elsevier's support asks for, and reminds off-campus users that a key is
-IP-bound and needs [[SCOPUS_INST_TOKEN]] elsewhere.
+syntax problem and once cost a review two days of Scopus cells.
+
+What we know about it comes from one episode in September 2026, and
+mostly consists of causes ruled out. It is not the syntax, since a bare
+word failed. It is not the key: a freshly created key failed the same
+way, and the old one kept working against the abstract API. It is not
+the IP binding either: the requests failed identically from the
+subscribing institution's own network. (The IP binding is real but
+shows up elsewhere: off campus and without [[SCOPUS_INST_TOKEN]], the
+default view answers normally and only [[view=COMPLETE]] is refused,
+with a 401.) The refusals did not count against the weekly quota, and
+some time within the following two weeks they stopped, with nothing
+changed on our side. So the fault was in Elsevier's search service, and
+the only advice that would have helped is the advice we give: leave the
+query alone, try again later, and if it lasts, give Elsevier's support
+the request id they ask for.
 
 <<scopus helpers>>=
 SCOPUS_UNTRANSLATABLE = "Error translating query"
-SCOPUS_ENTITLEMENT_HINT = (
+SCOPUS_SEARCH_REFUSED_HINT = (
     "Scopus answered HTTP 400 'Error translating query'{reqid}. When "
-    "even a bare word fails this way the query is not the problem: "
-    "Elsevier's search service is refusing this key's requests. Check "
-    "the key's Scopus Search API access at https://dev.elsevier.com/ "
-    "(or try a fresh key), and quote the request id to Elsevier support. "
-    "Off campus a key is IP-bound: set SCOPUS_INST_TOKEN there."
+    "even a bare word fails this way the query is not the problem, and "
+    "neither is the key or the network: Elsevier's search service is "
+    "refusing requests on its side. This has cleared by itself before, "
+    "so try again later; if it lasts, quote the request id to Elsevier "
+    "support or your library."
 )
 
 
-def scopus_entitlement_hint(response) -> str | None:
-    """Explain Scopus's misleading 400 when its search refuses the key."""
+def scopus_search_refused_hint(response) -> str | None:
+    """Explain Scopus's misleading 400 when its search refuses requests."""
     if getattr(response, "status_code", None) != 400:
         return None
     text = getattr(response, "text", "") or ""
@@ -9473,12 +9482,12 @@ def scopus_entitlement_hint(response) -> str | None:
     headers = getattr(response, "headers", None) or {}
     reqid = headers.get("X-ELS-ReqId") if hasattr(headers, "get") else None
     suffix = f" (request id {reqid})" if isinstance(reqid, str) else ""
-    return SCOPUS_ENTITLEMENT_HINT.format(reqid=suffix)
+    return SCOPUS_SEARCH_REFUSED_HINT.format(reqid=suffix)
 @
 
 <<scopus handle response errors>>=
 if response.status_code != 200:
-    hint = scopus_entitlement_hint(response)
+    hint = scopus_search_refused_hint(response)
     if hint:
         logger.warning("scopus: %s", hint)
     elif response.status_code == 401:
@@ -9850,7 +9859,7 @@ Scopus authenticates via the [[X-ELS-APIKey]] header (plus the optional
 institutional token, which we forward so the probe sees the same access level
 as real searches).  Any 401/403 points at [[SCOPUS_API_KEY]]; the
 untranslatable-query 400 gets the hint above instead of a bare status
-code, since it is the failure a valid key meets most often.
+code, which would send the user off to debug a query that is fine.
 
 <<scopus provider>>=
 
@@ -9868,7 +9877,7 @@ code, since it is the failure a valid key meets most often.
             params={"query": "TITLE-ABS-KEY(test)", "count": 1},
             timeout=30,
         )
-        hint = scopus_entitlement_hint(response)
+        hint = scopus_search_refused_hint(response)
         if hint:
             return HEALTH_HTTP_ERROR, hint
         return classify_check_response(
@@ -9905,8 +9914,8 @@ pagination, filter application, and institutional token support.
 class TestScopusProvider:
     """Tests for the Scopus provider."""
 
-    def test_untranslatable_query_400_explains_entitlement(self, caplog):
-        """The IP-binding 400 is explained in search and in the check."""
+    def test_untranslatable_query_400_explains_refusal(self, caplog):
+        """The misleading 400 is explained in search and in the check."""
         import logging
 
         provider = ScopusProvider(api_key="k")
@@ -9929,9 +9938,10 @@ class TestScopusProvider:
         with patch("requests.get", return_value=response):
             status, message = provider.check()
         assert status == HEALTH_HTTP_ERROR
-        assert "dev.elsevier.com" in message
+        assert "try again later" in message
+        assert "SCOPUS_INST_TOKEN" not in message
         plain = Mock(status_code=400, text="something else")
-        assert scopus_entitlement_hint(plain) is None
+        assert scopus_search_refused_hint(plain) is None
 
     def test_is_available_false_without_key(self):
         """Scopus is unavailable without API key."""
