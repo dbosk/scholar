@@ -116,7 +116,7 @@ from scholar.notes import (
 
 from scholar.utils import (
     clean_metadata_text, clean_paper_text, derive_arxiv_doi,
-    legacy_hash_paper_id,
+    given_name_first, legacy_hash_paper_id,
 )
 
 logger = logging.getLogger(__name__)
@@ -1331,10 +1331,51 @@ direction needs its own guard:
   ([[migrate_paper_id]], \cref{notes-module}).
 \end{description}
 
+\label{sec:review-surname-first}
+A third kind of entry changes identity without changing version.
+Scopus writes names surname first (\enquote{Fares E.}), and until the
+provider learnt to reorder them (\cref{sec:utils-surname-first}) a
+Scopus paper without a DOI was stored that way and hashed on its
+author's initial.
+The provider now returns \enquote{E. Fares}, hence another id, and
+without care the next run of the same search would add every such paper
+a second time, pending, next to the entry that already carries a
+decision.
+Nothing in the incoming paper points back at the old entry, so we work
+from the other end: for each stored paper whose first author is surname
+first, we compute the id it \emph{would} have in the right order, and
+recognise the incoming paper by that.
+The entry then takes the incoming authors (and with them the new id),
+keeps its decision, and its note and decision records are migrated like
+those of an adopted preprint.
+This needs no knowledge of Scopus: a stored name that ends in initials
+is surname first whoever supplied it, and the match is the same
+title-and-surname identity used everywhere else.
+
+<<review session functions>>=
+def given_name_first_id(paper: Paper) -> str | None:
+    """Return the id `paper` gets once its first author is reordered.
+
+    None when nothing would change: the paper has a DOI (the hash is
+    not its id), no authors, or a first author already in order.
+    """
+    if paper.doi or not paper.authors:
+        return None
+    reordered = given_name_first(paper.authors[0])
+    if reordered == paper.authors[0]:
+        return None
+    return legacy_hash_paper_id(paper.title, [reordered])
+@
+
 <<convert search results to decisions>>=
 decision_lookup: dict[str, ReviewDecision] = {
     get_paper_id(d.paper): d for d in session.decisions
 }
+surname_first_lookup: dict[str, ReviewDecision] = {}
+for d in session.decisions:
+    reordered_id = given_name_first_id(d.paper)
+    if reordered_id and reordered_id not in decision_lookup:
+        surname_first_lookup[reordered_id] = d
 provenance_lookup: dict[str, ReviewDecision] = {}
 for d in session.decisions:
     for entry in d.paper.published_versions or []:
@@ -1354,6 +1395,17 @@ for result in results:
                 existing.paper = existing.paper.merge_with(paper)
             except ValueError:
                 pass
+            continue
+
+        surname_first = surname_first_lookup.pop(paper_id, None)
+        if surname_first is not None:
+            old_id = get_paper_id(surname_first.paper)
+            migrate_paper_id(old_id, paper_id)
+            surname_first.paper = replace(
+                surname_first.paper, authors=paper.authors
+            ).merge_with(paper)
+            decision_lookup.pop(old_id, None)
+            decision_lookup[paper_id] = surname_first
             continue
 
         adopted = provenance_lookup.get(paper_id)
@@ -2176,6 +2228,68 @@ class TestSessionFunctions:
             entry = merged.decisions[0].paper
             assert entry.doi == "10.48550/arXiv.2401.1"
             assert entry.abstract == "Publisher abstract."
+
+    def test_surname_first_entry_keeps_its_decision(
+        self, tmp_path, monkeypatch
+    ):
+        """A paper stored as `Fares E.` is recognised as `E. Fares`."""
+        from scholar import isolated_registry
+
+        monkeypatch.setenv("SCHOLAR_DATA_DIR", str(tmp_path))
+
+        with isolated_registry():
+            stored = Paper(
+                title="A Work", authors=["Fares E."], sources=["scopus"]
+            )
+            session = ReviewSession(
+                query="test query",
+                providers=["scopus"],
+                timestamp=datetime.now(),
+                name="test query",
+            )
+            session.decisions.append(
+                ReviewDecision(
+                    paper=stored,
+                    provider="scopus",
+                    status=DecisionStatus.DISCARDED,
+                    tags=["off-topic"],
+                )
+            )
+            save_session(session)
+
+            result = Mock()
+            result.provider = "scopus"
+            result.query = "test query"
+            result.papers = [
+                Paper(
+                    title="A Work",
+                    authors=["Elie Fares", "Mamoun Filali"],
+                    abstract="Now with an abstract.",
+                    sources=["scopus"],
+                ),
+                Paper(title="A Work", authors=["E. Fares"],
+                      sources=["scopus"]),
+            ]
+
+            merged = create_review_session([result], "test query")
+
+            assert len(merged.decisions) == 1
+            decision = merged.decisions[0]
+            assert decision.status == DecisionStatus.DISCARDED
+            assert decision.tags == ["off-topic"]
+            assert decision.paper.authors == ["Elie Fares", "Mamoun Filali"]
+            assert decision.paper.abstract == "Now with an abstract."
+            assert get_paper_id(decision.paper) != get_paper_id(stored)
+
+    def test_given_name_first_id_only_for_reorderable_papers(self):
+        """DOIs, empty author lists and ordered names yield no alias."""
+        assert given_name_first_id(Paper(title="T", authors=["Fares E."]))
+        for paper in (
+            Paper(title="T", authors=["Fares E."], doi="10.1/x"),
+            Paper(title="T", authors=[]),
+            Paper(title="T", authors=["Elie Fares"]),
+        ):
+            assert given_name_first_id(paper) is None
 
     def test_incoming_adoption_upgrades_published_entry(
         self, tmp_path, monkeypatch

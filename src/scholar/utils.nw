@@ -352,6 +352,71 @@ def legacy_hash_paper_id(title: str, authors: list[str] | None = None) -> str:
     return f"hash:{hash_value}"
 @
 
+\subsection{Surname-first names}
+\label{sec:utils-surname-first}
+
+The hash above takes the first author's surname to be the \emph{last}
+word of the name.
+That holds for every provider but Scopus, which writes names surname
+first: \enquote{Fares E.}.
+Hashed as it comes, such a name contributes its initial
+(\enquote{e.}) instead of its surname, and the paper can never be
+matched with the same paper from another provider, nor with its
+preprint in the version-aware deduplication, which groups by this hash.
+
+[[given_name_first]] restores the expected order.
+It moves trailing initials to the front, and only those: a name that
+does not end in initials (a mononym, a consortium) is not ours to
+rearrange.
+Particles need no special care, since they stay with the surname on
+either side of the move.
+It lives here rather than with the Scopus provider because the review
+module needs it too, to recognise the entries that older sessions stored
+in Scopus's order (\cref{sec:review-surname-first}).
+
+<<utils functions>>=
+TRAILING_INITIALS = re.compile(r"^(?:[^\W\d_]\.-?)+$")
+
+
+def given_name_first(name: str) -> str:
+    """Turn a surname-first `Surname I.` into `I. Surname`.
+
+    Only trailing initials are moved, so `van der Berg J.H.` becomes
+    `J.H. van der Berg` and a name without them is returned unchanged.
+    """
+    parts = name.split()
+    split = len(parts)
+    while split > 1 and TRAILING_INITIALS.match(parts[split - 1]):
+        split -= 1
+    return " ".join(parts[split:] + parts[:split])
+@
+
+<<test functions>>=
+class TestGivenNameFirst:
+    """Surname-first names are rearranged, all others left alone."""
+
+    def test_moves_only_trailing_initials(self):
+        for surname_first, expected in [
+            ("Fares E.", "E. Fares"),
+            ("Bodeveix J.P.", "J.P. Bodeveix"),
+            ("Smith J.-P.", "J.-P. Smith"),
+            ("van der Berg J.H.", "J.H. van der Berg"),
+            ("Öztürk Ş.", "Ş. Öztürk"),
+            ("Plato", "Plato"),
+            ("ATLAS Collaboration", "ATLAS Collaboration"),
+            ("Donald E. Knuth", "Donald E. Knuth"),
+            ("E.", "E."),
+            ("", ""),
+        ]:
+            assert given_name_first(surname_first) == expected
+
+    def test_restores_the_surname_in_the_hash(self):
+        title = "Correct pattern-based development"
+        assert legacy_hash_paper_id(
+            title, [given_name_first("Fares E.")]
+        ) == legacy_hash_paper_id(title, ["Elie Fares"])
+@
+
 \subsection{arXiv IDs and DOIs}
 
 We treat arXiv identifiers as a special case because arXiv URLs are common in
