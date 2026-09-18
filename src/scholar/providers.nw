@@ -10196,6 +10196,87 @@ def _convert_entry(self, entry: dict) -> Paper:
 
 @
 
+\subsection{Looking a paper up by DOI}
+\label{sec:scopus-doi-lookup}
+
+Enrichment (\cref{enrich-module}) completes a paper found elsewhere by
+asking providers for its DOI, and uses any provider that has a
+[[get_paper_by_doi]].
+Scopus can answer with a one-result [[DOI(...)]] search, but whether it
+has anything to \emph{add} depends on the view
+(\cref{sec:scopus-view}): what enrichment lacks is nearly always the
+abstract, and the default view has none.
+So this lookup is for the entitled.
+It asks for [[COMPLETE]] without the fallback, and when that is
+refused it returns nothing, leaving [[_complete_ok]] to make every
+later lookup of the process return at once, without a request.
+A whole enrichment run off campus thus costs Scopus one request, not
+one per paper.
+
+The DOI is quoted, since DOIs may contain parentheses that Scopus's
+query language would read as grouping; a quote inside a DOI cannot be
+escaped, so we drop it and let the search find nothing rather than
+fail to parse.
+
+<<scopus provider>>=
+
+    def get_paper_by_doi(self, doi: str | None) -> Paper | None:
+        """Look a paper up by DOI; None unless the COMPLETE view serves it.
+
+        The default view adds nothing enrichment needs (no abstract),
+        so a network without the COMPLETE view gets None, and after the
+        first refusal without any request.
+        """
+        if not doi or not self.api_key or not self._wants_complete():
+            return None
+        query = 'DOI("%s")' % doi.replace('"', "")
+        try:
+            response = self._get_best_view(
+                self._headers(), {"query": query, "count": 1}, retry=False
+            )
+            if response.status_code != 200:
+                return None
+            entries = response.json().get("search-results", {}).get(
+                "entry", []
+            )
+        except RateLimited:
+            return None
+        except Exception as e:
+            logger.warning("scopus: DOI lookup failed for %s: %s", doi, e)
+            return None
+        for entry in entries:
+            if entry.get("@_fa") != "false" and entry.get("dc:title"):
+                return self._convert_entry(entry)
+        return None
+@
+
+<<scopus view test methods>>=
+def test_doi_lookup_only_where_complete_is_served(self):
+    """Entitled: the rich record. Refused: None, then no more requests."""
+    calls = []
+    with patch("requests.get", self.service(True, calls)):
+        paper = ScopusProvider(api_key="k").get_paper_by_doi("10.1/x(1)")
+    assert paper.abstract == "An abstract."
+    assert calls[0]["query"] == 'DOI("10.1/x(1)")'
+    assert calls[0]["view"] == "COMPLETE"
+
+    del calls[:]
+    provider = ScopusProvider(api_key="k")
+    with patch("requests.get", self.service(False, calls)):
+        assert provider.get_paper_by_doi("10.1/x") is None
+        assert provider.get_paper_by_doi("10.1/y") is None
+    assert len(calls) == 1
+
+def test_doi_lookup_without_a_match(self):
+    """Scopus's empty-result sentinel is not a paper."""
+    response = Mock(status_code=200, ok=True, headers={}, text="")
+    response.json.return_value = {"search-results": {
+        "entry": [{"@_fa": "false", "error": "Result set was empty"}]}}
+    with patch("requests.get", return_value=response):
+        assert ScopusProvider(api_key="k").get_paper_by_doi("10.1/x") is None
+    assert ScopusProvider(api_key=None).get_paper_by_doi("10.1/x") is None
+@
+
 \subsection{Health check}
 
 Scopus authenticates via the [[X-ELS-APIKey]] header (plus the optional

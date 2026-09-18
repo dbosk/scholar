@@ -139,6 +139,12 @@ part. COMPLETE results are served to everyone (unless
 available, which a new process learns from one `count=1` probe
 (`_complete_confirmed()`); a failed probe still serves the cache.
 
+`ScopusProvider.get_paper_by_doi()` (a one-result `DOI("...")` search)
+makes Scopus the *last* entry of `ENRICHMENT_PROVIDERS`. It returns
+`None` unless the COMPLETE view is served (the default view has no
+abstract to add), and after one refusal it declines without a request,
+so an off-campus enrichment run costs Scopus a single request.
+
 Scopus writes names surname first (`Fares E.`), which made
 `legacy_hash_paper_id` hash the initial. `scopus_authors()` uses
 COMPLETE's `given-name`/`surname`, else `utils.given_name_first()`
